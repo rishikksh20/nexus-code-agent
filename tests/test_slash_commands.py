@@ -1,0 +1,594 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+from rich.console import Console
+
+from nexus.config import load_config
+from nexus.integrations.mcp import MCPServerConfig, MCPServerRuntime, MCPToolSpec
+from nexus.memory.store import MemoryStore
+from nexus.runtime.delegation import DelegationRuntime, TaskStatus
+from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.repl_state import ReplState
+from nexus.runtime.sessions import SessionStore, new_snapshot
+from nexus.runtime.slash_commands import build_router
+from nexus.skills import load_skill_registry
+from nexus.tools.base import ToolRegistry
+from nexus.tools.builtin import GetTimeTool
+
+
+@pytest.mark.asyncio
+async def test_mode_slash_command_switches_state(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True),
+    )
+
+    router = build_router()
+    handled = await router.dispatch(state, "/mode plan")
+
+    assert handled is True
+    assert state.mode is ExecutionMode.PLAN
+
+
+@pytest.mark.asyncio
+async def test_slash_command_invalid_quoting_does_not_crash(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())
+    console = Console(record=True, no_color=True)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-invalid"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    router = build_router()
+    handled = await router.dispatch(state, '/memory save note "unterminated')
+
+    assert handled is True
+    assert "Invalid command syntax" in console.export_text()
+
+
+class _FakeMCPClient:
+    def __init__(self) -> None:
+        self._tools = [
+            MCPToolSpec(
+                name="read_file",
+                description="Read files.",
+                input_schema={"type": "object", "properties": {}, "required": []},
+            )
+        ]
+
+    async def list_tools(self) -> list[MCPToolSpec]:
+        return list(self._tools)
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_mcp_status_slash_command_shows_server_state(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    runtime = MCPServerRuntime(
+        server=MCPServerConfig(name="filesystem", command=("uvx", "mcp-server-filesystem", "."), prefix="fs_"),
+        client=_FakeMCPClient(),
+        connected=True,
+        registered_tools=("fs_read_file",),
+        discovered_tools=("fs_read_file",),
+    )
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        mcp_servers=[runtime],
+    )
+
+    router = build_router()
+    handled = await router.dispatch(state, "/mcp status")
+
+    assert handled is True
+    output = console.export_text()
+    assert "filesystem" in output
+    assert "connected" in output
+    assert "1" in output
+
+
+@pytest.mark.asyncio
+async def test_mcp_refresh_slash_command_updates_discovered_tools(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    runtime = MCPServerRuntime(
+        server=MCPServerConfig(name="filesystem", command=("uvx", "mcp-server-filesystem", "."), prefix="fs_"),
+        client=_FakeMCPClient(),
+        connected=True,
+        registered_tools=("fs_read_file",),
+    )
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-refresh"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        mcp_servers=[runtime],
+    )
+
+    router = build_router()
+    handled = await router.dispatch(state, "/mcp refresh filesystem")
+
+    assert handled is True
+    assert runtime.discovered_tools == ("fs_read_file",)
+    output = console.export_text()
+    assert "MCP status refreshed" in output
+
+
+@pytest.mark.asyncio
+async def test_delegate_spawn_slash_command_creates_task(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01)
+    await delegation.start()
+    try:
+        state = ReplState(
+            config=config,
+            mode=ExecutionMode.DEFAULT,
+            session=new_snapshot("delegate-slash"),
+            session_store=SessionStore(config.session_dir),
+            tool_registry=registry,
+            memory_store=MemoryStore(config.memory_dir),
+            console=console,
+            delegation=delegation,
+        )
+
+        router = build_router()
+        handled = await router.dispatch(
+            state,
+            '/delegate spawn "Review docs" "Summarize the key sections." --worker worker-1 --resource docs/README.md',
+        )
+
+        assert handled is True
+        tasks = delegation.list_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].assigned_worker == "worker-1"
+        assert tasks[0].allowed_tools == ()
+        assert tasks[0].claimed_resources == ("docs/README.md",)
+    finally:
+        await delegation.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delegate_spawn_slash_command_supports_tool_restrictions(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01, base_tool_registry=registry)
+    await delegation.start()
+    try:
+        state = ReplState(
+            config=config,
+            mode=ExecutionMode.DEFAULT,
+            session=new_snapshot("delegate-tool-scope"),
+            session_store=SessionStore(config.session_dir),
+            tool_registry=registry,
+            memory_store=MemoryStore(config.memory_dir),
+            console=console,
+            delegation=delegation,
+        )
+
+        router = build_router()
+        handled = await router.dispatch(
+            state,
+            '/delegate spawn "Check time" "Please check the time." --tool get_time --worker worker-1',
+        )
+
+        assert handled is True
+        tasks = delegation.list_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].allowed_tools == ("get_time",)
+    finally:
+        await delegation.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delegate_approve_slash_command_resolves_permission(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01)
+    await delegation.start()
+    try:
+        task = await delegation.submit(
+            __import__("nexus.runtime.delegation", fromlist=["DelegationRequest"]).DelegationRequest(
+                title="Persist findings",
+                instructions="Write results.",
+                permission_action="write_note",
+                permission_reason="Need to persist findings",
+            )
+        )
+        decision_id = None
+        for _ in range(50):
+            approvals = delegation.list_pending_permissions()
+            if approvals:
+                decision_id = approvals[0].correlation_id or approvals[0].message_id
+                break
+            await delegation.wait_for_task(task.task_id, timeout=0.02)
+        assert decision_id is not None
+
+        state = ReplState(
+            config=config,
+            mode=ExecutionMode.DEFAULT,
+            session=new_snapshot("delegate-approve"),
+            session_store=SessionStore(config.session_dir),
+            tool_registry=registry,
+            memory_store=MemoryStore(config.memory_dir),
+            console=console,
+            delegation=delegation,
+        )
+
+        router = build_router()
+        handled = await router.dispatch(state, f"/delegate approve {decision_id}")
+        completed = await delegation.wait_for_task(task.task_id, timeout=1.0)
+
+        assert handled is True
+        assert completed is not None
+        assert completed.status is TaskStatus.COMPLETED
+    finally:
+        await delegation.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_skills_slash_command_activates_skill(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    skill_root = config.skills_dir / "review"
+    skill_root.mkdir(parents=True, exist_ok=True)
+    (skill_root / "SKILL.md").write_text("# Review skill\n\nAlways review carefully.", encoding="utf-8")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("skills-slash"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        skill_registry=load_skill_registry(config.skills_dir, config.local_root / "skills"),
+    )
+
+    router = build_router()
+    handled = await router.dispatch(state, "/skills add review")
+
+    assert handled is True
+    assert state.active_skills == ["review"]
+
+
+@pytest.mark.asyncio
+async def test_provider_slash_command_shows_current_status(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("provider-status"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    router = build_router()
+    handled = await router.dispatch(state, "/provider")
+
+    assert handled is True
+    output = console.export_text()
+    assert "provider" in output
+    assert "mistral" in output
+    assert "model_name" in output
+    assert "temperature" in output
+
+
+@pytest.mark.asyncio
+async def test_provider_list_slash_command_shows_all_providers(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("provider-list"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    router = build_router()
+    handled = await router.dispatch(state, "/provider list")
+
+    assert handled is True
+    output = console.export_text()
+    assert "fake" in output
+    assert "openai" in output
+    assert "openai-compatible" in output
+    assert "mistral" in output
+    # The active provider (mistral by default) should be marked yes
+    assert "yes" in output
+
+
+@pytest.mark.asyncio
+async def test_provider_set_slash_command_updates_model_name(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    # Ensure the local config file directory exists so the TOML write succeeds
+    config.local_root.mkdir(parents=True, exist_ok=True)
+    config.local_config_file.parent.mkdir(parents=True, exist_ok=True)
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("provider-set-model"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    router = build_router()
+    handled = await router.dispatch(state, "/provider set model_name gpt-4o")
+
+    assert handled is True
+    assert state.config.model_name == "gpt-4o"
+    output = console.export_text()
+    assert "model_name" in output
+    assert "gpt-4o" in output
+
+
+@pytest.mark.asyncio
+async def test_provider_set_slash_command_rejects_restricted_key(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("provider-set-restricted"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    router = build_router()
+    # sandbox_image is not in PROVIDER_SETTABLE_PARAMS
+    handled = await router.dispatch(state, "/provider set sandbox_image evil-image:latest")
+
+    assert handled is True
+    output = console.export_text()
+    assert "restricted" in output or "Unknown" in output
+    # Config must not have changed
+    assert state.config.sandbox_image == config.sandbox_image
+
+
+@pytest.mark.asyncio
+async def test_session_export_slash_command_writes_json(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("session-export"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        history=[__import__("nexus.models", fromlist=["Message"]).Message(role="user", content="hello")],
+    )
+
+    export_path = tmp_path / "session.json"
+    router = build_router()
+    handled = await router.dispatch(state, f"/session export {export_path}")
+
+    assert handled is True
+    payload = json.loads(export_path.read_text(encoding="utf-8"))
+    assert payload[0]["content"] == "hello"
+
+
+# ── /context usage ────────────────────────────────────────────────────────────
+
+def _make_state(tmp_path, *, extra_history=None):
+    from nexus.models import Message
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("ctx-test"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        history=extra_history or [],
+    )
+    return state, console
+
+
+@pytest.mark.asyncio
+async def test_context_usage_command_shows_table(tmp_path):
+    state, console = _make_state(tmp_path)
+    router = build_router()
+    handled = await router.dispatch(state, "/context usage")
+
+    assert handled is True
+    output = console.export_text()
+    assert "Context Usage" in output
+    assert "Context window" in output
+    assert "tokens" in output
+
+
+@pytest.mark.asyncio
+async def test_context_usage_includes_provider_and_model(tmp_path):
+    state, console = _make_state(tmp_path)
+    router = build_router()
+    await router.dispatch(state, "/context usage")
+
+    output = console.export_text()
+    assert state.config.provider in output
+    assert state.config.model_name in output
+
+
+@pytest.mark.asyncio
+async def test_context_show_is_default_subcommand(tmp_path):
+    """'/context' without args should show the system prompt, not the usage table."""
+    state, console = _make_state(tmp_path)
+    state.current_system_prompt = "You are Nexus."
+    router = build_router()
+    await router.dispatch(state, "/context")
+
+    output = console.export_text()
+    assert "You are Nexus." in output
+    assert "Context window" not in output
+
+
+# ── /help subcommand ──────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("command", [
+    "/context help",
+    "/mode help",
+    "/provider help",
+    "/skills help",
+    "/config help",
+    "/session help",
+    "/memory help",
+    "/tools help",
+    "/history help",
+])
+@pytest.mark.asyncio
+async def test_help_subcommand_shows_table(tmp_path, command):
+    state, console = _make_state(tmp_path)
+    router = build_router()
+    handled = await router.dispatch(state, command)
+
+    assert handled is True
+    output = console.export_text()
+    # Every help table must include the literal word "help" and show at least one example
+    assert "help" in output.lower()
+    assert "/" in output  # at least one example contains a slash command
+
+
+@pytest.mark.asyncio
+async def test_context_help_lists_all_subcommands(tmp_path):
+    state, console = _make_state(tmp_path)
+    router = build_router()
+    await router.dispatch(state, "/context help")
+
+    output = console.export_text()
+    assert "show" in output
+    assert "usage" in output
+    assert "help" in output
+
+
+@pytest.mark.asyncio
+async def test_mode_help_lists_all_modes(tmp_path):
+    state, console = _make_state(tmp_path)
+    router = build_router()
+    await router.dispatch(state, "/mode help")
+
+    output = console.export_text()
+    for mode in ("plan", "default", "auto"):
+        assert mode in output
+
+
+# ── Unknown slash command forwarding ─────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_unknown_slash_command_returns_false(tmp_path):
+    """An unrecognised /command should return False so the REPL forwards it to the agent."""
+    state, _ = _make_state(tmp_path)
+    router = build_router()
+    handled = await router.dispatch(state, "/notacommand do something")
+
+    assert handled is False
+
+
+# ── Model context limits ──────────────────────────────────────────────────────
+
+def test_get_model_context_limit_exact_match():
+    from nexus.config.model_limits import get_model_context_limit
+    assert get_model_context_limit("mistral-medium-latest") == 32_768
+
+
+def test_get_model_context_limit_prefix_match():
+    from nexus.config.model_limits import get_model_context_limit
+    # "mistral-large-2407" is in the table but "mistral-large-9999" is not;
+    # it should prefix-match "mistral-large" (131_072 tokens).
+    assert get_model_context_limit("mistral-large-9999") == 131_072
+
+
+def test_get_model_context_limit_unknown_model_uses_default():
+    from nexus.config.model_limits import get_model_context_limit, _DEFAULT_CONTEXT_LIMIT
+    assert get_model_context_limit("some-unknown-model-xyz") == _DEFAULT_CONTEXT_LIMIT
+
+
+def test_apply_model_context_limits_overrides_defaults(tmp_path):
+    from nexus.app import _apply_model_context_limits
+    config = load_config(tmp_path, global_root=tmp_path / "global",
+                         cli_overrides={"model_name": "mistral-large-latest"})
+    # Defaults are 10_000 / 14_000
+    assert config.compaction_soft_limit == 10_000
+    assert config.compaction_hard_limit == 14_000
+
+    _apply_model_context_limits(config)
+
+    # mistral-large-latest context = 131_072 → 65% / 85%
+    assert config.compaction_soft_limit == int(131_072 * 0.65)
+    assert config.compaction_hard_limit == int(131_072 * 0.85)
+
+
+def test_apply_model_context_limits_respects_user_overrides(tmp_path):
+    from nexus.app import _apply_model_context_limits
+    config = load_config(tmp_path, global_root=tmp_path / "global",
+                         cli_overrides={"compaction_soft_limit": 5000,
+                                        "compaction_hard_limit": 8000,
+                                        "model_name": "mistral-large-latest"})
+    _apply_model_context_limits(config)
+    # User explicitly set both; function should not override either
+    assert config.compaction_soft_limit == 5000
+    assert config.compaction_hard_limit == 8000

@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+
+RUN useradd -m -u 1000 sandboxuser
+USER sandboxuser
+WORKDIR /workspace
+
+CMD ["/bin/sh"]

@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+import os
+import tomllib
+from dataclasses import fields
+from pathlib import Path
+from typing import Any
+
+from nexus.config.defaults import AgentConfig, build_default_config, config_to_plain_dict
+
+
+PATH_FIELDS = {
+    "skills_dir",
+    "plugins_dir",
+    "memory_dir",
+    "session_dir",
+    "knowledge_file",
+    "log_dir",
+    "workspace_root",
+    "global_root",
+    "local_root",
+    "global_config_file",
+    "local_config_file",
+}
+
+
+class ConfigError(ValueError):
+    """Raised when Nexus configuration is invalid."""
+
+
+def load_config(
+    workspace_root: Path,
+    *,
+    global_root: Path | None = None,
+    cli_overrides: dict[str, Any] | None = None,
+    local_config_path: Path | None = None,
+    global_config_path: Path | None = None,
+) -> AgentConfig:
+    # Load .env from the workspace root first so its values are visible to
+    # all subsequent os.environ reads (including resolve_provider_api_key).
+    # .env values take priority over the system environment; a key already
+    # set in .env is written into os.environ regardless of any existing value.
+    dotenv_path = workspace_root / ".env"
+    _inject_dotenv(dotenv_path)
+
+    defaults = build_default_config(workspace_root, global_root=global_root)
+    base = config_to_plain_dict(defaults)
+
+    global_path = (global_config_path or defaults.global_config_file).expanduser()
+    local_path = local_config_path or defaults.local_config_file
+
+    merged = dict(base)
+    merged.update(_read_toml(global_path))
+    merged.update(_read_toml(local_path))
+    merged.update(_read_environment(defaults))
+    merged.update(cli_overrides or {})
+    merged = _apply_provider_defaults(merged)
+
+    merged["workspace_root"] = str(defaults.workspace_root)
+    merged["global_root"] = str(defaults.global_root)
+    merged["local_root"] = str(defaults.local_root)
+    merged["global_config_file"] = str(global_path.expanduser())
+    merged["local_config_file"] = str(local_path)
+
+    resolved = _resolve_paths(merged, defaults.workspace_root)
+    values: dict[str, Any] = {}
+    for item in fields(AgentConfig):
+        raw_value = resolved[item.name]
+        values[item.name] = _coerce_value(raw_value, getattr(defaults, item.name))
+    _validate_config_values(values)
+    return AgentConfig(**values)
+
+
+def _inject_dotenv(path: Path) -> None:
+    """Parse a .env file and inject its key-value pairs into os.environ.
+
+    .env values take priority: existing os.environ entries for the same keys
+    are overwritten. Only simple KEY=VALUE lines are parsed; comments (#)
+    and blank lines are skipped. Quoted values have their surrounding quotes
+    stripped. If the file does not exist the function is a no-op.
+    """
+    if not path.exists():
+        return
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, raw_value = line.partition("=")
+            key = key.strip()
+            raw_value = raw_value.strip()
+            # Strip surrounding single or double quotes
+            if len(raw_value) >= 2 and raw_value[0] == raw_value[-1] and raw_value[0] in {'"', "'"}:
+                raw_value = raw_value[1:-1]
+            if key:
+                os.environ[key] = raw_value
+    except OSError:
+        pass  # Unreadable .env is silently ignored
+
+
+def ensure_config_dirs(config: AgentConfig) -> None:
+    for path in (
+        config.global_root,
+        config.local_root,
+        config.session_dir,
+        config.memory_dir,
+        config.skills_dir,
+        config.plugins_dir,
+        config.log_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    config.knowledge_file.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _read_toml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("rb") as handle:
+        data = tomllib.load(handle)
+    return {key: value for key, value in data.items() if not isinstance(value, dict)}
+
+
+def _read_environment(defaults: AgentConfig) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    for item in fields(defaults):
+        env_key = f"AGENT_{item.name.upper()}"
+        raw_value = os.getenv(env_key)
+        if raw_value is None:
+            continue
+        overrides[item.name] = _parse_scalar(raw_value, getattr(defaults, item.name))
+
+    if "AGENT_MAX_TOKENS" in os.environ:
+        overrides["compaction_hard_limit"] = int(os.environ["AGENT_MAX_TOKENS"])
+    return overrides
+
+
+def _resolve_paths(data: dict[str, Any], workspace_root: Path) -> dict[str, Any]:
+    resolved = dict(data)
+    for key in PATH_FIELDS:
+        value = resolved.get(key)
+        if not value:
+            continue
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute():
+            path = workspace_root / path
+        resolved[key] = str(path.resolve())
+    return resolved
+
+
+def _coerce_value(value: Any, template: Any) -> Any:
+    if isinstance(template, Path):
+        return Path(value)
+    if isinstance(template, bool):
+        return bool(value)
+    if isinstance(template, int):
+        return int(value)
+    if isinstance(template, float):
+        return float(value)
+    if isinstance(template, list):
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return []
+    return value
+
+
+def _parse_scalar(raw_value: str, template: Any) -> Any:
+    if isinstance(template, bool):
+        return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(template, int):
+        return int(raw_value)
+    if isinstance(template, float):
+        return float(raw_value)
+    if isinstance(template, list):
+        return [part.strip() for part in raw_value.split(",") if part.strip()]
+    return raw_value
+
+
+def _validate_config_values(values: dict[str, Any]) -> None:
+    valid_modes = {"plan", "default", "auto"}
+    valid_log_formats = {"text", "json"}
+    valid_providers = {"fake", "mistral", "openai", "openai-compatible"}
+    valid_approval_policies = {
+        "on-request", "approve-turn", "approve-session", "auto", "plan"
+    }
+
+    provider = str(values["provider"]).strip()
+    if provider not in valid_providers:
+        raise ConfigError(
+            f"Invalid provider '{provider}'. Expected one of: {', '.join(sorted(valid_providers))}."
+        )
+
+    if provider in {"mistral", "openai", "openai-compatible"} and not str(values["api_base_url"]).strip():
+        raise ConfigError(f"provider '{provider}' requires api_base_url to be set.")
+
+    default_mode = values["default_mode"]
+    if default_mode not in valid_modes:
+        raise ConfigError(
+            f"Invalid default_mode '{default_mode}'. Expected one of: {', '.join(sorted(valid_modes))}."
+        )
+
+    approval_policy = values.get("approval_policy", "on-request")
+    if approval_policy not in valid_approval_policies:
+        raise ConfigError(
+            f"Invalid approval_policy '{approval_policy}'. "
+            f"Expected one of: {', '.join(sorted(valid_approval_policies))}."
+        )
+
+    log_format = values["log_format"]
+    if log_format not in valid_log_formats:
+        raise ConfigError(
+            f"Invalid log_format '{log_format}'. Expected one of: {', '.join(sorted(valid_log_formats))}."
+        )
+
+    integer_fields = (
+        "max_output_tokens",
+        "compaction_soft_limit",
+        "compaction_hard_limit",
+        "compaction_keep_recent",
+        "max_loop_iterations",
+        "max_sessions_retained",
+        "write_note_max_bytes",
+        "delegation_message_history_limit",
+        "sandbox_timeout_seconds",
+        "context_prune_protect_tokens",
+        "context_prune_minimum_tokens",
+    )
+    for field_name in integer_fields:
+        if values[field_name] < 1:
+            raise ConfigError(f"{field_name} must be greater than 0.")
+
+    if values["delegation_poll_interval_seconds"] <= 0:
+        raise ConfigError("delegation_poll_interval_seconds must be greater than 0.")
+
+    if values["compaction_hard_limit"] < values["compaction_soft_limit"]:
+        raise ConfigError("compaction_hard_limit must be greater than or equal to compaction_soft_limit.")
+
+    temperature = values["temperature"]
+    if not 0.0 <= temperature <= 2.0:
+        raise ConfigError("temperature must be between 0.0 and 2.0.")
+
+    mcp_servers = values["mcp_servers"]
+    if not isinstance(mcp_servers, list):
+        raise ConfigError("mcp_servers must be a list of server definitions.")
+    for entry in mcp_servers:
+        if not isinstance(entry, dict):
+            raise ConfigError("Each mcp_servers entry must be a table with name and command fields.")
+        name = str(entry.get("name", "")).strip()
+        command = entry.get("command")
+        if not name:
+            raise ConfigError("Each mcp_servers entry must define a non-empty name.")
+        if not isinstance(command, list) or not command:
+            raise ConfigError(f"mcp_servers entry '{name}' must define a non-empty command list.")
+
+    delegation_workers = values["delegation_workers"]
+    if not isinstance(delegation_workers, list) or not delegation_workers:
+        raise ConfigError("delegation_workers must define at least one worker id.")
+    if any(not str(worker_id).strip() for worker_id in delegation_workers):
+        raise ConfigError("delegation_workers entries must be non-empty strings.")
+    if len({str(worker_id).strip() for worker_id in delegation_workers}) != len(delegation_workers):
+        raise ConfigError("delegation_workers must not contain duplicate worker ids.")
+
+    allowed_tools = values["allowed_tools"]
+    denied_tools = values["denied_tools"]
+    overlap = sorted(set(allowed_tools) & set(denied_tools))
+    if overlap:
+        raise ConfigError("allowed_tools and denied_tools must not overlap: " + ", ".join(overlap))
+
+    server_names: set[str] = set()
+    for entry in mcp_servers:
+        name = str(entry.get("name", "")).strip()
+        if name in server_names:
+            raise ConfigError(f"Duplicate mcp_servers entry '{name}'.")
+        server_names.add(name)
+
+
+def _apply_provider_defaults(values: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(values)
+    provider = str(resolved.get("provider", "")).strip().lower()
+    api_base_url = str(resolved.get("api_base_url", "")).strip()
+    if provider == "mistral":
+        # MISTRAL_BASE_URL always takes priority; fall back to the hardcoded default
+        # when api_base_url has not been set explicitly via TOML or env.
+        mistral_base_url_env = os.getenv("MISTRAL_BASE_URL")
+        if mistral_base_url_env:
+            resolved["api_base_url"] = mistral_base_url_env
+        elif not api_base_url:
+            resolved["api_base_url"] = "https://api.mistral.ai/v1"
+    return resolved
+
