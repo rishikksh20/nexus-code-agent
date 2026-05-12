@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import abc
+from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Protocol
 
 from nexus.models import ToolExecutionContext, ToolResult
@@ -24,12 +26,125 @@ class ToolKind(str, Enum):
     SANDBOX = "sandbox"  # Isolated container execution
 
 
+@dataclass
+class FileDiff:
+    """Captures the before/after state of a file edit for confirmation prompts."""
+
+    path: Path
+    old_content: str
+    new_content: str
+    is_new_file: bool = False
+    is_deletion: bool = False
+
+    def to_diff(self) -> str:
+        import difflib
+
+        old_lines = self.old_content.splitlines(keepends=True)
+        new_lines = self.new_content.splitlines(keepends=True)
+        if old_lines and not old_lines[-1].endswith("\n"):
+            old_lines[-1] += "\n"
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines[-1] += "\n"
+        old_name = "/dev/null" if self.is_new_file else str(self.path)
+        new_name = "/dev/null" if self.is_deletion else str(self.path)
+        return "".join(
+            difflib.unified_diff(old_lines, new_lines, fromfile=old_name, tofile=new_name)
+        )
+
+
+@dataclass
+class ToolConfirmation:
+    """Rich confirmation payload shown to the user before a mutating tool runs."""
+
+    tool_name: str
+    params: dict[str, Any]
+    description: str | None = None
+    diff: FileDiff | None = None
+    affected_paths: list[Path] = field(default_factory=list)
+    is_dangerous: bool = False
+    command: str | None = None
+
+
+class Tool(abc.ABC):
+    """Abstract base class for all Nexus tools.
+
+    Subclass this to build first-party and plugin tools.  The registry accepts
+    any object that satisfies :class:`BaseTool` (structural Protocol), but
+    inheriting from :class:`Tool` gives you ``get_confirmation``,
+    ``validate_params``, and ``to_openai_schema`` for free.
+
+    Class attributes
+    ----------------
+    name:
+        Machine-readable identifier used in tool-call payloads.
+    description:
+        Human-readable summary surfaced in the system prompt.
+    kind:
+        Semantic classification used by the permission system.
+    input_schema:
+        JSON Schema dict describing accepted parameters.
+    is_mutating:
+        Whether this tool modifies external state.
+    """
+
+    name: str
+    description: str
+    kind: ToolKind = ToolKind.READ
+    input_schema: dict[str, Any] = field(default_factory=dict)
+    is_mutating: bool = False
+
+    async def get_confirmation(
+        self,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolConfirmation | None:
+        """Return a :class:`ToolConfirmation` if this invocation needs approval.
+
+        The default implementation returns ``None`` (auto-approved).  Override
+        for tools that show diffs or need explicit user consent.
+        """
+        return None
+
+    def validate_params(self, arguments: dict[str, Any]) -> list[str]:
+        """Validate *arguments* against ``input_schema``.
+
+        Returns a (possibly empty) list of human-readable error strings.
+        The default implementation accepts anything; override or rely on JSON
+        Schema validation done upstream in the agent loop.
+        """
+        return []
+
+    def to_openai_schema(self) -> dict[str, Any]:
+        """Return an OpenAI-compatible function schema dict."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.input_schema,
+            },
+        }
+
+    @abc.abstractmethod
+    async def execute(
+        self,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        """Execute the tool and return a :class:`~nexus.models.ToolResult`."""
+
+
 class BaseTool(Protocol):
     """Structural protocol every Nexus tool must satisfy.
 
     Tools are registered in a :class:`ToolRegistry` and invoked by the agent
     during its agentic loop.  They must be stateless across calls — all
     per-call state lives in :class:`~nexus.models.ToolExecutionContext`.
+
+    Prefer subclassing :class:`Tool` which satisfies this protocol and
+    provides useful default implementations.
     """
 
     name: str

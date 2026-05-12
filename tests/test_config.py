@@ -148,6 +148,48 @@ def test_config_accepts_structured_mcp_servers(tmp_path):
     ]
 
 
+def test_config_accepts_structured_delegation_subagents(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'delegation_subagents = [{ name = "explore", description = "Investigate a focused codebase question.", goal_prompt = "Read the relevant code and summarize the answer.", allowed_tools = ["read_file", "glob"], max_turns = 12, timeout_seconds = 300 }]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.delegation_subagents == [
+        {
+            "name": "explore",
+            "description": "Investigate a focused codebase question.",
+            "goal_prompt": "Read the relevant code and summarize the answer.",
+            "allowed_tools": ["read_file", "glob"],
+            "max_turns": 12,
+            "timeout_seconds": 300,
+        }
+    ]
+
+
+def test_config_rejects_duplicate_delegation_subagents(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'delegation_subagents = [{ name = "explore", description = "First", goal_prompt = "One" }, { name = "explore", description = "Second", goal_prompt = "Two" }]\n',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(workspace, global_root=global_root)
+    except ConfigError as exc:
+        assert "Duplicate delegation_subagents entry 'explore'" in str(exc)
+    else:
+        raise AssertionError("Expected ConfigError for duplicate delegation_subagents")
+
+
 def test_config_rejects_empty_delegation_workers(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

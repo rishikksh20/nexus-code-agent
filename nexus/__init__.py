@@ -1,4 +1,4 @@
-"""Nexus Agent Framework."""
+"""Nexus Coding Agent."""
 
 __all__ = ["__version__"]
 

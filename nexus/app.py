@@ -1,3 +1,16 @@
+"""nexus/app.py — application entry point and runtime orchestrator.
+
+Structure mirrors the reference code's CLI class pattern:
+
+    app = NexusApp(config, console)   # reference: cli = CLI(config)
+    await app.initialize(params)      # build registry, agent, resources
+    await app.run_single(prompt)      # reference: cli.run_single(message)
+    await app.run_interactive()       # reference: cli.run_interactive()
+    await app.close()                 # teardown delegation + MCP
+
+Dispatch helpers (_dispatch_runtime, _dispatch_doctor, …) are thin shims
+called by the click commands defined in nexus/cli/args.py.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -6,10 +19,9 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from nexus import __version__
-from nexus.ui import TerminalUI
 import click
 
+from nexus import __version__
 from nexus.cli.args import args_to_config_overrides
 from nexus.cli.doctor import build_doctor_report, exit_code_for_report
 from nexus.cli.headless import EXIT_NEEDS_CONFIRM, run_headless
@@ -19,279 +31,239 @@ from nexus.config import config_to_plain_dict, ensure_config_dirs, load_config
 from nexus.config.loader import ConfigError
 from nexus.config.model_limits import get_model_context_limit
 from nexus.extensions.plugins import PluginLoader
+from nexus.hooks import HookExecutor, setup_hooks
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.integrations.mcp import MCPServerConfig, MCPServerRuntime, MCPToolAdapter
-from nexus.integrations.openai_compatible import OpenAICompatibleModelClient, resolve_provider_api_key
+from nexus.integrations.openai_compatible import (
+    OpenAICompatibleModelClient,
+    resolve_provider_api_key,
+)
 from nexus.memory.store import MemoryStore
-from nexus.hooks import HookExecutor, setup_hooks
 from nexus.runtime.agent import Agent
 from nexus.runtime.delegation import DelegationRuntime
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.repl import run_repl
-from nexus.runtime.repl_state import ReplState
 from nexus.runtime.post_session import run_post_session_updates
-from nexus.runtime.sessions import EphemeralSessionStore, SessionStore, new_snapshot
+from nexus.runtime.repl import run_repl
+from nexus.runtime.runtime_session import RuntimeSession, resolve_runtime_session
 from nexus.runtime.slash_commands import build_router
-from nexus.sandbox import register_agent_tool, register_sandbox_tool
+from nexus.sandbox import register_sandbox_tool
 from nexus.sandbox.tool import SandboxedCommandTool
-from nexus.security.manager import ApprovalManager
-from nexus.security.policy import ApprovalPolicy
-from nexus.skills import BUILTIN_SKILLS_DIR, SkillRegistry, load_skill_registry
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool, WriteNoteTool
-from nexus.tools.filesystem import (
-    BashTool,
-    GlobTool,
-    GrepTool,
-    LsTool,
-    ModifyFileTool,
-    ReadFileTool,
-    ReplaceTextTool,
-    WriteFileTool,
-)
-
+from nexus.tools.registry import register_core_tools, tool_enabled
+from nexus.tools.subagents import load_subagent_definitions, register_subagent_tools
+from nexus.ui import TerminalUI
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# RuntimeResources — groups long-lived async resources that need teardown
+# ---------------------------------------------------------------------------
+
 @dataclass(slots=True)
 class RuntimeResources:
+    """Holds async resources (delegation runtime, MCP server connections) that
+    must be shut down cleanly when the session ends."""
+
     mcp_servers: list[MCPServerRuntime] = field(default_factory=list)
     delegation: DelegationRuntime | None = None
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Entry point — wraps the click CLI so callers get a plain integer exit code."""
-    from nexus.cli.args import cli  # local import avoids any load-order issues
-
-    try:
-        result = cli.main(args=argv, standalone_mode=False)
-        return result if isinstance(result, int) else 0
-    except click.exceptions.Exit as exc:
-        return exc.code
-    except click.exceptions.Abort:
-        return 1
-    except click.exceptions.ClickException as exc:
-        exc.show()
-        return exc.exit_code
-    except SystemExit as exc:
-        return int(exc.code) if exc.code is not None else 0
-
-
 # ---------------------------------------------------------------------------
-# Dispatch helpers — called by click commands in nexus.cli.args (lazy import).
+# NexusApp — main runtime orchestrator (analogous to CLI in reference code)
 # ---------------------------------------------------------------------------
 
-def _dispatch_version() -> None:
-    console = TerminalUI()
-    console.print_version(__version__)
+class NexusApp:
+    """Orchestrates the Nexus agent runtime for a single user session.
 
+    Lifecycle (mirrors ``CLI`` in the reference code)::
 
-def _dispatch_runtime(params: dict) -> int:
-    workspace_root = Path.cwd()
-    console = TerminalUI()
-    try:
-        config = load_config(
-            workspace_root,
-            cli_overrides=args_to_config_overrides(**params),
-            local_config_path=params.get("config_file"),
-            global_config_path=params.get("global_config"),
+        app = NexusApp(config, console)
+        await app.initialize(load_plugins=True)   # build registry + agent
+        try:
+            exit_code = await app.run_single(prompt, params)
+            # — or —
+            exit_code = await app.run_interactive(params)
+        finally:
+            await app.close()                     # teardown resources
+
+    Parameters
+    ----------
+    config:
+        Fully resolved :class:`AgentConfig` for the current session.
+    console:
+        Terminal UI instance used for all user-facing output.
+    """
+
+    def __init__(self, config, console: TerminalUI) -> None:
+        self.config = config
+        self.console = console
+        # Set by initialize()
+        self._registry: ToolRegistry | None = None
+        self._resources: RuntimeResources | None = None
+        self._agent: Agent | None = None
+        self._hooks: HookExecutor | None = None
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    async def initialize(self, *, load_plugins: bool = True) -> None:
+        """Build the tool registry, start delegation, connect MCP servers.
+
+        Must be awaited before calling :meth:`run_single` or
+        :meth:`run_interactive`.
+        """
+        self._apply_model_context_limits()
+        self._hooks = setup_hooks(self.config)
+        self._registry, self._resources = await self._build_registry(
+            load_plugins=load_plugins
         )
-    except ConfigError as exc:
-        console.print_config_error(exc)
-        return 1
-    logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
-    console = TerminalUI(color=config.color_output)
-    return asyncio.run(_run_runtime(params, config, console, workspace_root))
-
-
-def _dispatch_doctor(output_format: str) -> int:
-    workspace_root = Path.cwd()
-    console = TerminalUI()
-    try:
-        config = load_config(workspace_root)
-    except ConfigError as exc:
-        console.print_config_error(exc)
-        return 1
-    logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
-    return asyncio.run(_run_doctor(config, console, output_format=output_format))
-
-
-def _dispatch_init(force: bool) -> None:
-    workspace_root = Path.cwd()
-    console = TerminalUI()
-    try:
-        config = load_config(workspace_root)
-    except ConfigError as exc:
-        console.print_config_error(exc)
-        return
-    logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
-    console = TerminalUI(color=config.color_output)
-    ensure_config_dirs(config)
-    created = init_workspace(
-        workspace_root,
-        global_root=config.global_root,
-        project_name=config.project_name,
-        project_description=config.project_description,
-        force=force,
-    )
-    if created:
-        console.print("Created:" if not force else "Reinitialized:")
-        for path in created:
-            console.print(f"- {path}")
-    else:
-        console.print("Nexus workspace already initialized.")
-    _print_provider_setup_reminder(console, config)
-
-
-def _dispatch_config(scope: str) -> None:
-    workspace_root = Path.cwd()
-    console = TerminalUI()
-    try:
-        config = load_config(workspace_root)
-    except ConfigError as exc:
-        console.print_config_error(exc)
-        return
-    console = TerminalUI(color=config.color_output)
-    if scope == "global":
-        console.print(
-            config.global_config_file.read_text(encoding="utf-8")
-            if config.global_config_file.exists()
-            else "# global config not initialized"
+        self._agent = Agent(
+            model_client=self._build_model_client(),
+            tool_registry=self._registry,
+            hooks=self._hooks,
         )
-    elif scope == "local":
-        console.print(
-            config.local_config_file.read_text(encoding="utf-8")
-            if config.local_config_file.exists()
-            else "# local config not initialized"
+        self._log_registered_tools()
+
+    async def run_single(self, prompt: str, params: dict) -> int:
+        """Run the agent once with *prompt* and return an exit code.
+
+        Equivalent to ``CLI.run_single`` in the reference code.
+        """
+        runtime_session = self._build_runtime_session(params)
+        result = await run_headless(
+            runtime_session.state,
+            self._agent,
+            prompt,
+            auto_confirm=params["auto_confirm"],
+            output_path=params["output"],
+            output_format=params["output_format"],
+            quiet=params["quiet"],
         )
-    else:
-        console.print(json.dumps(config_to_plain_dict(config), indent=2))
-
-
-async def _run_runtime(params: dict, config, console: TerminalUI, workspace_root: Path) -> int:
-    # Auto-tune compaction limits when the user hasn't overridden them.
-    _apply_model_context_limits(config)
-
-    ensure_config_dirs(config)
-    init_workspace(
-        workspace_root,
-        global_root=config.global_root,
-        project_name=config.project_name,
-        project_description=config.project_description,
-    )
-
-    hooks = setup_hooks(config)
-    registry, resources = await _build_registry(config, hooks, load_plugins=not params["no_plugins"])
-    _log_registered_tools(registry)
-    agent = Agent(model_client=_build_model_client(config), tool_registry=registry, hooks=hooks)
-    if params["no_session"]:
-        session_store = EphemeralSessionStore()
-    else:
-        session_store = SessionStore(
-            config.session_dir,
-            max_sessions_retained=config.max_sessions_retained,
-        )
-    session, session_resumed = _resolve_session(
-        params["session"], session_store, persist_sessions=not params["no_session"]
-    )
-    no_skills: bool = params["no_skills"]
-    skill_registry = SkillRegistry() if no_skills else load_skill_registry(
-        BUILTIN_SKILLS_DIR, config.skills_dir, config.local_root / "skills"
-    )
-    builtin_active = [] if no_skills else (
-        ["nexus-agent"] if skill_registry.get("nexus-agent") is not None else []
-    )
-    active_skills = builtin_active + [
-        name for name in params.get("skills", ()) if skill_registry.get(name) is not None
-    ]
-    state = ReplState(
-        config=config,
-        mode=ExecutionMode.PLAN if params["deny_mutating"] else ExecutionMode(config.default_mode),
-        session=session,
-        session_store=session_store,
-        tool_registry=registry,
-        memory_store=MemoryStore(config.memory_dir),
-        console=console,
-        hooks=hooks,
-        approval_manager=ApprovalManager(
-            policy=ApprovalPolicy(config.approval_policy)
-        ),
-        history=list(session.messages),
-        skill_registry=skill_registry,
-        active_skills=active_skills,
-        mcp_servers=resources.mcp_servers,
-        delegation=resources.delegation,
-    )
-
-    try:
-        prompt = resolve_prompt(params)
-        if prompt is not None:
-            result = await run_headless(
-                state,
-                agent,
-                prompt,
-                auto_confirm=params["auto_confirm"],
-                output_path=params["output"],
-                output_format=params["output_format"],
-                quiet=params["quiet"],
+        if result.exit_code == EXIT_NEEDS_CONFIRM:
+            self.console.print_warning(f"Confirmation required: {result.error}")
+        elif result.exit_code == 0:
+            run_post_session_updates(
+                self.config,
+                runtime_session.state.session,
+                active_skills=runtime_session.state.active_skills,
             )
-            if result.exit_code == EXIT_NEEDS_CONFIRM:
-                console.print_warning(f"Confirmation required: {result.error}")
-            elif result.exit_code == 0:
-                run_post_session_updates(config, state.session, active_skills=state.active_skills)
-            return result.exit_code
+        return result.exit_code
 
-        await run_repl(state, agent, build_router(), session_resumed=session_resumed)
-        run_post_session_updates(config, state.session, active_skills=state.active_skills)
+    async def run_interactive(self, params: dict) -> int:
+        """Start the interactive REPL and return an exit code when the user exits.
+
+        Equivalent to ``CLI.run_interactive`` in the reference code.
+        """
+        runtime_session = self._build_runtime_session(params)
+        await run_repl(
+            runtime_session.state,
+            self._agent,
+            build_router(),
+            session_resumed=runtime_session.session_resumed,
+        )
+        run_post_session_updates(
+            self.config,
+            runtime_session.state.session,
+            active_skills=runtime_session.state.active_skills,
+        )
         return 0
-    finally:
-        await _close_runtime_resources(resources)
 
+    async def close(self) -> None:
+        """Shut down delegation runtime and MCP server connections."""
+        if self._resources is None:
+            return
+        if self._resources.delegation is not None:
+            await self._resources.delegation.shutdown()
+        for server in self._resources.mcp_servers:
+            await server.close()
 
-async def _build_registry(config, hooks: HookExecutor, *, load_plugins: bool = True) -> tuple[ToolRegistry, RuntimeResources]:
-    registry = ToolRegistry()
-    resources = RuntimeResources()
-    model_client_factory = lambda: _build_model_client(config)
-    if config.delegation_enabled:
-        delegation = DelegationRuntime(
-            worker_ids=[str(worker_id) for worker_id in config.delegation_workers],
-            hooks=hooks,
-            poll_interval=float(config.delegation_poll_interval_seconds),
-            history_limit=int(config.delegation_message_history_limit),
-            base_tool_registry=registry,
-            model_client_factory=model_client_factory,
-            workspace_root=config.workspace_root,
-            temperature=float(config.temperature),
-            max_output_tokens=int(config.max_output_tokens),
-            auto_confirm_read_only=bool(config.auto_confirm_read_only),
+    # ------------------------------------------------------------------
+    # Private — session state
+    # ------------------------------------------------------------------
+
+    def _build_runtime_session(self, params: dict) -> RuntimeSession:
+        """Construct the runtime session for one headless or interactive run."""
+        return RuntimeSession.create(
+            config=self.config,
+            console=self.console,
+            params=params,
+            tool_registry=self._registry,
+            hooks=self._hooks,
+            resources=self._resources,
         )
-        await delegation.start()
-        resources.delegation = delegation
-    for tool in (
-        GetTimeTool(),
-        WriteNoteTool(max_bytes=int(config.write_note_max_bytes)),
-        ReadFileTool(),
-        WriteFileTool(),
-        ModifyFileTool(),
-        ReplaceTextTool(),
-        GlobTool(),
-        GrepTool(),
-        LsTool(),
-        BashTool(),
-    ):
-        if not _tool_enabled(config, tool.name):
-            continue
-        registry.register(tool, source="core", origin="builtin")
 
-    if load_plugins:
-        PluginLoader(config.plugins_dir).load_all(
+    # ------------------------------------------------------------------
+    # Private — registry + tool wiring
+    # ------------------------------------------------------------------
+
+    async def _build_registry(
+        self, *, load_plugins: bool = True
+    ) -> tuple[ToolRegistry, RuntimeResources]:
+        """Build the tool registry and start async runtime resources.
+
+        Order:
+        1. Start delegation runtime (if enabled)
+        2. Register all builtin tools
+        3. Load plugins (if enabled)
+        4. Connect MCP servers and register their tools
+        5. Register sandbox / sub-agent tools
+        """
+        registry = ToolRegistry()
+        resources = RuntimeResources()
+
+        # 1. Delegation runtime
+        if self.config.delegation_enabled:
+            delegation = DelegationRuntime(
+                worker_ids=[str(w) for w in self.config.delegation_workers],
+                hooks=self._hooks,
+                poll_interval=float(self.config.delegation_poll_interval_seconds),
+                history_limit=int(self.config.delegation_message_history_limit),
+                base_tool_registry=registry,
+                model_client_factory=self._build_model_client,
+                workspace_root=self.config.workspace_root,
+                temperature=float(self.config.temperature),
+                max_output_tokens=int(self.config.max_output_tokens),
+                auto_confirm_read_only=bool(self.config.auto_confirm_read_only),
+            )
+            await delegation.start()
+            resources.delegation = delegation
+
+        # 2. Builtin tools
+        register_core_tools(registry, self.config)
+
+        # 3. Plugins
+        if load_plugins:
+            PluginLoader(self.config.plugins_dir).load_all(
+                registry,
+                self._hooks,
+                can_register=lambda tool: self._tool_enabled(tool.name),
+            )
+
+        # 4. MCP servers
+        for payload in self.config.mcp_servers:
+            await self._connect_mcp_server(payload, registry, resources)
+
+        # 5. Sandbox + sub-agent tools
+        if self.config.sandbox_commands and self._tool_enabled(SandboxedCommandTool.name):
+            register_sandbox_tool(registry, self.config)
+        register_subagent_tools(
             registry,
-            hooks,
-            can_register=lambda tool: _tool_enabled(config, tool.name),
+            resources.delegation,
+            self.config,
+            definitions=load_subagent_definitions(self.config),
         )
 
-    for payload in config.mcp_servers:
+        return registry, resources
+
+    async def _connect_mcp_server(
+        self,
+        payload: dict,
+        registry: ToolRegistry,
+        resources: RuntimeResources,
+    ) -> None:
+        """Connect one MCP server and register its tools. Logs and skips on error."""
         server = MCPServerConfig.from_dict(payload)
         runtime = MCPServerRuntime(server=server)
         try:
@@ -300,54 +272,109 @@ async def _build_registry(config, hooks: HookExecutor, *, load_plugins: bool = T
             logger.warning("Skipping MCP server %s: %s", server.name, exc)
             runtime.last_error = str(exc)
             resources.mcp_servers.append(runtime)
-            continue
+            return
+
         resources.mcp_servers.append(runtime)
         client = runtime.client
         if client is None:
-            logger.warning("Skipping MCP server %s because no client is available after refresh.", server.name)
-            continue
+            logger.warning("Skipping MCP server %s: no client after refresh", server.name)
+            return
+
         for display_name in specs:
-            if not _tool_enabled(config, display_name):
+            if not self._tool_enabled(display_name):
                 continue
             try:
-                remote_name = display_name.removeprefix(server.prefix) if server.prefix else display_name
+                remote_name = (
+                    display_name.removeprefix(server.prefix)
+                    if server.prefix
+                    else display_name
+                )
                 registry.register(
                     MCPToolAdapter(
                         client,
-                        next(spec for spec in await runtime._list_tools() if spec.name == remote_name),
+                        next(
+                            spec
+                            for spec in await runtime._list_tools()
+                            if spec.name == remote_name
+                        ),
                         display_name=display_name,
                     ),
                     source="mcp",
                     origin=server.name,
                 )
             except ValueError as exc:
-                logger.warning("Skipping MCP tool %s from %s: %s", display_name, server.name, exc)
+                logger.warning(
+                    "Skipping MCP tool %s from %s: %s", display_name, server.name, exc
+                )
+
         runtime.registered_tools = tuple(
-            record.name for record in registry.records() if record.source == "mcp" and record.origin == server.name
+            r.name
+            for r in registry.records()
+            if r.source == "mcp" and r.origin == server.name
         )
 
-    if config.sandbox_commands and _tool_enabled(config, SandboxedCommandTool.name):
-        register_sandbox_tool(registry, config)
-    register_agent_tool(registry, resources.delegation, config)
-    return registry, resources
+    # ------------------------------------------------------------------
+    # Private — config / model helpers
+    # ------------------------------------------------------------------
+
+    def _tool_enabled(self, tool_name: str) -> bool:
+        """Return True if *tool_name* is permitted by the current config."""
+        return tool_enabled(self.config, tool_name)
+
+    def _build_model_client(self):
+        """Construct the LLM client from the current config."""
+        if self.config.provider == "fake":
+            return FakeModelClient()
+        if self.config.provider in {"mistral", "openai-compatible", "openai"}:
+            explicit_key = self.config.api_key or None
+            return OpenAICompatibleModelClient(
+                api_base_url=self.config.api_base_url,
+                api_key=resolve_provider_api_key(self.config.provider, explicit_key),
+                provider_name=self.config.provider,
+            )
+        raise ValueError(f"Unsupported provider: {self.config.provider}")
+
+    def _apply_model_context_limits(self) -> None:
+        """Auto-tune compaction thresholds to fit the active model's context window.
+
+        Only overrides the built-in defaults (10 000 / 14 000); explicit user
+        settings in ``config.toml`` or env vars are left untouched.
+        """
+        _SOFT_DEFAULT, _HARD_DEFAULT = 10_000, 14_000
+        if (
+            self.config.compaction_soft_limit != _SOFT_DEFAULT
+            and self.config.compaction_hard_limit != _HARD_DEFAULT
+        ):
+            return  # user overrode both; respect their settings
+        ctx_limit = get_model_context_limit(self.config.model_name)
+        if self.config.compaction_soft_limit == _SOFT_DEFAULT:
+            self.config.compaction_soft_limit = int(ctx_limit * 0.65)
+        if self.config.compaction_hard_limit == _HARD_DEFAULT:
+            self.config.compaction_hard_limit = int(ctx_limit * 0.85)
+
+    def _log_registered_tools(self) -> None:
+        for record in self._registry.records():
+            logger.info(
+                "Registered tool %s from %s (%s)",
+                record.name,
+                record.source,
+                record.origin or "default",
+            )
 
 
-def _tool_enabled(config, tool_name: str) -> bool:
-    if config.allowed_tools and tool_name not in config.allowed_tools:
-        return False
-    if tool_name in config.denied_tools:
-        return False
-    return True
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_session(*args, **kwargs) -> tuple:
+    """Backward-compat shim for tests that imported the old helper."""
+    return resolve_runtime_session(*args, **kwargs)
 
 
-def _print_provider_setup_reminder(console: TerminalUI, config) -> None:
-    """After init or on startup, remind the user how to set an API key if none is present."""
-    console.print_provider_setup_reminder(config)
-
-
-def _provider_error_message(exc: Exception, config) -> str:
-    """Return a user-friendly explanation for common provider request failures."""
+def provider_error_message(exc: Exception, config) -> str:
+    """Return a user-friendly explanation for common LLM provider failures."""
     from os import environ
+
     msg = str(exc)
     provider = config.provider
     has_key = bool(
@@ -379,7 +406,7 @@ def _provider_error_message(exc: Exception, config) -> str:
         return (
             f"No API base URL configured for provider [bold]{provider}[/bold]. "
             "Set [bold]api_base_url[/bold] in [bold].nexus/config.toml[/bold] "
-            "or via [bold]AGENT_API_BASE_URL[/bold] environment variable."
+            "or via [bold]AGENT_API_BASE_URL[/bold] env var."
         )
     if "connection" in msg.lower() or "urlopen" in msg.lower() or "name or service" in msg.lower():
         return (
@@ -390,88 +417,175 @@ def _provider_error_message(exc: Exception, config) -> str:
     return f"Provider error: {msg}"
 
 
-def _apply_model_context_limits(config) -> None:
-    """Auto-tune compaction thresholds to match the active model's context window.
+# ---------------------------------------------------------------------------
+# Dispatch helpers — called by click commands in nexus/cli/args.py
+# ---------------------------------------------------------------------------
 
-    Only overrides values that are still at the built-in defaults (10 000 / 14 000)
-    so explicit user settings in config.toml or env vars are preserved.
+def main(argv: list[str] | None = None) -> int:
+    """Entry point — wraps the click CLI and returns a plain integer exit code."""
+    from nexus.cli.args import cli  # local import avoids load-order issues
+
+    try:
+        result = cli.main(args=argv, standalone_mode=False)
+        return result if isinstance(result, int) else 0
+    except click.exceptions.Exit as exc:
+        return exc.code
+    except click.exceptions.Abort:
+        return 1
+    except click.exceptions.ClickException as exc:
+        exc.show()
+        return exc.exit_code
+    except SystemExit as exc:
+        return int(exc.code) if exc.code is not None else 0
+
+
+def _dispatch_version() -> None:
+    TerminalUI().print_version(__version__)
+
+
+def _dispatch_runtime(params: dict) -> int:
+    """Load config, create NexusApp, and dispatch to single or interactive mode."""
+    workspace_root = Path.cwd()
+    console = TerminalUI()
+    try:
+        config = load_config(
+            workspace_root,
+            cli_overrides=args_to_config_overrides(**params),
+            local_config_path=params.get("config_file"),
+            global_config_path=params.get("global_config"),
+        )
+    except ConfigError as exc:
+        console.print_config_error(exc)
+        return 1
+
+    logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
+    console = TerminalUI(color=config.color_output)
+    return asyncio.run(_run_app(config, console, params))
+
+
+async def _run_app(config, console: TerminalUI, params: dict) -> int:
+    """Initialize NexusApp and run headless or interactive mode.
+
+    This is the async heart of :func:`_dispatch_runtime` — analogous to
+    ``asyncio.run(cli.run_single(…))`` / ``asyncio.run(cli.run_interactive())``
+    in the reference code.
     """
-    _SOFT_DEFAULT = 10_000
-    _HARD_DEFAULT = 14_000
-    if config.compaction_soft_limit != _SOFT_DEFAULT and config.compaction_hard_limit != _HARD_DEFAULT:
-        return  # User has explicitly overridden both; respect their settings
-    ctx_limit = get_model_context_limit(config.model_name)
-    if config.compaction_soft_limit == _SOFT_DEFAULT:
-        config.compaction_soft_limit = int(ctx_limit * 0.65)
-    if config.compaction_hard_limit == _HARD_DEFAULT:
-        config.compaction_hard_limit = int(ctx_limit * 0.85)
+    workspace_root = Path.cwd()
+    ensure_config_dirs(config)
+    init_workspace(
+        workspace_root,
+        global_root=config.global_root,
+        project_name=config.project_name,
+        project_description=config.project_description,
+    )
+
+    app = NexusApp(config, console)
+    await app.initialize(load_plugins=not params["no_plugins"])
+    try:
+        prompt = resolve_prompt(params)
+        if prompt is not None:
+            return await app.run_single(prompt, params)
+        return await app.run_interactive(params)
+    finally:
+        await app.close()
 
 
-def _build_model_client(config):
-    if config.provider == "fake":
-        return FakeModelClient()
-    if config.provider in {"mistral", "openai-compatible", "openai"}:
-        # config.api_key is set if it was present in .nexus/config.toml, a .env
-        # file, or an AGENT_API_KEY environment variable. Fall back to the
-        # provider-specific env var lookup when none of those are present.
-        explicit_key = config.api_key or None
-        return OpenAICompatibleModelClient(
-            api_base_url=config.api_base_url,
-            api_key=resolve_provider_api_key(config.provider, explicit_key),
-            provider_name=config.provider,
-        )
-    raise ValueError(f"Unsupported provider: {config.provider}")
+def _dispatch_doctor(output_format: str) -> int:
+    """Run the health-check report and print results."""
+    workspace_root = Path.cwd()
+    console = TerminalUI()
+    try:
+        config = load_config(workspace_root)
+    except ConfigError as exc:
+        console.print_config_error(exc)
+        return 1
 
-
-def _log_registered_tools(registry: ToolRegistry) -> None:
-    for record in registry.records():
-        logger.info(
-            "Registered tool %s from %s (%s)",
-            record.name,
-            record.source,
-            record.origin or "default",
-        )
-
-
-async def _close_runtime_resources(resources: RuntimeResources) -> None:
-    if resources.delegation is not None:
-        await resources.delegation.shutdown()
-    for server in resources.mcp_servers:
-        await server.close()
+    logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
+    return asyncio.run(_run_doctor(config, console, output_format=output_format))
 
 
 async def _run_doctor(config, console: TerminalUI, *, output_format: str) -> int:
+    """Build NexusApp, collect health-check data, then tear down."""
     ensure_config_dirs(config)
-    hooks = setup_hooks(config)
-    registry, resources = await _build_registry(config, hooks)
+    app = NexusApp(config, console)
+    await app.initialize()
     try:
-        report = build_doctor_report(config, registry, resources)
+        report = build_doctor_report(config, app._registry, app._resources)
     finally:
-        await _close_runtime_resources(resources)
+        await app.close()
     console.print_doctor_report(report, output_format=output_format)
     return exit_code_for_report(report)
 
 
-def _resolve_session(session_id: str | None, store: SessionStore, *, persist_sessions: bool = True):
-    """Return (snapshot, resumed: bool).
+def _dispatch_init(force: bool) -> None:
+    """Initialise or reinitialise the workspace config skeleton."""
+    workspace_root = Path.cwd()
+    console = TerminalUI()
+    try:
+        config = load_config(workspace_root)
+    except ConfigError as exc:
+        console.print_config_error(exc)
+        return
 
-    When no explicit session ID is given and sessions are enabled, automatically
-    resume the most recently saved session so the user picks up where they left off.
-    """
-    if not persist_sessions:
-        return new_snapshot(), False
-    if session_id is not None:
-        try:
-            return store.load(session_id), True
-        except FileNotFoundError:
-            return new_snapshot(session_id=session_id), False
-    # Auto-resume: load the latest saved session if one exists.
-    latest = store.load_latest()
-    if latest is not None:
-        return latest, True
-    return new_snapshot(), False
+    logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
+    console = TerminalUI(color=config.color_output)
+    ensure_config_dirs(config)
+    created = init_workspace(
+        workspace_root,
+        global_root=config.global_root,
+        project_name=config.project_name,
+        project_description=config.project_description,
+        force=force,
+    )
+    if created:
+        console.print("Created:" if not force else "Reinitialized:")
+        for path in created:
+            console.print(f"- {path}")
+    else:
+        console.print("Nexus workspace already initialized.")
+    console.print_provider_setup_reminder(config)
+
+
+def _dispatch_config(scope: str) -> None:
+    """Print the resolved config (global, local, or merged JSON)."""
+    workspace_root = Path.cwd()
+    console = TerminalUI()
+    try:
+        config = load_config(workspace_root)
+    except ConfigError as exc:
+        console.print_config_error(exc)
+        return
+
+    console = TerminalUI(color=config.color_output)
+    if scope == "global":
+        console.print(
+            config.global_config_file.read_text(encoding="utf-8")
+            if config.global_config_file.exists()
+            else "# global config not initialized"
+        )
+    elif scope == "local":
+        console.print(
+            config.local_config_file.read_text(encoding="utf-8")
+            if config.local_config_file.exists()
+            else "# local config not initialized"
+        )
+    else:
+        console.print(json.dumps(config_to_plain_dict(config), indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat shims for tests that import old module-level names
+# ---------------------------------------------------------------------------
+
+def _build_model_client(config):
+    """Module-level shim — delegates to NexusApp._build_model_client."""
+    return NexusApp(config, TerminalUI())._build_model_client()
+
+
+def _apply_model_context_limits(config) -> None:
+    """Module-level shim — delegates to NexusApp._apply_model_context_limits."""
+    NexusApp(config, TerminalUI())._apply_model_context_limits()
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

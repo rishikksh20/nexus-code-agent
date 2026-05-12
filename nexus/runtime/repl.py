@@ -7,10 +7,9 @@ from uuid import uuid4
 from collections.abc import Awaitable, Callable
 from typing import cast
 
-from nexus.models import AgentEvent, ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message, ToolExecutionContext
-from nexus.prompts import build_context_sections
+from nexus.models import AgentEvent, ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message
 from nexus.runtime.agent import Agent
-from nexus.runtime.context import ContextBuilder, ContextCompactor, TokenEstimator, prune_tool_outputs
+from nexus.runtime.context import ContextCompactor, TokenEstimator, prune_tool_outputs
 from nexus.hooks import HookEvent
 from nexus.runtime.repl_state import ReplState
 from nexus.security.manager import ApprovalScope
@@ -50,40 +49,20 @@ async def collect_turn_events(
     started_at = time.perf_counter()
 
     while True:
-        state.current_system_prompt = _build_system_prompt(state, prompt_text)
-        compactor = ContextCompactor(
-            TokenEstimator(),
-            state.config.compaction_soft_limit,
-            state.config.compaction_hard_limit,
-        )
-        model_messages = list(state.history)
-        if state.config.context_prune_enabled:
-            prune_tool_outputs(
-                model_messages,
-                protect_tokens=state.config.context_prune_protect_tokens,
-                minimum_tokens=state.config.context_prune_minimum_tokens,
-            )
-        if compactor.should_compact(model_messages):
-            model_messages, state.carry_over = compactor.compact(
-                model_messages,
-                state.carry_over,
-                keep_recent=state.config.compaction_keep_recent,
-            )
-        context = ToolExecutionContext(
-            session_id=state.session.session_id,
-            working_directory=state.config.workspace_root,
-            metadata={
-                "turn_id": turn_id,
-                "trace_id": trace_id,
-                "active_skills": list(state.active_skills),
-            },
+        prepared_turn = state.prepare_turn(
+            prompt_text,
+            turn_id=turn_id,
+            trace_id=trace_id,
+            compactor_factory=ContextCompactor,
+            estimator_factory=TokenEstimator,
+            prune_outputs=prune_tool_outputs,
         )
         events: list[AgentEvent] = [
             event
             async for event in agent.run(
-                model_messages,
-                context,
-                system_prompt=state.current_system_prompt,
+                prepared_turn.model_messages,
+                prepared_turn.context,
+                system_prompt=prepared_turn.system_prompt,
                 model_name=state.config.model_name,
                 mode=state.mode,
                 approved_tools=state.approval_manager.get_approved_set(),
@@ -129,26 +108,7 @@ async def collect_turn_events(
 
 
 def apply_events_to_history(state: ReplState, events: list) -> None:
-    for event in events:
-        if event.kind == "model_response":
-            state.history.append(event.payload.message)
-            if event.payload.usage is not None:
-                _accumulate_usage(state, event.payload.usage)
-        elif event.kind == "tool_result":
-            state.history.append(
-                Message(
-                    role="tool",
-                    content=event.payload.output,
-                    name=event.payload.tool_name,
-                    tool_call_id=event.payload.call_id,
-                )
-            )
-    state.session.messages = list(state.history)
-    if not state.session.summary:
-        first_user = next((message.content for message in state.history if message.role == "user"), "")
-        state.session.summary = first_user
-    if state.config.save_on_every_turn:
-        state.session_store.save(state.session)
+    state.apply_events(events)
 
 
 def _render_event(ui: TerminalUI, event: AgentEvent, *, stream_output: bool, show_tool_calls: bool) -> None:
@@ -180,40 +140,20 @@ async def _stream_turn_live(
     started_at = time.perf_counter()
 
     while True:
-        state.current_system_prompt = _build_system_prompt(state, prompt_text)
-        compactor = ContextCompactor(
-            TokenEstimator(),
-            state.config.compaction_soft_limit,
-            state.config.compaction_hard_limit,
-        )
-        model_messages = list(state.history)
-        if state.config.context_prune_enabled:
-            prune_tool_outputs(
-                model_messages,
-                protect_tokens=state.config.context_prune_protect_tokens,
-                minimum_tokens=state.config.context_prune_minimum_tokens,
-            )
-        if compactor.should_compact(model_messages):
-            model_messages, state.carry_over = compactor.compact(
-                model_messages,
-                state.carry_over,
-                keep_recent=state.config.compaction_keep_recent,
-            )
-        context = ToolExecutionContext(
-            session_id=state.session.session_id,
-            working_directory=state.config.workspace_root,
-            metadata={
-                "turn_id": turn_id,
-                "trace_id": trace_id,
-                "active_skills": list(state.active_skills),
-            },
+        prepared_turn = state.prepare_turn(
+            prompt_text,
+            turn_id=turn_id,
+            trace_id=trace_id,
+            compactor_factory=ContextCompactor,
+            estimator_factory=TokenEstimator,
+            prune_outputs=prune_tool_outputs,
         )
 
         batch: list[AgentEvent] = []
         async for event in agent.run(
-            model_messages,
-            context,
-            system_prompt=state.current_system_prompt,
+            prepared_turn.model_messages,
+            prepared_turn.context,
+            system_prompt=prepared_turn.system_prompt,
             model_name=state.config.model_name,
             mode=state.mode,
             approved_tools=state.approval_manager.get_approved_set(),
@@ -323,7 +263,13 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
         return ConfirmationResponse()
 
     while not state.should_exit:
-        raw_input = input("> ").strip()
+        try:
+            raw_input = ui.prompt_user().strip()
+        except KeyboardInterrupt:
+            ui.print_muted("Use /quit to exit.")
+            continue
+        except EOFError:
+            break
         if not raw_input:
             continue
         if await router.dispatch(state, raw_input):
@@ -358,7 +304,7 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
             # Remove the user message we just added so it doesn't corrupt history
             state.history.pop()
             continue
-        apply_events_to_history(state, events)
+        state.apply_events(events)
         state.current_turn_id = ""
         state.current_trace_id = ""
 
@@ -376,38 +322,7 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
 
 
 def _build_system_prompt(state: ReplState, prompt_text: str) -> str:
-    sections = build_context_sections(
-        state.config,
-        state.tool_registry,
-        task_input=prompt_text,
-        execution_mode=state.mode.value,
-        skill_registry=state.skill_registry,
-        active_skills=state.active_skills,
-        carry_over=state.carry_over,
-    )
-    memory_matches = state.memory_store.search(prompt_text)
-    if memory_matches:
-        sections.project_notes.extend(entry.content for entry in memory_matches[:3])
-    return ContextBuilder().build(sections)
-
-
-def _accumulate_usage(state: ReplState, usage) -> None:
-    summary = state.session.metadata.setdefault(
-        "usage",
-        {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "estimated_cost_usd": 0.0,
-        },
-    )
-    summary["prompt_tokens"] += usage.prompt_tokens
-    summary["completion_tokens"] += usage.completion_tokens
-    summary["total_tokens"] += usage.total_tokens
-    summary["estimated_cost_usd"] = round(
-        summary["estimated_cost_usd"] + usage.estimated_cost_usd,
-        6,
-    )
+    return state.build_system_prompt(prompt_text)
 
 
 def _record_turn_telemetry(state: ReplState, events: list, *, turn_id: str, trace_id: str, duration_ms: float, status: str) -> None:

@@ -13,7 +13,7 @@ from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
 from nexus.runtime.slash_commands import build_router
-from nexus.skills import load_skill_registry
+from nexus.skills import get_skill_roots, load_skill_registry
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import GetTimeTool
 
@@ -292,6 +292,48 @@ async def test_skills_slash_command_activates_skill(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_skills_help_mentions_subagent_skill_convention(tmp_path):
+    state, console = _make_state(tmp_path)
+    router = build_router()
+
+    handled = await router.dispatch(state, "/skills help")
+
+    assert handled is True
+    output = console.export_text()
+    assert "subagent-*" in output
+
+
+@pytest.mark.asyncio
+async def test_skills_list_shows_subagent_type(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    skill_root = config.local_root / "skills" / "subagent-review"
+    skill_root.mkdir(parents=True, exist_ok=True)
+    (skill_root / "SKILL.md").write_text("# Review skill\n\nAlways review carefully.", encoding="utf-8")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("skills-list"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        skill_registry=load_skill_registry(config.skills_dir, config.local_root / "skills"),
+    )
+
+    router = build_router()
+    handled = await router.dispatch(state, "/skills")
+
+    assert handled is True
+    output = console.export_text()
+    assert "Type" in output
+    assert "subagent-review" in output
+    assert "subagent" in output
+
+
+@pytest.mark.asyncio
 async def test_provider_slash_command_shows_current_status(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
@@ -448,6 +490,43 @@ def _make_state(tmp_path, *, extra_history=None):
         history=extra_history or [],
     )
     return state, console
+
+
+@pytest.mark.asyncio
+async def test_skills_reload_registers_skill_backed_subagent_tools(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.delegation_enabled = True
+    skill_dir = config.local_root / "skills" / "subagent-review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "# Review Skill\n\nInspect the selected code and report issues.\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01, base_tool_registry=registry)
+    await delegation.start()
+    try:
+        state = ReplState(
+            config=config,
+            mode=ExecutionMode.DEFAULT,
+            session=new_snapshot("skills-reload"),
+            session_store=SessionStore(config.session_dir),
+            tool_registry=registry,
+            memory_store=MemoryStore(config.memory_dir),
+            console=console,
+            skill_registry=load_skill_registry(*get_skill_roots(config)),
+            delegation=delegation,
+        )
+
+        router = build_router()
+        handled = await router.dispatch(state, "/skills reload")
+
+        assert handled is True
+        assert state.tool_registry.record("subagent_review").source == "agent-skill"
+    finally:
+        await delegation.shutdown()
 
 
 @pytest.mark.asyncio

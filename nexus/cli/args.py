@@ -70,7 +70,7 @@ def cli(
     no_plugins: bool,
     no_skills: bool,
 ) -> int | None:
-    """Nexus — an AI agent framework with a REPL, headless runner, and tool ecosystem."""
+    """Nexus — an AI coding agent with a REPL, headless runner, and tool ecosystem."""
     if ctx.invoked_subcommand is not None:
         return None
 

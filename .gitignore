@@ -62,3 +62,5 @@ logs/
 !.env.example
 *.pem
 *.key
+
+reference_code/

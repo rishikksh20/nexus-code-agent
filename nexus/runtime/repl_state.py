@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from nexus.config.defaults import AgentConfig
 from nexus.integrations.mcp import MCPServerRuntime
 from nexus.memory.store import MemoryStore
-from nexus.models import Message
-from nexus.runtime.context import CarryOverState
+from nexus.models import AgentEvent, Message, ToolExecutionContext
+from nexus.prompts import build_context_sections
+from nexus.runtime.context import CarryOverState, ContextBuilder, ContextCompactor, TokenEstimator, prune_tool_outputs
 from nexus.runtime.delegation import DelegationRuntime
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookExecutor
@@ -16,6 +18,13 @@ from nexus.security.manager import ApprovalManager
 from nexus.skills import SkillRegistry
 from nexus.tools.base import ToolRegistry
 from nexus.ui import TerminalUI
+
+
+@dataclass(slots=True, frozen=True)
+class PreparedTurn:
+    model_messages: list[Message]
+    context: ToolExecutionContext
+    system_prompt: str
 
 
 @dataclass(slots=True)
@@ -40,3 +49,104 @@ class ReplState:
     current_trace_id: str = ""
     current_system_prompt: str = ""
     should_exit: bool = False
+
+    def build_system_prompt(self, prompt_text: str) -> str:
+        sections = build_context_sections(
+            self.config,
+            self.tool_registry,
+            task_input=prompt_text,
+            execution_mode=self.mode.value,
+            skill_registry=self.skill_registry,
+            active_skills=self.active_skills,
+            carry_over=self.carry_over,
+        )
+        memory_matches = self.memory_store.search(prompt_text)
+        if memory_matches:
+            sections.project_notes.extend(entry.content for entry in memory_matches[:3])
+        self.current_system_prompt = ContextBuilder().build(sections)
+        return self.current_system_prompt
+
+    def prepare_turn(
+        self,
+        prompt_text: str,
+        *,
+        turn_id: str,
+        trace_id: str,
+        compactor_factory: Callable[[TokenEstimator, int, int], ContextCompactor] = ContextCompactor,
+        estimator_factory: Callable[[], TokenEstimator] = TokenEstimator,
+        prune_outputs: Callable[..., None] = prune_tool_outputs,
+    ) -> PreparedTurn:
+        system_prompt = self.build_system_prompt(prompt_text)
+        compactor = compactor_factory(
+            estimator_factory(),
+            self.config.compaction_soft_limit,
+            self.config.compaction_hard_limit,
+        )
+        model_messages = list(self.history)
+        if self.config.context_prune_enabled:
+            prune_outputs(
+                model_messages,
+                protect_tokens=self.config.context_prune_protect_tokens,
+                minimum_tokens=self.config.context_prune_minimum_tokens,
+            )
+        if compactor.should_compact(model_messages):
+            model_messages, self.carry_over = compactor.compact(
+                model_messages,
+                self.carry_over,
+                keep_recent=self.config.compaction_keep_recent,
+            )
+        context = ToolExecutionContext(
+            session_id=self.session.session_id,
+            working_directory=self.config.workspace_root,
+            metadata={
+                "turn_id": turn_id,
+                "trace_id": trace_id,
+                "active_skills": list(self.active_skills),
+            },
+        )
+        return PreparedTurn(
+            model_messages=model_messages,
+            context=context,
+            system_prompt=system_prompt,
+        )
+
+    def apply_events(self, events: list[AgentEvent]) -> None:
+        for event in events:
+            if event.kind == "model_response":
+                self.history.append(event.payload.message)
+                if event.payload.usage is not None:
+                    _accumulate_usage(self, event.payload.usage)
+            elif event.kind == "tool_result":
+                self.history.append(
+                    Message(
+                        role="tool",
+                        content=event.payload.output,
+                        name=event.payload.tool_name,
+                        tool_call_id=event.payload.call_id,
+                    )
+                )
+        self.session.messages = list(self.history)
+        if not self.session.summary:
+            first_user = next((message.content for message in self.history if message.role == "user"), "")
+            self.session.summary = first_user
+        if self.config.save_on_every_turn:
+            self.session_store.save(self.session)
+
+
+def _accumulate_usage(state: ReplState, usage) -> None:
+    summary = state.session.metadata.setdefault(
+        "usage",
+        {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_usd": 0.0,
+        },
+    )
+    summary["prompt_tokens"] += usage.prompt_tokens
+    summary["completion_tokens"] += usage.completion_tokens
+    summary["total_tokens"] += usage.total_tokens
+    summary["estimated_cost_usd"] = round(
+        summary["estimated_cost_usd"] + usage.estimated_cost_usd,
+        6,
+    )

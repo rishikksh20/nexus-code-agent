@@ -10,7 +10,7 @@ from nexus.ui import TerminalUI
 
 from nexus.models import ConfirmationKind, Message
 from nexus.runtime.hooks import HookEvent
-from nexus.runtime.repl import apply_events_to_history, collect_turn_events, prompt_for_confirmation
+from nexus.runtime.repl import collect_turn_events, prompt_for_confirmation
 from nexus.runtime.repl_state import ReplState
 
 
@@ -87,7 +87,7 @@ async def run_headless(
             stream_output=state.config.stream_output,
             show_tool_calls=state.config.show_tool_calls,
         )
-    apply_events_to_history(state, events)
+    state.apply_events(events)
     if state.hooks is not None:
         await state.hooks.emit(
             HookEvent.STOP,

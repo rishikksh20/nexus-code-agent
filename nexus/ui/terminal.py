@@ -93,6 +93,10 @@ class TerminalUI:
         """Pass-through to ``Console.input`` for interactive prompts."""
         return self._console.input(prompt)
 
+    def prompt_user(self) -> str:
+        """Render the standard interactive user prompt and return the input."""
+        return self._console.input("[primary]>[/primary] ")
+
     # ------------------------------------------------------------------
     # Semantic output — generic severity levels
     # ------------------------------------------------------------------
@@ -160,7 +164,7 @@ class TerminalUI:
     # ------------------------------------------------------------------
 
     def print_banner(self, provider: str, model: str, mode: str) -> None:
-        self._console.print("Nexus Agent Framework", style="banner.title")
+        self._console.print("Nexus Coding Agent", style="banner.title")
         self._console.print(f"Provider: {provider}  |  Model: {model}  |  Mode: {mode}")
 
     def print_session_resumed(self, session_id: str, msg_count: int) -> None:
@@ -173,13 +177,13 @@ class TerminalUI:
         )
 
     def print_help_hint(self) -> None:
-        self._console.print("Type /help for commands or /quit to exit.\n")
+        self._console.print("Type /help for runtime commands, /skills for skill control, or /quit to exit.\n")
 
     def print_fake_provider_notice(self) -> None:
         self._console.print(
             "[warning]Note:[/warning] Using the [bold]fake[/bold] provider — "
             "responses are mocked. Set a real provider and API key in your "
-            ".env or .nexus/config.toml for live AI responses."
+            ".env or .nexus/config.toml for live coding-agent responses."
         )
         self._console.print()
 

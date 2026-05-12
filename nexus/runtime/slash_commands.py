@@ -18,7 +18,8 @@ from nexus.runtime.delegation import DelegationRequest
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import new_snapshot
-from nexus.skills import load_skill_registry
+from nexus.skills import get_skill_roots, load_skill_registry
+from nexus.tools.subagents import register_skill_subagent_tools
 
 
 CommandHandler = Callable[[ReplState, list[str]], Awaitable[None]]
@@ -496,13 +497,13 @@ async def handle_skills(state: ReplState, args: list[str]) -> None:
     subcommand = args[0].lower() if args else "list"
     if subcommand == "help":
         _print_subcommand_help(
-            state, "skills", "Inspect and activate session skills.",
+            state, "skills", "Inspect and activate session skills. Skills named subagent-* register specialist worker tools when delegation is enabled.",
             (
-                ("(no args) / list",  "List all loaded skills with name, description, and active status.", "/skills"),
+                ("(no args) / list",  "List all loaded skills with name, type, description, and active status.", "/skills"),
                 ("show <name>",      "Print the full content of a skill file.",                          "/skills show nexus-agent"),
                 ("add <name>",       "Activate a skill for this session.",                               "/skills add nexus-agent"),
                 ("remove <name>",    "Deactivate a skill.",                                             "/skills remove nexus-agent"),
-                ("reload",           "Rescan skill directories and rebuild the registry.",               "/skills reload"),
+                ("reload",           "Rescan builtin, user, and workspace skill directories.",          "/skills reload"),
                 ("help",             "Show this help.",                                                 "/skills help"),
             ),
         )
@@ -514,10 +515,16 @@ async def handle_skills(state: ReplState, args: list[str]) -> None:
             return
         table = Table(title="Skills")
         table.add_column("Name")
+        table.add_column("Type")
         table.add_column("Description")
         table.add_column("Active")
         for skill in skills:
-            table.add_row(skill.name, skill.description, "yes" if skill.name in state.active_skills else "no")
+            table.add_row(
+                skill.name,
+                "subagent" if _is_subagent_skill_name(skill.name) else "skill",
+                skill.description,
+                "yes" if skill.name in state.active_skills else "no",
+            )
         state.console.print(table)
         return
     if subcommand == "show" and len(args) > 1:
@@ -538,11 +545,25 @@ async def handle_skills(state: ReplState, args: list[str]) -> None:
         state.console.print(f"Removed skill: {args[1]}")
         return
     if subcommand == "reload":
-        state.skill_registry = load_skill_registry(state.config.skills_dir, state.config.local_root / "skills")
+        state.skill_registry = load_skill_registry(*get_skill_roots(state.config))
         state.active_skills = [name for name in state.active_skills if state.skill_registry.get(name) is not None]
+        preserved_records = [record for record in state.tool_registry.records() if record.source != "agent-skill"]
+        state.tool_registry.clear()
+        for record in preserved_records:
+            state.tool_registry.register(record.tool, source=record.source, origin=record.origin)
+        register_skill_subagent_tools(
+            state.tool_registry,
+            state.delegation,
+            state.config,
+            state.skill_registry,
+        )
         state.console.print("Reloaded skills.")
         return
     state.console.print("Usage: /skills [list|show <name>|add <name>|remove <name>|reload]")
+
+
+def _is_subagent_skill_name(skill_name: str) -> bool:
+    return skill_name.startswith("subagent-") or skill_name.startswith("subagent_")
 
 
 async def handle_tools(state: ReplState, args: list[str]) -> None:
@@ -559,11 +580,7 @@ async def handle_tools(state: ReplState, args: list[str]) -> None:
         return
     if subcommand == "reload":
         from nexus.config import load_config
-        from nexus.tools.builtin import GetTimeTool, WriteNoteTool
-        from nexus.tools.filesystem import (
-            ReadFileTool, WriteFileTool, ModifyFileTool,
-            ReplaceTextTool, GlobTool, GrepTool, LsTool, BashTool,
-        )
+        from nexus.tools.registry import register_core_tools, tool_enabled
 
         state.config = load_config(
             state.config.workspace_root,
@@ -573,32 +590,14 @@ async def handle_tools(state: ReplState, args: list[str]) -> None:
         )
         cfg = state.config
 
-        def _enabled(name: str) -> bool:
-            if cfg.allowed_tools and name not in cfg.allowed_tools:
-                return False
-            return name not in cfg.denied_tools
-
         # Save non-builtin records (MCP, plugins) so they survive the clear
         non_builtin = [r for r in state.tool_registry.records() if r.source != "core"]
 
         state.tool_registry.clear()
-        for tool in (
-            GetTimeTool(),
-            WriteNoteTool(max_bytes=int(cfg.write_note_max_bytes)),
-            ReadFileTool(),
-            WriteFileTool(),
-            ModifyFileTool(),
-            ReplaceTextTool(),
-            GlobTool(),
-            GrepTool(),
-            LsTool(),
-            BashTool(),
-        ):
-            if _enabled(tool.name):
-                state.tool_registry.register(tool, source="core", origin="builtin")
+        register_core_tools(state.tool_registry, cfg)
 
         for record in non_builtin:
-            if _enabled(record.name):
+            if tool_enabled(cfg, record.name):
                 state.tool_registry.register(record.tool, source=record.source, origin=record.origin)
 
         count = len(state.tool_registry.records())

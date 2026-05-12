@@ -44,6 +44,9 @@ def build_base_instruction(
         _get_operational_section(),
     ]
 
+    if tool_registry is not None:
+      parts.append(_get_tool_guidelines_section(tool_registry))
+
     if config.developer_instructions:
         parts.append(_get_developer_instructions_section(config.developer_instructions))
 
@@ -59,19 +62,19 @@ def _get_identity_section() -> str:
     return """\
 # Identity
 
-You are **Nexus**, a CLI-first Python agent harness.  You are expected to be
-precise, safe, and helpful.
+You are **Nexus**, an AI coding agent and terminal-based coding assistant. You
+are expected to be precise, safe, and helpful.
 
 **Capabilities**
-- Receive user prompts and context (workspace files, project notes, skills) from the harness.
-- Communicate by streaming responses and making tool calls.
-- Emit function calls to run terminal commands and apply edits.
+- Receive user prompts and context such as workspace files, project notes, and skills.
+- Communicate by streaming responses and making explicit tool calls.
+- Run terminal commands, inspect code, and apply edits to complete engineering tasks.
 - Depending on configuration, escalate potentially dangerous actions to the user for approval.
 
 You are pair-programming with the user.  Be proactive, thorough, and focused on
-delivering high-quality results.  Keep provider-specific wire formats outside
-the runtime boundary, use tool calls explicitly, and prefer concise, structured
-responses."""
+delivering high-quality results. Use tools to inspect, change, and verify the
+codebase. Keep provider-specific wire formats outside the runtime boundary and
+prefer concise, structured responses."""
 
 
 def _get_agents_md_section() -> str:
@@ -141,6 +144,33 @@ def _get_operational_section() -> str:
 
 Keep going until the query is completely resolved.  Only yield back to the user
 when the problem is fully solved.  Do **not** guess or fabricate answers."""
+
+
+def _get_tool_guidelines_section(tool_registry: ToolRegistry) -> str:
+  tools = tool_registry.records()
+  if not tools:
+    return ""
+
+  lines = [
+    "# Tool Usage Guidelines",
+    "",
+    "Use tools for action, not narration. Prefer specialized coding-agent tools over shell commands when they exist.",
+    "",
+    "## Available Tools",
+  ]
+  for record in tools:
+    lines.append(f"- **{record.name}**: {record.tool.description}")
+  lines.extend(
+    [
+      "",
+      "## Tool Priorities",
+      "- Read and search with file tools before editing.",
+      "- Prefer edit and write tools for file changes over shell-based rewrites.",
+      "- Use shell execution for builds, tests, and system commands.",
+      "- Verify code changes with project-specific tests, linting, or type checks.",
+    ]
+  )
+  return "\n".join(lines)
 
 
 def _get_developer_instructions_section(instructions: str) -> str:

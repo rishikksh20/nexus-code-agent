@@ -46,6 +46,7 @@ class AgentConfig:
     context_prune_minimum_tokens: int = 20_000
     delegation_enabled: bool = False
     delegation_workers: list[str] = field(default_factory=lambda: ["worker-1", "worker-2"])
+    delegation_subagents: list[dict[str, Any]] = field(default_factory=list)
     delegation_poll_interval_seconds: float = 0.05
     delegation_message_history_limit: int = 200
     sandbox_commands: bool = False

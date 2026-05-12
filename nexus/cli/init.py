@@ -88,6 +88,8 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             f'# Example: mcp_servers = [{mcp_server_example_for_workspace(workspace_root)}]',
             'delegation_enabled = false',
             'delegation_workers = ["worker-1", "worker-2"]',
+            'delegation_subagents = []',
+            '# Example: delegation_subagents = [{ name = "explore", description = "Investigate a focused codebase question.", goal_prompt = "Read the relevant code and summarize the answer.", allowed_tools = ["read_file", "glob", "grep"], max_turns = 12, timeout_seconds = 300 }]',
             'sandbox_commands = false',
             '',
         ]

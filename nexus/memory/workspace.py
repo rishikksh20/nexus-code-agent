@@ -122,7 +122,7 @@ def bootstrap_workspace_knowledge(
         return
     knowledge = WorkspaceKnowledge(
         project_name=project_name,
-        description=description or "CLI-first Python agent harness workspace.",
+        description=description or "AI coding agent workspace.",
         source_of_truth=["docs/action-plan", "docs/openai-code-tutorial"],
         conventions=[
             "Use Python 3.11+ with modular package boundaries.",

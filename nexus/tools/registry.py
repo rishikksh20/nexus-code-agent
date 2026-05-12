@@ -1,0 +1,70 @@
+"""Registry helpers for the Nexus coding-agent tool package.
+
+This module centralizes first-party tool construction so runtime bootstrap and
+interactive tool reload share the same registration flow.
+"""
+from __future__ import annotations
+
+from nexus.tools.base import ToolRegistry
+from nexus.tools.builtin import (
+    EditTool,
+    GetTimeTool,
+    MemoryTool,
+    TodoTool,
+    WebFetchTool,
+    WebSearchTool,
+    WriteNoteTool,
+)
+from nexus.tools.filesystem import (
+    BashTool,
+    GlobTool,
+    GrepTool,
+    LsTool,
+    ModifyFileTool,
+    ReadFileTool,
+    ReplaceTextTool,
+    WriteFileTool,
+)
+
+
+def tool_enabled(config, tool_name: str) -> bool:
+    """Return True when *tool_name* is permitted by the active config."""
+    allowed_tools = getattr(config, "allowed_tools", [])
+    denied_tools = getattr(config, "denied_tools", [])
+    if allowed_tools and tool_name not in allowed_tools:
+        return False
+    return tool_name not in denied_tools
+
+
+def get_core_tools(config) -> list:
+    """Return pre-constructed first-party coding-agent tool instances."""
+    return [
+        GetTimeTool(),
+        WriteNoteTool(max_bytes=int(config.write_note_max_bytes)),
+        ReadFileTool(),
+        WriteFileTool(),
+        EditTool(),
+        ModifyFileTool(),
+        ReplaceTextTool(),
+        GlobTool(),
+        GrepTool(),
+        LsTool(),
+        BashTool(),
+        MemoryTool(memory_dir=config.memory_dir),
+        TodoTool(),
+        WebFetchTool(),
+        WebSearchTool(),
+    ]
+
+
+def register_core_tools(registry: ToolRegistry, config) -> ToolRegistry:
+    """Register all enabled first-party tools into *registry*."""
+    for tool in get_core_tools(config):
+        if tool_enabled(config, tool.name):
+            registry.register(tool, source="core", origin="builtin")
+    return registry
+
+
+def create_tool_registry(config) -> ToolRegistry:
+    """Create a registry pre-populated with enabled first-party tools."""
+    return register_core_tools(ToolRegistry(), config)

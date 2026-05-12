@@ -10,6 +10,7 @@ Only registered when delegation is enabled (checked by
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from nexus.models import ToolExecutionContext, ToolResult
@@ -17,6 +18,43 @@ from nexus.tools.base import ToolKind
 
 if TYPE_CHECKING:
     from nexus.runtime.delegation import DelegationRuntime
+
+
+# ---------------------------------------------------------------------------
+# SubagentDefinition — pre-configured worker persona
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SubagentDefinition:
+    """Pre-configure a named worker-agent persona for delegation.
+
+    When a :class:`SubAgentTool` is initialised with a
+    ``SubagentDefinition``, the tool name and description are derived from the
+    definition so the LLM can pick the right specialist worker.
+
+    Parameters
+    ----------
+    name:
+        Short identifier used as part of the tool name
+        (``subagent_<name>``).
+    description:
+        One-sentence description shown to the LLM in the tool schema.
+    goal_prompt:
+        System prompt / goal injected into the worker agent.
+    allowed_tools:
+        Restrict which tools the worker may use.  ``None`` = all.
+    max_turns:
+        Maximum number of agent turns for the worker.
+    timeout_seconds:
+        Hard wall-clock timeout for the worker in seconds.
+    """
+
+    name: str
+    description: str
+    goal_prompt: str
+    allowed_tools: list[str] | None = None
+    max_turns: int = 20
+    timeout_seconds: float = 600.0
 
 
 class SubAgentTool:
@@ -33,6 +71,7 @@ class SubAgentTool:
         instance.  Must be alive for the duration of the agent session.
     """
 
+    # Default class-level attrs — overridden per-instance when a definition is given
     name = "delegate_task"
     kind = ToolKind.AGENT
     is_mutating = True
@@ -67,8 +106,17 @@ class SubAgentTool:
 
     _MAX_OUTPUT_BYTES: int = 8_192
 
-    def __init__(self, delegation: "DelegationRuntime") -> None:
+    def __init__(
+        self,
+        delegation: "DelegationRuntime",
+        definition: SubagentDefinition | None = None,
+    ) -> None:
         self._delegation = delegation
+        self._definition = definition
+        if definition is not None:
+            # Override the instance tool name/description from the definition
+            self.name = f"subagent_{definition.name}"
+            self.description = definition.description
 
     async def execute(
         self,
@@ -89,6 +137,14 @@ class SubAgentTool:
                 output="Both 'title' and 'instructions' are required.",
                 is_error=True,
             )
+
+        # Merge definition-level allowed_tools if caller didn't override
+        if raw_tools is None and self._definition and self._definition.allowed_tools:
+            raw_tools = self._definition.allowed_tools
+
+        # Prepend definition goal_prompt if available
+        if self._definition and self._definition.goal_prompt:
+            instructions = f"{self._definition.goal_prompt}\n\n{instructions}"
 
         request = DelegationRequest(
             title=title,

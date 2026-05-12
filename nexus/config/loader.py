@@ -261,6 +261,38 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     if len({str(worker_id).strip() for worker_id in delegation_workers}) != len(delegation_workers):
         raise ConfigError("delegation_workers must not contain duplicate worker ids.")
 
+    delegation_subagents = values["delegation_subagents"]
+    if not isinstance(delegation_subagents, list):
+        raise ConfigError("delegation_subagents must be a list of subagent definitions.")
+    subagent_names: set[str] = set()
+    for entry in delegation_subagents:
+        if not isinstance(entry, dict):
+            raise ConfigError("Each delegation_subagents entry must be a table.")
+        name = str(entry.get("name", "")).strip()
+        description = str(entry.get("description", "")).strip()
+        goal_prompt = str(entry.get("goal_prompt", "")).strip()
+        if not name:
+            raise ConfigError("Each delegation_subagents entry must define a non-empty name.")
+        if not description:
+            raise ConfigError(f"delegation_subagents entry '{name}' must define a non-empty description.")
+        if not goal_prompt:
+            raise ConfigError(f"delegation_subagents entry '{name}' must define a non-empty goal_prompt.")
+        allowed = entry.get("allowed_tools")
+        if allowed is not None:
+            if not isinstance(allowed, list):
+                raise ConfigError(f"delegation_subagents entry '{name}' allowed_tools must be a list.")
+            if any(not str(tool_name).strip() for tool_name in allowed):
+                raise ConfigError(f"delegation_subagents entry '{name}' allowed_tools must only contain non-empty strings.")
+        max_turns = entry.get("max_turns", 20)
+        if int(max_turns) < 1:
+            raise ConfigError(f"delegation_subagents entry '{name}' max_turns must be greater than 0.")
+        timeout_seconds = entry.get("timeout_seconds", 600.0)
+        if float(timeout_seconds) <= 0:
+            raise ConfigError(f"delegation_subagents entry '{name}' timeout_seconds must be greater than 0.")
+        if name in subagent_names:
+            raise ConfigError(f"Duplicate delegation_subagents entry '{name}'.")
+        subagent_names.add(name)
+
     allowed_tools = values["allowed_tools"]
     denied_tools = values["denied_tools"]
     overlap = sorted(set(allowed_tools) & set(denied_tools))
