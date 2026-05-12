@@ -19,7 +19,7 @@ class WriteFileTool(Tool):
     description = (
         "Write content to a file. Creates the file if it does not exist, or "
         "overwrites it completely if it does. Parent directories are created "
-        "automatically. For targeted edits use the edit tool instead."
+        "automatically. Prefer the edit tool for changes to existing files; use this for new files or true full rewrites."
     )
     kind = ToolKind.WRITE
     is_mutating = True

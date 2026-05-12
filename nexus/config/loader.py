@@ -234,6 +234,7 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         "compaction_hard_limit",
         "compaction_keep_recent",
         "max_loop_iterations",
+        "max_tool_calls_per_turn",
         "max_sessions_retained",
         "write_note_max_bytes",
         "delegation_message_history_limit",

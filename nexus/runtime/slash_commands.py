@@ -13,11 +13,13 @@ from nexus.config import config_to_plain_dict, load_config
 from nexus.config.model_limits import get_model_context_limit
 from nexus.cli.init import _global_config_toml, _local_config_toml
 from nexus.memory.store import MemoryEntry
-from nexus.context import TokenEstimator
+from nexus.context import CarryOverState, TokenEstimator
 from nexus.runtime.delegation import DelegationRequest
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import message_to_dict, new_snapshot
+from nexus.security.manager import ApprovalManager
+from nexus.security.policy import ApprovalPolicy
 from nexus.skills import get_skill_roots, load_skill_registry
 from nexus.tools.subagents import register_skill_subagent_tools
 
@@ -353,6 +355,7 @@ async def handle_config(state: ReplState, args: list[str]) -> None:
                 ("show local",              "Print .nexus/config.toml (local workspace config).",              "/config show local"),
                 ("show global",             "Print ~/.nexus/config.toml (global user config).",                "/config show global"),
                 ("set <key> <value>",       "Write a key to local config and reload immediately.",             "/config set show_tool_calls false"),
+                ("",                        "Example hidden-path override: /config set allow_hidden_paths true", ""),
                 ("reset <key>",             "Remove a key from local config and reload.",                      "/config reset temperature"),
                 ("reload",                  "Reload all config layers from disk without restarting.",          "/config reload"),
                 ("reinit [local|global]",   "Rewrite local (default) or global config to clean Nexus defaults.  Clears provider/model overrides. Does not touch sessions or memory.","/config reinit"),
@@ -454,6 +457,7 @@ async def handle_session(state: ReplState, args: list[str]) -> None:
         state.session_store.save(state.session)
         state.session = new_snapshot()
         state.history = []
+        _reset_session_runtime_state(state)
         state.console.print(f"Started new session: {state.session.session_id}")
         return
     if args and args[0].lower() == "list":
@@ -472,6 +476,7 @@ async def handle_session(state: ReplState, args: list[str]) -> None:
     if args and args[0].lower() == "resume" and len(args) > 1:
         state.session = state.session_store.load(args[1])
         state.history = list(state.session.messages)
+        _reset_session_runtime_state(state)
         state.console.print(f"Resumed session: {state.session.session_id}")
         return
     if args and args[0].lower() == "save":
@@ -488,6 +493,14 @@ async def handle_session(state: ReplState, args: list[str]) -> None:
     state.console.print(
         f"Session {state.session.session_id} with {len(state.history)} messages."
     )
+
+
+def _reset_session_runtime_state(state: ReplState) -> None:
+    state.carry_over = CarryOverState()
+    state.current_system_prompt = ""
+    state.current_turn_id = ""
+    state.current_trace_id = ""
+    state.approval_manager = ApprovalManager(policy=ApprovalPolicy(state.config.approval_policy))
 
 
 async def handle_skills(state: ReplState, args: list[str]) -> None:

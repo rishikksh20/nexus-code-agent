@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Iterable
 
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
 
-_SKIP_DIRS = frozenset({"node_modules", "__pycache__", ".git", ".venv", "venv", ".hg", ".svn"})
+_SKIP_DIRS = frozenset({"node_modules", "__pycache__", ".git", ".venv", "venv", ".hg", ".svn", ".nexus"})
 
 BINARY_EXTENSIONS = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico",
@@ -51,15 +52,62 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def walk_text_files(root: Path, max_files: int = 500) -> list[Path]:
+def allow_hidden_reads(metadata: dict[str, object] | None) -> bool:
+    """Return ``True`` when hidden/private read access was explicitly enabled."""
+    if not metadata:
+        return False
+    return bool(metadata.get("allow_hidden_paths", False))
+
+
+def read_path_policy_error(
+    target: Path,
+    workspace_root: Path,
+    *,
+    allow_hidden: bool = False,
+) -> str | None:
+    """Return a human-readable denial reason for blocked read targets, if any."""
+    try:
+        relative = target.relative_to(workspace_root)
+    except ValueError:
+        return None
+    restricted_part = next(_restricted_path_part(relative.parts, allow_hidden=allow_hidden), None)
+    if restricted_part is None:
+        return None
+    if restricted_part == ".nexus":
+        return "Refusing to read Nexus-managed .nexus state."
+    return (
+        "Refusing to read hidden/private paths unless allow_hidden_paths is enabled. "
+        f"Blocked path component: {restricted_part}"
+    )
+
+
+def include_directory_entry(name: str, *, show_hidden: bool, allow_hidden: bool) -> bool:
+    """Return whether a directory entry should be shown in list-style output."""
+    if name == ".nexus":
+        return False
+    if not is_hidden_or_private_name(name):
+        return True
+    return show_hidden and allow_hidden
+
+
+def can_read_match(path: Path, workspace_root: Path, *, allow_hidden: bool = False) -> bool:
+    """Return whether *path* is visible to read-only discovery tools."""
+    return read_path_policy_error(path, workspace_root, allow_hidden=allow_hidden) is None
+
+
+def walk_text_files(root: Path, *, allow_hidden: bool = False, max_files: int = 500) -> list[Path]:
     """Walk *root* recursively, returning up to *max_files* non-binary files."""
     found: list[Path] = []
     for dirpath, dirnames, filenames in root_walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        current_dir = Path(dirpath)
+        dirnames[:] = [
+            d for d in dirnames
+            if _include_walk_entry(current_dir / d, root, allow_hidden=allow_hidden, is_dir=True)
+        ]
         for name in filenames:
-            if name.startswith("."):
+            fp = current_dir / name
+            if not _include_walk_entry(fp, root, allow_hidden=allow_hidden, is_dir=False):
                 continue
-            fp = Path(dirpath) / name
             if not is_binary_file(fp):
                 found.append(fp)
                 if len(found) >= max_files:
@@ -71,6 +119,34 @@ def root_walk(root: Path):
     """Thin wrapper around ``os.walk`` that yields ``(dirpath, dirnames, filenames)``."""
     import os
     yield from os.walk(root)
+
+
+def is_hidden_or_private_name(name: str) -> bool:
+    if not name or name in {".", ".."}:
+        return False
+    return name.startswith(".") or name.casefold().startswith("private")
+
+
+def _restricted_path_part(parts: Iterable[str], *, allow_hidden: bool) -> Iterable[str]:
+    for part in parts:
+        if part in {"", "."}:
+            continue
+        if part == ".nexus":
+            yield part
+            continue
+        if not allow_hidden and is_hidden_or_private_name(part):
+            yield part
+
+
+def _include_walk_entry(path: Path, root: Path, *, allow_hidden: bool, is_dir: bool) -> bool:
+    name = path.name
+    if name in _SKIP_DIRS:
+        return False
+    if not can_read_match(path, root, allow_hidden=allow_hidden):
+        return False
+    if is_dir:
+        return True
+    return True
 
 
 # ---------------------------------------------------------------------------

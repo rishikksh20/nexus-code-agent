@@ -131,6 +131,34 @@ class TestReadFileTool:
         result = await ReadFileTool().execute("c5", {}, tool_context)
         assert result.is_error
 
+    @pytest.mark.asyncio
+    async def test_rejects_hidden_file_reads_by_default(self, tool_context):
+        (tool_context.working_directory / ".env").write_text("API_KEY=test\n")
+
+        result = await ReadFileTool().execute("c6", {"path": ".env"}, tool_context)
+
+        assert result.is_error
+        assert "hidden/private" in result.output.lower()
+
+    @pytest.mark.asyncio
+    async def test_allows_hidden_file_reads_when_enabled_except_nexus(self, tool_context):
+        (tool_context.working_directory / ".env").write_text("API_KEY=test\n")
+        (tool_context.working_directory / ".nexus").mkdir(exist_ok=True)
+        (tool_context.working_directory / ".nexus" / "config.toml").write_text("provider = 'fake'\n")
+        allow_hidden_context = ToolExecutionContext(
+            session_id=tool_context.session_id,
+            working_directory=tool_context.working_directory,
+            metadata={"allow_hidden_paths": True},
+        )
+
+        hidden_result = await ReadFileTool().execute("c7", {"path": ".env"}, allow_hidden_context)
+        nexus_result = await ReadFileTool().execute("c8", {"path": ".nexus/config.toml"}, allow_hidden_context)
+
+        assert not hidden_result.is_error
+        assert hidden_result.output == "API_KEY=test"
+        assert nexus_result.is_error
+        assert ".nexus" in nexus_result.output
+
 
 # ---------------------------------------------------------------------------
 # WriteFileTool
@@ -186,6 +214,21 @@ class TestWriteFileTool:
 
 class TestModifyFileTool:
     @pytest.mark.asyncio
+    async def test_builds_confirmation_diff(self, tool_context):
+        (tool_context.working_directory / "src.txt").write_text("line1\nline2\nline3\n")
+
+        confirmation = await ModifyFileTool().get_confirmation(
+            "confirm-1",
+            {"path": "src.txt", "start_line": 2, "end_line": 2, "new_content": "updated\n"},
+            tool_context,
+        )
+
+        assert confirmation is not None
+        assert confirmation.diff is not None
+        assert "-line2" in confirmation.diff.to_diff()
+        assert "+updated" in confirmation.diff.to_diff()
+
+    @pytest.mark.asyncio
     async def test_replaces_line_range(self, tool_context):
         (tool_context.working_directory / "src.txt").write_text("line1\nline2\nline3\n")
         result = await ModifyFileTool().execute(
@@ -236,6 +279,21 @@ class TestModifyFileTool:
 # ---------------------------------------------------------------------------
 
 class TestReplaceTextTool:
+    @pytest.mark.asyncio
+    async def test_builds_confirmation_diff(self, tool_context):
+        (tool_context.working_directory / "f.txt").write_text("foo foo foo")
+
+        confirmation = await ReplaceTextTool().get_confirmation(
+            "confirm-2",
+            {"path": "f.txt", "old_text": "foo", "new_text": "bar"},
+            tool_context,
+        )
+
+        assert confirmation is not None
+        assert confirmation.diff is not None
+        assert "-foo foo foo" in confirmation.diff.to_diff()
+        assert "+bar foo foo" in confirmation.diff.to_diff()
+
     @pytest.mark.asyncio
     async def test_replaces_first_occurrence(self, tool_context):
         (tool_context.working_directory / "f.txt").write_text("foo foo foo")
@@ -309,6 +367,26 @@ class TestGlobTool:
         assert not result.is_error
         assert "deep.py" in result.output
 
+    @pytest.mark.asyncio
+    async def test_hidden_and_private_matches_require_override(self, tool_context):
+        (tool_context.working_directory / ".hidden.py").write_text("")
+        private_dir = tool_context.working_directory / "private_docs"
+        private_dir.mkdir()
+        (private_dir / "secret.py").write_text("")
+        allow_hidden_context = ToolExecutionContext(
+            session_id=tool_context.session_id,
+            working_directory=tool_context.working_directory,
+            metadata={"allow_hidden_paths": True},
+        )
+
+        default_result = await GlobTool().execute("c4", {"pattern": "**/*.py"}, tool_context)
+        override_result = await GlobTool().execute("c5", {"pattern": "**/*.py"}, allow_hidden_context)
+
+        assert ".hidden.py" not in default_result.output
+        assert "private_docs/secret.py" not in default_result.output
+        assert ".hidden.py" in override_result.output
+        assert "private_docs/secret.py" in override_result.output
+
 
 # ---------------------------------------------------------------------------
 # GrepTool
@@ -364,6 +442,20 @@ class TestGrepTool:
         assert result.is_error
         assert "outside" in result.output.lower()
 
+    @pytest.mark.asyncio
+    async def test_grep_permanently_blocks_nexus_even_with_hidden_override(self, tool_context):
+        (tool_context.working_directory / ".nexus").mkdir(exist_ok=True)
+        allow_hidden_context = ToolExecutionContext(
+            session_id=tool_context.session_id,
+            working_directory=tool_context.working_directory,
+            metadata={"allow_hidden_paths": True},
+        )
+
+        result = await GrepTool().execute("c7", {"pattern": "provider", "path": ".nexus"}, allow_hidden_context)
+
+        assert result.is_error
+        assert ".nexus" in result.output
+
 
 # ---------------------------------------------------------------------------
 # LsTool
@@ -391,9 +483,31 @@ class TestLsTool:
     @pytest.mark.asyncio
     async def test_shows_hidden_when_requested(self, tool_context):
         (tool_context.working_directory / ".hidden").write_text("")
-        result = await LsTool().execute("c3", {"show_hidden": True}, tool_context)
+        allow_hidden_context = ToolExecutionContext(
+            session_id=tool_context.session_id,
+            working_directory=tool_context.working_directory,
+            metadata={"allow_hidden_paths": True},
+        )
+        result = await LsTool().execute("c3", {"show_hidden": True}, allow_hidden_context)
         assert not result.is_error
         assert ".hidden" in result.output
+
+    @pytest.mark.asyncio
+    async def test_show_hidden_requires_hidden_override_and_never_shows_nexus(self, tool_context):
+        (tool_context.working_directory / ".hidden").write_text("")
+        (tool_context.working_directory / ".nexus").mkdir(exist_ok=True)
+        allow_hidden_context = ToolExecutionContext(
+            session_id=tool_context.session_id,
+            working_directory=tool_context.working_directory,
+            metadata={"allow_hidden_paths": True},
+        )
+
+        default_result = await LsTool().execute("c7", {"show_hidden": True}, tool_context)
+        override_result = await LsTool().execute("c8", {"show_hidden": True}, allow_hidden_context)
+
+        assert ".hidden" not in default_result.output
+        assert ".hidden" in override_result.output
+        assert ".nexus" not in override_result.output
 
     @pytest.mark.asyncio
     async def test_subdirectory(self, tool_context):

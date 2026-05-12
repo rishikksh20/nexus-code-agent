@@ -35,6 +35,12 @@ def test_args_to_config_overrides_stream_flag_enables_streaming():
     assert overrides["stream_output"] is True
 
 
+def test_args_to_config_overrides_maps_allow_hidden_paths_flag():
+    overrides = args_to_config_overrides(allow_hidden_paths=True)
+
+    assert overrides["allow_hidden_paths"] is True
+
+
 def test_cli_rejects_stream_and_no_stream_together():
     exit_code = main(["--stream", "--no-stream", "--prompt", "hello"])
 

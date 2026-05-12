@@ -38,6 +38,7 @@ async def run_headless(
     quiet: bool,
 ) -> HeadlessResult:
     approval_callback = _headless_approval_callback() if _can_prompt_for_confirmation() else None
+    effective_prompt, resumed_paused_turn = state.consume_turn_prompt(prompt)
     state.current_turn_id = uuid4().hex[:12]
     state.current_trace_id = uuid4().hex
     if state.hooks is not None:
@@ -50,14 +51,18 @@ async def run_headless(
                 "trace_id": state.current_trace_id,
                 "mode": state.mode.value,
                 "headless": True,
+                "effective_prompt": effective_prompt,
+                "resumed_paused_turn": resumed_paused_turn,
             },
         )
     state.history.append(Message(role="user", content=prompt))
+    if not resumed_paused_turn:
+        state.approval_manager.begin_turn()
     try:
         events = await collect_turn_events(
             state,
             agent,
-            prompt_text=prompt,
+            prompt_text=effective_prompt,
             approval_callback=approval_callback,
             auto_confirm=auto_confirm,
         )

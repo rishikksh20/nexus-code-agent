@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
-
 from nexus.config.defaults import AgentConfig
 from nexus.integrations.mcp import MCPServerRuntime
 from nexus.memory.store import MemoryStore
@@ -18,6 +16,9 @@ from nexus.security.manager import ApprovalManager
 from nexus.skills import SkillRegistry
 from nexus.tools.base import ToolRegistry
 from nexus.ui import TerminalUI
+
+
+_PAUSED_TURN_KEY = "paused_turn"
 
 
 @dataclass(slots=True, frozen=True)
@@ -50,6 +51,33 @@ class ReplState:
     current_system_prompt: str = ""
     should_exit: bool = False
 
+    @property
+    def paused_turn_prompt(self) -> str:
+        payload = self.session.metadata.get(_PAUSED_TURN_KEY)
+        if not isinstance(payload, dict):
+            return ""
+        prompt = payload.get("prompt")
+        return str(prompt).strip() if prompt else ""
+
+    def has_paused_turn(self) -> bool:
+        return bool(self.paused_turn_prompt)
+
+    def mark_paused_turn(self, prompt_text: str) -> None:
+        self.session.metadata[_PAUSED_TURN_KEY] = {"prompt": prompt_text}
+
+    def clear_paused_turn(self) -> None:
+        self.session.metadata.pop(_PAUSED_TURN_KEY, None)
+
+    def consume_turn_prompt(self, raw_input: str) -> tuple[str, bool]:
+        stripped = raw_input.strip()
+        paused_prompt = self.paused_turn_prompt
+        if not paused_prompt:
+            return stripped, False
+        self.clear_paused_turn()
+        if _is_continue_prompt(stripped):
+            return paused_prompt, True
+        return stripped, False
+
     def build_system_prompt(self, prompt_text: str) -> str:
         sections = build_context_sections(
             self.config,
@@ -72,9 +100,10 @@ class ReplState:
         *,
         turn_id: str,
         trace_id: str,
+        history: list[Message] | None = None,
         compactor_factory: Callable[[TokenEstimator, int, int], ContextCompactor] = ContextCompactor,
         estimator_factory: Callable[[], TokenEstimator] = TokenEstimator,
-        prune_outputs: Callable[..., None] = prune_tool_outputs,
+        prune_outputs: Callable[..., int] = prune_tool_outputs,
     ) -> PreparedTurn:
         system_prompt = self.build_system_prompt(prompt_text)
         compactor = compactor_factory(
@@ -82,7 +111,8 @@ class ReplState:
             self.config.compaction_soft_limit,
             self.config.compaction_hard_limit,
         )
-        model_messages = sanitize_session_messages(list(self.history))
+        source_history = self.history if history is None else history
+        model_messages = sanitize_session_messages(list(source_history))
         if self.config.context_prune_enabled:
             prune_outputs(
                 model_messages,
@@ -102,6 +132,8 @@ class ReplState:
                 "turn_id": turn_id,
                 "trace_id": trace_id,
                 "active_skills": list(self.active_skills),
+                "approval_policy": self.approval_manager.policy.value,
+                "allow_hidden_paths": self.config.allow_hidden_paths,
             },
         )
         return PreparedTurn(
@@ -111,37 +143,45 @@ class ReplState:
         )
 
     def apply_events(self, events: list[AgentEvent]) -> None:
-        completed_tool_calls = {
-            event.payload.call_id
-            for event in events
-            if event.kind == "tool_result"
-        }
-        for event in events:
-            if event.kind == "model_response":
-                message = event.payload.message
-                if message.tool_calls and not all(
-                    tool_call.call_id in completed_tool_calls
-                    for tool_call in message.tool_calls
-                ):
-                    continue
-                self.history.append(message)
-                if event.payload.usage is not None:
-                    _accumulate_usage(self, event.payload.usage)
-            elif event.kind == "tool_result":
-                self.history.append(
-                    Message(
-                        role="tool",
-                        content=event.payload.output,
-                        name=event.payload.tool_name,
-                        tool_call_id=event.payload.call_id,
-                    )
-                )
+        usage_updates = apply_events_to_messages(self.history, events)
+        for usage in usage_updates:
+            _accumulate_usage(self, usage)
         self.session.messages = list(self.history)
         if not self.session.summary:
             first_user = next((message.content for message in self.history if message.role == "user"), "")
             self.session.summary = first_user
         if self.config.save_on_every_turn:
             self.session_store.save(self.session)
+
+
+def apply_events_to_messages(history: list[Message], events: list[AgentEvent]) -> list:
+    completed_tool_calls = {
+        event.payload.call_id
+        for event in events
+        if event.kind == "tool_result"
+    }
+    usage_updates = []
+    for event in events:
+        if event.kind == "model_response":
+            message = event.payload.message
+            if message.tool_calls and not all(
+                tool_call.call_id in completed_tool_calls
+                for tool_call in message.tool_calls
+            ):
+                continue
+            history.append(message)
+            if event.payload.usage is not None:
+                usage_updates.append(event.payload.usage)
+        elif event.kind == "tool_result":
+            history.append(
+                Message(
+                    role="tool",
+                    content=event.payload.output,
+                    name=event.payload.tool_name,
+                    tool_call_id=event.payload.call_id,
+                )
+            )
+    return usage_updates
 
 
 def _accumulate_usage(state: ReplState, usage) -> None:
@@ -161,3 +201,10 @@ def _accumulate_usage(state: ReplState, usage) -> None:
         summary["estimated_cost_usd"] + usage.estimated_cost_usd,
         6,
     )
+
+
+def _is_continue_prompt(value: str) -> bool:
+    normalized = value.strip().casefold().strip("`'\"")
+    normalized = normalized.rstrip(".!?")
+    return normalized == "continue"
+

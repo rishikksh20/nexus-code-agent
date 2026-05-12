@@ -193,15 +193,18 @@ class ConfirmationRequest:
     tool_name: str
     prompt: str
     reason: str
-    payload: dict[str, str] = field(default_factory=dict)
+    payload: dict[str, Any] = field(default_factory=dict)
+    call_id: str = ""
     # Tool arguments carried through so the confirmation UI can show exactly what
     # will be written/executed before asking the user for approval.
     arguments: dict[str, Any] = field(default_factory=dict)
+    preview: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
 class ConfirmationResponse:
     approved: bool = False
+    scope: str = ""
     clarification: str = ""
 
     @property
@@ -246,10 +249,22 @@ class AgentEvent:
         return cls(kind=AgentEventType.TEXT_COMPLETE, payload=content)
 
     @classmethod
-    def tool_call_start(cls, call_id: str, name: str, arguments: dict[str, Any]) -> AgentEvent:
+    def tool_call_start(
+        cls,
+        call_id: str,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        preview: dict[str, Any] | None = None,
+    ) -> AgentEvent:
         return cls(
             kind=AgentEventType.TOOL_CALL_START,
-            payload={"call_id": call_id, "name": name, "arguments": arguments},
+            payload={
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "preview": preview or {},
+            },
         )
 
     @classmethod

@@ -252,3 +252,102 @@ async def test_delegation_worker_uses_workspace_root_for_tool_execution(tmp_path
         assert not (outside_cwd / "notes" / "worker.txt").exists()
     finally:
         await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delegation_worker_requests_fresh_approval_for_each_mutating_call(tmp_path):
+    registry = ToolRegistry()
+    registry.register(WriteNoteTool(), source="core", origin="builtin")
+    runtime = DelegationRuntime(
+        worker_ids=["worker-1"],
+        poll_interval=0.01,
+        base_tool_registry=registry,
+        workspace_root=tmp_path,
+        model_client_factory=lambda: FakeModelClient(
+            scripted=[
+                RuntimeResponse(
+                    message=Message(role="assistant", content="Write the first note."),
+                    tool_calls=(
+                        ToolCall(
+                            call_id="note-1",
+                            tool_name="write_note",
+                            arguments={"path": "notes/one.txt", "content": "one"},
+                        ),
+                    ),
+                    finish_reason="tool_calls",
+                ),
+                RuntimeResponse(
+                    message=Message(role="assistant", content="Write both notes."),
+                    tool_calls=(
+                        ToolCall(
+                            call_id="note-1",
+                            tool_name="write_note",
+                            arguments={"path": "notes/one.txt", "content": "one"},
+                        ),
+                        ToolCall(
+                            call_id="note-2",
+                            tool_name="write_note",
+                            arguments={"path": "notes/two.txt", "content": "two"},
+                        ),
+                    ),
+                    finish_reason="tool_calls",
+                ),
+                RuntimeResponse(
+                    message=Message(role="assistant", content="Write the second note."),
+                    tool_calls=(
+                        ToolCall(
+                            call_id="note-2",
+                            tool_name="write_note",
+                            arguments={"path": "notes/two.txt", "content": "two"},
+                        ),
+                    ),
+                    finish_reason="tool_calls",
+                ),
+                RuntimeResponse(message=Message(role="assistant", content="done")),
+            ]
+        ),
+    )
+    await runtime.start()
+    try:
+        task = await runtime.submit(
+            DelegationRequest(
+                title="Write two notes",
+                instructions="Write two different notes.",
+                allowed_tools=("write_note",),
+            )
+        )
+
+        first_pending = None
+        for _ in range(50):
+            approvals = runtime.list_pending_permissions()
+            if approvals:
+                first_pending = approvals[0]
+                break
+            await runtime.wait_for_task(task.task_id, timeout=0.02)
+
+        assert first_pending is not None
+        assert first_pending.payload["action"] == "write_note"
+        await runtime.decide_permission(first_pending.correlation_id or first_pending.message_id, approved=True)
+
+        second_pending = None
+        for _ in range(50):
+            approvals = runtime.list_pending_permissions()
+            if approvals:
+                second_pending = approvals[0]
+                if second_pending.correlation_id != (first_pending.correlation_id or first_pending.message_id):
+                    break
+            await runtime.wait_for_task(task.task_id, timeout=0.02)
+
+        assert second_pending is not None
+        assert second_pending.correlation_id != (first_pending.correlation_id or first_pending.message_id)
+        await runtime.decide_permission(second_pending.correlation_id or second_pending.message_id, approved=True)
+
+        completed = await runtime.wait_for_task(task.task_id, timeout=1.0)
+
+        assert completed is not None
+        assert completed.status is TaskStatus.COMPLETED
+        assert (tmp_path / "notes" / "one.txt").read_text(encoding="utf-8") == "one"
+        assert (tmp_path / "notes" / "two.txt").read_text(encoding="utf-8") == "two"
+    finally:
+        await runtime.shutdown()
+

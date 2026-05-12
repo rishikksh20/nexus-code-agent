@@ -5,7 +5,7 @@ from typing import Any
 
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import Tool, ToolKind
-from nexus.tools.utils import resolve_path
+from nexus.tools.utils import allow_hidden_reads, can_read_match, read_path_policy_error, resolve_path
 
 
 class GlobTool(Tool):
@@ -53,13 +53,37 @@ class GlobTool(Tool):
             return ToolResult(call_id=call_id, tool_name=self.name, output="Missing required argument: pattern", is_error=True)
 
         raw_path = str(arguments.get("path", "."))
-        search_path = resolve_path(context.working_directory, raw_path)
+        workspace = context.working_directory.resolve()
+        search_path = resolve_path(workspace, raw_path)
+        allow_hidden = allow_hidden_reads(context.metadata)
+
+        try:
+            search_path.relative_to(workspace)
+        except ValueError:
+            return ToolResult(
+                call_id=call_id,
+                tool_name=self.name,
+                output="Refusing to search outside the current workspace.",
+                is_error=True,
+            )
+
+        policy_error = read_path_policy_error(search_path, workspace, allow_hidden=allow_hidden)
+        if policy_error is not None:
+            return ToolResult(
+                call_id=call_id,
+                tool_name=self.name,
+                output=policy_error,
+                is_error=True,
+            )
 
         if not search_path.exists() or not search_path.is_dir():
             return ToolResult(call_id=call_id, tool_name=self.name, output=f"Directory does not exist: {search_path}", is_error=True)
 
         try:
-            matches = [p for p in search_path.glob(pattern) if p.is_file()]
+            matches = [
+                p for p in search_path.glob(pattern)
+                if p.is_file() and can_read_match(p, workspace, allow_hidden=allow_hidden)
+            ]
         except Exception as exc:
             return ToolResult(call_id=call_id, tool_name=self.name, output=f"Glob error: {exc}", is_error=True)
 

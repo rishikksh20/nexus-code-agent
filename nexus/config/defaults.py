@@ -19,6 +19,7 @@ class AgentConfig:
     default_mode: str = "default"
     auto_confirm_read_only: bool = True
     max_loop_iterations: int = 8
+    max_tool_calls_per_turn: int = 30
     stream_output: bool = True
     show_tool_calls: bool = True
     show_thinking_indicator: bool = True
@@ -40,6 +41,7 @@ class AgentConfig:
     denied_tools: list[str] = field(default_factory=list)
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
     approval_policy: str = "on-request"
+    allow_hidden_paths: bool = False
     developer_instructions: str = ""
     user_instructions: str = ""
     context_prune_enabled: bool = True

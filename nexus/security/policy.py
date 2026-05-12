@@ -3,16 +3,17 @@
 Policies
 --------
 ``on-request``
-    Ask every time a mutating or dangerous tool is invoked.  This is the
-    safest (and default) mode.
+    Ask for every individual mutating or dangerous tool invocation.  A single
+    approval does not carry forward to later mutating calls in the same turn.
+    This is the safest (and default) mode.
 
 ``approve-turn``
-    Once the user approves a tool within a turn, do not ask again for the
-    same tool until the next user message.
+    Once the user approves a specific tool invocation within a turn, do not ask
+    again for that same invocation until the next user message.
 
 ``approve-session``
-    Once the user approves a tool, remember it for the lifetime of the
-    session — never ask again.
+    Once the user approves a specific tool invocation, remember it for the
+    lifetime of the session.
 
 ``auto``
     Auto-approve tools with LOW or MEDIUM risk; always confirm HIGH/DANGEROUS

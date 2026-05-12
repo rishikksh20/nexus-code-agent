@@ -6,9 +6,9 @@ from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import ConfirmationKind, Message, RuntimeResponse, ToolCall
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
-from nexus.security import PermissionDecision
+from nexus.security import ApprovalManager, PermissionDecision
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool, WriteNoteTool
+from nexus.tools.builtin import BashTool, GetTimeTool, WriteFileTool, WriteNoteTool
 
 
 @pytest.mark.asyncio
@@ -86,6 +86,155 @@ async def test_agent_requires_confirmation_for_mutating_tool(tool_context):
     ]
     denial = next(event for event in denied_events if event.kind == "tool_denied")
     assert denial.payload.decision is PermissionDecision.DENY
+
+
+@pytest.mark.asyncio
+async def test_agent_confirmation_request_includes_file_diff_preview(tool_context):
+    initial_response = RuntimeResponse(
+        message=Message(role="assistant", content="Writing file."),
+        tool_calls=(
+            ToolCall(
+                call_id="wf-1",
+                tool_name="write_file",
+                arguments={"path": "calculator.py", "content": "print('calculator')\n"},
+            ),
+        ),
+        finish_reason="tool_calls",
+    )
+    registry = ToolRegistry()
+    registry.register(WriteFileTool())
+    agent = Agent(
+        model_client=FakeModelClient(scripted=[initial_response]),
+        tool_registry=registry,
+    )
+
+    events = [
+        event async for event in agent.run(
+            [Message(role="user", content="create calculator")],
+            tool_context,
+            mode=ExecutionMode.DEFAULT,
+        )
+    ]
+
+    tool_start = next(event for event in events if event.kind == "TOOL_CALL_START")
+    confirmation = next(event for event in events if event.kind == "confirmation_requested")
+
+    assert tool_start.payload["preview"]["diff"]["path"].endswith("calculator.py")
+    assert "+print('calculator')" in tool_start.payload["preview"]["diff"]["unified_diff"]
+    assert confirmation.payload.call_id == "wf-1"
+    assert confirmation.payload.preview["diff"]["path"].endswith("calculator.py")
+
+
+@pytest.mark.asyncio
+async def test_agent_confirmation_request_includes_shell_command_preview(tool_context):
+    initial_response = RuntimeResponse(
+        message=Message(role="assistant", content="Running shell."),
+        tool_calls=(
+            ToolCall(
+                call_id="sh-1",
+                tool_name="bash",
+                arguments={"command": "mkdir -p operations && touch operations/add.py"},
+            ),
+        ),
+        finish_reason="tool_calls",
+    )
+    registry = ToolRegistry()
+    registry.register(BashTool())
+    agent = Agent(
+        model_client=FakeModelClient(scripted=[initial_response]),
+        tool_registry=registry,
+    )
+
+    events = [
+        event async for event in agent.run(
+            [Message(role="user", content="create ops")],
+            tool_context,
+            mode=ExecutionMode.DEFAULT,
+        )
+    ]
+
+    confirmation = next(event for event in events if event.kind == "confirmation_requested")
+
+    assert confirmation.payload.call_id == "sh-1"
+    assert confirmation.payload.preview["command"] == "mkdir -p operations && touch operations/add.py"
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_wide_approval_still_requires_confirmation_for_dangerous_bash(tool_context):
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Run dangerous command."),
+                tool_calls=(
+                    ToolCall(
+                        call_id="sh-danger",
+                        tool_name="bash",
+                        arguments={"command": "rm -rf build"},
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(BashTool())
+    approval_manager = ApprovalManager()
+    approval_manager.record_turn_wide_mutating_approval()
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="clean the build output")],
+            tool_context,
+            mode=ExecutionMode.DEFAULT,
+            approval_manager=approval_manager,
+        )
+    ]
+
+    confirmation = next(event for event in events if event.kind == "confirmation_requested")
+    assert confirmation.payload.tool_name == "bash"
+    assert confirmation.payload.payload["risk_level"] == "dangerous"
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_with_continue_message_when_tool_call_limit_is_reached(tool_context):
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Checking time twice."),
+                tool_calls=(
+                    ToolCall(call_id="time-1", tool_name="get_time", arguments={}),
+                    ToolCall(call_id="time-2", tool_name="get_time", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="check the time twice")],
+            tool_context,
+            max_tool_calls_per_turn=1,
+        )
+    ]
+
+    text_complete = next(
+        event
+        for event in reversed(events)
+        if event.kind == "TEXT_COMPLETE" and "continue" in str(event.payload).lower()
+    )
+    turn_completed = next(event for event in events if event.kind == "turn_completed")
+    tool_results = [event for event in events if event.kind == "tool_result"]
+
+    assert len(tool_results) == 1
+    assert "Write `continue`" in text_complete.payload
+    assert turn_completed.payload == "tool_call_limit"
 
 
 @pytest.mark.asyncio

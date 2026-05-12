@@ -7,7 +7,7 @@ from nexus.prompts import build_context_sections
 from nexus.context import CarryOverState
 from nexus.skills import load_skill_registry
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool
+from nexus.tools.builtin import GetTimeTool, WriteFileTool
 
 
 def test_build_context_uses_live_execution_mode(tmp_path):
@@ -88,3 +88,46 @@ def test_build_context_includes_active_skill_and_carry_over(tmp_path):
 
     assert any("Active Skill: review" in item for item in sections.skills)
     assert "Earlier context compacted." in sections.carry_over
+
+
+def test_base_instruction_prefers_read_only_tools_for_repo_explanations(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())
+    registry.register(WriteFileTool())
+
+    sections = build_context_sections(
+        config,
+        registry,
+        task_input="scan this repo and explain the structure",
+    )
+
+    assert "treat the task as read-only by default" in sections.base_instruction
+    assert "Do **not** call mutating tools unless the user explicitly asks" in sections.base_instruction
+
+
+def test_base_instruction_mentions_hidden_path_read_restrictions(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())
+
+    sections = build_context_sections(
+        config,
+        registry,
+        task_input="inspect config files",
+    )
+
+    assert "Hidden/private dot-path reads are blocked by default" in sections.base_instruction
+    assert "Never rely on reading `.nexus`" in sections.base_instruction
+
+
+def test_context_tools_label_read_only_vs_mutating(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())
+    registry.register(WriteFileTool())
+
+    sections = build_context_sections(config, registry, task_input="describe tools")
+
+    assert any("[core] [read-only] get_time" in entry for entry in sections.tools)
+    assert any("[core] [mutating] write_file" in entry for entry in sections.tools)

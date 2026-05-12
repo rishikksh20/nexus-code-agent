@@ -1,4 +1,4 @@
-"""Approval state manager — tracks which tools have been approved and at what scope.
+"""Approval state manager — tracks which tool invocations have been approved.
 
 ``ApprovalScope`` controls how long a user approval is remembered:
 
@@ -7,13 +7,17 @@
 * ``session`` — approved for the entire conversation session.
 
 ``ApprovalManager`` is the stateful companion to :class:`PermissionChecker`.
-It maintains per-turn and per-session approval sets and exposes the helpers
-needed by the REPL and headless runner to drive the confirmation loop.
+It remembers approvals by *tool name + normalized arguments* so that approving
+one mutating call (for example ``write_file`` on ``calculator.py``) never
+implicitly approves a later distinct call (for example ``write_file`` on
+``logging_calculator.py``).
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from nexus.security.policy import ApprovalPolicy
 
@@ -38,6 +42,9 @@ class ApprovalManager:
     policy: ApprovalPolicy = ApprovalPolicy.ON_REQUEST
     _session_approved: set[str] = field(default_factory=set, repr=False)
     _turn_approved: set[str] = field(default_factory=set, repr=False)
+    _once_approved: dict[str, int] = field(default_factory=dict, repr=False)
+    _turn_mutating_approved: bool = field(default=False, repr=False)
+    _turn_refused: set[str] = field(default_factory=set, repr=False)
 
     # ------------------------------------------------------------------
     # Turn lifecycle
@@ -49,41 +56,123 @@ class ApprovalManager:
         Call this at the start of each new user message so that tools
         approved with ``APPROVE_TURN`` scope are forgotten.
         """
-        if self.policy is not ApprovalPolicy.APPROVE_SESSION:
-            self._turn_approved.clear()
+        self._once_approved.clear()
+        self._turn_approved.clear()
+        self._turn_mutating_approved = False
+        self._turn_refused.clear()
 
     # ------------------------------------------------------------------
     # Approval recording
     # ------------------------------------------------------------------
 
-    def record_approval(self, tool_name: str, scope: ApprovalScope) -> None:
-        """Record that *tool_name* was approved with the given *scope*."""
-        # ONCE, TURN, and SESSION all add to _turn_approved so that the
-        # current iteration loop can proceed without another prompt.
-        self._turn_approved.add(tool_name)
+    def record_approval(
+        self,
+        tool_name: str,
+        scope: ApprovalScope,
+        *,
+        arguments: dict[str, Any] | None = None,
+    ) -> None:
+        """Record that a specific tool invocation was approved with *scope*."""
+        key = _approval_key(tool_name, arguments)
+        if scope is ApprovalScope.ONCE:
+            self._once_approved[key] = self._once_approved.get(key, 0) + 1
+            return
+        self._turn_approved.add(key)
         if scope is ApprovalScope.SESSION:
-            self._session_approved.add(tool_name)
+            self._session_approved.add(key)
 
-    def record_approval_once(self, tool_name: str) -> None:
+    def record_approval_once(
+        self,
+        tool_name: str,
+        *,
+        arguments: dict[str, Any] | None = None,
+    ) -> None:
         """Record a one-time approval (for a single retry iteration)."""
-        self._turn_approved.add(tool_name)
+        self.record_approval(tool_name, ApprovalScope.ONCE, arguments=arguments)
+
+    def record_turn_wide_mutating_approval(self) -> None:
+        """Approve non-dangerous confirmable tool calls for the current user turn."""
+        self._turn_mutating_approved = True
+
+    def record_refusal(
+        self,
+        tool_name: str,
+        *,
+        arguments: dict[str, Any] | None = None,
+    ) -> None:
+        """Remember that the user refused this invocation for the current turn."""
+        self._turn_refused.add(_approval_key(tool_name, arguments))
 
     # ------------------------------------------------------------------
     # Approval queries
     # ------------------------------------------------------------------
 
-    def is_pre_approved(self, tool_name: str) -> bool:
+    def is_pre_approved(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> bool:
         """Return ``True`` if *tool_name* is currently pre-approved.
 
-        A tool is pre-approved when it has been explicitly approved at
-        session or turn scope by the user.
+        A tool invocation is pre-approved when its normalized signature has been
+        explicitly approved at session or turn scope by the user.
         """
+        once_key = _approval_key(tool_name, arguments)
         return (
-            tool_name in self._session_approved
-            or tool_name in self._turn_approved
+            once_key in self._session_approved
+            or once_key in self._turn_approved
+            or self._once_approved.get(once_key, 0) > 0
         )
 
-    def should_auto_approve(self, tool_name: str, risk_level: str = "medium") -> bool:
+    def consume_approval(
+        self,
+        tool_name: str,
+        *,
+        arguments: dict[str, Any] | None = None,
+    ) -> None:
+        """Consume a one-time approval after the matching invocation executes."""
+        key = _approval_key(tool_name, arguments)
+        remaining = self._once_approved.get(key, 0)
+        if remaining <= 0:
+            return
+        if remaining == 1:
+            self._once_approved.pop(key, None)
+            return
+        self._once_approved[key] = remaining - 1
+
+    def is_turn_wide_mutating_preapproved(
+        self,
+        tool_name: str,
+        *,
+        is_mutating: bool,
+        risk_level: str = "medium",
+    ) -> bool:
+        """Return ``True`` when the current turn has blanket per-turn approval.
+
+        Turn-wide approvals intentionally do not cover high/dangerous shell
+        commands, which must always be confirmed per invocation. Callers only
+        consult this helper for tools that would otherwise prompt.
+        """
+        del is_mutating
+        if not self._turn_mutating_approved:
+            return False
+        return not _requires_fresh_turn_approval(tool_name, risk_level)
+
+    def is_refused(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> bool:
+        """Return ``True`` when the current turn already refused this invocation."""
+        return _approval_key(tool_name, arguments) in self._turn_refused
+
+    def should_auto_approve(
+        self,
+        tool_name: str,
+        risk_level: str = "medium",
+        *,
+        arguments: dict[str, Any] | None = None,
+    ) -> bool:
         """Return ``True`` if the policy says to skip the confirmation prompt.
 
         This is consulted *before* the agent checks ``PermissionChecker``.
@@ -94,12 +183,23 @@ class ApprovalManager:
             # Auto-approve low and medium risk without asking; still ask for high.
             return risk_level in {"low", "medium"}
         # For all scoped policies: auto-approve only if already approved.
-        return self.is_pre_approved(tool_name)
+        return self.is_pre_approved(tool_name, arguments)
 
     def get_approved_set(self) -> set[str]:
-        """Return the union of session- and turn-approved tools.
+        """Return the union of session- and turn-approved invocation keys.
 
-        Pass this to ``Agent.run(approved_tools=...)`` to signal which
-        tools the agent may execute without another confirmation event.
+        Legacy callers may pass this to ``Agent.run(approved_tools=...)``.
         """
         return self._session_approved | self._turn_approved
+
+
+def _approval_key(tool_name: str, arguments: dict[str, Any] | None) -> str:
+    normalised_arguments = json.dumps(arguments or {}, sort_keys=True, separators=(",", ":"), default=str)
+    return f"{tool_name}:{normalised_arguments}"
+
+
+def _requires_fresh_turn_approval(tool_name: str, risk_level: str) -> bool:
+    normalised_risk = str(risk_level).strip().lower().split(".")[-1]
+    return tool_name == "bash" and normalised_risk in {"high", "dangerous"}
+
+

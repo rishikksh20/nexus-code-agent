@@ -180,10 +180,18 @@ def _get_tool_guidelines_section(tool_registry: "ToolRegistry") -> str:
         "",
         "## Best Practices",
         "",
+        "0. **Intent Matching**",
+        "   - For requests to explain, scan, summarize, review, inspect, or describe the repo/code, treat the task as read-only by default.",
+        "   - Prefer `list_dir`, `glob`, `grep`, and `read_file` for discovery and explanation tasks.",
+        "   - Do **not** call mutating tools unless the user explicitly asks to create, edit, patch, write, or delete something.",
+        "",
         "1. **File Operations**",
         "   - Read files before editing to understand current content.",
-        "   - Use edit/replace tools for surgical changes; use write tools for new files or complete rewrites.",
+        "   - Prefer edit/replace tools when changing an existing file; use write tools for brand new files or true full rewrites.",
         "   - Do not use shell `cat`/`echo` redirection for file creation.",
+        "   - Hidden/private dot-path reads are blocked by default; only inspect them when the runtime explicitly allows hidden paths.",
+        "   - Never rely on reading `.nexus` — Nexus-managed state is permanently hidden from agent read tools.",
+        "   - Never store memory by writing files under `.nexus`; always use the dedicated `memory` tool for persistent user/context memory.",
         "",
         "2. **Search & Discovery**",
         "   - Use `grep`/`rg` to find code by content — much faster than alternatives.",
@@ -259,6 +267,8 @@ When asked to fix bugs, add features, refactor, or explain code:
    search tools extensively (in parallel when independent) to understand file
    structure, existing patterns, and conventions. Read files to validate
    assumptions; make multiple parallel `read_file` calls when needed.
+   For explanation-only or repo-structure questions, stop after read-only
+   investigation and answer directly — do not modify files.
 
 2. **Plan** — build a coherent, grounded plan. For complex tasks, break them
    down into smaller, manageable subtasks. Share a concise plan with the user

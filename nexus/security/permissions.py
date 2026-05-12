@@ -88,6 +88,33 @@ class PermissionChecker:
                 risk_level=RiskLevel.HIGH,
             )
 
+        # 4b. memory — get/list are read-only; set/delete/clear are mutating.
+        if tool.name == "memory":
+            action = str(arguments.get("action", "")).strip().lower()
+            if action in {"get", "list"}:
+                return PermissionResult(
+                    decision=PermissionDecision.ALLOW,
+                    reason="Read-only memory access is allowed.",
+                    risk_level=RiskLevel.LOW,
+                )
+            if in_plan_mode:
+                return PermissionResult(
+                    decision=PermissionDecision.DENY,
+                    reason="Mutating tools are blocked in plan mode.",
+                    risk_level=RiskLevel.MEDIUM,
+                )
+            if self.policy is ApprovalPolicy.AUTO or mode is ExecutionMode.AUTO:
+                return PermissionResult(
+                    decision=PermissionDecision.ALLOW,
+                    reason="Mutating memory update allowed under auto policy/mode.",
+                    risk_level=RiskLevel.MEDIUM,
+                )
+            return PermissionResult(
+                decision=PermissionDecision.CONFIRM,
+                reason="Memory update requires confirmation.",
+                risk_level=RiskLevel.MEDIUM,
+            )
+
         # 5. Standard mutating / read-only logic for all other tools.
         if not tool.is_mutating:
             if mode is ExecutionMode.DEFAULT and not auto_confirm_read_only:
@@ -212,6 +239,17 @@ class PermissionChecker:
             )
 
         nexus_state_root = (workspace_root / ".nexus").resolve()
+        nexus_memory_root = (nexus_state_root / "memory").resolve()
+        try:
+            target.relative_to(nexus_memory_root)
+        except ValueError:
+            pass
+        else:
+            return PermissionResult(
+                decision=PermissionDecision.DENY,
+                reason="Direct writes into `.nexus/memory` are denied. Use the `memory` tool for persistent memory instead.",
+                risk_level=RiskLevel.HIGH,
+            )
         try:
             target.relative_to(nexus_state_root)
         except ValueError:

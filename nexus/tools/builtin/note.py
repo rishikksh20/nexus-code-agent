@@ -14,7 +14,7 @@ class WriteNoteTool(Tool):
     """
 
     name = "write_note"
-    description = "Write a short note within the current workspace."
+    description = "Write a short note within the current workspace. Use the `memory` tool instead for persistent agent/user memory."
     kind = ToolKind.WRITE
     is_mutating = True
     input_schema: dict[str, Any] = {

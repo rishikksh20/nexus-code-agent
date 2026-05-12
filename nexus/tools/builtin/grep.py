@@ -6,7 +6,7 @@ from typing import Any
 
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import Tool, ToolKind
-from nexus.tools.utils import resolve_path, walk_text_files
+from nexus.tools.utils import allow_hidden_reads, read_path_policy_error, resolve_path, walk_text_files
 
 
 class GrepTool(Tool):
@@ -60,6 +60,7 @@ class GrepTool(Tool):
         raw_path = str(arguments.get("path", "."))
         workspace = context.working_directory.resolve()
         search_path = resolve_path(workspace, raw_path)
+        allow_hidden = allow_hidden_reads(context.metadata)
 
         # Workspace boundary check
         try:
@@ -68,6 +69,15 @@ class GrepTool(Tool):
             return ToolResult(
                 call_id=call_id, tool_name=self.name,
                 output="Refusing to search outside the current workspace.",
+                is_error=True,
+            )
+
+        policy_error = read_path_policy_error(search_path, workspace, allow_hidden=allow_hidden)
+        if policy_error is not None:
+            return ToolResult(
+                call_id=call_id,
+                tool_name=self.name,
+                output=policy_error,
                 is_error=True,
             )
 
@@ -87,7 +97,10 @@ class GrepTool(Tool):
         except re.error as exc:
             return ToolResult(call_id=call_id, tool_name=self.name, output=f"Invalid regex: {exc}", is_error=True)
 
-        files = walk_text_files(search_path) if search_path.is_dir() else [search_path]
+        files = (
+            walk_text_files(search_path, allow_hidden=allow_hidden)
+            if search_path.is_dir() else [search_path]
+        )
 
         output_lines: list[str] = []
         total_matches = 0

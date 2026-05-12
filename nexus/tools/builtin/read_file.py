@@ -5,7 +5,7 @@ from typing import Any
 
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import Tool, ToolKind
-from nexus.tools.utils import count_tokens, is_binary_file, resolve_path, truncate_text
+from nexus.tools.utils import allow_hidden_reads, count_tokens, is_binary_file, read_path_policy_error, resolve_path, truncate_text
 
 _MAX_FILE_BYTES = 10 * 1024 * 1024   # 10 MB
 _MAX_OUTPUT_TOKENS = 25_000
@@ -72,6 +72,7 @@ class ReadFileTool(Tool):
 
         workspace = context.working_directory.resolve()
         path = resolve_path(workspace, raw_path)
+        allow_hidden = allow_hidden_reads(context.metadata)
 
         # Workspace boundary check
         try:
@@ -80,6 +81,15 @@ class ReadFileTool(Tool):
             return ToolResult(
                 call_id=call_id, tool_name=self.name,
                 output="Refusing to access paths outside the current workspace.",
+                is_error=True,
+            )
+
+        policy_error = read_path_policy_error(path, workspace, allow_hidden=allow_hidden)
+        if policy_error is not None:
+            return ToolResult(
+                call_id=call_id,
+                tool_name=self.name,
+                output=policy_error,
                 is_error=True,
             )
 

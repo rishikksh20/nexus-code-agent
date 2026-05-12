@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from nexus.models import Message, ToolCall
+from nexus.runtime.runtime_session import resolve_runtime_session
 from nexus.runtime.sessions import SessionStore, new_snapshot, sanitize_session_messages
 
 
@@ -127,3 +128,30 @@ def test_session_store_writes_latest_session_pointer(tmp_path):
     store.save(snapshot)
 
     assert (tmp_path / "latest_session.txt").read_text(encoding="utf-8") == "latest"
+
+
+def test_resolve_runtime_session_does_not_resume_latest_by_default(tmp_path):
+    store = SessionStore(tmp_path)
+    snapshot = new_snapshot("latest")
+    snapshot.messages.append(Message(role="user", content="previous task"))
+    store.save(snapshot)
+
+    resolved, resumed = resolve_runtime_session(None, store, persist_sessions=True)
+
+    assert resumed is False
+    assert resolved.session_id != "latest"
+    assert resolved.messages == []
+
+
+def test_resolve_runtime_session_resumes_latest_when_opted_in(tmp_path):
+    store = SessionStore(tmp_path)
+    snapshot = new_snapshot("latest")
+    snapshot.messages.append(Message(role="user", content="previous task"))
+    store.save(snapshot)
+
+    resolved, resumed = resolve_runtime_session(None, store, persist_sessions=True, resume_latest=True)
+
+    assert resumed is True
+    assert resolved.session_id == "latest"
+    assert resolved.messages[0].content == "previous task"
+

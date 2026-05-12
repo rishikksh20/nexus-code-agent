@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from rich import box
 from rich.console import Console, Group
@@ -54,6 +54,8 @@ NEXUS_THEME = Theme(
     }
 )
 
+_MAX_PREVIEW_CHARS = 150
+
 
 class TerminalUI:
     """Centralised terminal output layer built on Rich."""
@@ -62,6 +64,7 @@ class TerminalUI:
         self._console = Console(theme=NEXUS_THEME, no_color=not color, highlight=False)
         self._assistant_stream_open = False
         self._tool_args_by_call_id: dict[str, dict[str, Any]] = {}
+        self._tool_preview_by_call_id: dict[str, dict[str, Any]] = {}
         self._workspace_root: Path | None = None
 
     @property
@@ -272,10 +275,10 @@ class TerminalUI:
             "read_file": ["path", "offset", "limit"],
             "write_file": ["path", "content"],
             "create_file": ["path", "content"],
-            "modify_file": ["path", "start_line", "end_line", "replacement"],
-            "replace_text": ["path", "old_string", "new_string", "replace_all"],
+            "modify_file": ["path", "start_line", "end_line", "new_content"],
+            "replace_text": ["path", "old_text", "new_text", "replace_all"],
             "insert_edit_into_file": ["path", "code"],
-            "apply_patch": ["input"],
+            "apply_patch": ["patch", "strip"],
             "bash": ["command", "timeout", "cwd"],
             "glob": ["pattern"],
             "grep": ["pattern", "path"],
@@ -291,18 +294,112 @@ class TerminalUI:
 
     def _compact_value(self, key: str, value: Any) -> str:
         if isinstance(value, str):
-            if key in {"content", "old_string", "new_string", "replacement", "code", "input"}:
+            if key in {"content", "old_string", "new_string", "old_text", "new_text", "replacement", "new_content", "code", "input"}:
                 line_count = len(value.splitlines()) or 0
                 byte_count = len(value.encode("utf-8", errors="replace"))
-                preview = value.splitlines()[0][:80] if value.strip() else ""
-                suffix = f" — {preview}…" if preview else ""
+                preview = self._truncate_preview(value.splitlines()[0] if value.strip() else "")
+                suffix = f" — {preview}" if preview else ""
                 return f"<{line_count} lines • {byte_count} bytes>{suffix}"
             if key in {"path", "cwd"}:
                 return self._relative_path(value)
-            if len(value) > 120:
-                return value[:120] + "…"
-            return value
+            return self._truncate_preview(value)
         return json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list, bool, int, float)) else str(value)
+
+    def _truncate_preview(self, text: str, *, limit: int = _MAX_PREVIEW_CHARS) -> str:
+        single_line = text.replace("\n", " ⏎ ").strip()
+        if len(single_line) <= limit:
+            return single_line
+        return single_line[: limit - 1] + "…"
+
+    def _compact_diff_preview(self, preview: dict[str, Any]) -> str:
+        diff = preview.get("diff") if isinstance(preview.get("diff"), dict) else {}
+        unified_diff = str(diff.get("unified_diff", "") or "")
+        changed_lines = [
+            line.strip()
+            for line in unified_diff.splitlines()
+            if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+        ]
+        if not changed_lines:
+            old_content = str(diff.get("old_content", "") or "")
+            new_content = str(diff.get("new_content", "") or "")
+            changed_lines = [f"- {old_content}", f"+ {new_content}"] if (old_content or new_content) else []
+        return self._truncate_preview(" | ".join(changed_lines))
+
+    def _render_diff_block(self, diff_text: str) -> Syntax:
+        cleaned = diff_text.rstrip() or "(no diff preview)"
+        if len(cleaned) > 4000:
+            cleaned = cleaned[:4000] + "\n… [truncated]"
+        return Syntax(
+            cleaned,
+            "diff",
+            theme="monokai",
+            word_wrap=True,
+            line_numbers=False,
+        )
+
+    def _render_tool_preview(self, tool_name: str, args: dict[str, Any], preview: dict[str, Any]) -> Group | Table | None:
+        if not preview:
+            if tool_name == "apply_patch":
+                patch_text = str(args.get("patch", "") or "").strip()
+                if patch_text:
+                    return Group(self._render_diff_block(patch_text))
+            return None
+        table = Table.grid(padding=(0, 1))
+        table.add_column(style="muted", justify="right", no_wrap=True)
+        table.add_column(style="tool.args", overflow="fold")
+        blocks: list[Any] = []
+
+        affected_paths = preview.get("affected_paths") if isinstance(preview.get("affected_paths"), list) else []
+        if affected_paths:
+            table.add_row("target", self._relative_path(str(affected_paths[0])))
+        command = preview.get("command")
+        if isinstance(command, str) and command.strip():
+            table.add_row("command", self._truncate_preview(command))
+        diff = preview.get("diff") if isinstance(preview.get("diff"), dict) else None
+        if diff is not None:
+            diff_path = diff.get("path")
+            if isinstance(diff_path, str) and not affected_paths:
+                table.add_row("target", self._relative_path(diff_path))
+            blocks.append(Text("diff", style="muted"))
+            blocks.append(self._render_diff_block(str(diff.get("unified_diff", "") or self._compact_diff_preview(preview))))
+        if tool_name == "apply_patch" and diff is None:
+            patch_text = str(args.get("patch", "") or "").strip()
+            if patch_text:
+                blocks.append(Text("diff", style="muted"))
+                blocks.append(self._render_diff_block(patch_text))
+        if table.row_count:
+            blocks.insert(0, table)
+        if not blocks:
+            return None
+        if len(blocks) == 1:
+            return blocks[0]
+        return Group(*blocks)
+
+    def _render_tool_panel_body(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        preview: dict[str, Any] | None = None,
+        reason: str | None = None,
+        approval_policy: str | None = None,
+        clarification_prompt: str | None = None,
+    ) -> Group:
+        blocks: list[Any] = []
+        if args:
+            blocks.append(self._render_args_table(tool_name, args))
+        else:
+            blocks.append(Text("(no arguments)", style="muted"))
+        preview_block = self._render_tool_preview(tool_name, args, preview or {})
+        if preview_block is not None:
+            blocks.append(preview_block)
+        if clarification_prompt:
+            blocks.append(Text(clarification_prompt, style="info"))
+        if reason:
+            blocks.append(Text(reason, style="warning"))
+        if approval_policy is not None:
+            blocks.append(Text(self._approval_choices(approval_policy), style="muted"))
+        return Group(*blocks)
 
     def _render_args_table(self, tool_name: str, args: dict[str, Any]) -> Table:
         table = Table.grid(padding=(0, 1))
@@ -339,7 +436,7 @@ class TerminalUI:
             line_numbers=False,
         )
 
-    def _render_tool_result_body(self, result: ToolResult) -> Group:
+    def _render_tool_result_body(self, result: ToolResult, *, preview: dict[str, Any] | None = None) -> Group:
         metadata = result.metadata or {}
         blocks: list[Any] = []
         path = metadata.get("path") if isinstance(metadata.get("path"), str) else None
@@ -347,34 +444,27 @@ class TerminalUI:
         summary.add_column(style="muted", no_wrap=True)
         summary.add_column(style="tool.result")
         if path:
-            summary.add_row("path", self._relative_path(path))
+            summary.add_row("path", self._relative_path(str(path)))
         for key in ("lines", "bytes", "entries", "matches", "files_searched", "status_code", "timezone", "results", "count"):
             if key in metadata:
                 summary.add_row(key, str(metadata[key]))
         if summary.row_count:
             blocks.append(summary)
+        preview_block = self._render_tool_preview(result.tool_name, self._tool_args_by_call_id.get(result.call_id, {}), preview or {})
+        if preview_block is not None:
+            blocks.append(preview_block)
         if result.is_error:
             blocks.append(Text(result.output or "Tool failed.", style="error"))
         else:
             blocks.append(self._preview_block(result.output, path=path))
         return Group(*blocks)
 
-    def print_approval_request(self, req: ConfirmationRequest) -> None:
-        args_panel = self._render_args_table(req.tool_name, req.arguments) if req.arguments else Text("(no arguments)", style="muted")
-        self._console.print(
-            Panel(
-                Group(
-                    Text(req.reason, style="warning"),
-                    args_panel,
-                    Text("Approve: [y]es once  •  [t]urn  •  [s]ession  •  [n]o", style="muted"),
-                ),
-                title=Text(f"Approval required — {req.tool_name}", style="approval.header"),
-                title_align="left",
-                border_style="warning",
-                box=box.ROUNDED,
-                padding=(1, 2),
-            )
-        )
+    def _approval_choices(self, approval_policy: str) -> str:
+        if approval_policy == "approve-turn":
+            return "Approval: [y]es for this turn  •  [n]o"
+        if approval_policy == "approve-session":
+            return "Approval: [y]es for this session  •  [n]o"
+        return "Approval: [y]es once  •  yes [t]urn  •  [n]o"
 
     def print_clarification_request(self, req: ConfirmationRequest) -> None:
         self._console.print(
@@ -421,7 +511,7 @@ class TerminalUI:
                 self.end_assistant()
             elif event.payload:
                 self.begin_assistant()
-                self._console.print(Markdown(event.payload))
+                self._console.print(Markdown(str(event.payload)))
                 self.end_assistant()
             return
 
@@ -431,12 +521,12 @@ class TerminalUI:
             call_id = str(payload.get("call_id", ""))
             tool_name = str(payload.get("name", "tool"))
             arguments = payload.get("arguments", {}) if isinstance(payload.get("arguments", {}), dict) else {}
+            preview = payload.get("preview", {}) if isinstance(payload.get("preview", {}), dict) else {}
             self._tool_args_by_call_id[call_id] = dict(arguments)
+            self._tool_preview_by_call_id[call_id] = dict(preview)
             self._console.print(
                 Panel(
-                    self._render_args_table(tool_name, arguments)
-                    if arguments
-                    else Text("(no arguments)", style="muted"),
+                    self._render_tool_panel_body(tool_name, arguments, preview=preview),
                     title=Text(f"{tool_name}  #{call_id[:8] or 'pending'}", style="tool"),
                     title_align="left",
                     subtitle=Text("running", style="muted"),
@@ -450,12 +540,13 @@ class TerminalUI:
 
         if event.kind == AgentEventType.TOOL_CALL_COMPLETE and show_tool_calls:
             self.end_assistant()
-            result = event.payload
+            result = cast("ToolResult", event.payload)
             if result is None:
                 return
+            preview = self._tool_preview_by_call_id.get(result.call_id, {})
             self._console.print(
                 Panel(
-                    self._render_tool_result_body(result),
+                    self._render_tool_result_body(result, preview=preview),
                     title=Text(f"{result.tool_name}  #{result.call_id[:8]}", style="tool"),
                     title_align="left",
                     subtitle=Text("failed" if result.is_error else "done", style="error" if result.is_error else "success"),
@@ -466,6 +557,7 @@ class TerminalUI:
                 )
             )
             self._tool_args_by_call_id.pop(result.call_id, None)
+            self._tool_preview_by_call_id.pop(result.call_id, None)
             return
 
         if event.kind == AgentEventType.TOOL_DENIED:
@@ -484,12 +576,48 @@ class TerminalUI:
 
         if event.kind == AgentEventType.CONFIRMATION_REQUESTED:
             self.end_assistant()
-            req: ConfirmationRequest = event.payload
+            req = cast("ConfirmationRequest", event.payload)
             self._console.print()
             if req.kind is ConfirmationKind.APPROVAL:
-                self.print_approval_request(req)
+                self._tool_args_by_call_id[req.call_id] = {str(key): value for key, value in req.arguments.items()}
+                self._tool_preview_by_call_id[req.call_id] = {str(key): value for key, value in req.preview.items()}
+                self._console.print(
+                    Panel(
+                        self._render_tool_panel_body(
+                            req.tool_name,
+                            req.arguments,
+                            preview=req.preview,
+                            reason=req.reason,
+                            approval_policy=str(req.payload.get("approval_policy", "on-request")),
+                        ),
+                        title=Text(f"{req.tool_name}  #{req.call_id[:8] or 'pending'}", style="tool"),
+                        title_align="left",
+                        subtitle=Text("approval required", style="warning"),
+                        subtitle_align="right",
+                        border_style=self._tool_border_style(req.tool_name),
+                        box=box.ROUNDED,
+                        padding=(1, 2),
+                    )
+                )
             else:
-                self.print_clarification_request(req)
+                self._console.print(
+                    Panel(
+                        self._render_tool_panel_body(
+                            req.tool_name,
+                            req.arguments,
+                            preview=req.preview,
+                            clarification_prompt=req.prompt,
+                            reason=req.reason,
+                        ),
+                        title=Text(f"{req.tool_name}  #{req.call_id[:8] or 'pending'}", style="tool"),
+                        title_align="left",
+                        subtitle=Text("clarification needed", style="info"),
+                        subtitle_align="right",
+                        border_style=self._tool_border_style(req.tool_name),
+                        box=box.ROUNDED,
+                        padding=(1, 2),
+                    )
+                )
             self._console.print()
             return
 

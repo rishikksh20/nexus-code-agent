@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from nexus.models import ToolExecutionContext, ToolResult
-from nexus.tools.base import ToolKind
+from nexus.tools.base import FileDiff, ToolConfirmation, ToolKind
 
 # ---------------------------------------------------------------------------
 # Re-exports from nexus.tools.builtin (backward-compat imports)
@@ -191,6 +191,47 @@ class ModifyFileTool:
     }
     is_mutating = True
 
+    async def get_confirmation(
+        self,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolConfirmation | None:
+        del call_id
+        raw_path = str(arguments.get("path", "")).strip()
+        if not raw_path:
+            return None
+
+        workspace = context.working_directory.resolve()
+        target = _resolve_path(workspace, raw_path)
+        if _workspace_write_check(target, workspace) or not target.exists() or not target.is_file():
+            return None
+
+        try:
+            original = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+        lines = original.splitlines(keepends=True)
+        start_line = int(arguments.get("start_line", 1))
+        end_line = int(arguments.get("end_line", start_line))
+        if start_line > end_line or start_line < 1 or start_line > len(lines):
+            return None
+
+        new_content = str(arguments.get("new_content", ""))
+        replacement_lines = new_content.splitlines(keepends=True)
+        if replacement_lines and not replacement_lines[-1].endswith("\n"):
+            replacement_lines[-1] += "\n"
+        updated = "".join(lines[: start_line - 1] + replacement_lines + lines[end_line:])
+
+        return ToolConfirmation(
+            tool_name=self.name,
+            params=arguments,
+            description=f"Modify lines {start_line}-{end_line} in {target}",
+            diff=FileDiff(path=target, old_content=original, new_content=updated),
+            affected_paths=[target],
+        )
+
     async def execute(
         self,
         call_id: str,
@@ -306,6 +347,43 @@ class ReplaceTextTool:
         "additionalProperties": False,
     }
     is_mutating = True
+
+    async def get_confirmation(
+        self,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolConfirmation | None:
+        del call_id
+        raw_path = str(arguments.get("path", "")).strip()
+        if not raw_path:
+            return None
+
+        workspace = context.working_directory.resolve()
+        target = _resolve_path(workspace, raw_path)
+        if _workspace_write_check(target, workspace) or not target.exists() or not target.is_file():
+            return None
+
+        try:
+            original = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+        old_text = str(arguments.get("old_text", ""))
+        if not old_text or old_text not in original:
+            return None
+
+        new_text = str(arguments.get("new_text", ""))
+        replace_all = bool(arguments.get("replace_all", False))
+        updated = original.replace(old_text, new_text) if replace_all else original.replace(old_text, new_text, 1)
+
+        return ToolConfirmation(
+            tool_name=self.name,
+            params=arguments,
+            description=f"Replace text in {target}",
+            diff=FileDiff(path=target, old_content=original, new_content=updated),
+            affected_paths=[target],
+        )
 
     async def execute(
         self,

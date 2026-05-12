@@ -7,12 +7,13 @@ from uuid import uuid4
 from collections.abc import Awaitable, Callable
 from typing import cast
 
-from nexus.models import AgentEvent, ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message
+from nexus.models import AgentEvent, AgentEventType, ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message, RuntimeResponse
 from nexus.runtime.agent import Agent
-from nexus.context import ContextCompactor, TokenEstimator, prune_tool_outputs
+from nexus.context import ContextCompactor, TokenEstimator
 from nexus.hooks import HookEvent
-from nexus.runtime.repl_state import ReplState
+from nexus.runtime.repl_state import ReplState, apply_events_to_messages
 from nexus.security.manager import ApprovalScope
+from nexus.security.policy import ApprovalPolicy
 from nexus.ui import TerminalUI
 
 
@@ -29,10 +30,11 @@ def prompt_for_confirmation(
         if request.kind is ConfirmationKind.CLARIFICATION:
             answer = input_reader(f"{request.prompt} ").strip()
             return ConfirmationResponse(clarification=answer) if answer else ConfirmationResponse()
-        answer = input_reader(f"{request.prompt} [y/N]: ").strip().lower()
+        approval_policy = _approval_policy_for_request(request)
+        answer = input_reader(f"{request.prompt} {_approval_prompt_label(approval_policy)} ").strip().lower()
     except EOFError:
         return ConfirmationResponse()
-    return ConfirmationResponse(approved=answer in {"y", "yes"})
+    return _approval_response_from_answer(answer, approval_policy)
 
 
 async def collect_turn_events(
@@ -44,6 +46,8 @@ async def collect_turn_events(
     auto_confirm: bool = False,
 ) -> list[AgentEvent]:
     committed_events: list[AgentEvent] = []
+    working_history = list(state.history)
+    initial_prompt_text = prompt_text
     turn_id = state.current_turn_id or uuid4().hex[:12]
     trace_id = state.current_trace_id or uuid4().hex
     started_at = time.perf_counter()
@@ -53,9 +57,9 @@ async def collect_turn_events(
             prompt_text,
             turn_id=turn_id,
             trace_id=trace_id,
+            history=working_history,
             compactor_factory=ContextCompactor,
             estimator_factory=TokenEstimator,
-            prune_outputs=prune_tool_outputs,
         )
         events: list[AgentEvent] = [
             event
@@ -65,47 +69,71 @@ async def collect_turn_events(
                 system_prompt=prepared_turn.system_prompt,
                 model_name=state.config.model_name,
                 mode=state.mode,
-                approved_tools=state.approval_manager.get_approved_set(),
+                approval_manager=state.approval_manager,
                 auto_confirm=auto_confirm,
                 auto_confirm_read_only=state.config.auto_confirm_read_only,
                 temperature=state.config.temperature,
                 max_output_tokens=state.config.max_output_tokens,
                 max_turns=state.config.max_loop_iterations,
+                max_tool_calls_per_turn=state.config.max_tool_calls_per_turn,
             )
         ]
-        confirmation = next((event for event in events if event.kind == "confirmation_requested"), None)
+        confirmation_index = next((index for index, event in enumerate(events) if event.kind == "confirmation_requested"), None)
+        if confirmation_index is not None:
+            committed_prefix = _history_safe_completed_events(events[:confirmation_index])
+            if committed_prefix:
+                apply_events_to_messages(working_history, committed_prefix)
+                committed_events.extend(committed_prefix)
+        confirmation = None if confirmation_index is None else events[confirmation_index]
         if confirmation is None:
             committed_events.extend(events)
+            _sync_paused_turn_state(state, committed_events, prompt_text=initial_prompt_text)
             _record_turn_telemetry(state, committed_events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="completed")
             return committed_events
         confirmation_request = cast(ConfirmationRequest, confirmation.payload)
 
         if auto_confirm and confirmation_request.kind is ConfirmationKind.APPROVAL:
-            state.approval_manager.record_approval(confirmation_request.tool_name, ApprovalScope.TURN)
+            state.approval_manager.record_approval(
+                confirmation_request.tool_name,
+                _approval_scope_for_policy(state.approval_manager.policy),
+                arguments=confirmation_request.arguments,
+            )
             continue
 
         if approval_callback is None:
-            pending_events = [*committed_events, *events]
+            confirmation_event = cast(AgentEvent, confirmation)
+            pending_events = [*committed_events, confirmation_event]
             _record_turn_telemetry(state, pending_events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="awaiting_confirmation")
             return pending_events
 
         response = await approval_callback(confirmation_request)
         if confirmation_request.kind is ConfirmationKind.APPROVAL and response.approved:
-            state.approval_manager.record_approval(confirmation_request.tool_name, ApprovalScope.ONCE)
+            _record_approval_response(state, confirmation_request, response)
+            continue
+        if confirmation_request.kind is ConfirmationKind.APPROVAL and response.denied:
+            state.approval_manager.record_refusal(
+                confirmation_request.tool_name,
+                arguments=confirmation_request.arguments,
+            )
             continue
         if confirmation_request.kind is ConfirmationKind.CLARIFICATION and response.clarification:
             clarification_text = (
                 f"Clarification for {confirmation_request.tool_name} "
                 f"({confirmation_request.payload.get('field', 'value')}): {response.clarification}"
             )
-            state.history.append(Message(role="user", content=clarification_text))
+            clarification_message = Message(role="user", content=clarification_text)
+            state.history.append(clarification_message)
+            working_history.append(clarification_message)
             prompt_text = clarification_text
             continue
-        pending_events = [*committed_events, *events]
+        confirmation_event = cast(AgentEvent, confirmation)
+        pending_events = [*committed_events, confirmation_event]
+        _sync_paused_turn_state(state, pending_events, prompt_text=initial_prompt_text)
         _record_turn_telemetry(state, pending_events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="stopped")
         return pending_events
 
-    return committed_events
+    _sync_paused_turn_state(state, committed_events, prompt_text=initial_prompt_text)
+    return []
 
 
 def apply_events_to_history(state: ReplState, events: list) -> None:
@@ -136,6 +164,8 @@ async def _stream_turn_live(
     Returns all collected events so the caller can apply them to history.
     """
     committed_events: list[AgentEvent] = []
+    working_history = list(state.history)
+    initial_prompt_text = prompt_text
     turn_id = state.current_turn_id or uuid4().hex[:12]
     trace_id = state.current_trace_id or uuid4().hex
     started_at = time.perf_counter()
@@ -145,9 +175,9 @@ async def _stream_turn_live(
             prompt_text,
             turn_id=turn_id,
             trace_id=trace_id,
+            history=working_history,
             compactor_factory=ContextCompactor,
             estimator_factory=TokenEstimator,
-            prune_outputs=prune_tool_outputs,
         )
 
         batch: list[AgentEvent] = []
@@ -157,12 +187,13 @@ async def _stream_turn_live(
             system_prompt=prepared_turn.system_prompt,
             model_name=state.config.model_name,
             mode=state.mode,
-            approved_tools=state.approval_manager.get_approved_set(),
+            approval_manager=state.approval_manager,
             auto_confirm=auto_confirm,
             auto_confirm_read_only=state.config.auto_confirm_read_only,
             temperature=state.config.temperature,
             max_output_tokens=state.config.max_output_tokens,
             max_turns=state.config.max_loop_iterations,
+            max_tool_calls_per_turn=state.config.max_tool_calls_per_turn,
         ):
             _render_event(
                 ui,
@@ -172,10 +203,19 @@ async def _stream_turn_live(
             )
             batch.append(event)
 
-        confirmation = next((e for e in batch if e.kind == "confirmation_requested"), None)
+        confirmation_index = next((index for index, event in enumerate(batch) if event.kind == "confirmation_requested"), None)
+
+        if confirmation_index is not None:
+            committed_prefix = _history_safe_completed_events(batch[:confirmation_index])
+            if committed_prefix:
+                apply_events_to_messages(working_history, committed_prefix)
+                committed_events.extend(committed_prefix)
+
+        confirmation = None if confirmation_index is None else batch[confirmation_index]
 
         if confirmation is None:
             committed_events.extend(batch)
+            _sync_paused_turn_state(state, committed_events, prompt_text=initial_prompt_text)
             _record_turn_telemetry(
                 state, committed_events, turn_id=turn_id, trace_id=trace_id,
                 duration_ms=(time.perf_counter() - started_at) * 1000, status="completed",
@@ -185,11 +225,16 @@ async def _stream_turn_live(
         confirmation_request = cast(ConfirmationRequest, confirmation.payload)
 
         if auto_confirm and confirmation_request.kind is ConfirmationKind.APPROVAL:
-            state.approval_manager.record_approval(confirmation_request.tool_name, ApprovalScope.TURN)
+            state.approval_manager.record_approval(
+                confirmation_request.tool_name,
+                _approval_scope_for_policy(state.approval_manager.policy),
+                arguments=confirmation_request.arguments,
+            )
             continue
 
         if approval_callback is None:
-            pending_events = [*committed_events, *batch]
+            confirmation_event = cast(AgentEvent, confirmation)
+            pending_events = [*committed_events, confirmation_event]
             _record_turn_telemetry(
                 state, pending_events, turn_id=turn_id, trace_id=trace_id,
                 duration_ms=(time.perf_counter() - started_at) * 1000, status="awaiting_confirmation",
@@ -198,24 +243,35 @@ async def _stream_turn_live(
 
         response = await approval_callback(confirmation_request)
         if confirmation_request.kind is ConfirmationKind.APPROVAL and response.approved:
-            # scope is already recorded inside ask_for_approval; ONCE is the fallback.
-            if not state.approval_manager.is_pre_approved(confirmation_request.tool_name):
-                state.approval_manager.record_approval(confirmation_request.tool_name, ApprovalScope.ONCE)
+            _record_approval_response(state, confirmation_request, response)
+            continue
+        if confirmation_request.kind is ConfirmationKind.APPROVAL and response.denied:
+            state.approval_manager.record_refusal(
+                confirmation_request.tool_name,
+                arguments=confirmation_request.arguments,
+            )
             continue
         if confirmation_request.kind is ConfirmationKind.CLARIFICATION and response.clarification:
             clarification_text = (
                 f"Clarification for {confirmation_request.tool_name} "
                 f"({confirmation_request.payload.get('field', 'value')}): {response.clarification}"
             )
-            state.history.append(Message(role="user", content=clarification_text))
+            clarification_message = Message(role="user", content=clarification_text)
+            state.history.append(clarification_message)
+            working_history.append(clarification_message)
             prompt_text = clarification_text
             continue
-        pending_events = [*committed_events, *batch]
+        confirmation_event = cast(AgentEvent, confirmation)
+        pending_events = [*committed_events, confirmation_event]
+        _sync_paused_turn_state(state, pending_events, prompt_text=initial_prompt_text)
         _record_turn_telemetry(
             state, pending_events, turn_id=turn_id, trace_id=trace_id,
             duration_ms=(time.perf_counter() - started_at) * 1000, status="stopped",
         )
         return pending_events
+
+    _sync_paused_turn_state(state, committed_events, prompt_text=initial_prompt_text)
+    return []
 
 
 async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: bool = False) -> None:
@@ -224,6 +280,8 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
     ui.print_banner(cfg.provider, cfg.model_name, state.mode.value, workspace=cfg.workspace_root)
     if session_resumed:
         ui.print_session_resumed(state.session.session_id, len(state.history))
+    if state.has_paused_turn():
+        ui.print_muted("A previous task was paused after hitting the tool-call limit. Type `continue` to resume it, or enter a new prompt to start something else.")
     ui.print_help_hint()
     if cfg.provider == "fake":
         ui.print_fake_provider_notice()
@@ -248,23 +306,12 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
                 field = request.payload.get("field", "value")
                 answer = ui.input(f"  [bold]Value for [cyan]{field!r}[/cyan]:[/bold] ").strip()
                 return ConfirmationResponse(clarification=answer) if answer else ConfirmationResponse()
-            # Scoped approval prompt: once / turn / session / no
-            answer = ui.input(
-                "[bold yellow]  Allow? \\[y]es (once) / \\[t]urn / \\[s]ession / \\[N]o:[/bold yellow] "
-            ).strip().lower()
+            prompt_label = _approval_prompt_label(_approval_policy_for_request(request))
+            answer = ui.input(f"[bold yellow]  Allow? {prompt_label}[/bold yellow] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return ConfirmationResponse()
 
-        if answer in {"y", "yes"}:
-            state.approval_manager.record_approval(request.tool_name, ApprovalScope.ONCE)
-            return ConfirmationResponse(approved=True)
-        if answer in {"t", "turn"}:
-            state.approval_manager.record_approval(request.tool_name, ApprovalScope.TURN)
-            return ConfirmationResponse(approved=True)
-        if answer in {"s", "session"}:
-            state.approval_manager.record_approval(request.tool_name, ApprovalScope.SESSION)
-            return ConfirmationResponse(approved=True)
-        return ConfirmationResponse()
+        return _approval_response_from_answer(answer, _approval_policy_for_request(request))
 
     while not state.should_exit:
         try:
@@ -279,6 +326,10 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
         if await router.dispatch(state, raw_input):
             continue
 
+        effective_prompt, resumed_paused_turn = state.consume_turn_prompt(raw_input)
+        if resumed_paused_turn:
+            ui.print_muted("Resuming paused task…")
+
         if state.hooks is not None:
             state.current_turn_id = uuid4().hex[:12]
             state.current_trace_id = uuid4().hex
@@ -290,15 +341,18 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
                     "turn_id": state.current_turn_id,
                     "trace_id": state.current_trace_id,
                     "mode": state.mode.value,
+                    "effective_prompt": effective_prompt,
+                    "resumed_paused_turn": resumed_paused_turn,
                 },
             )
         state.history.append(Message(role="user", content=raw_input))
-        state.approval_manager.begin_turn()
+        if not resumed_paused_turn:
+            state.approval_manager.begin_turn()
         try:
             events = await _stream_turn_live(
                 state,
                 agent,
-                raw_input,
+                effective_prompt,
                 ui,
                 approval_callback=ask_for_approval,
             )
@@ -324,6 +378,143 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
             },
         )
     state.session_store.save(state.session)
+def _approval_scope_for_policy(policy: ApprovalPolicy) -> ApprovalScope:
+    if policy is ApprovalPolicy.APPROVE_TURN:
+        return ApprovalScope.TURN
+    if policy is ApprovalPolicy.APPROVE_SESSION:
+        return ApprovalScope.SESSION
+    return ApprovalScope.ONCE
+
+
+def _approval_prompt_label(policy: ApprovalPolicy) -> str:
+    if policy is ApprovalPolicy.APPROVE_TURN:
+        return "(y)es for this turn / (N)o:"
+    if policy is ApprovalPolicy.APPROVE_SESSION:
+        return "(y)es for this session / (N)o:"
+    return "(y)es once / yes (t)urn / (N)o:"
+
+
+def _approval_policy_for_request(request: ConfirmationRequest) -> ApprovalPolicy:
+    return ApprovalPolicy(str(request.payload.get("approval_policy", ApprovalPolicy.ON_REQUEST.value)))
+
+
+def _approval_response_from_answer(answer: str, policy: ApprovalPolicy) -> ConfirmationResponse:
+    normalized = _normalize_approval_answer(answer)
+    if normalized in {"y", "yes", "once", "yes once"}:
+        return ConfirmationResponse(approved=True, scope=_approval_scope_for_policy(policy).value)
+    if policy is ApprovalPolicy.ON_REQUEST and normalized in {"t", "turn", "yes turn", "yes t"}:
+        return ConfirmationResponse(approved=True, scope=ApprovalScope.TURN.value)
+    return ConfirmationResponse()
+
+
+def _normalize_approval_answer(answer: str) -> str:
+    normalized = answer.strip().lower()
+    for token in ("(", ")", "-", "_"):
+        normalized = normalized.replace(token, " ")
+    return " ".join(normalized.split())
+
+
+def _record_approval_response(
+    state: ReplState,
+    request: ConfirmationRequest,
+    response: ConfirmationResponse,
+) -> None:
+    scope = ApprovalScope(response.scope or _approval_scope_for_policy(state.approval_manager.policy).value)
+    request_policy = _approval_policy_for_request(request)
+    if scope is ApprovalScope.TURN and request_policy is ApprovalPolicy.ON_REQUEST:
+        if _supports_turn_wide_approval(request):
+            state.approval_manager.record_turn_wide_mutating_approval()
+            return
+        state.approval_manager.record_approval(
+            request.tool_name,
+            ApprovalScope.ONCE,
+            arguments=request.arguments,
+        )
+        return
+    state.approval_manager.record_approval(
+        request.tool_name,
+        scope,
+        arguments=request.arguments,
+    )
+
+
+def _supports_turn_wide_approval(request: ConfirmationRequest) -> bool:
+    risk_level = str(request.payload.get("risk_level", "medium")).strip().lower().split(".")[-1]
+    return not (request.tool_name == "bash" and risk_level in {"high", "dangerous"})
+
+
+def _sync_paused_turn_state(state: ReplState, events: list[AgentEvent], *, prompt_text: str) -> None:
+    if _turn_finished_with_tool_call_limit(events):
+        state.mark_paused_turn(prompt_text)
+        return
+    state.clear_paused_turn()
+
+
+def _turn_finished_with_tool_call_limit(events: list[AgentEvent]) -> bool:
+    turn_completed = next(
+        (event for event in reversed(events) if event.kind == AgentEventType.TURN_COMPLETED),
+        None,
+    )
+    return bool(turn_completed and turn_completed.payload == "tool_call_limit")
+
+
+def _history_safe_completed_events(events: list[AgentEvent]) -> list[AgentEvent]:
+    completed_tool_calls = {
+        event.payload.call_id
+        for event in events
+        if event.kind == AgentEventType.TOOL_RESULT
+    }
+    if not completed_tool_calls:
+        return []
+
+    committed: list[AgentEvent] = []
+    for event in events:
+        if event.kind == AgentEventType.MODEL_RESPONSE:
+            payload = cast(RuntimeResponse, event.payload)
+            message = payload.message
+            if not message.tool_calls:
+                committed.append(event)
+                continue
+            completed_calls = tuple(
+                tool_call for tool_call in message.tool_calls
+                if tool_call.call_id in completed_tool_calls
+            )
+            if not completed_calls and not message.content:
+                continue
+            committed.append(
+                AgentEvent(
+                    kind=event.kind,
+                    payload=RuntimeResponse(
+                        message=Message(
+                            role=message.role,
+                            content=message.content,
+                            name=message.name,
+                            tool_calls=completed_calls,
+                            tool_call_id=message.tool_call_id,
+                        ),
+                        tool_calls=completed_calls,
+                        usage=payload.usage,
+                        finish_reason="tool_calls" if completed_calls else payload.finish_reason,
+                    ),
+                )
+            )
+            continue
+        if event.kind == AgentEventType.TOOL_CALL_START:
+            if event.payload.get("call_id") in completed_tool_calls:
+                committed.append(event)
+            continue
+        if event.kind == AgentEventType.TOOL_CALL_REQUESTED:
+            if event.payload.call_id in completed_tool_calls:
+                committed.append(event)
+            continue
+        if event.kind in {AgentEventType.TOOL_CALL_COMPLETE, AgentEventType.TOOL_RESULT}:
+            if event.payload.call_id in completed_tool_calls:
+                committed.append(event)
+            continue
+        committed.append(event)
+    return committed
+
+
 
 
 def _build_system_prompt(state: ReplState, prompt_text: str) -> str:

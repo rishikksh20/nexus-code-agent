@@ -18,6 +18,7 @@ _CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], max_content_width=1
 @click.option("--prompt-file", "-f", "prompt_file", type=click.Path(path_type=Path), default=None, metavar="FILE", help="Read the headless prompt from a file.")
 @click.option("--stdin", "use_stdin", is_flag=True, help="Read the headless prompt from stdin.")
 @click.option("--session", "-s", default=None, metavar="NAME", help="Resume or create a named session.")
+@click.option("--resume-last", "resume_last", is_flag=True, help="Resume the latest saved session for this workspace.")
 @click.option("--no-session", "no_session", is_flag=True, help="Skip session persistence.")
 @click.option("--model", "-m", default=None, metavar="NAME", help="Override the model name from config.")
 @click.option("--provider", default=None, metavar="NAME", help="Override the provider from config.")
@@ -39,6 +40,7 @@ _CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], max_content_width=1
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug-level logging.")
 @click.option("--auto-confirm", "auto_confirm", is_flag=True, help="Automatically confirm all mutating tool calls.")
 @click.option("--deny-mutating", "deny_mutating", is_flag=True, help="Deny all mutating tools (implies plan mode).")
+@click.option("--allow-hidden-paths", "allow_hidden_paths", is_flag=True, help="Allow the agent to read hidden/private paths other than .nexus for this run.")
 @click.option("--allowed-tools", "allowed_tools", default=None, metavar="LIST", help="Comma-separated allowlist of tool names.")
 @click.option("--denied-tools", "denied_tools", default=None, metavar="LIST", help="Comma-separated denylist of tool names.")
 @click.option("--skill", "skills", multiple=True, metavar="NAME", help="Activate a skill for this run (repeatable).")
@@ -50,6 +52,7 @@ def cli(
     prompt_file: Path | None,
     use_stdin: bool,
     session: str | None,
+    resume_last: bool,
     no_session: bool,
     model: str | None,
     provider: str | None,
@@ -66,6 +69,7 @@ def cli(
     verbose: bool,
     auto_confirm: bool,
     deny_mutating: bool,
+    allow_hidden_paths: bool,
     allowed_tools: str | None,
     denied_tools: str | None,
     skills: tuple[str, ...],
@@ -147,6 +151,7 @@ def args_to_config_overrides(
     no_stream: bool = False,
     quiet: bool = False,
     verbose: bool = False,
+    allow_hidden_paths: bool = False,
     allowed_tools: str | None = None,
     denied_tools: str | None = None,
     **_ignored: Any,
@@ -171,6 +176,8 @@ def args_to_config_overrides(
         overrides["show_tool_calls"] = False
     if verbose:
         overrides["log_level"] = "DEBUG"
+    if allow_hidden_paths:
+        overrides["allow_hidden_paths"] = True
     if allowed_tools:
         overrides["allowed_tools"] = [t.strip() for t in allowed_tools.split(",") if t.strip()]
     if denied_tools:

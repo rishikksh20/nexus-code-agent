@@ -1,19 +1,19 @@
 """MemoryTool — persistent key/value agent memory store.
 
-Memory entries survive across sessions.  They are stored as a JSON file in
-the configured memory directory (defaults to ``~/.nexus/memory/``).
+Memory entries survive across sessions. They are stored as a single JSON
+dictionary under the configured memory directory (defaults to
+``~/.nexus/memory/``).
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
+from nexus.memory.store import MemoryEntry, MemoryStore
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import Tool, ToolKind
 
 _DEFAULT_MEMORY_DIR = Path.home() / ".nexus" / "memory"
-_MEMORY_FILE = "agent_memory.json"
 
 
 class MemoryTool(Tool):
@@ -26,8 +26,8 @@ class MemoryTool(Tool):
 
     name = "memory"
     description = (
-        "Store and retrieve persistent memory across sessions. "
-        "Actions: set, get, delete, list, clear."
+        "Store and retrieve persistent memory across sessions. Use this for user preferences, identity, and important context instead "
+        "of writing ad-hoc memory files. Actions: set, get, delete, list, clear."
     )
     kind = ToolKind.MEMORY
     is_mutating = True
@@ -53,24 +53,8 @@ class MemoryTool(Tool):
     }
 
     def __init__(self, memory_dir: Path | None = None) -> None:
-        self._memory_path = (memory_dir or _DEFAULT_MEMORY_DIR) / _MEMORY_FILE
-
-    # ------------------------------------------------------------------
-    # Private persistence helpers
-    # ------------------------------------------------------------------
-
-    def _load(self) -> dict[str, str]:
-        if not self._memory_path.exists():
-            return {}
-        try:
-            data = json.loads(self._memory_path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
-    def _save(self, entries: dict[str, str]) -> None:
-        self._memory_path.parent.mkdir(parents=True, exist_ok=True)
-        self._memory_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
+        root = memory_dir or _DEFAULT_MEMORY_DIR
+        self._store = MemoryStore(root)
 
     # ------------------------------------------------------------------
     # Tool execution
@@ -82,51 +66,50 @@ class MemoryTool(Tool):
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
+        del context
         action = str(arguments.get("action", "")).lower().strip()
         key = arguments.get("key")
         value = arguments.get("value")
 
         if action == "set":
-            if not key or value is None:
-                return ToolResult(call_id=call_id, tool_name=self.name, output="'key' and 'value' are required for set", is_error=True)
-            entries = self._load()
-            entries[str(key)] = str(value)
-            self._save(entries)
-            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Stored memory: {key}")
+            if not key or not value:
+                return ToolResult(call_id=call_id, tool_name=self.name, output="`key` and `value` are required for 'set' action", is_error=True)
+            self._store.save(MemoryEntry(key=str(key), content=str(value), keywords=(str(key),)))
+            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Set memory: {key}")
 
         if action == "get":
             if not key:
-                return ToolResult(call_id=call_id, tool_name=self.name, output="'key' is required for get", is_error=True)
-            entries = self._load()
-            if str(key) not in entries:
+                return ToolResult(call_id=call_id, tool_name=self.name, output="`key` required for 'get' action", is_error=True)
+            entry = self._store.load(str(key))
+            if entry is None:
                 return ToolResult(call_id=call_id, tool_name=self.name, output=f"Memory not found: {key}", metadata={"found": False})
             return ToolResult(
-                call_id=call_id, tool_name=self.name,
-                output=f"{key}: {entries[str(key)]}",
+                call_id=call_id,
+                tool_name=self.name,
+                output=f"Memory found: {key}: {entry.content}",
                 metadata={"found": True},
             )
 
         if action == "delete":
             if not key:
-                return ToolResult(call_id=call_id, tool_name=self.name, output="'key' is required for delete", is_error=True)
-            entries = self._load()
-            if str(key) not in entries:
+                return ToolResult(call_id=call_id, tool_name=self.name, output="`key` required for 'delete' action", is_error=True)
+            if not self._store.delete(str(key)):
                 return ToolResult(call_id=call_id, tool_name=self.name, output=f"Memory not found: {key}")
-            del entries[str(key)]
-            self._save(entries)
             return ToolResult(call_id=call_id, tool_name=self.name, output=f"Deleted memory: {key}")
 
         if action == "list":
-            entries = self._load()
+            entries = {
+                entry.key: entry.content
+                for entry in (self._store.load(key) for key in self._store.list_keys())
+                if entry is not None
+            }
             if not entries:
-                return ToolResult(call_id=call_id, tool_name=self.name, output="No memories stored.", metadata={"count": 0})
+                return ToolResult(call_id=call_id, tool_name=self.name, output="No memories stored", metadata={"found": False, "count": 0})
             lines = ["Stored memories:"] + [f"  {k}: {v}" for k, v in sorted(entries.items())]
-            return ToolResult(call_id=call_id, tool_name=self.name, output="\n".join(lines), metadata={"count": len(entries)})
+            return ToolResult(call_id=call_id, tool_name=self.name, output="\n".join(lines), metadata={"found": True, "count": len(entries)})
 
         if action == "clear":
-            entries = self._load()
-            count = len(entries)
-            self._save({})
-            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Cleared {count} memory entries.")
+            count = self._store.clear()
+            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Cleared {count} memory entries")
 
-        return ToolResult(call_id=call_id, tool_name=self.name, output=f"Unknown action: {action!r}. Use set, get, delete, list, or clear.", is_error=True)
+        return ToolResult(call_id=call_id, tool_name=self.name, output=f"Unknown action: {action}", is_error=True)

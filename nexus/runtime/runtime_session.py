@@ -40,6 +40,7 @@ class RuntimeSession:
             params["session"],
             session_store,
             persist_sessions=not params["no_session"],
+            resume_latest=bool(params.get("resume_last", False)),
         )
         session.messages = sanitize_session_messages(list(session.messages))
 
@@ -97,6 +98,7 @@ def resolve_runtime_session(
     store: SessionStore | EphemeralSessionStore,
     *,
     persist_sessions: bool = True,
+    resume_latest: bool = False,
 ) -> tuple:
     """Return ``(snapshot, resumed: bool)`` for the active runtime session."""
     if not persist_sessions:
@@ -106,7 +108,8 @@ def resolve_runtime_session(
             return store.load(session_id), True
         except FileNotFoundError:
             return new_snapshot(session_id=session_id), False
-    latest = store.load_latest()
-    if latest is not None:
-        return latest, True
+    if resume_latest:
+        latest = store.load_latest()
+        if latest is not None:
+            return latest, True
     return new_snapshot(), False

@@ -285,3 +285,19 @@ def test_config_default_provider_is_openai_compatible(tmp_path):
     assert config.provider == "openai-compatible"
     assert config.model_name == "mistral-medium-latest"
     assert config.api_base_url == "https://api.mistral.ai/v1"
+
+
+def test_config_can_enable_hidden_path_reads(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'allow_hidden_paths = true\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.allow_hidden_paths is True
+

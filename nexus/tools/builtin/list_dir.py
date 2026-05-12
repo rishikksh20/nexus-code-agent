@@ -5,7 +5,7 @@ from typing import Any
 
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import Tool, ToolKind
-from nexus.tools.utils import resolve_path
+from nexus.tools.utils import allow_hidden_reads, include_directory_entry, read_path_policy_error, resolve_path
 
 
 class ListDirTool(Tool):
@@ -47,6 +47,7 @@ class ListDirTool(Tool):
         raw_path = str(arguments.get("path", "."))
         workspace = context.working_directory.resolve()
         dir_path = resolve_path(workspace, raw_path)
+        allow_hidden = allow_hidden_reads(context.metadata)
 
         # Workspace boundary check
         try:
@@ -55,6 +56,15 @@ class ListDirTool(Tool):
             return ToolResult(
                 call_id=call_id, tool_name=self.name,
                 output="Refusing to list directories outside the current workspace.",
+                is_error=True,
+            )
+
+        policy_error = read_path_policy_error(dir_path, workspace, allow_hidden=allow_hidden)
+        if policy_error is not None:
+            return ToolResult(
+                call_id=call_id,
+                tool_name=self.name,
+                output=policy_error,
                 is_error=True,
             )
 
@@ -69,8 +79,10 @@ class ListDirTool(Tool):
         except OSError as exc:
             return ToolResult(call_id=call_id, tool_name=self.name, output=f"Error listing directory: {exc}", is_error=True)
 
-        if not show_hidden:
-            items = [item for item in items if not item.name.startswith(".")]
+        items = [
+            item for item in items
+            if include_directory_entry(item.name, show_hidden=show_hidden, allow_hidden=allow_hidden)
+        ]
 
         if not items:
             return ToolResult(

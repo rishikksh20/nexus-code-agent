@@ -11,9 +11,6 @@ Public surface
 """
 from __future__ import annotations
 
-import os
-import platform
-import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -120,7 +117,7 @@ def build_context_sections(
             f"Model: {config.model_name}",
         ],
         tools=[
-            f"[{record.source}] {record.name}: {record.tool.description}"
+            f"[{record.source}] [{'mutating' if record.tool.is_mutating else 'read-only'}] {record.name}: {record.tool.description}"
             for record in tool_registry.records()
         ],
         skills=skills,

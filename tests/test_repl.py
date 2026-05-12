@@ -6,6 +6,7 @@ import pytest
 from rich.console import Console
 
 from nexus.config import load_config
+from nexus.integrations.fake_model import FakeModelClient
 from nexus.memory.store import MemoryStore
 from nexus.models import (
     AgentEvent,
@@ -21,11 +22,11 @@ from nexus.models import (
 )
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.repl import collect_turn_events
+from nexus.runtime.repl import collect_turn_events, prompt_for_confirmation
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import EphemeralSessionStore, new_snapshot
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool
+from nexus.tools.builtin import GetTimeTool, MemoryTool, WriteNoteTool
 
 
 class _CaptureModelClient:
@@ -118,6 +119,103 @@ class _ApprovalRetryAgent:
         yield AgentEvent(
             kind=AgentEventType.TOOL_RESULT,
             payload=ToolResult(call_id="call-1", tool_name="write_file", output="Created hello.py"),
+        )
+        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="done")
+
+
+class _SequentialApprovalAgent:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.seen_messages: list[list[Message]] = []
+
+    async def run(self, messages, context, **kwargs):
+        del context, kwargs
+        self.calls += 1
+        self.seen_messages.append(list(messages))
+
+        calc_call = ToolCall(
+            call_id="call-calc",
+            tool_name="write_file",
+            arguments={"path": "calculator.py", "content": "print('calc')\n"},
+        )
+        logging_call = ToolCall(
+            call_id="call-logging",
+            tool_name="write_file",
+            arguments={"path": "logging_calculator.py", "content": "print('logging')\n"},
+        )
+
+        if self.calls == 1:
+            yield AgentEvent(
+                kind=AgentEventType.MODEL_RESPONSE,
+                payload=RuntimeResponse(
+                    message=Message(role="assistant", content="Creating calculator.", tool_calls=(calc_call,)),
+                    tool_calls=(calc_call,),
+                    finish_reason="tool_calls",
+                ),
+            )
+            yield AgentEvent(
+                kind=AgentEventType.CONFIRMATION_REQUESTED,
+                payload=ConfirmationRequest(
+                    kind=ConfirmationKind.APPROVAL,
+                    tool_name="write_file",
+                    prompt="Allow write_file?",
+                    reason="write_file replaces the entire file.",
+                    arguments=calc_call.arguments,
+                ),
+            )
+            return
+
+        if self.calls == 2:
+            yield AgentEvent(
+                kind=AgentEventType.MODEL_RESPONSE,
+                payload=RuntimeResponse(
+                    message=Message(
+                        role="assistant",
+                        content="Creating both files.",
+                        tool_calls=(calc_call, logging_call),
+                    ),
+                    tool_calls=(calc_call, logging_call),
+                    finish_reason="tool_calls",
+                ),
+            )
+            yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=calc_call)
+            yield AgentEvent(
+                kind=AgentEventType.TOOL_RESULT,
+                payload=ToolResult(call_id="call-calc", tool_name="write_file", output="Created calculator.py"),
+            )
+            yield AgentEvent(
+                kind=AgentEventType.CONFIRMATION_REQUESTED,
+                payload=ConfirmationRequest(
+                    kind=ConfirmationKind.APPROVAL,
+                    tool_name="write_file",
+                    prompt="Allow write_file?",
+                    reason="write_file replaces the entire file.",
+                    arguments=logging_call.arguments,
+                ),
+            )
+            return
+
+        assert any(message.role == "tool" and message.tool_call_id == "call-calc" for message in messages)
+        assert not any(message.role == "tool" and message.tool_call_id == "call-logging" for message in messages)
+
+        yield AgentEvent(
+            kind=AgentEventType.MODEL_RESPONSE,
+            payload=RuntimeResponse(
+                message=Message(role="assistant", content="Finishing logging file.", tool_calls=(logging_call,)),
+                tool_calls=(logging_call,),
+                finish_reason="tool_calls",
+            ),
+        )
+        yield AgentEvent(
+            kind=AgentEventType.TOOL_RESULT,
+            payload=ToolResult(call_id="call-logging", tool_name="write_file", output="Created logging_calculator.py"),
+        )
+        yield AgentEvent(
+            kind=AgentEventType.MODEL_RESPONSE,
+            payload=RuntimeResponse(
+                message=Message(role="assistant", content="Done."),
+                finish_reason="stop",
+            ),
         )
         yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="done")
 
@@ -271,6 +369,22 @@ def test_apply_events_keeps_completed_tool_call_messages(tmp_path):
     assert state.history[1].tool_call_id == "call-1"
 
 
+def test_prompt_for_confirmation_accepts_yes_turn_aliases():
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_note",
+        prompt="Allow write_note?",
+        reason="Mutating tool requires confirmation.",
+        payload={"approval_policy": "on-request"},
+    )
+
+    for answer in ("t", "turn", "yes(turn)", "yes (turn)", "yes-turn"):
+        response = prompt_for_confirmation(request, input_func=lambda _prompt, value=answer: value)
+
+        assert response.approved is True
+        assert response.scope == "turn"
+
+
 @pytest.mark.asyncio
 async def test_collect_turn_events_discards_preapproval_batches_on_retry(tmp_path):
     state = _build_state(tmp_path)
@@ -292,6 +406,199 @@ async def test_collect_turn_events_discards_preapproval_batches_on_retry(tmp_pat
     assert agent.calls == 2
     assert len(model_responses) == 1
     assert model_responses[0].payload.message.content == "Created the file."
+    assert not any(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events)
+
+
+@pytest.mark.asyncio
+async def test_collect_turn_events_requires_confirmation_for_each_mutating_call(tmp_path):
+    state = _build_state(tmp_path)
+    state.history.append(Message(role="user", content="create two files"))
+    agent = _SequentialApprovalAgent()
+    seen_requests: list[ConfirmationRequest] = []
+
+    async def _approve(request):
+        seen_requests.append(request)
+        return ConfirmationResponse(approved=True)
+
+    events = await collect_turn_events(
+        state,
+        agent,
+        prompt_text="create two files",
+        approval_callback=_approve,
+    )
+
+    tool_results = [event.payload for event in events if event.kind == AgentEventType.TOOL_RESULT]
+
+    assert agent.calls == 3
+    assert [request.arguments["path"] for request in seen_requests] == [
+        "calculator.py",
+        "logging_calculator.py",
+    ]
+    assert [result.tool_name for result in tool_results] == ["write_file", "write_file"]
+    assert [result.call_id for result in tool_results] == ["call-calc", "call-logging"]
+    assert not any(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events)
+
+
+@pytest.mark.asyncio
+async def test_collect_turn_events_yes_turn_skips_later_non_dangerous_mutating_confirmations(tmp_path):
+    state = _build_state(tmp_path)
+    state.tool_registry.register(WriteNoteTool())
+    state.history.append(Message(role="user", content="create two notes"))
+
+    note_one = ToolCall(
+        call_id="note-1",
+        tool_name="write_note",
+        arguments={"path": "notes/one.txt", "content": "one"},
+    )
+    note_two = ToolCall(
+        call_id="note-2",
+        tool_name="write_note",
+        arguments={"path": "notes/two.txt", "content": "two"},
+    )
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Creating notes."),
+                tool_calls=(note_one, note_two),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(
+                message=Message(role="assistant", content="Creating notes."),
+                tool_calls=(note_one, note_two),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Done.")),
+        ]
+    )
+    agent = Agent(model_client=model, tool_registry=state.tool_registry)
+    seen_requests: list[ConfirmationRequest] = []
+
+    async def _approve(request):
+        seen_requests.append(request)
+        return ConfirmationResponse(approved=True, scope="turn")
+
+    events = await collect_turn_events(
+        state,
+        agent,
+        prompt_text="create two notes",
+        approval_callback=_approve,
+    )
+
+    tool_results = [event.payload for event in events if event.kind == AgentEventType.TOOL_RESULT]
+
+    assert len(seen_requests) == 1
+    assert seen_requests[0].arguments["path"] == "notes/one.txt"
+    assert [result.call_id for result in tool_results] == ["note-1", "note-2"]
+    assert (tmp_path / "notes" / "one.txt").read_text(encoding="utf-8") == "one"
+    assert (tmp_path / "notes" / "two.txt").read_text(encoding="utf-8") == "two"
+    assert not any(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events)
+
+
+@pytest.mark.asyncio
+async def test_collect_turn_events_denied_nexus_memory_file_write_continues_turn(tmp_path):
+    state = _build_state(tmp_path)
+    state.tool_registry.register(WriteNoteTool())
+    state.history.append(Message(role="user", content="remember my name"))
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="I'll save that."),
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-note",
+                        tool_name="write_note",
+                        arguments={
+                            "path": ".nexus/memory/rishikesh_name.md",
+                            "content": "Rishikesh",
+                        },
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(
+                message=Message(role="assistant", content="I can't write directly under `.nexus/memory`; I should use the memory tool instead."),
+            ),
+        ]
+    )
+    agent = Agent(model_client=model, tool_registry=state.tool_registry)
+
+    events = await collect_turn_events(state, agent, prompt_text="remember my name")
+
+    denied_results = [event.payload for event in events if event.kind == AgentEventType.TOOL_RESULT]
+    assert len(denied_results) == 1
+    assert denied_results[0].tool_name == "write_note"
+    assert denied_results[0].is_error is True
+    assert "use the `memory` tool" in denied_results[0].output.lower()
+    assert any(event.kind == AgentEventType.TOOL_DENIED for event in events)
+    assert any(
+        event.kind == AgentEventType.MODEL_RESPONSE
+        and event.payload.message.content.startswith("I can't write directly")
+        for event in events
+    )
+    assert any(event.kind == AgentEventType.TURN_COMPLETED for event in events)
+
+
+@pytest.mark.asyncio
+async def test_collect_turn_events_denied_memory_write_is_not_reprompted_same_turn(tmp_path):
+    state = _build_state(tmp_path)
+    state.tool_registry.register(MemoryTool(memory_dir=state.config.memory_dir))
+    state.history.append(Message(role="user", content="remember my name"))
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="I'll remember that."),
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-memory-1",
+                        tool_name="memory",
+                        arguments={"action": "set", "key": "user_name", "value": "rishikesh"},
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(
+                message=Message(role="assistant", content="I'll try again."),
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-memory-2",
+                        tool_name="memory",
+                        arguments={"action": "set", "key": "user_name", "value": "rishikesh"},
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(
+                message=Message(role="assistant", content="Okay, I won't store it right now. What's next?"),
+            ),
+        ]
+    )
+    agent = Agent(model_client=model, tool_registry=state.tool_registry)
+    seen_requests: list[ConfirmationRequest] = []
+
+    async def _deny(request):
+        seen_requests.append(request)
+        return ConfirmationResponse()
+
+    events = await collect_turn_events(
+        state,
+        agent,
+        prompt_text="remember my name",
+        approval_callback=_deny,
+    )
+
+    tool_results = [event.payload for event in events if event.kind == AgentEventType.TOOL_RESULT]
+
+    assert len(seen_requests) == 1
+    assert len(tool_results) == 1
+    assert tool_results[0].call_id == "call-memory-2"
+    assert tool_results[0].is_error is True
+    assert "previously denied" in tool_results[0].output.lower()
+    assert not (state.config.memory_dir / "user_memory.json").exists()
+    assert any(
+        event.kind == AgentEventType.MODEL_RESPONSE
+        and event.payload.message.content == "Okay, I won't store it right now. What's next?"
+        for event in events
+    )
     assert not any(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events)
 
 

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from nexus.security import PermissionChecker, PermissionDecision
+from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.delegation import DelegationRuntime
 from nexus.sandbox.agent_tool import SubagentDefinition
+from nexus.tools.filesystem import WriteFileTool
 from nexus.skills import Skill, SkillRegistry
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool, WriteNoteTool
+from nexus.tools.builtin import GetTimeTool, MemoryTool, WriteNoteTool
 from nexus.tools.subagents import (
     load_subagent_definitions,
     load_subagent_definitions_from_skills,
@@ -60,6 +64,35 @@ async def test_write_note_tool_rejects_large_content(tool_context):
 
     assert result.is_error is True
     assert "larger than 8 bytes" in result.output.lower()
+
+
+@pytest.mark.asyncio
+async def test_memory_tool_persists_entries_as_dictionary(tmp_path, tool_context):
+    memory_dir = tmp_path / ".nexus" / "memory"
+    tool = MemoryTool(memory_dir=memory_dir)
+
+    result = await tool.execute(
+        "call-memory",
+        {"action": "set", "key": "user_name", "value": "rishikesh"},
+        tool_context,
+    )
+
+    payload = json.loads((memory_dir / "user_memory.json").read_text(encoding="utf-8"))
+
+    assert result.is_error is False
+    assert payload == {"entries": {"user_name": "rishikesh"}}
+
+
+def test_permission_checker_denies_direct_nexus_memory_file_writes_with_memory_hint(tmp_path, tool_context):
+    result = PermissionChecker().evaluate(
+        WriteFileTool(),
+        {"path": ".nexus/memory/user_name.md", "content": "rishikesh"},
+        ExecutionMode.DEFAULT,
+        context=tool_context,
+    )
+
+    assert result.decision is PermissionDecision.DENY
+    assert "memory" in result.reason.lower()
 
 
 @pytest.mark.asyncio

@@ -23,7 +23,11 @@ from nexus.models import (
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
-from nexus.tools.base import ToolRegistry
+from nexus.security.manager import ApprovalManager
+from nexus.tools.base import FileDiff, ToolConfirmation, ToolRegistry
+
+
+TOOL_CALL_LIMIT_FINISH_REASON = "tool_call_limit"
 
 
 @runtime_checkable
@@ -67,11 +71,13 @@ class Agent:
         model_name: str = "fake-model",
         mode: ExecutionMode = ExecutionMode.DEFAULT,
         approved_tools: set[str] | None = None,
+        approval_manager: ApprovalManager | None = None,
         auto_confirm: bool = False,
         auto_confirm_read_only: bool = True,
         temperature: float = 0.0,
         max_output_tokens: int | None = None,
         max_turns: int = 3,
+        max_tool_calls_per_turn: int = 30,
     ) -> AsyncGenerator[AgentEvent, None]:
         """Run the agentic loop, yielding :class:`AgentEvent` objects.
 
@@ -95,11 +101,13 @@ class Agent:
             model_name=model_name,
             mode=mode,
             approved_tools=approved,
+            approval_manager=approval_manager,
             auto_confirm=auto_confirm,
             auto_confirm_read_only=auto_confirm_read_only,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
             max_turns=max_turns,
+            max_tool_calls_per_turn=max_tool_calls_per_turn,
         ):
             if event.kind == AgentEventType.TEXT_COMPLETE:
                 final_response = event.payload
@@ -116,13 +124,17 @@ class Agent:
         model_name: str,
         mode: ExecutionMode,
         approved_tools: set[str],
+        approval_manager: ApprovalManager | None,
         auto_confirm: bool,
         auto_confirm_read_only: bool,
         temperature: float,
         max_output_tokens: int | None,
         max_turns: int,
+        max_tool_calls_per_turn: int,
     ) -> AsyncGenerator[AgentEvent, None]:
         """Core agentic loop — processes stream events and executes tools."""
+
+        tool_calls_executed = 0
 
         for _ in range(max_turns):
             request = RuntimeRequest(
@@ -209,14 +221,32 @@ class Agent:
             # Tool execution
             # ----------------------------------------------------------------
             for tool_call in tool_calls:
-                # Emit both new TOOL_CALL_START and legacy TOOL_CALL_REQUESTED.
-                yield AgentEvent.tool_call_start(
-                    tool_call.call_id, tool_call.tool_name, tool_call.arguments
-                )
-                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
-
                 record = self.tool_registry.record(tool_call.tool_name)
                 tool = record.tool
+                confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
+                confirmation_preview = _confirmation_preview(confirmation)
+
+                if tool_calls_executed >= max_tool_calls_per_turn:
+                    pause_message = _tool_call_limit_pause_message(max_tool_calls_per_turn)
+                    yield AgentEvent.text_complete(pause_message)
+                    yield AgentEvent(
+                        kind=AgentEventType.MODEL_RESPONSE,
+                        payload=RuntimeResponse(
+                            message=Message(role="assistant", content=pause_message),
+                            finish_reason=TOOL_CALL_LIMIT_FINISH_REASON,
+                        ),
+                    )
+                    yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload=TOOL_CALL_LIMIT_FINISH_REASON)
+                    return
+
+                # Emit both new TOOL_CALL_START and legacy TOOL_CALL_REQUESTED.
+                yield AgentEvent.tool_call_start(
+                    tool_call.call_id,
+                    tool_call.tool_name,
+                    tool_call.arguments,
+                    preview=confirmation_preview,
+                )
+                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
 
                 missing_fields = _missing_required_fields(tool.input_schema, tool_call.arguments)
                 if missing_fields:
@@ -241,8 +271,10 @@ class Agent:
                             tool_name=tool.name,
                             prompt=f"Provide a value for '{missing_field}' before running '{tool.name}'.",
                             reason="Required tool argument is missing.",
+                            call_id=tool_call.call_id,
                             payload={"tool_name": tool.name, "field": missing_field},
                             arguments=tool_call.arguments,
+                            preview=confirmation_preview,
                         ),
                     )
                     return
@@ -256,6 +288,12 @@ class Agent:
                 )
 
                 if decision.decision is PermissionDecision.DENY:
+                    denied_result = _denied_tool_result(
+                        tool_call.call_id,
+                        tool.name,
+                        decision.reason,
+                        risk_level=_risk_level_name(decision.risk_level),
+                    )
                     await self.hooks.emit(
                         HookEvent.NOTIFICATION,
                         {
@@ -270,13 +308,48 @@ class Agent:
                             **_correlation_payload(context, tool_call_id=tool_call.call_id),
                         },
                     )
+                    tool_calls_executed += 1
+                    history.append(Message(
+                        role="tool",
+                        content=denied_result.output,
+                        name=denied_result.tool_name,
+                        tool_call_id=denied_result.call_id,
+                    ))
                     yield AgentEvent(kind=AgentEventType.TOOL_DENIED, payload=decision)
+                    yield AgentEvent.tool_call_complete(denied_result)
+                    yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=denied_result)
+                    continue
+
+                if approval_manager is not None and approval_manager.is_refused(tool.name, tool_call.arguments):
+                    refused_reason = "User previously denied this tool call in the current turn. Continue without running it."
+                    refused_result = _denied_tool_result(
+                        tool_call.call_id,
+                        tool.name,
+                        refused_reason,
+                        risk_level=_risk_level_name(decision.risk_level),
+                    )
+                    tool_calls_executed += 1
+                    history.append(Message(
+                        role="tool",
+                        content=refused_result.output,
+                        name=refused_result.tool_name,
+                        tool_call_id=refused_result.call_id,
+                    ))
+                    yield AgentEvent.tool_call_complete(refused_result)
+                    yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=refused_result)
                     continue
 
                 if (
                     decision.decision is PermissionDecision.CONFIRM
                     and not auto_confirm
-                    and tool.name not in approved_tools
+                    and not _is_tool_preapproved(
+                        tool.name,
+                        tool_call.arguments,
+                        is_mutating=tool.is_mutating,
+                        risk_level=_risk_level_name(decision.risk_level),
+                        approved_tools=approved_tools,
+                        approval_manager=approval_manager,
+                    )
                 ):
                     await self.hooks.emit(
                         HookEvent.NOTIFICATION,
@@ -299,8 +372,15 @@ class Agent:
                             tool_name=tool.name,
                             prompt=f"Allow tool '{tool.name}'?",
                             reason=decision.reason,
-                            payload={"tool_name": tool.name, "reason": decision.reason},
+                            call_id=tool_call.call_id,
+                            payload={
+                                "tool_name": tool.name,
+                                "reason": decision.reason,
+                                "approval_policy": str(context.metadata.get("approval_policy", "on-request")),
+                                "risk_level": _risk_level_name(decision.risk_level),
+                            },
                             arguments=tool_call.arguments,
+                            preview=confirmation_preview,
                         ),
                     )
                     return
@@ -321,6 +401,9 @@ class Agent:
 
                 started_at = time.perf_counter()
                 result = await tool.execute(tool_call.call_id, tool_call.arguments, context)
+                tool_calls_executed += 1
+                if approval_manager is not None:
+                    approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
                 history.append(Message(
                     role="tool",
                     content=result.output,
@@ -368,6 +451,36 @@ def _missing_required_fields(schema: dict[str, Any], arguments: dict[str, Any]) 
     return missing
 
 
+def _is_tool_preapproved(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    is_mutating: bool,
+    risk_level: str,
+    approved_tools: set[str],
+    approval_manager: ApprovalManager | None,
+) -> bool:
+    if approval_manager is not None:
+        return approval_manager.is_pre_approved(tool_name, arguments) or approval_manager.is_turn_wide_mutating_preapproved(
+            tool_name,
+            is_mutating=is_mutating,
+            risk_level=risk_level,
+        )
+    return tool_name in approved_tools
+
+
+def _tool_call_limit_pause_message(max_tool_calls_per_turn: int) -> str:
+    return (
+        "Tool call limit reached for this turn "
+        f"({max_tool_calls_per_turn}). Write `continue` to resume the previous task."
+    )
+
+
+def _risk_level_name(value: Any) -> str:
+    raw_value = getattr(value, "value", value)
+    return str(raw_value).strip().lower().split(".")[-1]
+
+
 def _correlation_payload(context: ToolExecutionContext, *, tool_call_id: str | None = None) -> dict[str, Any]:
     payload = {
         "turn_id": context.metadata.get("turn_id"),
@@ -377,3 +490,64 @@ def _correlation_payload(context: ToolExecutionContext, *, tool_call_id: str | N
     if tool_call_id is not None:
         payload["tool_call_id"] = tool_call_id
     return {key: value for key, value in payload.items() if value}
+
+
+async def _get_tool_confirmation(
+    tool: Any,
+    call_id: str,
+    arguments: dict[str, Any],
+    context: ToolExecutionContext,
+) -> ToolConfirmation | None:
+    get_confirmation = getattr(tool, "get_confirmation", None)
+    if get_confirmation is None:
+        return None
+    return await get_confirmation(call_id, arguments, context)
+
+
+def _confirmation_preview(confirmation: ToolConfirmation | None) -> dict[str, Any]:
+    if confirmation is None:
+        return {}
+    preview: dict[str, Any] = {
+        "description": confirmation.description or "",
+        "is_dangerous": confirmation.is_dangerous,
+    }
+    if confirmation.command:
+        preview["command"] = confirmation.command
+    if confirmation.affected_paths:
+        preview["affected_paths"] = [str(path) for path in confirmation.affected_paths]
+    if confirmation.diff is not None:
+        preview["diff"] = _serialize_file_diff(confirmation.diff)
+    return preview
+
+
+def _serialize_file_diff(diff: FileDiff) -> dict[str, Any]:
+    return {
+        "path": str(diff.path),
+        "is_new_file": diff.is_new_file,
+        "is_deletion": diff.is_deletion,
+        "old_content": diff.old_content,
+        "new_content": diff.new_content,
+        "unified_diff": diff.to_diff(),
+    }
+
+
+def _denied_tool_result(
+    call_id: str,
+    tool_name: str,
+    reason: str,
+    *,
+    risk_level: str,
+) -> ToolResult:
+    return ToolResult(
+        call_id=call_id,
+        tool_name=tool_name,
+        output=f"Permission denied: {reason}",
+        is_error=True,
+        metadata={
+            "denied": True,
+            "reason": reason,
+            "risk_level": risk_level,
+        },
+    )
+
+

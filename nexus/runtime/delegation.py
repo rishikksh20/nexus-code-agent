@@ -11,9 +11,10 @@ from typing import Any
 from uuid import uuid4
 
 from nexus.integrations.fake_model import FakeModelClient
-from nexus.models import ConfirmationKind, Message, RuntimeResponse, ToolCall, ToolExecutionContext
+from nexus.models import AgentEventType, ConfirmationKind, Message, ToolExecutionContext
 from nexus.runtime.agent import Agent
 from nexus.hooks import HookEvent, HookExecutor
+from nexus.security.manager import ApprovalManager, ApprovalScope
 from nexus.tools.base import ToolRegistry
 
 
@@ -66,9 +67,14 @@ class AgentMessage:
         permission_action: str | None = None,
         permission_reason: str | None = None,
     ) -> "AgentMessage":
-        payload = {"title": title, "instructions": instructions}
         if allowed_tools:
-            payload["allowed_tools"] = list(allowed_tools)
+            payload: dict[str, Any] = {
+                "title": title,
+                "instructions": instructions,
+                "allowed_tools": list(allowed_tools),
+            }
+        else:
+            payload = {"title": title, "instructions": instructions}
         if permission_action:
             payload["permission_action"] = permission_action
         if permission_reason:
@@ -393,13 +399,13 @@ class WorkerAgent:
             )
         )
 
-    async def _execute_command(self, message: AgentMessage) -> None:
-        task_id = message.task_id or "unknown"
-        title = str(message.payload.get("title", task_id))
-        instructions = str(message.payload.get("instructions", "")).strip()
-        permission_action = str(message.payload.get("permission_action", "")).strip()
-        permission_reason = str(message.payload.get("permission_reason", "Need coordinator approval.")).strip()
-        allowed_tools = tuple(str(tool_name) for tool_name in message.payload.get("allowed_tools", []))
+    async def _execute_command(self, command_message: AgentMessage) -> None:
+        task_id = command_message.task_id or "unknown"
+        title = str(command_message.payload.get("title", task_id))
+        instructions = str(command_message.payload.get("instructions", "")).strip()
+        permission_action = str(command_message.payload.get("permission_action", "")).strip()
+        permission_reason = str(command_message.payload.get("permission_reason", "Need coordinator approval.")).strip()
+        allowed_tools = tuple(str(tool_name) for tool_name in command_message.payload.get("allowed_tools", []))
 
         try:
             if permission_action:
@@ -421,7 +427,7 @@ class WorkerAgent:
             registry = self._tool_registry_factory(allowed_tools)
             agent = Agent(model_client=self._model_client_factory(), tool_registry=registry)
             history = [Message(role="user", content=instructions)]
-            approved_tools: set[str] = set()
+            approval_manager = ApprovalManager()
             assistant_summary = ""
             context = ToolExecutionContext(
                 session_id=f"worker-{self.worker_id}-{task_id}",
@@ -438,7 +444,7 @@ class WorkerAgent:
                         context,
                         system_prompt=system_prompt,
                         model_name=f"worker-{self.worker_id}",
-                        approved_tools=approved_tools,
+                        approval_manager=approval_manager,
                         auto_confirm_read_only=self._auto_confirm_read_only,
                         temperature=self._temperature,
                         max_output_tokens=self._max_output_tokens,
@@ -447,11 +453,33 @@ class WorkerAgent:
 
                 approval_request = None
                 clarification_request = None
+                committed_tool_calls = {
+                    event.payload.call_id
+                    for event in events
+                    if event.kind == AgentEventType.TOOL_RESULT
+                }
                 for event in events:
                     if event.kind == "model_response":
-                        history.append(event.payload.message)
-                        if event.payload.message.content:
-                            assistant_summary = event.payload.message.content
+                        assistant_message = event.payload.message
+                        if assistant_message.tool_calls and not all(
+                            tool_call.call_id in committed_tool_calls
+                            for tool_call in assistant_message.tool_calls
+                        ):
+                            assistant_message = Message(
+                                role=assistant_message.role,
+                                content=assistant_message.content,
+                                name=assistant_message.name,
+                                tool_calls=tuple(
+                                    tool_call for tool_call in assistant_message.tool_calls
+                                    if tool_call.call_id in committed_tool_calls
+                                ),
+                                tool_call_id=assistant_message.tool_call_id,
+                            )
+                            if not assistant_message.content and not assistant_message.tool_calls:
+                                continue
+                        history.append(assistant_message)
+                        if assistant_message.content:
+                            assistant_summary = assistant_message.content
                             await self.mailbox.send(
                                 AgentMessage.status(
                                     sender=self.worker_id,
@@ -462,7 +490,12 @@ class WorkerAgent:
                             )
                     elif event.kind == "tool_result":
                         history.append(
-                            Message(role="tool", content=event.payload.output, name=event.payload.tool_name)
+                            Message(
+                                role="tool",
+                                content=event.payload.output,
+                                name=event.payload.tool_name,
+                                tool_call_id=event.payload.call_id,
+                            )
                         )
                         assistant_summary = event.payload.output
                         await self.mailbox.send(
@@ -497,12 +530,16 @@ class WorkerAgent:
                     approved = await self._request_permission(task_id, approval_request.tool_name, approval_request.reason)
                     if not approved:
                         return
-                    approved_tools.add(approval_request.tool_name)
+                    approval_manager.record_approval(
+                        approval_request.tool_name,
+                        ApprovalScope.ONCE,
+                        arguments=approval_request.arguments,
+                    )
                     continue
 
                 break
 
-            await self._complete(message, summary=f"Finished {title}: {assistant_summary or instructions}")
+            await self._complete(command_message, summary=f"Finished {title}: {assistant_summary or instructions}")
         except asyncio.CancelledError:
             self.state.status = "idle"
             self.state.current_task_id = None
@@ -720,11 +757,12 @@ class DelegationRuntime:
 
         if message.kind is MessageKind.PERMISSION:
             task.status = TaskStatus.WAITING
-            task.pending_decision_id = message.correlation_id or message.message_id
+            pending_decision_id = message.correlation_id or message.message_id
+            task.pending_decision_id = pending_decision_id
             task.append_note(
                 f"Permission requested for {message.payload.get('action', 'action')}: {message.payload.get('reason', '')}"
             )
-            self.pending_permissions[task.pending_decision_id] = message
+            self.pending_permissions[pending_decision_id] = message
             return
 
         if message.kind is MessageKind.RESULT:
@@ -737,16 +775,18 @@ class DelegationRuntime:
                 )
                 if not committed:
                     task.status = TaskStatus.FAILED
-                    task.error = f"Optimistic concurrency conflict for resource '{conflict_resource}'."
-                    task.append_note(task.error)
+                    error = f"Optimistic concurrency conflict for resource '{conflict_resource}'."
+                    task.error = error
+                    task.append_note(error)
                     return
                 task.status = TaskStatus.COMPLETED
                 task.result_summary = summary
                 task.append_note(summary)
                 return
             task.status = TaskStatus.FAILED
-            task.error = summary or "Worker failed."
-            task.append_note(task.error)
+            error = summary or "Worker failed."
+            task.error = error
+            task.append_note(error)
 
     def _choose_worker(self) -> str:
         worker_ids = list(self.workers)
