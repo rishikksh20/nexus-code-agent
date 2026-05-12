@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any, Protocol, cast, runtime_checkable
 
 from nexus.models import (
@@ -10,6 +10,7 @@ from nexus.models import (
     AgentEventType,
     ConfirmationKind,
     ConfirmationRequest,
+    ConfirmationResponse,
     Message,
     RuntimeRequest,
     RuntimeResponse,
@@ -23,11 +24,13 @@ from nexus.models import (
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
-from nexus.security.manager import ApprovalManager
+from nexus.context import LoopDetector, prune_tool_outputs
+from nexus.security.manager import ApprovalManager, ApprovalScope
 from nexus.tools.base import FileDiff, ToolConfirmation, ToolRegistry
 
 
 TOOL_CALL_LIMIT_FINISH_REASON = "tool_call_limit"
+_ApprovalCallback = Callable[[ConfirmationRequest], Awaitable[ConfirmationResponse]] | None
 
 
 @runtime_checkable
@@ -72,6 +75,7 @@ class Agent:
         mode: ExecutionMode = ExecutionMode.DEFAULT,
         approved_tools: set[str] | None = None,
         approval_manager: ApprovalManager | None = None,
+        approval_callback: _ApprovalCallback = None,
         auto_confirm: bool = False,
         auto_confirm_read_only: bool = True,
         temperature: float = 0.0,
@@ -102,6 +106,7 @@ class Agent:
             mode=mode,
             approved_tools=approved,
             approval_manager=approval_manager,
+            approval_callback=approval_callback,
             auto_confirm=auto_confirm,
             auto_confirm_read_only=auto_confirm_read_only,
             temperature=temperature,
@@ -125,6 +130,7 @@ class Agent:
         mode: ExecutionMode,
         approved_tools: set[str],
         approval_manager: ApprovalManager | None,
+        approval_callback: _ApprovalCallback,
         auto_confirm: bool,
         auto_confirm_read_only: bool,
         temperature: float,
@@ -135,6 +141,7 @@ class Agent:
         """Core agentic loop — processes stream events and executes tools."""
 
         tool_calls_executed = 0
+        loop_detector = LoopDetector()
 
         for _ in range(max_turns):
             request = RuntimeRequest(
@@ -174,6 +181,7 @@ class Agent:
 
             if response_text:
                 yield AgentEvent.text_complete(response_text)
+                loop_detector.record_action("response", text=response_text[:200])
 
             # Build the assistant message and RuntimeResponse for history.
             tool_calls: tuple[ToolCall, ...] = tuple(stream_tool_calls)
@@ -221,6 +229,7 @@ class Agent:
             # ----------------------------------------------------------------
             # Tool execution
             # ----------------------------------------------------------------
+            tool_result_messages: list[Message] = []
             for tool_call in tool_calls:
                 record = self.tool_registry.record(tool_call.tool_name)
                 tool = record.tool
@@ -310,7 +319,7 @@ class Agent:
                         },
                     )
                     tool_calls_executed += 1
-                    history.append(Message(
+                    tool_result_messages.append(Message(
                         role="tool",
                         content=denied_result.output,
                         name=denied_result.tool_name,
@@ -319,6 +328,7 @@ class Agent:
                     yield AgentEvent(kind=AgentEventType.TOOL_DENIED, payload=decision)
                     yield AgentEvent.tool_call_complete(denied_result)
                     yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=denied_result)
+                    loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="denied")
                     continue
 
                 if approval_manager is not None and approval_manager.is_refused(tool.name, tool_call.arguments):
@@ -330,7 +340,7 @@ class Agent:
                         risk_level=_risk_level_name(decision.risk_level),
                     )
                     tool_calls_executed += 1
-                    history.append(Message(
+                    tool_result_messages.append(Message(
                         role="tool",
                         content=refused_result.output,
                         name=refused_result.tool_name,
@@ -338,6 +348,7 @@ class Agent:
                     ))
                     yield AgentEvent.tool_call_complete(refused_result)
                     yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=refused_result)
+                    loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="refused")
                     continue
 
                 if (
@@ -352,6 +363,21 @@ class Agent:
                         approval_manager=approval_manager,
                     )
                 ):
+                    conf_request = ConfirmationRequest(
+                        kind=ConfirmationKind.APPROVAL,
+                        tool_name=tool.name,
+                        prompt=f"Allow tool '{tool.name}'?",
+                        reason=decision.reason,
+                        call_id=tool_call.call_id,
+                        payload={
+                            "tool_name": tool.name,
+                            "reason": decision.reason,
+                            "approval_policy": str(context.metadata.get("approval_policy", "on-request")),
+                            "risk_level": _risk_level_name(decision.risk_level),
+                        },
+                        arguments=tool_call.arguments,
+                        preview=confirmation_preview,
+                    )
                     await self.hooks.emit(
                         HookEvent.NOTIFICATION,
                         {
@@ -366,25 +392,33 @@ class Agent:
                             **_correlation_payload(context, tool_call_id=tool_call.call_id),
                         },
                     )
-                    yield AgentEvent(
-                        kind=AgentEventType.CONFIRMATION_REQUESTED,
-                        payload=ConfirmationRequest(
-                            kind=ConfirmationKind.APPROVAL,
-                            tool_name=tool.name,
-                            prompt=f"Allow tool '{tool.name}'?",
-                            reason=decision.reason,
-                            call_id=tool_call.call_id,
-                            payload={
-                                "tool_name": tool.name,
-                                "reason": decision.reason,
-                                "approval_policy": str(context.metadata.get("approval_policy", "on-request")),
-                                "risk_level": _risk_level_name(decision.risk_level),
-                            },
-                            arguments=tool_call.arguments,
-                            preview=confirmation_preview,
-                        ),
-                    )
-                    return
+                    if approval_callback is None:
+                        yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=conf_request)
+                        return
+                    response = await approval_callback(conf_request)
+                    if response.denied:
+                        refused_result = _denied_tool_result(
+                            tool_call.call_id, tool.name,
+                            "User denied the tool call.",
+                            risk_level=_risk_level_name(decision.risk_level),
+                        )
+                        tool_calls_executed += 1
+                        tool_result_messages.append(Message(
+                            role="tool",
+                            content=refused_result.output,
+                            name=refused_result.tool_name,
+                            tool_call_id=refused_result.call_id,
+                        ))
+                        if approval_manager is not None:
+                            approval_manager.record_refusal(tool.name, arguments=tool_call.arguments)
+                        yield AgentEvent.tool_call_complete(refused_result)
+                        yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=refused_result)
+                        loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="refused")
+                        continue
+                    if not response.approved:
+                        return
+                    if approval_manager is not None:
+                        approval_manager.record_approval(tool.name, ApprovalScope.ONCE, arguments=tool_call.arguments)
 
                 await self.hooks.emit(
                     HookEvent.PRE_TOOL_USE,
@@ -405,7 +439,7 @@ class Agent:
                 tool_calls_executed += 1
                 if approval_manager is not None:
                     approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
-                history.append(Message(
+                tool_result_messages.append(Message(
                     role="tool",
                     content=result.output,
                     name=result.tool_name,
@@ -429,9 +463,22 @@ class Agent:
                     },
                 )
 
+                loop_detector.record_action("tool_call", tool_name=tool_call.tool_name)
                 # Emit both new TOOL_CALL_COMPLETE and legacy TOOL_RESULT events.
                 yield AgentEvent.tool_call_complete(result)
                 yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
+
+            # Add all tool results to history after the complete batch, then prune
+            # and check for loops — matching the reference-code execution model.
+            for msg in tool_result_messages:
+                history.append(msg)
+            prune_tool_outputs(history, protect_tokens=2000, minimum_tokens=500)
+            loop_error = loop_detector.check_for_loop()
+            if loop_error:
+                history.append(Message(
+                    role="user",
+                    content=f"[Loop detected] {loop_error} Try a different approach.",
+                ))
 
         yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="max_turns")
 

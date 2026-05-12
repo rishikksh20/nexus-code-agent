@@ -301,3 +301,76 @@ def test_config_can_enable_hidden_path_reads(tmp_path):
 
     assert config.allow_hidden_paths is True
 
+
+def test_config_dotenv_provides_model_name(tmp_path):
+    """Test that model_name can be set via .env using the MODEL key."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".env").write_text("MODEL=custom-model-name\n", encoding="utf-8")
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.model_name == "custom-model-name"
+
+
+def test_config_dotenv_provides_provider(tmp_path):
+    """Test that provider can be set via .env using the PROVIDER key."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".env").write_text("PROVIDER=mistral\n", encoding="utf-8")
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.provider == "mistral"
+
+
+def test_config_dotenv_overrides_config_toml_model_name(tmp_path):
+    """Test that .env MODEL overrides config.toml model_name."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text('model_name = "toml-model"\n', encoding="utf-8")
+    (workspace / ".env").write_text("MODEL=env-model\n", encoding="utf-8")
+
+    config = load_config(workspace, global_root=global_root)
+
+    # .env (via os.environ) should override config.toml
+    assert config.model_name == "env-model"
+
+
+def test_config_dotenv_overrides_config_toml_provider(tmp_path):
+    """Test that .env PROVIDER overrides config.toml provider."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text('provider = "openai-compatible"\n', encoding="utf-8")
+    (workspace / ".env").write_text("PROVIDER=mistral\n", encoding="utf-8")
+
+    config = load_config(workspace, global_root=global_root)
+
+    # .env (via os.environ) should override config.toml
+    assert config.provider == "mistral"
+
+
+def test_config_dotenv_provides_both_model_and_provider(tmp_path):
+    """Test that both MODEL and PROVIDER can be set together in .env."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".env").write_text(
+        "MODEL=claude-3-sonnet\nPROVIDER=openai-compatible\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.model_name == "claude-3-sonnet"
+    assert config.provider == "openai-compatible"
+

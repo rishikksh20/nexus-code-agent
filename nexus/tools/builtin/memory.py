@@ -19,7 +19,7 @@ _DEFAULT_MEMORY_DIR = Path.home() / ".nexus" / "memory"
 class MemoryTool(Tool):
     """Store and retrieve persistent key/value memory.
 
-    Actions: ``set``, ``get``, ``delete``, ``list``, ``clear``.
+    Actions: ``set``, ``get``, ``delete``, ``list``, ``search``, ``clear``.
 
     Memory persists across agent sessions in a JSON file on disk.
     """
@@ -27,7 +27,7 @@ class MemoryTool(Tool):
     name = "memory"
     description = (
         "Store and retrieve persistent memory across sessions. Use this for user preferences, identity, and important context instead "
-        "of writing ad-hoc memory files. Actions: set, get, delete, list, clear."
+        "of writing ad-hoc memory files. Actions: set, get, delete, list, search, clear."
     )
     kind = ToolKind.MEMORY
     is_mutating = True
@@ -36,12 +36,12 @@ class MemoryTool(Tool):
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["set", "get", "delete", "list", "clear"],
+                "enum": ["set", "get", "delete", "list", "search", "clear"],
                 "description": "Memory action to perform.",
             },
             "key": {
                 "type": "string",
-                "description": "Memory key (required for set, get, delete).",
+                "description": "Memory key (required for set, get, delete; optional for search as query term).",
             },
             "value": {
                 "type": "string",
@@ -107,6 +107,16 @@ class MemoryTool(Tool):
                 return ToolResult(call_id=call_id, tool_name=self.name, output="No memories stored", metadata={"found": False, "count": 0})
             lines = ["Stored memories:"] + [f"  {k}: {v}" for k, v in sorted(entries.items())]
             return ToolResult(call_id=call_id, tool_name=self.name, output="\n".join(lines), metadata={"found": True, "count": len(entries)})
+
+        if action == "search":
+            query = str(key or value or "").strip()
+            if not query:
+                return ToolResult(call_id=call_id, tool_name=self.name, output="`key` (as search query) required for 'search' action", is_error=True)
+            matches = self._store.search(query)
+            if not matches:
+                return ToolResult(call_id=call_id, tool_name=self.name, output=f"No memories found for: {query}", metadata={"found": False, "count": 0})
+            lines = [f"Found {len(matches)} match(es) for '{query}':"] + [f"  {e.key}: {e.content}" for e in matches]
+            return ToolResult(call_id=call_id, tool_name=self.name, output="\n".join(lines), metadata={"found": True, "count": len(matches)})
 
         if action == "clear":
             count = self._store.clear()

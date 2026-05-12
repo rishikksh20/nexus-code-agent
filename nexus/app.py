@@ -385,7 +385,7 @@ def provider_error_message(exc: Exception, config) -> str:
         or environ.get("API_KEY")
     )
     if not has_key:
-        key_env = "MISTRAL_API_KEY" if provider == "mistral" else "API_KEY"
+        key_env = "API_KEY"
         return (
             f"No API key found for provider [bold]{provider}[/bold]. "
             f"Set [bold]{key_env}[/bold] in your [bold].env[/bold] file or environment, "
