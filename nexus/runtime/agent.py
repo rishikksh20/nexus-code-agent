@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 
 from collections.abc import AsyncGenerator
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from nexus.models import (
     AgentEvent,
@@ -40,7 +40,7 @@ class ModelClient(Protocol):
     retained for backward compatibility with existing tests.
     """
 
-    async def chat_completion(
+    def chat_completion(
         self,
         request: RuntimeRequest,
         *,
@@ -153,7 +153,8 @@ class Agent:
             stream_tool_calls: list[ToolCall] = []
             usage: UsageSnapshot | None = None
 
-            async for stream_event in self.model_client.chat_completion(request, stream=True):
+            stream = cast(AsyncGenerator[StreamEvent, None], self.model_client.chat_completion(request, stream=True))
+            async for stream_event in stream:
                 if stream_event.type == StreamEventType.TEXT_DELTA:
                     if stream_event.text_delta and stream_event.text_delta.content:
                         chunk = stream_event.text_delta.content
