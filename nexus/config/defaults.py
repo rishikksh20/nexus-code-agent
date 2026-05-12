@@ -30,7 +30,7 @@ class AgentConfig:
     memory_dir: Path = field(default_factory=Path)
     session_dir: Path = field(default_factory=Path)
     knowledge_file: Path = field(default_factory=Path)
-    log_level: str = "INFO"
+    log_level: str = "WARNING"
     log_format: str = "text"
     log_dir: Path = field(default_factory=Path)
     write_note_max_bytes: int = 65_536

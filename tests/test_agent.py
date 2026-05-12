@@ -191,3 +191,28 @@ async def test_agent_hard_denies_write_note_into_internal_nexus_state(tool_conte
     assert denial.payload.decision is PermissionDecision.DENY
     assert ".nexus" in denial.payload.reason
     assert not (tool_context.working_directory / ".nexus" / "config.toml").exists()
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_emit_empty_assistant_message(tool_context):
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content=""),
+                finish_reason="stop",
+            )
+        ]
+    )
+    agent = Agent(model_client=model, tool_registry=ToolRegistry())
+
+    events = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="hello")],
+            tool_context,
+        )
+    ]
+
+    assert not any(event.kind == "model_response" for event in events)
+    assert any(event.kind == "turn_completed" for event in events)
+

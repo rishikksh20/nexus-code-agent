@@ -9,97 +9,78 @@ from __future__ import annotations
 
 import json
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-from rich.console import Console
+from rich import box
+from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.rule import Rule
+from rich.syntax import Syntax
 from rich.table import Table
+from rich.text import Text
 from rich.theme import Theme
 
 if TYPE_CHECKING:
-    from nexus.models import AgentEvent, ConfirmationRequest
+    from nexus.models import AgentEvent, ConfirmationRequest, ToolResult
 
-# ---------------------------------------------------------------------------
-# Theme — all semantic colour/style names used throughout the package
-# ---------------------------------------------------------------------------
 
 NEXUS_THEME = Theme(
     {
-        # Generic severity levels
         "primary": "bold cyan",
         "success": "bold green",
         "warning": "bold yellow",
         "error": "bold red",
-        "info": "blue",
-        "muted": "dim",
-        # Agent event rendering
-        "tool.name": "dim cyan",
-        "tool.args": "dim",
-        "tool.result": "dim",
+        "info": "cyan",
+        "muted": "grey62",
+        "border": "grey35",
+        "banner.title": "bold bright_white",
+        "assistant.header": "bold bright_white",
+        "tool": "bold bright_magenta",
+        "tool.read": "cyan",
+        "tool.write": "yellow",
+        "tool.shell": "magenta",
+        "tool.network": "bright_blue",
+        "tool.memory": "green",
+        "tool.agent": "bright_cyan",
+        "tool.result": "grey70",
+        "tool.args": "grey70",
         "tool.denied": "bold red",
-        # Confirmation panels
         "approval.header": "bold yellow",
         "clarification.header": "bold cyan",
-        # REPL startup
-        "banner.title": "bold",
-        # Version string
         "version": "bold",
     }
 )
 
 
-# ---------------------------------------------------------------------------
-# TerminalUI
-# ---------------------------------------------------------------------------
-
-
 class TerminalUI:
-    """Centralised terminal output layer built on Rich.
-
-    All console interactions — rendering, prompting, and theming — go through
-    this class so that styling rules and Rich markup live in exactly one place.
-
-    The underlying ``Console`` is accessible via the :attr:`console` property
-    for the handful of callers that pass it to Rich internals (e.g. ``Live``).
-    The :attr:`file` property and the :meth:`print` / :meth:`input` pass-throughs
-    ensure that existing code using ``console.print(...)`` or
-    ``console.file.write(...)`` continues to work without change.
-    """
+    """Centralised terminal output layer built on Rich."""
 
     def __init__(self, *, color: bool = True) -> None:
-        self._console = Console(theme=NEXUS_THEME, no_color=not color)
-
-    # ------------------------------------------------------------------
-    # Raw pass-throughs
-    # ------------------------------------------------------------------
+        self._console = Console(theme=NEXUS_THEME, no_color=not color, highlight=False)
+        self._assistant_stream_open = False
+        self._tool_args_by_call_id: dict[str, dict[str, Any]] = {}
+        self._workspace_root: Path | None = None
 
     @property
     def console(self) -> Console:
-        """Expose the underlying Rich Console (e.g. for ``Live(console=…)``)."""
         return self._console
 
     @property
     def file(self):
-        """Expose ``console.file`` for callers that write raw text (e.g. JSON)."""
         return self._console.file
 
     def print(self, *args, **kwargs) -> None:
-        """Pass-through to ``Console.print``; all existing call-sites work unchanged."""
         self._console.print(*args, **kwargs)
 
     def input(self, prompt: str = "") -> str:
-        """Pass-through to ``Console.input`` for interactive prompts."""
         return self._console.input(prompt)
 
     def prompt_user(self) -> str:
-        """Render the standard interactive user prompt and return the input."""
+        self.end_assistant()
         return self._console.input("[primary]>[/primary] ")
-
-    # ------------------------------------------------------------------
-    # Semantic output — generic severity levels
-    # ------------------------------------------------------------------
 
     def print_version(self, version: str) -> None:
         self._console.print(version, style="version")
@@ -108,8 +89,19 @@ class TerminalUI:
         self._console.print(f"[error]Configuration error:[/error] {exc}")
 
     def print_error(self, msg: str) -> None:
-        """Red bold ✗ error block (e.g. provider request failure)."""
-        self._console.print(f"\n[error]✗ Request failed.[/error] {msg}\n")
+        self.end_assistant()
+        self._console.print()
+        self._console.print(
+            Panel(
+                Text(msg, style="error"),
+                title=Text("Request failed", style="error"),
+                title_align="left",
+                border_style="error",
+                box=box.ROUNDED,
+                padding=(1, 2),
+            )
+        )
+        self._console.print()
 
     def print_warning(self, msg: str) -> None:
         self._console.print(f"[warning]Warning:[/warning] {msg}")
@@ -123,82 +115,283 @@ class TerminalUI:
     def print_muted(self, msg: str) -> None:
         self._console.print(msg, style="muted")
 
-    # ------------------------------------------------------------------
-    # Structural primitives
-    # ------------------------------------------------------------------
-
-    def print_rule(self, title: str = "", *, style: str = "rule.line") -> None:
+    def print_rule(self, title: str = "", *, style: str = "border") -> None:
         self._console.print(Rule(title, style=style))
 
     def print_markdown(self, content: str) -> None:
         self._console.print(Markdown(content))
 
     def stream_markdown(self, content: str) -> None:
-        """Word-by-word typewriter effect with progressive Rich Markdown rendering."""
         words = content.split()
         if not words:
             return
         accumulated = ""
-        update_every = 5
         with Live(
             Markdown(""),
             console=self._console,
             refresh_per_second=20,
             vertical_overflow="visible",
         ) as live:
-            for i, word in enumerate(words):
-                accumulated += ("" if i == 0 else " ") + word
-                if i % update_every == update_every - 1 or i == len(words) - 1:
-                    live.update(Markdown(accumulated))
-                    time.sleep(0.012)
+            for index, word in enumerate(words):
+                accumulated += ("" if index == 0 else " ") + word
+                live.update(Markdown(accumulated))
+                time.sleep(0.012)
 
     def make_table(self, title: str = "", *columns: str) -> Table:
-        """Create and return a Rich ``Table`` pre-loaded with *columns*."""
         table = Table(title=title) if title else Table()
         for col in columns:
             table.add_column(col)
         return table
 
-    # ------------------------------------------------------------------
-    # REPL banner & startup messages
-    # ------------------------------------------------------------------
+    def begin_assistant(self) -> None:
+        if self._assistant_stream_open:
+            return
+        self._console.print()
+        self._console.print(Rule(Text("Assistant", style="assistant.header"), style="border"))
+        self._assistant_stream_open = True
 
-    def print_banner(self, provider: str, model: str, mode: str) -> None:
-        self._console.print("Nexus Coding Agent", style="banner.title")
-        self._console.print(f"Provider: {provider}  |  Model: {model}  |  Mode: {mode}")
+    def end_assistant(self) -> None:
+        if self._assistant_stream_open:
+            self._console.print()
+            self._console.print()
+        self._assistant_stream_open = False
+
+    def print_banner(
+        self,
+        provider: str,
+        model: str,
+        mode: str,
+        *,
+        workspace: str | Path | None = None,
+    ) -> None:
+        self._workspace_root = Path(workspace).resolve() if workspace is not None else None
+        body = Table.grid(expand=True)
+        body.add_column(style="muted", width=12)
+        body.add_column(style="primary")
+        body.add_row("Provider", provider)
+        body.add_row("Model", model)
+        body.add_row("Mode", mode)
+        if workspace is not None:
+            body.add_row("Workspace", str(Path(workspace).resolve()))
+        body.add_row("Quick help", "/help  •  /skills  •  /session  •  /quit")
+        self._console.print(
+            Panel(
+                body,
+                title=Text("Nexus Coding Agent", style="banner.title"),
+                title_align="left",
+                border_style="border",
+                box=box.ROUNDED,
+                padding=(1, 2),
+            )
+        )
 
     def print_session_resumed(self, session_id: str, msg_count: int) -> None:
         noun = "message" if msg_count == 1 else "messages"
         self._console.print(
-            f"[muted]Resumed session [bold]{session_id}[/bold] "
-            f"({msg_count} {noun}). "
-            "Use [bold]/session new[/bold] to start fresh or "
-            "[bold]/session list[/bold] to pick another.[/muted]"
+            Panel(
+                Text(
+                    f"Resumed session {session_id} with {msg_count} {noun}. "
+                    "Use /session new to start fresh or /session list to switch.",
+                    style="muted",
+                ),
+                title=Text("Session", style="info"),
+                title_align="left",
+                border_style="border",
+                box=box.ROUNDED,
+                padding=(0, 2),
+            )
         )
 
     def print_help_hint(self) -> None:
-        self._console.print("Type /help for runtime commands, /skills for skill control, or /quit to exit.\n")
+        self._console.print("[muted]Type /help for runtime commands, /skills for skill control, or /quit to exit.[/muted]")
+        self._console.print()
 
     def print_fake_provider_notice(self) -> None:
         self._console.print(
-            "[warning]Note:[/warning] Using the [bold]fake[/bold] provider — "
-            "responses are mocked. Set a real provider and API key in your "
-            ".env or .nexus/config.toml for live coding-agent responses."
+            Panel(
+                Text(
+                    "Using the fake provider — responses are mocked. Set a real provider, API_KEY, and BASE_URL in .env for live coding-agent responses.",
+                    style="warning",
+                ),
+                title=Text("Provider notice", style="warning"),
+                title_align="left",
+                border_style="warning",
+                box=box.ROUNDED,
+                padding=(0, 2),
+            )
         )
         self._console.print()
 
     def print_no_api_key_warning(self, provider: str) -> None:
         self._console.print(
-            f"[warning]Warning:[/warning] No API key found for provider "
-            f"[bold]{provider}[/bold]. Requests will fail. Add your key to "
-            "[bold].env[/bold] (e.g. MISTRAL_API_KEY=sk-...) or set the "
-            "environment variable."
+            Panel(
+                Text(
+                    f"No API key found for provider {provider}. Add API_KEY to .env (or a provider-specific key such as MISTRAL_API_KEY / OPENAI_API_KEY) before starting a live session.",
+                    style="warning",
+                ),
+                title=Text("Provider setup required", style="warning"),
+                title_align="left",
+                border_style="warning",
+                box=box.ROUNDED,
+                padding=(0, 2),
+            )
         )
         self._console.print()
 
-    # ------------------------------------------------------------------
-    # Agent event rendering
-    # ------------------------------------------------------------------
+    def _relative_path(self, value: str) -> str:
+        if self._workspace_root is None:
+            return value
+        try:
+            return str(Path(value).resolve().relative_to(self._workspace_root))
+        except Exception:  # noqa: BLE001
+            return value
+
+    def _guess_language(self, path: str | None) -> str:
+        if not path:
+            return "text"
+        suffix = Path(path).suffix.lower()
+        return {
+            ".py": "python",
+            ".js": "javascript",
+            ".jsx": "jsx",
+            ".ts": "typescript",
+            ".tsx": "tsx",
+            ".json": "json",
+            ".toml": "toml",
+            ".yaml": "yaml",
+            ".yml": "yaml",
+            ".md": "markdown",
+            ".sh": "bash",
+            ".bash": "bash",
+            ".zsh": "bash",
+            ".diff": "diff",
+        }.get(suffix, "text")
+
+    def _ordered_args(self, tool_name: str, args: dict[str, Any]) -> list[tuple[str, Any]]:
+        preferred = {
+            "read_file": ["path", "offset", "limit"],
+            "write_file": ["path", "content"],
+            "create_file": ["path", "content"],
+            "modify_file": ["path", "start_line", "end_line", "replacement"],
+            "replace_text": ["path", "old_string", "new_string", "replace_all"],
+            "insert_edit_into_file": ["path", "code"],
+            "apply_patch": ["input"],
+            "bash": ["command", "timeout", "cwd"],
+            "glob": ["pattern"],
+            "grep": ["pattern", "path"],
+        }.get(tool_name, [])
+        ordered: list[tuple[str, Any]] = []
+        seen: set[str] = set()
+        for key in preferred:
+            if key in args:
+                ordered.append((key, args[key]))
+                seen.add(key)
+        ordered.extend((key, value) for key, value in args.items() if key not in seen)
+        return ordered
+
+    def _compact_value(self, key: str, value: Any) -> str:
+        if isinstance(value, str):
+            if key in {"content", "old_string", "new_string", "replacement", "code", "input"}:
+                line_count = len(value.splitlines()) or 0
+                byte_count = len(value.encode("utf-8", errors="replace"))
+                preview = value.splitlines()[0][:80] if value.strip() else ""
+                suffix = f" — {preview}…" if preview else ""
+                return f"<{line_count} lines • {byte_count} bytes>{suffix}"
+            if key in {"path", "cwd"}:
+                return self._relative_path(value)
+            if len(value) > 120:
+                return value[:120] + "…"
+            return value
+        return json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list, bool, int, float)) else str(value)
+
+    def _render_args_table(self, tool_name: str, args: dict[str, Any]) -> Table:
+        table = Table.grid(padding=(0, 1))
+        table.add_column(style="muted", justify="right", no_wrap=True)
+        table.add_column(style="tool.args", overflow="fold")
+        for key, value in self._ordered_args(tool_name, args):
+            table.add_row(key, self._compact_value(key, value))
+        return table
+
+    def _tool_border_style(self, tool_name: str) -> str:
+        if tool_name in {"read_file", "glob", "grep", "ls", "get_time"}:
+            return "tool.read"
+        if tool_name in {"write_file", "create_file", "modify_file", "replace_text", "insert_edit_into_file", "apply_patch", "write_note"}:
+            return "tool.write"
+        if tool_name == "bash":
+            return "tool.shell"
+        if tool_name.startswith("web_"):
+            return "tool.network"
+        if tool_name.startswith("memory") or tool_name.startswith("todo"):
+            return "tool.memory"
+        if tool_name.startswith("subagent") or tool_name.startswith("delegate"):
+            return "tool.agent"
+        return "tool"
+
+    def _preview_block(self, text: str, *, path: str | None = None) -> Syntax | Text:
+        cleaned = text.rstrip() or "(no tool output)"
+        if len(cleaned) > 4000:
+            cleaned = cleaned[:4000] + "\n… [truncated]"
+        return Syntax(
+            cleaned,
+            self._guess_language(path),
+            theme="monokai",
+            word_wrap=True,
+            line_numbers=False,
+        )
+
+    def _render_tool_result_body(self, result: ToolResult) -> Group:
+        metadata = result.metadata or {}
+        blocks: list[Any] = []
+        path = metadata.get("path") if isinstance(metadata.get("path"), str) else None
+        summary = Table.grid(padding=(0, 2))
+        summary.add_column(style="muted", no_wrap=True)
+        summary.add_column(style="tool.result")
+        if path:
+            summary.add_row("path", self._relative_path(path))
+        for key in ("lines", "bytes", "entries", "matches", "files_searched", "status_code", "timezone", "results", "count"):
+            if key in metadata:
+                summary.add_row(key, str(metadata[key]))
+        if summary.row_count:
+            blocks.append(summary)
+        if result.is_error:
+            blocks.append(Text(result.output or "Tool failed.", style="error"))
+        else:
+            blocks.append(self._preview_block(result.output, path=path))
+        return Group(*blocks)
+
+    def print_approval_request(self, req: ConfirmationRequest) -> None:
+        args_panel = self._render_args_table(req.tool_name, req.arguments) if req.arguments else Text("(no arguments)", style="muted")
+        self._console.print(
+            Panel(
+                Group(
+                    Text(req.reason, style="warning"),
+                    args_panel,
+                    Text("Approve: [y]es once  •  [t]urn  •  [s]ession  •  [n]o", style="muted"),
+                ),
+                title=Text(f"Approval required — {req.tool_name}", style="approval.header"),
+                title_align="left",
+                border_style="warning",
+                box=box.ROUNDED,
+                padding=(1, 2),
+            )
+        )
+
+    def print_clarification_request(self, req: ConfirmationRequest) -> None:
+        self._console.print(
+            Panel(
+                Group(
+                    Text(req.prompt),
+                    self._render_args_table(req.tool_name, req.arguments)
+                    if req.arguments
+                    else Text("(no arguments)", style="muted"),
+                ),
+                title=Text(f"Clarification needed — {req.tool_name}", style="clarification.header"),
+                title_align="left",
+                border_style="info",
+                box=box.ROUNDED,
+                padding=(1, 2),
+            )
+        )
 
     def render_event(
         self,
@@ -207,78 +400,90 @@ class TerminalUI:
         stream_output: bool,
         show_tool_calls: bool,
     ) -> None:
-        """Render a single agent event to the terminal."""
-        from nexus.models import AgentEventType, ConfirmationKind  # local import avoids circular
+        from nexus.models import AgentEventType, ConfirmationKind
 
-        # ------------------------------------------------------------------
-        # Reference-style streaming events
-        # ------------------------------------------------------------------
+        if event.kind == AgentEventType.AGENT_START:
+            return
+
+        if event.kind == AgentEventType.THINKING_STARTED and show_tool_calls:
+            self.end_assistant()
+            self._console.print("[muted]⋯ thinking…[/muted]")
+            return
 
         if event.kind == AgentEventType.TEXT_DELTA:
-            # Real-time token chunk: print inline without markup so that
-            # _stream_turn_live produces a live typewriter effect.
             if stream_output and event.payload:
+                self.begin_assistant()
                 self._console.print(event.payload, end="", markup=False, highlight=False)
+            return
 
-        elif event.kind == AgentEventType.TEXT_COMPLETE:
+        if event.kind == AgentEventType.TEXT_COMPLETE:
             if stream_output:
-                # Chunks were already streamed; just close the paragraph.
-                self._console.print("\n")
-            else:
-                # Batch mode: render the full text as Markdown.
-                if event.payload:
-                    self._console.print()
-                    self._console.print(Markdown(event.payload))
-                    self._console.print()
+                self.end_assistant()
+            elif event.payload:
+                self.begin_assistant()
+                self._console.print(Markdown(event.payload))
+                self.end_assistant()
+            return
 
-        elif event.kind == AgentEventType.TOOL_CALL_START and show_tool_calls:
+        if event.kind == AgentEventType.TOOL_CALL_START and show_tool_calls:
+            self.end_assistant()
             payload = event.payload or {}
-            name = payload.get("name", "")
-            args = payload.get("arguments", {})
-            args_str = str(args)
-            args_preview = args_str[:150] + ("…" if len(args_str) > 150 else "")
+            call_id = str(payload.get("call_id", ""))
+            tool_name = str(payload.get("name", "tool"))
+            arguments = payload.get("arguments", {}) if isinstance(payload.get("arguments", {}), dict) else {}
+            self._tool_args_by_call_id[call_id] = dict(arguments)
             self._console.print(
-                f"[tool.name]⚙ {name}[/tool.name] [tool.args]{args_preview}[/tool.args]"
+                Panel(
+                    self._render_args_table(tool_name, arguments)
+                    if arguments
+                    else Text("(no arguments)", style="muted"),
+                    title=Text(f"{tool_name}  #{call_id[:8] or 'pending'}", style="tool"),
+                    title_align="left",
+                    subtitle=Text("running", style="muted"),
+                    subtitle_align="right",
+                    border_style=self._tool_border_style(tool_name),
+                    box=box.ROUNDED,
+                    padding=(1, 2),
+                )
             )
+            return
 
-        elif event.kind == AgentEventType.TOOL_CALL_COMPLETE and show_tool_calls:
+        if event.kind == AgentEventType.TOOL_CALL_COMPLETE and show_tool_calls:
+            self.end_assistant()
             result = event.payload
-            if result is not None:
-                output = str(result.output)
-                preview = output[:150] + ("…" if len(output) > 150 else "")
-                self._console.print(f"[tool.result]  ↳ {preview}[/tool.result]")
-
-        # ------------------------------------------------------------------
-        # Legacy Nexus events (backward-compatible)
-        # ------------------------------------------------------------------
-
-        elif event.kind == AgentEventType.THINKING_STARTED and show_tool_calls:
-            self._console.print("[muted]⋯ thinking…[/muted]")
-
-        elif event.kind == AgentEventType.MODEL_RESPONSE:
-            # Content is now rendered via TEXT_DELTA / TEXT_COMPLETE.
-            # MODEL_RESPONSE is kept for history management only; no output here.
-            pass
-
-        elif event.kind == AgentEventType.TOOL_CALL_REQUESTED and show_tool_calls:
-            args_str = str(event.payload.arguments)
-            args_preview = args_str[:150] + ("…" if len(args_str) > 150 else "")
+            if result is None:
+                return
             self._console.print(
-                f"[tool.name]⚙ {event.payload.tool_name}[/tool.name] "
-                f"[tool.args]{args_preview}[/tool.args]"
+                Panel(
+                    self._render_tool_result_body(result),
+                    title=Text(f"{result.tool_name}  #{result.call_id[:8]}", style="tool"),
+                    title_align="left",
+                    subtitle=Text("failed" if result.is_error else "done", style="error" if result.is_error else "success"),
+                    subtitle_align="right",
+                    border_style=self._tool_border_style(result.tool_name),
+                    box=box.ROUNDED,
+                    padding=(1, 2),
+                )
             )
+            self._tool_args_by_call_id.pop(result.call_id, None)
+            return
 
-        elif event.kind == AgentEventType.TOOL_RESULT and show_tool_calls:
-            output = str(event.payload.output)
-            preview = output[:150] + ("…" if len(output) > 150 else "")
-            self._console.print(f"[tool.result]  ↳ {preview}[/tool.result]")
-
-        elif event.kind == AgentEventType.TOOL_DENIED:
+        if event.kind == AgentEventType.TOOL_DENIED:
+            self.end_assistant()
             self._console.print(
-                f"[tool.denied]✗ denied:[/tool.denied] {event.payload.reason}"
+                Panel(
+                    Text(event.payload.reason, style="tool.denied"),
+                    title=Text("Tool denied", style="tool.denied"),
+                    title_align="left",
+                    border_style="tool.denied",
+                    box=box.ROUNDED,
+                    padding=(0, 2),
+                )
             )
+            return
 
-        elif event.kind == AgentEventType.CONFIRMATION_REQUESTED:
+        if event.kind == AgentEventType.CONFIRMATION_REQUESTED:
+            self.end_assistant()
             req: ConfirmationRequest = event.payload
             self._console.print()
             if req.kind is ConfirmationKind.APPROVAL:
@@ -286,6 +491,24 @@ class TerminalUI:
             else:
                 self.print_clarification_request(req)
             self._console.print()
+            return
+
+        if event.kind == AgentEventType.AGENT_ERROR:
+            payload = event.payload or {}
+            error = payload.get("error") if isinstance(payload, dict) else str(payload)
+            self.print_error(str(error or "Unknown provider error."))
+            return
+
+        # Legacy events are emitted alongside the new reference-style events.
+        # Ignore their UI rendering here to avoid duplicate tool/status lines.
+        if event.kind in {
+            AgentEventType.MODEL_RESPONSE,
+            AgentEventType.TURN_COMPLETED,
+            AgentEventType.TOOL_CALL_REQUESTED,
+            AgentEventType.TOOL_RESULT,
+            AgentEventType.AGENT_STOP,
+        }:
+            return
 
     def render_events(
         self,
@@ -294,62 +517,8 @@ class TerminalUI:
         stream_output: bool,
         show_tool_calls: bool,
     ) -> None:
-        """Render a list of agent events in order."""
         for event in events:
             self.render_event(event, stream_output=stream_output, show_tool_calls=show_tool_calls)
-
-    # ------------------------------------------------------------------
-    # Confirmation / clarification panels
-    # ------------------------------------------------------------------
-
-    def print_approval_request(self, req: ConfirmationRequest) -> None:
-        self._console.print(
-            Rule(
-                "[approval.header]Approval Required[/approval.header]",
-                style="approval.header",
-            )
-        )
-        self._console.print(f"  [bold]Tool:[/bold] [primary]{req.tool_name}[/primary]")
-        for key, val in req.arguments.items():
-            val_str = str(val)
-            preview = val_str[:150] + ("…" if len(val_str) > 150 else "")
-            self._console.print(f"  [muted]  {key}:[/muted] {preview}")
-        if req.reason:
-            # Highlight risk level inside the reason string for visibility.
-            reason = req.reason
-            for marker, style in (
-                ("Dangerous", "bold red"),
-                ("dangerous", "bold red"),
-                ("High-risk", "bold red"),
-                ("high-risk", "bold red"),
-                ("Medium-risk", "bold yellow"),
-                ("medium-risk", "bold yellow"),
-            ):
-                if marker in reason:
-                    reason = reason.replace(marker, f"[{style}]{marker}[/{style}]")
-                    break
-            self._console.print(f"  [muted]Reason:[/muted] {reason}")
-        self._console.print(
-            "  [muted]Approve:[/muted] "
-            "[bold]\\[y][/bold]es (once)  "
-            "[bold]\\[t][/bold]urn  "
-            "[bold]\\[s][/bold]ession  "
-            "[bold]\\[N][/bold]o"
-        )
-
-    def print_clarification_request(self, req: ConfirmationRequest) -> None:
-        self._console.print(
-            Rule(
-                f"[clarification.header]Clarification Needed — "
-                f"{req.tool_name}[/clarification.header]",
-                style="clarification.header",
-            )
-        )
-        self._console.print(f"  {req.prompt}")
-
-    # ------------------------------------------------------------------
-    # Provider setup reminder (shown after nexus init or on startup)
-    # ------------------------------------------------------------------
 
     def print_provider_setup_reminder(self, config) -> None:
         from os import environ
@@ -362,38 +531,26 @@ class TerminalUI:
             or environ.get("MISTRAL_API_KEY")
             or environ.get("NEXUS_API_KEY")
             or environ.get("OPENAI_API_KEY")
+            or environ.get("API_KEY")
         )
         if has_key:
             return
 
         self._console.print()
         self._console.print(
-            f"[warning]⚠  No API key found for provider [bold]{provider}[/bold].[/warning]"
-        )
-        self._console.print("Set your key using one of the following methods:\n")
-        if provider == "mistral":
-            self._console.print("  1. Create a [bold].env[/bold] file in this directory:")
-            self._console.print("       [success]MISTRAL_API_KEY=sk-...[/success]\n")
-            self._console.print("  2. Export as an environment variable:")
-            self._console.print("       [success]export MISTRAL_API_KEY=sk-...[/success]\n")
-            self._console.print("  3. Set it in [bold].nexus/config.toml[/bold]:")
-            self._console.print('       [success]api_key = "sk-..."[/success]\n')
-            self._console.print(
-                "  Get a key at "
-                "[link=https://console.mistral.ai]https://console.mistral.ai[/link]"
+            Panel(
+                Text(
+                    "Create a .env file with API_KEY and BASE_URL, or set api_key in .nexus/config.toml before running live provider requests.",
+                    style="warning",
+                ),
+                title=Text(f"No API key found for {provider}", style="warning"),
+                title_align="left",
+                border_style="warning",
+                box=box.ROUNDED,
+                padding=(1, 2),
             )
-        else:
-            self._console.print("  1. Create a [bold].env[/bold] file in this directory:")
-            self._console.print("       [success]NEXUS_API_KEY=sk-...[/success]\n")
-            self._console.print("  2. Export as an environment variable:")
-            self._console.print("       [success]export NEXUS_API_KEY=sk-...[/success]\n")
-            self._console.print("  3. Set it in [bold].nexus/config.toml[/bold]:")
-            self._console.print('       [success]api_key = "sk-..."[/success]')
+        )
         self._console.print()
-
-    # ------------------------------------------------------------------
-    # Doctor report rendering (moved from cli/doctor.py)
-    # ------------------------------------------------------------------
 
     def print_doctor_report(self, report, *, output_format: str) -> None:
         if output_format == "json":
@@ -414,6 +571,4 @@ class TerminalUI:
                 table.add_row(check.name, check.status, check.detail)
             self._console.print(table)
         if report.registered_tools:
-            self._console.print(
-                "Registered tools: " + ", ".join(report.registered_tools)
-            )
+            self._console.print("Registered tools: " + ", ".join(report.registered_tools))

@@ -418,6 +418,11 @@ def provider_error_message(exc: Exception, config) -> str:
     return f"Provider error: {msg}"
 
 
+def _provider_error_message(exc: Exception, config) -> str:
+    """Backward-compat shim for older REPL/headless call sites."""
+    return provider_error_message(exc, config)
+
+
 # ---------------------------------------------------------------------------
 # Dispatch helpers — called by click commands in nexus/cli/args.py
 # ---------------------------------------------------------------------------

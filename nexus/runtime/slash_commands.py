@@ -17,7 +17,7 @@ from nexus.context import TokenEstimator
 from nexus.runtime.delegation import DelegationRequest
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
-from nexus.runtime.sessions import new_snapshot
+from nexus.runtime.sessions import message_to_dict, new_snapshot
 from nexus.skills import get_skill_roots, load_skill_registry
 from nexus.tools.subagents import register_skill_subagent_tools
 
@@ -481,10 +481,7 @@ async def handle_session(state: ReplState, args: list[str]) -> None:
         return
     if args and args[0].lower() == "export" and len(args) > 1:
         export_path = Path(args[1])
-        body = json.dumps(
-            [{"role": message.role, "content": message.content, "name": message.name} for message in state.history],
-            indent=2,
-        )
+        body = json.dumps([message_to_dict(message) for message in state.history], indent=2)
         export_path.write_text(body, encoding="utf-8")
         state.console.print(f"Exported session to {export_path}")
         return

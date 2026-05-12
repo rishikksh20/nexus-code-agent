@@ -13,7 +13,7 @@ from nexus.context import CarryOverState, ContextBuilder, ContextCompactor, Toke
 from nexus.runtime.delegation import DelegationRuntime
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookExecutor
-from nexus.runtime.sessions import SessionSnapshot, SessionStore
+from nexus.runtime.sessions import SessionSnapshot, SessionStore, sanitize_session_messages
 from nexus.security.manager import ApprovalManager
 from nexus.skills import SkillRegistry
 from nexus.tools.base import ToolRegistry
@@ -82,7 +82,7 @@ class ReplState:
             self.config.compaction_soft_limit,
             self.config.compaction_hard_limit,
         )
-        model_messages = list(self.history)
+        model_messages = sanitize_session_messages(list(self.history))
         if self.config.context_prune_enabled:
             prune_outputs(
                 model_messages,
@@ -111,9 +111,20 @@ class ReplState:
         )
 
     def apply_events(self, events: list[AgentEvent]) -> None:
+        completed_tool_calls = {
+            event.payload.call_id
+            for event in events
+            if event.kind == "tool_result"
+        }
         for event in events:
             if event.kind == "model_response":
-                self.history.append(event.payload.message)
+                message = event.payload.message
+                if message.tool_calls and not all(
+                    tool_call.call_id in completed_tool_calls
+                    for tool_call in message.tool_calls
+                ):
+                    continue
+                self.history.append(message)
                 if event.payload.usage is not None:
                     _accumulate_usage(self, event.payload.usage)
             elif event.kind == "tool_result":

@@ -43,7 +43,7 @@ async def collect_turn_events(
     approval_callback: ConfirmationCallback | None = None,
     auto_confirm: bool = False,
 ) -> list[AgentEvent]:
-    collected_events: list[AgentEvent] = []
+    committed_events: list[AgentEvent] = []
     turn_id = state.current_turn_id or uuid4().hex[:12]
     trace_id = state.current_trace_id or uuid4().hex
     started_at = time.perf_counter()
@@ -73,12 +73,11 @@ async def collect_turn_events(
                 max_turns=state.config.max_loop_iterations,
             )
         ]
-        collected_events.extend(events)
-
         confirmation = next((event for event in events if event.kind == "confirmation_requested"), None)
         if confirmation is None:
-            _record_turn_telemetry(state, events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="completed")
-            return collected_events
+            committed_events.extend(events)
+            _record_turn_telemetry(state, committed_events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="completed")
+            return committed_events
         confirmation_request = cast(ConfirmationRequest, confirmation.payload)
 
         if auto_confirm and confirmation_request.kind is ConfirmationKind.APPROVAL:
@@ -86,8 +85,9 @@ async def collect_turn_events(
             continue
 
         if approval_callback is None:
-            _record_turn_telemetry(state, collected_events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="awaiting_confirmation")
-            return collected_events
+            pending_events = [*committed_events, *events]
+            _record_turn_telemetry(state, pending_events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="awaiting_confirmation")
+            return pending_events
 
         response = await approval_callback(confirmation_request)
         if confirmation_request.kind is ConfirmationKind.APPROVAL and response.approved:
@@ -101,10 +101,11 @@ async def collect_turn_events(
             state.history.append(Message(role="user", content=clarification_text))
             prompt_text = clarification_text
             continue
-        _record_turn_telemetry(state, collected_events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="stopped")
-        return collected_events
+        pending_events = [*committed_events, *events]
+        _record_turn_telemetry(state, pending_events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="stopped")
+        return pending_events
 
-    return collected_events
+    return committed_events
 
 
 def apply_events_to_history(state: ReplState, events: list) -> None:
@@ -134,7 +135,7 @@ async def _stream_turn_live(
 
     Returns all collected events so the caller can apply them to history.
     """
-    all_events: list[AgentEvent] = []
+    committed_events: list[AgentEvent] = []
     turn_id = state.current_turn_id or uuid4().hex[:12]
     trace_id = state.current_trace_id or uuid4().hex
     started_at = time.perf_counter()
@@ -171,15 +172,15 @@ async def _stream_turn_live(
             )
             batch.append(event)
 
-        all_events.extend(batch)
         confirmation = next((e for e in batch if e.kind == "confirmation_requested"), None)
 
         if confirmation is None:
+            committed_events.extend(batch)
             _record_turn_telemetry(
-                state, all_events, turn_id=turn_id, trace_id=trace_id,
+                state, committed_events, turn_id=turn_id, trace_id=trace_id,
                 duration_ms=(time.perf_counter() - started_at) * 1000, status="completed",
             )
-            return all_events
+            return committed_events
 
         confirmation_request = cast(ConfirmationRequest, confirmation.payload)
 
@@ -188,11 +189,12 @@ async def _stream_turn_live(
             continue
 
         if approval_callback is None:
+            pending_events = [*committed_events, *batch]
             _record_turn_telemetry(
-                state, all_events, turn_id=turn_id, trace_id=trace_id,
+                state, pending_events, turn_id=turn_id, trace_id=trace_id,
                 duration_ms=(time.perf_counter() - started_at) * 1000, status="awaiting_confirmation",
             )
-            return all_events
+            return pending_events
 
         response = await approval_callback(confirmation_request)
         if confirmation_request.kind is ConfirmationKind.APPROVAL and response.approved:
@@ -208,17 +210,18 @@ async def _stream_turn_live(
             state.history.append(Message(role="user", content=clarification_text))
             prompt_text = clarification_text
             continue
+        pending_events = [*committed_events, *batch]
         _record_turn_telemetry(
-            state, all_events, turn_id=turn_id, trace_id=trace_id,
+            state, pending_events, turn_id=turn_id, trace_id=trace_id,
             duration_ms=(time.perf_counter() - started_at) * 1000, status="stopped",
         )
-        return all_events
+        return pending_events
 
 
 async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: bool = False) -> None:
     ui: TerminalUI = state.console
     cfg = state.config
-    ui.print_banner(cfg.provider, cfg.model_name, cfg.default_mode)
+    ui.print_banner(cfg.provider, cfg.model_name, state.mode.value, workspace=cfg.workspace_root)
     if session_resumed:
         ui.print_session_resumed(state.session.session_id, len(state.history))
     ui.print_help_hint()
@@ -231,6 +234,7 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
             or environ.get("MISTRAL_API_KEY")
             or environ.get("NEXUS_API_KEY")
             or environ.get("OPENAI_API_KEY")
+            or environ.get("API_KEY")
         )
         if not has_key:
             ui.print_no_api_key_warning(cfg.provider)
@@ -299,8 +303,9 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
                 approval_callback=ask_for_approval,
             )
         except Exception as exc:  # noqa: BLE001
-            from nexus.app import _provider_error_message
-            ui.print_error(_provider_error_message(exc, state.config))
+            from nexus.app import provider_error_message
+
+            ui.print_error(provider_error_message(exc, state.config))
             # Remove the user message we just added so it doesn't corrupt history
             state.history.pop()
             continue

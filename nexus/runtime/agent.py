@@ -169,7 +169,9 @@ class Agent:
                 content=response_text or "",
                 tool_calls=tool_calls,
             )
-            history.append(message)
+            should_record_message = bool(message.content or message.tool_calls)
+            if should_record_message:
+                history.append(message)
 
             runtime_response = RuntimeResponse(
                 message=message,
@@ -196,7 +198,8 @@ class Agent:
 
             # Emit the legacy MODEL_RESPONSE event for backward-compatible consumers
             # (history management in apply_events_to_history, etc.).
-            yield AgentEvent(kind=AgentEventType.MODEL_RESPONSE, payload=runtime_response)
+            if should_record_message:
+                yield AgentEvent(kind=AgentEventType.MODEL_RESPONSE, payload=runtime_response)
 
             if not tool_calls:
                 yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload=runtime_response.finish_reason)

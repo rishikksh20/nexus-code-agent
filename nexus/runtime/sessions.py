@@ -4,10 +4,74 @@ import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
-from nexus.models import Message
+from nexus.models import Message, ToolCall
+
+
+def message_to_dict(message: Message) -> dict[str, object]:
+    return {
+        "role": message.role,
+        "content": message.content,
+        "name": message.name,
+        "tool_calls": [
+            {
+                "call_id": tool_call.call_id,
+                "tool_name": tool_call.tool_name,
+                "arguments": tool_call.arguments,
+            }
+            for tool_call in message.tool_calls
+        ],
+        "tool_call_id": message.tool_call_id,
+    }
+
+
+def message_from_dict(payload: dict[str, object]) -> Message:
+    raw_tool_calls = cast(list[dict[str, object]], payload.get("tool_calls", []))
+    tool_calls = tuple(
+        ToolCall(
+            call_id=str(item["call_id"]),
+            tool_name=str(item["tool_name"]),
+            arguments=dict(item.get("arguments", {})),
+        )
+        for item in raw_tool_calls
+        if isinstance(item, dict)
+    )
+    return Message(
+        role=cast("Any", str(payload["role"])),
+        content=str(payload.get("content", "")),
+        name=str(payload["name"]) if payload.get("name") is not None else None,
+        tool_calls=tool_calls,
+        tool_call_id=(
+            str(payload["tool_call_id"])
+            if payload.get("tool_call_id") is not None
+            else None
+        ),
+    )
+
+
+def sanitize_session_messages(messages: list[Message]) -> list[Message]:
+    sanitized: list[Message] = []
+    valid_tool_call_ids: set[str] = set()
+
+    for message in messages:
+        if message.role == "assistant":
+            if not message.content and not message.tool_calls:
+                continue
+            sanitized.append(message)
+            valid_tool_call_ids.update(tool_call.call_id for tool_call in message.tool_calls)
+            continue
+
+        if message.role == "tool":
+            if not message.tool_call_id or message.tool_call_id not in valid_tool_call_ids:
+                continue
+            sanitized.append(message)
+            continue
+
+        sanitized.append(message)
+
+    return sanitized
 
 
 @dataclass(slots=True)
@@ -20,22 +84,22 @@ class SessionSnapshot:
     summary: str = ""
 
     def to_dict(self) -> dict[str, object]:
+        messages = sanitize_session_messages(self.messages)
         return {
             "session_id": self.session_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "messages": [
-                {"role": message.role, "content": message.content, "name": message.name}
-                for message in self.messages
-            ],
+            "messages": [message_to_dict(message) for message in messages],
             "metadata": self.metadata,
             "summary": self.summary,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "SessionSnapshot":
-        raw_messages = data.get("messages", [])
-        messages = [Message(**item) for item in raw_messages]  # type: ignore[arg-type]
+        raw_messages = cast(list[dict[str, object]], data.get("messages", []))
+        messages = sanitize_session_messages(
+            [message_from_dict(item) for item in raw_messages if isinstance(item, dict)]
+        )
         return cls(
             session_id=str(data["session_id"]),
             created_at=str(data["created_at"]),
@@ -107,8 +171,7 @@ class SessionStore:
 
 class EphemeralSessionStore(SessionStore):
     def __init__(self) -> None:
-        self.root = Path(".")
-        self.max_sessions_retained = None
+        super().__init__(Path("."), max_sessions_retained=None)
 
     def save(self, snapshot: SessionSnapshot) -> None:
         snapshot.updated_at = datetime.now(UTC).isoformat()

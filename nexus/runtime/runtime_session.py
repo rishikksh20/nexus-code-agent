@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from nexus.memory.store import MemoryStore
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
-from nexus.runtime.sessions import EphemeralSessionStore, SessionStore, new_snapshot
+from nexus.runtime.sessions import EphemeralSessionStore, SessionStore, new_snapshot, sanitize_session_messages
 from nexus.security.manager import ApprovalManager
 from nexus.security.policy import ApprovalPolicy
 from nexus.skills import SkillRegistry, get_skill_roots, load_skill_registry
@@ -41,6 +41,7 @@ class RuntimeSession:
             session_store,
             persist_sessions=not params["no_session"],
         )
+        session.messages = sanitize_session_messages(list(session.messages))
 
         no_skills: bool = params["no_skills"]
         skill_registry = (

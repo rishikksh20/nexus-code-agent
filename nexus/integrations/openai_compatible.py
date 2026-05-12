@@ -48,11 +48,19 @@ class OpenAICompatibleAdapter:
                     ],
                 }
             elif message.role == "tool":
+                if not message.tool_call_id:
+                    continue
                 # Tool-result message — tool_call_id correlates to the assistant's call.
                 item = {"role": "tool", "content": message.content}
                 if message.tool_call_id:
                     item["tool_call_id"] = message.tool_call_id
                 elif message.name:
+                    item["name"] = message.name
+            elif message.role == "assistant":
+                if not (message.content or message.tool_calls):
+                    continue
+                item = {"role": message.role, "content": message.content}
+                if message.name:
                     item["name"] = message.name
             else:
                 item = {"role": message.role, "content": message.content}

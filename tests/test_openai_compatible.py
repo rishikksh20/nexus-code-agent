@@ -8,7 +8,7 @@ import pytest
 from nexus.app import _build_model_client
 from nexus.config import load_config
 from nexus.integrations.fake_model import FakeModelClient
-from nexus.integrations.openai_compatible import OpenAICompatibleModelClient
+from nexus.integrations.openai_compatible import OpenAICompatibleAdapter, OpenAICompatibleModelClient
 from nexus.models import Message, RuntimeRequest
 
 
@@ -184,3 +184,25 @@ def test_build_model_client_uses_provider_config(tmp_path):
     assert isinstance(mistral_client, OpenAICompatibleModelClient)
     assert mistral_client.provider_name == "mistral"
     assert mistral_client.api_base_url == "https://api.mistral.ai/v1"
+
+
+def test_openai_adapter_skips_invalid_legacy_assistant_and_tool_messages():
+    adapter = OpenAICompatibleAdapter(provider_name="openai-compatible")
+
+    payload = adapter.to_wire_request(
+        RuntimeRequest(
+            model_name="demo-model",
+            system_prompt="system",
+            messages=(
+                Message(role="user", content="hello"),
+                Message(role="assistant", content=""),
+                Message(role="tool", content="tool output", name="write_file"),
+            ),
+        )
+    )
+
+    assert payload["messages"] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "hello"},
+    ]
+

@@ -7,7 +7,18 @@ from rich.console import Console
 
 from nexus.config import load_config
 from nexus.memory.store import MemoryStore
-from nexus.models import AgentEvent, Message, RuntimeRequest, RuntimeResponse, ToolCall
+from nexus.models import (
+    AgentEvent,
+    AgentEventType,
+    ConfirmationKind,
+    ConfirmationRequest,
+    ConfirmationResponse,
+    Message,
+    RuntimeRequest,
+    RuntimeResponse,
+    ToolCall,
+    ToolResult,
+)
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl import collect_turn_events
@@ -51,7 +62,64 @@ class _RecordingAgent:
         del context
         self.messages = list(messages)
         self.kwargs = kwargs
-        yield AgentEvent(kind="turn_completed", payload="done")
+        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="done")
+
+
+class _ApprovalRetryAgent:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, messages, context, **kwargs):
+        del messages, context, kwargs
+        self.calls += 1
+        if self.calls == 1:
+            yield AgentEvent(
+                kind=AgentEventType.MODEL_RESPONSE,
+                payload=RuntimeResponse(
+                    message=Message(
+                        role="assistant",
+                        content="I'll write the file.",
+                        tool_calls=(
+                            ToolCall(
+                                call_id="call-1",
+                                tool_name="write_file",
+                                arguments={"path": "hello.py", "content": "print('hi')\n"},
+                            ),
+                        ),
+                    ),
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-1",
+                            tool_name="write_file",
+                            arguments={"path": "hello.py", "content": "print('hi')\n"},
+                        ),
+                    ),
+                    finish_reason="tool_calls",
+                ),
+            )
+            yield AgentEvent(
+                kind=AgentEventType.CONFIRMATION_REQUESTED,
+                payload=ConfirmationRequest(
+                    kind=ConfirmationKind.APPROVAL,
+                    tool_name="write_file",
+                    prompt="Allow write_file?",
+                    reason="write_file replaces the entire file.",
+                    arguments={"path": "hello.py", "content": "print('hi')\n"},
+                ),
+            )
+            return
+
+        yield AgentEvent(
+            kind=AgentEventType.MODEL_RESPONSE,
+            payload=RuntimeResponse(
+                message=Message(role="assistant", content="Created the file."),
+            ),
+        )
+        yield AgentEvent(
+            kind=AgentEventType.TOOL_RESULT,
+            payload=ToolResult(call_id="call-1", tool_name="write_file", output="Created hello.py"),
+        )
+        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="done")
 
 
 def _build_state(tmp_path, **overrides) -> ReplState:
@@ -142,4 +210,88 @@ async def test_collect_turn_events_does_not_apply_second_compaction_pass(tmp_pat
 
     assert events[-1].kind == "turn_completed"
     assert agent.messages == expected_messages
+
+
+def test_apply_events_skips_unmatched_tool_call_messages(tmp_path):
+    state = _build_state(tmp_path)
+    pending_call = ToolCall(call_id="call-1", tool_name="write_file", arguments={"path": "hello.py"})
+
+    state.apply_events(
+        [
+            AgentEvent(
+                kind=AgentEventType.MODEL_RESPONSE,
+                payload=RuntimeResponse(
+                    message=Message(
+                        role="assistant",
+                        content="I'll write the file.",
+                        tool_calls=(pending_call,),
+                    ),
+                    tool_calls=(pending_call,),
+                    finish_reason="tool_calls",
+                ),
+            )
+        ]
+    )
+
+    assert state.history == []
+
+
+def test_apply_events_keeps_completed_tool_call_messages(tmp_path):
+    state = _build_state(tmp_path)
+    completed_call = ToolCall(call_id="call-1", tool_name="write_file", arguments={"path": "hello.py"})
+
+    state.apply_events(
+        [
+            AgentEvent(
+                kind=AgentEventType.MODEL_RESPONSE,
+                payload=RuntimeResponse(
+                    message=Message(
+                        role="assistant",
+                        content="I'll write the file.",
+                        tool_calls=(completed_call,),
+                    ),
+                    tool_calls=(completed_call,),
+                    finish_reason="tool_calls",
+                ),
+            ),
+            AgentEvent(
+                kind=AgentEventType.TOOL_RESULT,
+                payload=ToolResult(
+                    call_id="call-1",
+                    tool_name="write_file",
+                    output="Created hello.py",
+                ),
+            ),
+        ]
+    )
+
+    assert state.history[0].role == "assistant"
+    assert state.history[0].tool_calls[0].call_id == "call-1"
+    assert state.history[1].role == "tool"
+    assert state.history[1].tool_call_id == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_collect_turn_events_discards_preapproval_batches_on_retry(tmp_path):
+    state = _build_state(tmp_path)
+    state.history.append(Message(role="user", content="write hello.py"))
+    agent = _ApprovalRetryAgent()
+
+    async def _approve(_request):
+        return ConfirmationResponse(approved=True)
+
+    events = await collect_turn_events(
+        state,
+        agent,
+        prompt_text="write hello.py",
+        approval_callback=_approve,
+    )
+
+    model_responses = [event for event in events if event.kind == AgentEventType.MODEL_RESPONSE]
+
+    assert agent.calls == 2
+    assert len(model_responses) == 1
+    assert model_responses[0].payload.message.content == "Created the file."
+    assert not any(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events)
+
 

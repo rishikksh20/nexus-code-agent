@@ -8,6 +8,7 @@ from rich.console import Console
 from nexus.config import load_config
 from nexus.integrations.mcp import MCPServerConfig, MCPServerRuntime, MCPToolSpec
 from nexus.memory.store import MemoryStore
+from nexus.models import Message, ToolCall
 from nexus.runtime.delegation import DelegationRuntime, TaskStatus
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
@@ -469,6 +470,45 @@ async def test_session_export_slash_command_writes_json(tmp_path):
     assert handled is True
     payload = json.loads(export_path.read_text(encoding="utf-8"))
     assert payload[0]["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_session_export_slash_command_preserves_tool_call_metadata(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("session-export-tool-meta"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        history=[
+            Message(
+                role="assistant",
+                content="Checking time.",
+                tool_calls=(ToolCall(call_id="call-1", tool_name="get_time", arguments={}),),
+            ),
+            Message(
+                role="tool",
+                content="2026-05-12T00:00:00Z",
+                name="get_time",
+                tool_call_id="call-1",
+            ),
+        ],
+    )
+
+    export_path = tmp_path / "session-with-tools.json"
+    router = build_router()
+    handled = await router.dispatch(state, f"/session export {export_path}")
+
+    assert handled is True
+    payload = json.loads(export_path.read_text(encoding="utf-8"))
+    assert payload[0]["tool_calls"][0]["call_id"] == "call-1"
+    assert payload[1]["tool_call_id"] == "call-1"
 
 
 # ── /context usage ────────────────────────────────────────────────────────────
