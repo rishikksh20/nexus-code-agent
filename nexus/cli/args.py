@@ -33,6 +33,7 @@ _CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], max_content_width=1
     default="text", show_default=True,
     help="Format for the final response.",
 )
+@click.option("--stream", "stream", is_flag=True, help="Enable streamed output (overrides config).")
 @click.option("--no-stream", "no_stream", is_flag=True, help="Disable streamed output.")
 @click.option("--quiet", "-q", is_flag=True, help="Suppress tool call and progress output.")
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug-level logging.")
@@ -59,6 +60,7 @@ def cli(
     max_turns: int | None,
     output: Path | None,
     output_format: str,
+    stream: bool,
     no_stream: bool,
     quiet: bool,
     verbose: bool,
@@ -77,6 +79,9 @@ def cli(
     # Enforce mutual exclusion of prompt-source flags.
     if sum([prompt is not None, prompt_file is not None, use_stdin]) > 1:
         raise click.UsageError("--prompt, --prompt-file, and --stdin are mutually exclusive.")
+
+    if stream and no_stream:
+        raise click.UsageError("--stream and --no-stream are mutually exclusive.")
 
     # Lazy import avoids a circular dependency (nexus.app imports nexus.cli.args at module level).
     from nexus.app import _dispatch_runtime  # noqa: PLC0415
@@ -138,6 +143,7 @@ def args_to_config_overrides(
     mode: str | None = None,
     max_tokens: int | None = None,
     max_turns: int | None = None,
+    stream: bool = False,
     no_stream: bool = False,
     quiet: bool = False,
     verbose: bool = False,
@@ -157,7 +163,9 @@ def args_to_config_overrides(
         overrides["compaction_hard_limit"] = max_tokens
     if max_turns:
         overrides["max_loop_iterations"] = max_turns
-    if no_stream:
+    if stream:
+        overrides["stream_output"] = True
+    elif no_stream:
         overrides["stream_output"] = False
     if quiet:
         overrides["show_tool_calls"] = False

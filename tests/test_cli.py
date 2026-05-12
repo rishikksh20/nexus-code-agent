@@ -29,6 +29,18 @@ def test_args_to_config_overrides_maps_flags():
     assert overrides["stream_output"] is False
 
 
+def test_args_to_config_overrides_stream_flag_enables_streaming():
+    overrides = args_to_config_overrides(stream=True)
+
+    assert overrides["stream_output"] is True
+
+
+def test_cli_rejects_stream_and_no_stream_together():
+    exit_code = main(["--stream", "--no-stream", "--prompt", "hello"])
+
+    assert exit_code == 2
+
+
 @pytest.mark.asyncio
 async def test_headless_runner_returns_final_response(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")

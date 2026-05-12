@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from nexus.runtime.delegation import DelegationRuntime
+from nexus.sandbox.agent_tool import SubagentDefinition
 from nexus.skills import Skill, SkillRegistry
-from nexus.tools import SubagentDefinition
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import GetTimeTool, WriteNoteTool
 from nexus.tools.subagents import (

@@ -20,15 +20,6 @@ from nexus.tools.builtin import (
     get_all_builtin_tools,
 )
 from nexus.tools.registry import create_tool_registry, get_core_tools, register_core_tools, tool_enabled
-from nexus.tools.subagents import (
-    SubAgentTool,
-    SubagentDefinition,
-    load_subagent_definitions,
-    load_subagent_definitions_from_skills,
-    register_agent_tool,
-    register_skill_subagent_tools,
-    register_subagent_tools,
-)
 
 __all__ = [
     # Base types
@@ -53,14 +44,6 @@ __all__ = [
     "WebSearchTool",
     "WriteFileTool",
     "WriteNoteTool",
-    # Subagent tools
-    "SubAgentTool",
-    "SubagentDefinition",
-    "load_subagent_definitions",
-    "load_subagent_definitions_from_skills",
-    "register_agent_tool",
-    "register_skill_subagent_tools",
-    "register_subagent_tools",
     # Factory
     "create_tool_registry",
     "get_all_builtin_tools",
