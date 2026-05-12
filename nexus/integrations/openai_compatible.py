@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import threading
 from collections.abc import AsyncGenerator
 from os import environ
@@ -169,13 +170,41 @@ class OpenAICompatibleModelClient:
         arrive.  When *stream* is ``False`` a single blocking request is made
         and the response is wrapped into equivalent :class:`StreamEvent` values
         so callers always see the same interface.
+
+        Both modes retry on transient provider errors (5xx, 429, etc.) using
+        exponential back-off so that a single 503 does not surface to the UI.
         """
         wire_payload = self.adapter.to_wire_request(request)
 
         if stream:
             wire_payload["stream"] = True
-            async for event in self._stream_sse(wire_payload):
-                yield event
+            last_error: str | None = None
+            for attempt in range(self.retries):
+                events: list[StreamEvent] = []
+                got_retryable_error = False
+                async for event in self._stream_sse(wire_payload):
+                    if event.type == StreamEventType.ERROR:
+                        error_msg = event.error or ""
+                        if any(
+                            marker in error_msg
+                            for marker in ("503", "502", "504", "429", "500", "408", "409", "connection failed")
+                        ):
+                            last_error = error_msg
+                            got_retryable_error = True
+                            break
+                        # Non-retryable: pass through immediately.
+                        yield event
+                        return
+                    events.append(event)
+                if not got_retryable_error:
+                    for ev in events:
+                        yield ev
+                    return
+                if attempt < self.retries - 1:
+                    delay = self.base_delay * (2 ** attempt) + random.uniform(0, self.jitter)
+                    await asyncio.sleep(delay)
+            # All retries exhausted — surface the last error.
+            yield StreamEvent(type=StreamEventType.ERROR, error=last_error or "Provider request failed after retries.")
         else:
             response_payload = await call_with_backoff(
                 lambda: asyncio.to_thread(self._send_request, wire_payload),
