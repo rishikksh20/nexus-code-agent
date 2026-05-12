@@ -14,14 +14,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from nexus.tools.builtin.create_file import CreateFileTool
 from nexus.tools.builtin.edit_file import EditTool
 from nexus.tools.builtin.glob import GlobTool
 from nexus.tools.builtin.grep import GrepTool
 from nexus.tools.builtin.list_dir import ListDirTool, LsTool
 from nexus.tools.builtin.memory import MemoryTool
 from nexus.tools.builtin.note import WriteNoteTool
+from nexus.tools.builtin.patch import ApplyPatchTool
 from nexus.tools.builtin.read_file import ReadFileTool
 from nexus.tools.builtin.shell import BashTool, ShellTool
+from nexus.tools.builtin.smart_edit import InsertEditIntoFileTool
 from nexus.tools.builtin.time import GetTimeTool
 from nexus.tools.builtin.todo import TodoTool
 from nexus.tools.builtin.web_fetch import WebFetchTool
@@ -34,7 +37,11 @@ __all__ = [
     # File I/O
     "ReadFileTool",
     "WriteFileTool",
+    "CreateFileTool",          # create-only (refuse to overwrite)
     "EditTool",
+    "InsertEditIntoFileTool",  # semantic context-anchor editor
+    # Patching
+    "ApplyPatchTool",
     # Search
     "GlobTool",
     "GrepTool",
@@ -72,7 +79,10 @@ def get_all_builtin_tools(
         GetTimeTool(),
         ReadFileTool(),
         WriteFileTool(),
+        CreateFileTool(),
         EditTool(),
+        InsertEditIntoFileTool(),
+        ApplyPatchTool(),
         GlobTool(),
         GrepTool(),
         ListDirTool(),

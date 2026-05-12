@@ -44,15 +44,14 @@ def init_workspace(
 def _global_config_toml() -> str:
     return "\n".join(
         [
-            'provider = "mistral"',
+            'provider = "openai-compatible"',
             'model_name = "mistral-medium-latest"',
-            '# API key resolution order for Mistral:',
-            '#   1. MISTRAL_API_KEY in workspace .env file',
-            '#   2. MISTRAL_API_KEY environment variable',
-            '#   3. NEXUS_API_KEY environment variable',
-            '# Create a .env file in your workspace root: MISTRAL_API_KEY=your_key_here',
-            '# Mistral base URL defaults to https://api.mistral.ai/v1.',
-            '# Override with MISTRAL_BASE_URL env var or api_base_url in config.',
+            '# API key and base URL are loaded from the workspace .env file:',
+            '#   API_KEY=your_key_here',
+            '#   BASE_URL=https://api.mistral.ai/v1',
+            '# You can also use provider-specific env vars:',
+            '#   MISTRAL_API_KEY, OPENAI_API_KEY, NEXUS_API_KEY',
+            '# Or override api_key and api_base_url directly in this file.',
             '# Switch to provider = "fake" for local offline use (no API key required).',
             'default_mode = "default"',
             'stream_output = true',

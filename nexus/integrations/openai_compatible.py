@@ -363,7 +363,9 @@ def resolve_provider_api_key(provider_name: str, explicit_api_key: str | None = 
     candidates: list[str] = []
     if provider_name == "mistral":
         candidates.append("MISTRAL_API_KEY")
-    candidates.extend(["NEXUS_API_KEY", "OPENAI_API_KEY"])
+    # API_KEY is the generic shorthand used in .env; check it last so provider-specific
+    # vars take priority, but it works as a universal fallback.
+    candidates.extend(["NEXUS_API_KEY", "OPENAI_API_KEY", "API_KEY"])
     for key in candidates:
         value = environ.get(key)
         if value:
@@ -377,5 +379,10 @@ def resolve_provider_api_base_url(provider_name: str, explicit_api_base_url: str
         return normalized
     if provider_name == "mistral":
         return (environ.get("MISTRAL_BASE_URL") or "https://api.mistral.ai/v1").strip().rstrip("/")
+    # BASE_URL is the generic shorthand used in .env — works for openai-compatible and
+    # any other provider that has not set a provider-specific env var above.
+    base_url_env = environ.get("BASE_URL", "").strip().rstrip("/")
+    if base_url_env:
+        return base_url_env
     return ""
 

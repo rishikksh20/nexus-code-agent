@@ -64,3 +64,4 @@ logs/
 *.key
 
 reference_code/
+workspace/

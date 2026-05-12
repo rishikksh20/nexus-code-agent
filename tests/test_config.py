@@ -13,6 +13,7 @@ def test_config_merges_local_overrides(tmp_path, monkeypatch):
     (global_root / "config.toml").write_text('model_name = "global-model"\n', encoding="utf-8")
     (workspace / ".nexus" / "config.toml").write_text('model_name = "local-model"\nstream_output = false\n', encoding="utf-8")
     monkeypatch.setenv("AGENT_DEFAULT_MODE", "auto")
+    monkeypatch.setenv("BASE_URL", "https://api.example.com/v1")
 
     config = load_config(workspace, global_root=global_root)
 
@@ -273,7 +274,7 @@ def test_config_dotenv_overrides_env_for_its_keys(tmp_path, monkeypatch):
     os.environ.pop("MISTRAL_API_KEY", None)
 
 
-def test_config_default_provider_is_mistral(tmp_path):
+def test_config_default_provider_is_openai_compatible(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     global_root = tmp_path / "global"
@@ -281,6 +282,6 @@ def test_config_default_provider_is_mistral(tmp_path):
 
     config = load_config(workspace, global_root=global_root)
 
-    assert config.provider == "mistral"
+    assert config.provider == "openai-compatible"
     assert config.model_name == "mistral-medium-latest"
     assert config.api_base_url == "https://api.mistral.ai/v1"

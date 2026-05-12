@@ -14,6 +14,7 @@
 4. [Running Nexus](#running-nexus)
    - [Interactive REPL](#interactive-repl)
    - [Headless One-Shot](#headless-one-shot)
+   - [Running in a Custom Workspace](#running-in-a-custom-workspace)
 5. [CLI Arguments](#cli-arguments)
 6. [Slash Commands](#slash-commands)
 7. [Examples](#examples)
@@ -158,6 +159,7 @@ nexus/                         # Main package
 
 tests/                         # Pytest test suite
 docs/                          # Architecture plans and tutorial reference material
+workspace/                     # Example project workspace — run nexus here
 ```
 
 ---
@@ -173,19 +175,24 @@ cd nexus-code-agent
 uv sync --group dev
 ```
 
-**Initialize workspace state** (creates `.nexus/` and `~/.nexus/`):
+**Create a `.env` file** in the workspace root (loaded automatically at startup):
+
+```bash
+# .env — all LLM settings in one place
+PROVIDER=openai-compatible
+MODEL=mistral-medium-latest
+API_KEY=your_api_key_here
+BASE_URL=https://api.mistral.ai/v1
+```
+
+> **Tip**: `BASE_URL` can point to any OpenAI-compatible endpoint — Mistral, OpenAI,
+> Ollama (`http://localhost:11434/v1`), vLLM, LM Studio, etc.
+
+**Initialize workspace state** (creates `.nexus/` config and state directories):
 
 ```bash
 uv run nexus init
 ```
-
-**Set your API key** — add it to a `.env` file in the workspace root (loaded automatically at startup):
-
-```bash
-echo 'MISTRAL_API_KEY=sk-...' > .env
-```
-
-Alternatively export it or set `api_key` in `.nexus/config.toml`.
 
 ---
 
@@ -200,7 +207,7 @@ uv run nexus
 The startup banner shows the active provider, model, and mode:
 
 ```
-Provider: mistral  |  Model: mistral-medium-latest  |  Mode: default
+Provider: openai-compatible  |  Model: mistral-medium-latest  |  Mode: default
 ```
 
 If a previous session exists it is resumed automatically:
@@ -229,6 +236,64 @@ uv run nexus --prompt "list all tools" --output result.json --output-format json
 
 In non-interactive (non-TTY) runs Nexus exits with code `3` when confirmation is required — pass `--auto-confirm` or `--mode plan` to avoid blocking.
 
+### Running in a Custom Workspace
+
+Nexus always uses the **current working directory** as the workspace root. To run the agent against the `./workspace` directory:
+
+**Step 1 — Create a `.env` inside `workspace/`** (if not already present):
+
+```bash
+cat > workspace/.env << 'EOF'
+PROVIDER=openai-compatible
+MODEL=mistral-medium-latest
+API_KEY=your_api_key_here
+BASE_URL=https://api.mistral.ai/v1
+EOF
+```
+
+**Step 2 — Initialize Nexus inside the workspace:**
+
+```bash
+cd workspace
+uv run nexus init
+```
+
+This creates `workspace/.nexus/` with a `config.toml`, `sessions/`, `memory/`, and `knowledge.md`.
+
+**Step 3 — Run the agent:**
+
+```bash
+# Interactive REPL (from inside workspace/)
+cd workspace
+uv run nexus
+
+# Headless one-shot (from inside workspace/)
+cd workspace
+uv run nexus --prompt "what files are here?"
+```
+
+You can also stay in the repo root and use a subshell:
+
+```bash
+(cd workspace && uv run nexus)
+(cd workspace && uv run nexus --prompt "summarize this project")
+```
+
+Or with a single command:
+
+```bash
+# Init
+uv run --directory workspace nexus init
+
+# Interactive REPL
+uv run --directory workspace nexus
+
+# Headless
+uv run --directory workspace nexus --prompt "summarize this project"
+```
+
+> `uv run --directory <path>` changes the working directory before running the command, so Nexus picks up `<path>/.env` and `<path>/.nexus/` automatically.
+
 ---
 
 ## CLI Arguments
@@ -243,7 +308,7 @@ In non-interactive (non-TTY) runs Nexus exits with code `3` when confirmation is
 | `--session NAME` | `-s` | Resume or create a named session |
 | `--no-session` | | Skip session persistence for this run |
 | `--model NAME` | `-m` | Override the model from config |
-| `--provider NAME` | | Override the provider (`fake`, `mistral`, `openai`, `openai-compatible`) |
+| `--provider NAME` | | Override the provider (`fake`, `openai-compatible`, `openai`, `mistral`) |
 | `--mode MODE` | | Execution mode: `plan`, `default`, or `auto` |
 | `--config FILE` | `-c` | Path to a local config TOML file |
 | `--global-config FILE` | | Path to a global config TOML file |
@@ -301,11 +366,12 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 ### Interactive REPL
 
 ```bash
+cd workspace
 uv run nexus
 ```
 
 ```
-Provider: mistral  |  Model: mistral-medium-latest  |  Mode: default
+Provider: openai-compatible  |  Model: mistral-medium-latest  |  Mode: default
 Type /help for available commands.
 
 > what files are in the nexus/tools directory?
@@ -320,16 +386,16 @@ Mode set to: auto
 Done. Added a module-level docstring describing the BaseTool protocol and ToolRegistry.
 
 > /context usage
-┌─ Context Usage ──────────────────────────────┐
-│ Provider          mistral                     │
-│ Model             mistral-medium-latest        │
-│ Context window    131,072 tokens               │
-│ System prompt     ~420 tokens                  │
-│ History           ~1,840 tokens                │
-│ Total used        ~2,260 tokens  (1.7%)        │
-│ Compaction soft   85,197 tokens  (65%)         │
-│ Compaction hard   111,411 tokens (85%)         │
-└──────────────────────────────────────────────┘
+┌─ Context Usage ──────────────────────────────────────┐
+│ Provider          openai-compatible                   │
+│ Model             mistral-medium-latest               │
+│ Context window    131,072 tokens                      │
+│ System prompt     ~420 tokens                         │
+│ History           ~1,840 tokens                       │
+│ Total used        ~2,260 tokens  (1.7%)               │
+│ Compaction soft   85,197 tokens  (65%)                │
+│ Compaction hard   111,411 tokens (85%)                │
+└──────────────────────────────────────────────────────┘
 
 > /session save
 Saved session: abc123def
@@ -351,7 +417,7 @@ uv run nexus \
   --output result.json \
   --output-format json
 
-# Override provider and model for a local Ollama endpoint
+# Use a local Ollama endpoint
 uv run nexus \
   --provider openai-compatible \
   --model qwen2.5-coder:7b \
@@ -464,14 +530,41 @@ Configuration is resolved in this order (later layers override earlier ones):
 5. `AGENT_*` environment variables
 6. CLI flags
 
+### `.env` File (Recommended)
+
+The simplest way to configure the provider is a `.env` file in the workspace root:
+
+```bash
+# .env
+PROVIDER=openai-compatible          # or: mistral, openai, fake
+MODEL=mistral-medium-latest         # any model supported by the endpoint
+API_KEY=your_api_key_here           # generic key — works for any provider
+BASE_URL=https://api.mistral.ai/v1  # any OpenAI-compatible endpoint
+```
+
+**Env var resolution order for API key:**
+
+| Provider | Lookup order |
+|---|---|
+| `openai-compatible` | `API_KEY` → `NEXUS_API_KEY` → `OPENAI_API_KEY` |
+| `mistral` | `MISTRAL_API_KEY` → `NEXUS_API_KEY` → `OPENAI_API_KEY` → `API_KEY` |
+| `openai` | `OPENAI_API_KEY` → `NEXUS_API_KEY` → `API_KEY` |
+
+**Env var resolution order for base URL:**
+
+| Provider | Lookup order |
+|---|---|
+| `openai-compatible` / `openai` | `BASE_URL` env var → `api_base_url` in config |
+| `mistral` | `MISTRAL_BASE_URL` → defaults to `https://api.mistral.ai/v1` |
+
 ### Workspace-Level Config (`.nexus/config.toml`)
 
 ```toml
-# Provider and model
-provider = "mistral"
+# Provider and model — can be omitted if set via .env
+provider = "openai-compatible"
 model_name = "mistral-medium-latest"
 api_base_url = "https://api.mistral.ai/v1"
-# api_key = "sk-..."  # or set MISTRAL_API_KEY in .env
+# api_key = "sk-..."  # prefer setting API_KEY in .env
 
 # Execution
 default_mode = "default"         # plan | default | auto
@@ -545,13 +638,6 @@ Same format as the workspace config. Applied to all workspaces; overridden by wo
 | `~/.nexus/logs/runtime.jsonl` | JSONL runtime event log |
 | `~/.nexus/logs/metrics.json` | Aggregated runtime metrics |
 
-### Provider Auth
-
-| Provider | Environment variable lookup order |
-|---|---|
-| `mistral` | `MISTRAL_API_KEY` → `NEXUS_API_KEY` → `OPENAI_API_KEY` |
-| `openai` / `openai-compatible` | `OPENAI_API_KEY` → `NEXUS_API_KEY` |
-
 ---
 
 ## Prompt Architecture
@@ -607,14 +693,35 @@ The compaction prompt (`nexus/prompts/compression.py`) uses a structured 7-secti
 | Provider | Value | Notes |
 |---|---|---|
 | Fake | `fake` | Deterministic; no API key required; used for CI |
-| Mistral | `mistral` | Default provider; `api_base_url` defaults to `https://api.mistral.ai/v1` |
-| OpenAI | `openai` | Requires `api_base_url` and `OPENAI_API_KEY` |
-| OpenAI-compatible | `openai-compatible` | Any compatible endpoint (Ollama, vLLM, LM Studio, etc.) |
+| OpenAI-compatible | `openai-compatible` | **Default.** Any compatible endpoint — Mistral, Ollama, vLLM, LM Studio, etc. Set `BASE_URL` and `API_KEY` in `.env` |
+| Mistral | `mistral` | `api_base_url` auto-defaults to `https://api.mistral.ai/v1`; key via `MISTRAL_API_KEY` |
+| OpenAI | `openai` | Requires `BASE_URL` (or `api_base_url`) and `OPENAI_API_KEY` |
+
+**Common endpoint examples:**
+
+```bash
+# Mistral (via OpenAI-compatible)
+BASE_URL=https://api.mistral.ai/v1
+MODEL=mistral-medium-latest
+
+# OpenAI
+BASE_URL=https://api.openai.com/v1
+MODEL=gpt-4o
+
+# Local Ollama
+BASE_URL=http://localhost:11434/v1
+MODEL=qwen2.5-coder:7b
+API_KEY=ollama    # Ollama accepts any non-empty key
+
+# vLLM
+BASE_URL=http://localhost:8000/v1
+MODEL=your-model-id
+```
 
 Override at runtime:
 
 ```bash
-uv run nexus --provider mistral --model mistral-large-latest --prompt "hello"
+uv run nexus --provider openai-compatible --model mistral-large-latest --prompt "hello"
 uv run nexus --provider openai-compatible --model llama3.2 --prompt "hello"
 ```
 

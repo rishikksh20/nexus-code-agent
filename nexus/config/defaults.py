@@ -7,10 +7,10 @@ from typing import Any
 
 @dataclass(slots=True)
 class AgentConfig:
-    provider: str = "mistral"
+    provider: str = "openai-compatible"
     model_name: str = "mistral-medium-latest"
     api_base_url: str = "https://api.mistral.ai/v1"
-    api_key: str = ""
+    api_key: str = ""       # Set via API_KEY in .env or api_key in config.toml
     max_output_tokens: int = 4096
     temperature: float = 0.0
     compaction_soft_limit: int = 10_000

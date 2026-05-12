@@ -131,6 +131,21 @@ def _read_environment(defaults: AgentConfig) -> dict[str, Any]:
 
     if "AGENT_MAX_TOKENS" in os.environ:
         overrides["compaction_hard_limit"] = int(os.environ["AGENT_MAX_TOKENS"])
+
+    # Generic shorthand aliases used in .env (no AGENT_ prefix).
+    # These only apply when the AGENT_-prefixed form hasn't already been set.
+    _generic_aliases: list[tuple[str, str]] = [
+        ("PROVIDER", "provider"),
+        ("MODEL", "model_name"),
+        ("API_KEY", "api_key"),
+        ("BASE_URL", "api_base_url"),
+    ]
+    for env_key, field_name in _generic_aliases:
+        if field_name not in overrides:
+            raw = os.getenv(env_key)
+            if raw:
+                overrides[field_name] = _parse_scalar(raw, getattr(defaults, field_name))
+
     return overrides
 
 
@@ -319,5 +334,10 @@ def _apply_provider_defaults(values: dict[str, Any]) -> dict[str, Any]:
             resolved["api_base_url"] = mistral_base_url_env
         elif not api_base_url:
             resolved["api_base_url"] = "https://api.mistral.ai/v1"
+    elif not api_base_url:
+        # For openai-compatible (and openai) provider, fall back to generic BASE_URL env var.
+        base_url_env = os.getenv("BASE_URL", "").strip().rstrip("/")
+        if base_url_env:
+            resolved["api_base_url"] = base_url_env
     return resolved
 
