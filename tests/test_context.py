@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from nexus.models import Message
-from nexus.runtime.context import CarryOverState, ContextCompactor, TokenEstimator, compact_messages
+from nexus.context import CarryOverState, ContextCompactor, TokenEstimator, compact_messages
 
 
 def test_compact_messages_keeps_assistant_with_tool_results_at_recent_boundary():

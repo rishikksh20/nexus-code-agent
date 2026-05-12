@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from nexus.config.defaults import AgentConfig
-from nexus.runtime.context import CarryOverState, ContextSections
+from nexus.context import CarryOverState, ContextSections
 from nexus.tools.base import ToolRegistry
 
 if TYPE_CHECKING:

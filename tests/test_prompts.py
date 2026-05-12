@@ -4,7 +4,7 @@ from pathlib import Path
 
 from nexus.config import load_config
 from nexus.prompts import build_context_sections
-from nexus.runtime.context import CarryOverState
+from nexus.context import CarryOverState
 from nexus.skills import load_skill_registry
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import GetTimeTool

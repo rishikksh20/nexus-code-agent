@@ -5,7 +5,7 @@ import pytest
 
 from nexus.models import ToolExecutionContext
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.permissions import PermissionChecker, PermissionDecision
+from nexus.security import PermissionChecker, PermissionDecision
 from nexus.tools.filesystem import (
     BashTool,
     GlobTool,

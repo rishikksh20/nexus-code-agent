@@ -22,7 +22,7 @@ from nexus.models import (
 )
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookEvent, HookExecutor
-from nexus.runtime.permissions import PermissionChecker, PermissionDecision
+from nexus.security import PermissionChecker, PermissionDecision
 from nexus.tools.base import ToolRegistry
 
 

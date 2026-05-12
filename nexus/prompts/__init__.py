@@ -5,11 +5,15 @@ Public surface
 - :func:`build_context_sections` — main entry point; returns a
   :class:`~nexus.context.ContextSections` from config + tool/skill registries.
 - :func:`_current_utc_time` — exposed at package level so tests can monkeypatch it.
-- :mod:`nexus.prompts.system` — static base-instruction sections.
+- :mod:`nexus.prompts.system` — static base-instruction sections (including
+  :func:`~nexus.prompts.system.create_loop_breaker_prompt`).
 - :mod:`nexus.prompts.compression` — LLM-based compaction prompt.
 """
 from __future__ import annotations
 
+import os
+import platform
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -42,6 +46,7 @@ def build_context_sections(
     active_skills: list[str] | None = None,
     carry_over: CarryOverState | None = None,
     current_working_directory: Path | None = None,
+    user_instructions: str = "",
 ) -> ContextSections:
     """Assemble a :class:`~nexus.context.ContextSections` from runtime state.
 
@@ -63,6 +68,8 @@ def build_context_sections(
         Compacted context carried over from previous compaction rounds.
     current_working_directory:
         Override for the agent's effective CWD (defaults to ``Path.cwd()``).
+    user_instructions:
+        Optional user-level custom instructions forwarded into the base instruction.
 
     Returns
     -------
@@ -95,15 +102,22 @@ def build_context_sections(
         carry_over_notes.extend(carry_over.active_constraints[-3:])
 
     cwd = (current_working_directory or Path.cwd()).resolve()
+    _ui = user_instructions or config.user_instructions
 
     return ContextSections(
-        base_instruction=build_base_instruction(config, tool_registry),
+        base_instruction=build_base_instruction(
+            config,
+            tool_registry,
+            user_instructions=_ui,
+        ),
         environment=[
             f"Current UTC time: {_current_utc_time()}",
+            f"Current date: {datetime.now(UTC).strftime('%A, %B %d, %Y')}",
             f"Current working directory: {cwd}",
             f"Workspace: {config.workspace_root}",
             f"Mode: {execution_mode or config.default_mode}",
             f"Provider adapter: {config.provider}",
+            f"Model: {config.model_name}",
         ],
         tools=[
             f"[{record.source}] {record.name}: {record.tool.description}"

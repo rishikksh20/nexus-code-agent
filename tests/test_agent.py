@@ -6,7 +6,7 @@ from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import ConfirmationKind, Message, RuntimeResponse, ToolCall
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.permissions import PermissionDecision
+from nexus.security import PermissionDecision
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import GetTimeTool, WriteNoteTool
 

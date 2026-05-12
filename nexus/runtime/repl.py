@@ -9,7 +9,7 @@ from typing import cast
 
 from nexus.models import AgentEvent, ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message
 from nexus.runtime.agent import Agent
-from nexus.runtime.context import ContextCompactor, TokenEstimator, prune_tool_outputs
+from nexus.context import ContextCompactor, TokenEstimator, prune_tool_outputs
 from nexus.hooks import HookEvent
 from nexus.runtime.repl_state import ReplState
 from nexus.security.manager import ApprovalScope

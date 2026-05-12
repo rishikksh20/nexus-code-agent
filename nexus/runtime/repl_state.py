@@ -9,7 +9,7 @@ from nexus.integrations.mcp import MCPServerRuntime
 from nexus.memory.store import MemoryStore
 from nexus.models import AgentEvent, Message, ToolExecutionContext
 from nexus.prompts import build_context_sections
-from nexus.runtime.context import CarryOverState, ContextBuilder, ContextCompactor, TokenEstimator, prune_tool_outputs
+from nexus.context import CarryOverState, ContextBuilder, ContextCompactor, TokenEstimator, prune_tool_outputs
 from nexus.runtime.delegation import DelegationRuntime
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookExecutor

@@ -9,7 +9,7 @@ from uuid import uuid4
 from nexus.ui import TerminalUI
 
 from nexus.models import ConfirmationKind, Message
-from nexus.runtime.hooks import HookEvent
+from nexus.hooks import HookEvent
 from nexus.runtime.repl import collect_turn_events, prompt_for_confirmation
 from nexus.runtime.repl_state import ReplState
 

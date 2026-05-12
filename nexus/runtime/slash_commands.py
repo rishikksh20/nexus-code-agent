@@ -13,7 +13,7 @@ from nexus.config import config_to_plain_dict, load_config
 from nexus.config.model_limits import get_model_context_limit
 from nexus.cli.init import _global_config_toml, _local_config_toml
 from nexus.memory.store import MemoryEntry
-from nexus.runtime.context import TokenEstimator
+from nexus.context import TokenEstimator
 from nexus.runtime.delegation import DelegationRequest
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState

@@ -41,6 +41,7 @@ class AgentConfig:
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
     approval_policy: str = "on-request"
     developer_instructions: str = ""
+    user_instructions: str = ""
     context_prune_enabled: bool = True
     context_prune_protect_tokens: int = 40_000
     context_prune_minimum_tokens: int = 20_000

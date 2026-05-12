@@ -8,7 +8,7 @@ from nexus.config import load_config
 from nexus.extensions.plugins import PluginLoader
 from nexus.memory.store import MemoryStore
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.hooks import HookExecutor
+from nexus.hooks import HookExecutor
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
 from nexus.runtime.slash_commands import build_router

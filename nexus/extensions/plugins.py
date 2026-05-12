@@ -5,7 +5,7 @@ from importlib import util
 from pathlib import Path
 from typing import Callable
 
-from nexus.runtime.hooks import HookExecutor
+from nexus.hooks import HookExecutor
 from nexus.tools.base import BaseTool, ToolRegistry
 
 

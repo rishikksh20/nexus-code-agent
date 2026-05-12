@@ -12,7 +12,7 @@ from nexus.models import ConfirmationKind, Message, RuntimeResponse, ToolCall, U
 from nexus.observability import JsonlAuditTrail, JsonlRuntimeLogger, RuntimeMetricsCollector, redact_payload, register_audit_hooks, register_default_runtime_hooks
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.hooks import HookEvent, HookExecutor
+from nexus.hooks import HookEvent, HookExecutor
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
 from nexus.memory.store import MemoryStore
