@@ -127,6 +127,7 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
         ("/provider [list|set <param> <value>]", "Show active provider and update model/session parameters."),
         ("/skills [list|show|add|remove|reload]", "Inspect and activate session skills."),
         ("/config show [scope]", "Print config for merged, local, or global scope."),
+        ("/config upgrade [local|global]", "Add new config keys from latest Nexus defaults without overwriting existing values."),
         ("/session [new|list|resume|save|export]", "Show current session or manage saved sessions."),
         ("/tools [reload]", "List tools or reload the tool registry from config."),
         ("/memory list|search|save|show", "Inspect or update workspace memory."),
@@ -358,10 +359,14 @@ async def handle_config(state: ReplState, args: list[str]) -> None:
                 ("",                        "Example hidden-path override: /config set allow_hidden_paths true", ""),
                 ("reset <key>",             "Remove a key from local config and reload.",                      "/config reset temperature"),
                 ("reload",                  "Reload all config layers from disk without restarting.",          "/config reload"),
+                ("upgrade [local|global]",  "Add new config keys introduced in latest Nexus version without changing existing values. Does not touch memory or sessions.", "/config upgrade"),
                 ("reinit [local|global]",   "Rewrite local (default) or global config to clean Nexus defaults.  Clears provider/model overrides. Does not touch sessions or memory.","/config reinit"),
                 ("help",                    "Show this help.",                                                 "/config help"),
             ),
         )
+        return
+    if args and args[0].lower() == "upgrade":
+        await _handle_config_upgrade(state, scope=args[1].lower() if len(args) > 1 else "local")
         return
     if not args or args[0].lower() == "show":
         scope = args[1].lower() if len(args) > 1 else "merged"
@@ -927,6 +932,84 @@ async def _refresh_mcp_servers(state: ReplState, target_name: str | None) -> boo
         matched = True
         await server.refresh()
     return matched
+
+
+async def _handle_config_upgrade(state: ReplState, scope: str) -> None:
+    """Merge any new template keys into the existing local or global config file.
+
+    Existing values are **never** modified — only keys that are absent from the
+    on-disk file are appended.  Memory, sessions, and storage are untouched.
+    """
+    if scope == "global":
+        path = state.config.global_config_file
+        template_str = _global_config_toml()
+        label = "global"
+    elif scope == "local":
+        path = state.config.local_config_file
+        template_str = _local_config_toml(
+            workspace_root=state.config.workspace_root,
+            project_name=state.config.project_name or state.config.workspace_root.name,
+            project_description=state.config.project_description,
+        )
+        label = "local"
+    else:
+        state.console.print(f"[red]Unknown scope '{scope}'. Use 'local' or 'global'.[/red]")
+        return
+
+    # Parse existing file and canonical template.  We intentionally skip keys
+    # that are not explicitly present in the template (e.g. computed path keys)
+    # so the upgrade is minimal and predictable.
+    existing: dict[str, object] = (
+        tomllib.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    )
+    try:
+        template_parsed: dict[str, object] = tomllib.loads(template_str)
+    except Exception as exc:  # noqa: BLE001
+        state.console.print(f"[red]Failed to parse template: {exc}[/red]")
+        return
+
+    # Keys present in the template but absent from the current file.
+    missing: dict[str, object] = {
+        k: v for k, v in template_parsed.items() if k not in existing
+    }
+
+    if not missing:
+        state.console.print(
+            f"[green]{label.capitalize()} config is already up to date — no new keys to add.[/green]"
+        )
+        return
+
+    # Append missing keys to the file (preserving all existing content + comments).
+    lines_to_add: list[str] = [
+        f"\n# Added by /config upgrade",
+    ]
+    for key, value in missing.items():
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            rendered = str(value)
+        elif isinstance(value, list):
+            rendered = "[" + ", ".join(json.dumps(item) for item in value) + "]"
+        else:
+            rendered = json.dumps(value)
+        lines_to_add.append(f"{key} = {rendered}")
+
+    current_content = path.read_text(encoding="utf-8") if path.exists() else ""
+    separator = "" if current_content.endswith("\n") else "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(current_content + separator + "\n".join(lines_to_add) + "\n", encoding="utf-8")
+
+    state.config = load_config(
+        state.config.workspace_root,
+        global_root=state.config.global_root,
+        local_config_path=state.config.local_config_file,
+        global_config_path=state.config.global_config_file,
+    )
+    state.console.print(
+        f"[green]Upgraded {label} config at {path} — added {len(missing)} new key(s):[/green]"
+    )
+    for key in missing:
+        state.console.print(f"  [bold]+[/bold] {key}")
 
 
 def _update_toml_value(path: Path, key: str, value: str) -> None:

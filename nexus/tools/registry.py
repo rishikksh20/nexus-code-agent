@@ -7,8 +7,11 @@ from __future__ import annotations
 
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import (
+    ApplyPatchTool,
+    CreateFileTool,
     EditTool,
     GetTimeTool,
+    InsertEditIntoFileTool,
     MemoryTool,
     TodoTool,
     WebFetchTool,
@@ -43,7 +46,10 @@ def get_core_tools(config) -> list:
         WriteNoteTool(max_bytes=int(config.write_note_max_bytes)),
         ReadFileTool(),
         WriteFileTool(),
+        CreateFileTool(),
         EditTool(),
+        InsertEditIntoFileTool(),
+        ApplyPatchTool(),
         ModifyFileTool(),
         ReplaceTextTool(),
         GlobTool(),

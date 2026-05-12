@@ -44,6 +44,7 @@ def build_context_sections(
     carry_over: CarryOverState | None = None,
     current_working_directory: Path | None = None,
     user_instructions: str = "",
+    memory_entries: list[str] | None = None,
 ) -> ContextSections:
     """Assemble a :class:`~nexus.context.ContextSections` from runtime state.
 
@@ -67,6 +68,12 @@ def build_context_sections(
         Override for the agent's effective CWD (defaults to ``Path.cwd()``).
     user_instructions:
         Optional user-level custom instructions forwarded into the base instruction.
+    memory_entries:
+        Pre-formatted memory strings (``"key: content"`` lines) loaded from the
+        :class:`~nexus.memory.store.MemoryStore`.  When supplied they are
+        surfaced in the ``## Persistent Memory`` section of the system prompt so
+        the agent always has access to stored user/context knowledge regardless
+        of the current query.
 
     Returns
     -------
@@ -122,6 +129,7 @@ def build_context_sections(
         ],
         skills=skills,
         project_notes=project_notes,
+        memory=list(memory_entries) if memory_entries else [],
         carry_over=carry_over_notes,
         task_focus=[task_input],
     )

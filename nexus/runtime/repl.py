@@ -479,7 +479,14 @@ def _history_safe_completed_events(events: list[AgentEvent]) -> list[AgentEvent]
                 tool_call for tool_call in message.tool_calls
                 if tool_call.call_id in completed_tool_calls
             )
-            if not completed_calls and not message.content:
+            if not completed_calls:
+                # No tool calls from this response were completed before the
+                # interruption point.  The textual content (if any) is just
+                # narration that the model will regenerate on re-run.  Including
+                # it as a tool-call-free assistant message would produce an
+                # invalid message sequence (history ending with "assistant") and
+                # causes HTTP 400 on providers like Mistral that require the last
+                # message to be role user or tool.
                 continue
             committed.append(
                 AgentEvent(

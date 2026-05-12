@@ -18,6 +18,10 @@ class ContextSections:
     tools: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
     project_notes: list[str] = field(default_factory=list)
+    # Persistent memory entries loaded from the MemoryStore at session start.
+    # Each entry is a pre-formatted string: "key: content" (possibly multi-line).
+    # Present in every turn so the agent always knows what the user has stored.
+    memory: list[str] = field(default_factory=list)
     carry_over: list[str] = field(default_factory=list)
     task_focus: list[str] = field(default_factory=list)
 
@@ -39,6 +43,13 @@ class ContextBuilder:
             )
         if sections.skills:
             blocks.append("## Skills\n\n" + "\n\n".join(sections.skills))
+        if sections.memory:
+            blocks.append(
+                "## Persistent Memory\n"
+                "The following entries were stored in memory across previous sessions "
+                "and are always available to you:\n"
+                + "\n".join(f"- {item}" for item in sections.memory)
+            )
         if sections.project_notes:
             blocks.append(
                 "## Project Notes\n"

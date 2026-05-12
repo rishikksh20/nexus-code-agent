@@ -45,6 +45,14 @@ class ApprovalManager:
     _once_approved: dict[str, int] = field(default_factory=dict, repr=False)
     _turn_mutating_approved: bool = field(default=False, repr=False)
     _turn_refused: set[str] = field(default_factory=set, repr=False)
+    # Normalised (case-folded + whitespace-collapsed) once-approvals.
+    # The agent re-runs from scratch after user approval, so the LLM may
+    # regenerate the same tool call with minor formatting differences (e.g.
+    # "rishikesh" → "Rishikesh").  Storing a normalised key means a single
+    # "yes" never prompts twice for semantically-identical calls.  Structural
+    # differences (different paths, keys, commands) still produce different
+    # normalised keys, so cross-invocation security is preserved.
+    _once_normalized: dict[str, int] = field(default_factory=dict, repr=False)
 
     # ------------------------------------------------------------------
     # Turn lifecycle
@@ -60,6 +68,7 @@ class ApprovalManager:
         self._turn_approved.clear()
         self._turn_mutating_approved = False
         self._turn_refused.clear()
+        self._once_normalized.clear()
 
     # ------------------------------------------------------------------
     # Approval recording
@@ -76,6 +85,12 @@ class ApprovalManager:
         key = _approval_key(tool_name, arguments)
         if scope is ApprovalScope.ONCE:
             self._once_approved[key] = self._once_approved.get(key, 0) + 1
+            # Also store a normalised (case-folded) copy so that a re-run of
+            # the agent that regenerates the same call with minor formatting
+            # differences (e.g. different capitalisation of a value) doesn't
+            # prompt the user a second time.
+            norm_key = _normalized_approval_key(tool_name, arguments)
+            self._once_normalized[norm_key] = self._once_normalized.get(norm_key, 0) + 1
             return
         self._turn_approved.add(key)
         if scope is ApprovalScope.SESSION:
@@ -115,13 +130,17 @@ class ApprovalManager:
         """Return ``True`` if *tool_name* is currently pre-approved.
 
         A tool invocation is pre-approved when its normalized signature has been
-        explicitly approved at session or turn scope by the user.
+        explicitly approved at session or turn scope by the user, OR when a
+        case-/whitespace-normalised once-approval exists (covering re-runs where
+        the LLM may regenerate the same tool call with subtly different
+        formatting, e.g. different capitalisation of a value).
         """
         once_key = _approval_key(tool_name, arguments)
         return (
             once_key in self._session_approved
             or once_key in self._turn_approved
             or self._once_approved.get(once_key, 0) > 0
+            or self._once_normalized.get(_normalized_approval_key(tool_name, arguments), 0) > 0
         )
 
     def consume_approval(
@@ -133,12 +152,21 @@ class ApprovalManager:
         """Consume a one-time approval after the matching invocation executes."""
         key = _approval_key(tool_name, arguments)
         remaining = self._once_approved.get(key, 0)
-        if remaining <= 0:
-            return
-        if remaining == 1:
-            self._once_approved.pop(key, None)
-            return
-        self._once_approved[key] = remaining - 1
+        if remaining > 0:
+            if remaining == 1:
+                self._once_approved.pop(key, None)
+            else:
+                self._once_approved[key] = remaining - 1
+        # Also consume the normalised entry so that subsequent invocations of
+        # the same tool with the same normalised arguments are not silently
+        # auto-approved after the matched execution.
+        norm_key = _normalized_approval_key(tool_name, arguments)
+        norm_remaining = self._once_normalized.get(norm_key, 0)
+        if norm_remaining > 0:
+            if norm_remaining == 1:
+                self._once_normalized.pop(norm_key, None)
+            else:
+                self._once_normalized[norm_key] = norm_remaining - 1
 
     def is_turn_wide_mutating_preapproved(
         self,
@@ -196,6 +224,18 @@ class ApprovalManager:
 def _approval_key(tool_name: str, arguments: dict[str, Any] | None) -> str:
     normalised_arguments = json.dumps(arguments or {}, sort_keys=True, separators=(",", ":"), default=str)
     return f"{tool_name}:{normalised_arguments}"
+
+
+def _normalized_approval_key(tool_name: str, arguments: dict[str, Any] | None) -> str:
+    """Return a case-folded, whitespace-collapsed approval key.
+
+    Used as a secondary lookup so that the LLM re-generating a tool call with
+    minor formatting differences (e.g. ``"rishikesh"`` vs ``"Rishikesh"``) is
+    treated as the same invocation.  Structural differences (different paths,
+    keys, commands) still produce distinct normalised keys.
+    """
+    raw = _approval_key(tool_name, arguments)
+    return " ".join(raw.lower().split())
 
 
 def _requires_fresh_turn_approval(tool_name: str, risk_level: str) -> bool:

@@ -74,6 +74,43 @@ def sanitize_session_messages(messages: list[Message]) -> list[Message]:
     return sanitized
 
 
+def prepare_messages_for_model(messages: list[Message]) -> list[Message]:
+    """Sanitize *messages* and strip any trailing assistant turn that would
+    cause an HTTP 400 from strict providers (e.g. Mistral).
+
+    Providers like Mistral require the last message to be role ``user`` or
+    ``tool`` (or ``assistant`` with ``prefix: true``, which Nexus does not
+    use).  A trailing assistant message can appear when the session history is
+    replayed after an approval loop or when loading a session that was saved
+    mid-turn.  We strip it here rather than at save-time so the stored history
+    stays intact and round-trips correctly.
+    """
+    sanitized = sanitize_session_messages(messages)
+
+    # Strip trailing assistant messages with unresolved tool_calls.
+    # An assistant message is "resolved" when every one of its tool_calls has
+    # a corresponding tool-result message that follows it in the history.
+    while sanitized and sanitized[-1].role == "assistant":
+        last = sanitized[-1]
+        if not last.tool_calls:
+            # Text-only trailing assistant — Mistral rejects this unless the
+            # caller sets prefix=true.  Strip it: it will be regenerated.
+            sanitized.pop()
+            continue
+        tool_result_ids = {
+            msg.tool_call_id
+            for msg in sanitized
+            if msg.role == "tool" and msg.tool_call_id
+        }
+        if all(tc.call_id in tool_result_ids for tc in last.tool_calls):
+            # All results are present — the trailing assistant message is valid.
+            break
+        # Some tool_calls have no results yet — strip the incomplete assistant.
+        sanitized.pop()
+
+    return sanitized
+
+
 @dataclass(slots=True)
 class SessionSnapshot:
     session_id: str

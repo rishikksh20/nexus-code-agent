@@ -11,7 +11,7 @@ from nexus.context import CarryOverState, ContextBuilder, ContextCompactor, Toke
 from nexus.runtime.delegation import DelegationRuntime
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookExecutor
-from nexus.runtime.sessions import SessionSnapshot, SessionStore, sanitize_session_messages
+from nexus.runtime.sessions import SessionSnapshot, SessionStore, prepare_messages_for_model, sanitize_session_messages
 from nexus.security.manager import ApprovalManager
 from nexus.skills import SkillRegistry
 from nexus.tools.base import ToolRegistry
@@ -87,10 +87,8 @@ class ReplState:
             skill_registry=self.skill_registry,
             active_skills=self.active_skills,
             carry_over=self.carry_over,
+            memory_entries=_load_all_memory(self.memory_store),
         )
-        memory_matches = self.memory_store.search(prompt_text)
-        if memory_matches:
-            sections.project_notes.extend(entry.content for entry in memory_matches[:3])
         self.current_system_prompt = ContextBuilder().build(sections)
         return self.current_system_prompt
 
@@ -112,7 +110,7 @@ class ReplState:
             self.config.compaction_hard_limit,
         )
         source_history = self.history if history is None else history
-        model_messages = sanitize_session_messages(list(source_history))
+        model_messages = prepare_messages_for_model(list(source_history))
         if self.config.context_prune_enabled:
             prune_outputs(
                 model_messages,
@@ -207,4 +205,24 @@ def _is_continue_prompt(value: str) -> bool:
     normalized = value.strip().casefold().strip("`'\"")
     normalized = normalized.rstrip(".!?")
     return normalized == "continue"
+
+
+def _load_all_memory(store: MemoryStore) -> list[str]:
+    """Return all entries from *store* as pre-formatted ``"key: content"`` strings.
+
+    Called once per system-prompt build so the agent always sees the full
+    persistent memory regardless of which session it is in.  Multi-line values
+    are preserved; the caller (ContextBuilder) wraps each item in a list bullet.
+    """
+    keys = store.list_keys()
+    entries: list[str] = []
+    for key in keys:
+        entry = store.load(key)
+        if entry is None:
+            continue
+        content = entry.content.strip()
+        if content:
+            entries.append(f"{key}: {content}")
+    return entries
+
 
