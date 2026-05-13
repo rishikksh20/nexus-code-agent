@@ -37,132 +37,27 @@ def prompt_for_confirmation(
     return _approval_response_from_answer(answer, approval_policy)
 
 
-async def collect_turn_events(
+async def run_agent_turn(
     state: ReplState,
     agent: Agent,
     *,
     prompt_text: str,
+    ui: TerminalUI | None = None,
     approval_callback: ConfirmationCallback | None = None,
     auto_confirm: bool = False,
 ) -> list[AgentEvent]:
-    committed_events: list[AgentEvent] = []
-    working_history = list(state.history)
-    initial_prompt_text = prompt_text
-    turn_id = state.current_turn_id or uuid4().hex[:12]
-    trace_id = state.current_trace_id or uuid4().hex
-    started_at = time.perf_counter()
+    """Run one user turn through the agentic loop and return all events.
 
-    while True:
-        prepared_turn = state.prepare_turn(
-            prompt_text,
-            turn_id=turn_id,
-            trace_id=trace_id,
-            history=working_history,
-            compactor_factory=ContextCompactor,
-            estimator_factory=TokenEstimator,
-        )
-        events: list[AgentEvent] = [
-            event
-            async for event in agent.run(
-                prepared_turn.model_messages,
-                prepared_turn.context,
-                system_prompt=prepared_turn.system_prompt,
-                model_name=state.config.model_name,
-                mode=state.mode,
-                approval_manager=state.approval_manager,
-                approval_callback=approval_callback,
-                auto_confirm=auto_confirm,
-                auto_confirm_read_only=state.config.auto_confirm_read_only,
-                temperature=state.config.temperature,
-                max_output_tokens=state.config.max_output_tokens,
-                max_turns=state.config.max_loop_iterations,
-                max_tool_calls_per_turn=state.config.max_tool_calls_per_turn,
-            )
-        ]
-        confirmation_index = next((index for index, event in enumerate(events) if event.kind == "confirmation_requested"), None)
-        if confirmation_index is not None:
-            committed_prefix = _history_safe_completed_events(events[:confirmation_index])
-            if committed_prefix:
-                apply_events_to_messages(working_history, committed_prefix)
-                committed_events.extend(committed_prefix)
-        confirmation = None if confirmation_index is None else events[confirmation_index]
-        if confirmation is None:
-            committed_events.extend(events)
-            _sync_paused_turn_state(state, committed_events, prompt_text=initial_prompt_text)
-            _record_turn_telemetry(state, committed_events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="completed")
-            return committed_events
-        confirmation_request = cast(ConfirmationRequest, confirmation.payload)
+    **User turn** ends when this function is called (the interactive loop in
+    :func:`run_repl` already consumed the raw input).  Everything that happens
+    inside — model streaming, tool calls, approvals — is the **AI turn** driven
+    by :meth:`Agent.run`.
 
-        if auto_confirm and confirmation_request.kind is ConfirmationKind.APPROVAL:
-            state.approval_manager.record_approval(
-                confirmation_request.tool_name,
-                _approval_scope_for_policy(state.approval_manager.policy),
-                arguments=confirmation_request.arguments,
-            )
-            continue
-
-        if approval_callback is None:
-            confirmation_event = cast(AgentEvent, confirmation)
-            pending_events = [*committed_events, confirmation_event]
-            _record_turn_telemetry(state, pending_events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="awaiting_confirmation")
-            return pending_events
-
-        response = await approval_callback(confirmation_request)
-        if confirmation_request.kind is ConfirmationKind.APPROVAL and response.approved:
-            _record_approval_response(state, confirmation_request, response)
-            continue
-        if confirmation_request.kind is ConfirmationKind.APPROVAL and response.denied:
-            state.approval_manager.record_refusal(
-                confirmation_request.tool_name,
-                arguments=confirmation_request.arguments,
-            )
-            continue
-        if confirmation_request.kind is ConfirmationKind.CLARIFICATION and response.clarification:
-            clarification_text = (
-                f"Clarification for {confirmation_request.tool_name} "
-                f"({confirmation_request.payload.get('field', 'value')}): {response.clarification}"
-            )
-            clarification_message = Message(role="user", content=clarification_text)
-            state.history.append(clarification_message)
-            working_history.append(clarification_message)
-            prompt_text = clarification_text
-            continue
-        confirmation_event = cast(AgentEvent, confirmation)
-        pending_events = [*committed_events, confirmation_event]
-        _sync_paused_turn_state(state, pending_events, prompt_text=initial_prompt_text)
-        _record_turn_telemetry(state, pending_events, turn_id=turn_id, trace_id=trace_id, duration_ms=(time.perf_counter() - started_at) * 1000, status="stopped")
-        return pending_events
-
-    _sync_paused_turn_state(state, committed_events, prompt_text=initial_prompt_text)
-    return []
-
-
-def apply_events_to_history(state: ReplState, events: list) -> None:
-    state.apply_events(events)
-
-
-def _render_event(ui: TerminalUI, event: AgentEvent, *, stream_output: bool, show_tool_calls: bool) -> None:
-    """Render a single agent event — delegates to :class:`TerminalUI`."""
-    ui.render_event(event, stream_output=stream_output, show_tool_calls=show_tool_calls)
-
-
-def render_events(ui: TerminalUI, events: list, *, stream_output: bool, show_tool_calls: bool) -> None:
-    """Render a list of agent events — delegates to :class:`TerminalUI`."""
-    ui.render_events(events, stream_output=stream_output, show_tool_calls=show_tool_calls)
-
-
-async def _stream_turn_live(
-    state: ReplState,
-    agent: Agent,
-    prompt_text: str,
-    ui: TerminalUI,
-    *,
-    approval_callback: ConfirmationCallback | None = None,
-    auto_confirm: bool = False,
-) -> list[AgentEvent]:
-    """Run the agent turn, rendering each event via *ui* as it arrives.
-
-    Returns all collected events so the caller can apply them to history.
+    Parameters
+    ----------
+    ui:
+        When provided each event is rendered live as it arrives (interactive
+        REPL).  When ``None`` events are silently collected (headless mode).
     """
     committed_events: list[AgentEvent] = []
     working_history = list(state.history)
@@ -182,6 +77,8 @@ async def _stream_turn_live(
         )
 
         batch: list[AgentEvent] = []
+
+        # ── AI turn: stream model responses and tool calls ──────────────────
         async for event in agent.run(
             prepared_turn.model_messages,
             prepared_turn.context,
@@ -197,15 +94,19 @@ async def _stream_turn_live(
             max_turns=state.config.max_loop_iterations,
             max_tool_calls_per_turn=state.config.max_tool_calls_per_turn,
         ):
-            _render_event(
-                ui,
-                event,
-                stream_output=state.config.stream_output,
-                show_tool_calls=state.config.show_tool_calls,
-            )
+            if ui is not None:
+                ui.render_event(
+                    event,
+                    stream_output=state.config.stream_output,
+                    show_tool_calls=state.config.show_tool_calls,
+                )
             batch.append(event)
 
-        confirmation_index = next((index for index, event in enumerate(batch) if event.kind == "confirmation_requested"), None)
+        # ── confirmation / clarification handling ────────────────────────────
+        confirmation_index = next(
+            (index for index, event in enumerate(batch) if event.kind == "confirmation_requested"),
+            None,
+        )
 
         if confirmation_index is not None:
             committed_prefix = _history_safe_completed_events(batch[:confirmation_index])
@@ -216,6 +117,7 @@ async def _stream_turn_live(
         confirmation = None if confirmation_index is None else batch[confirmation_index]
 
         if confirmation is None:
+            # Normal completion — no confirmation needed.
             committed_events.extend(batch)
             _sync_paused_turn_state(state, committed_events, prompt_text=initial_prompt_text)
             _record_turn_telemetry(
@@ -263,6 +165,7 @@ async def _stream_turn_live(
             working_history.append(clarification_message)
             prompt_text = clarification_text
             continue
+
         confirmation_event = cast(AgentEvent, confirmation)
         pending_events = [*committed_events, confirmation_event]
         _sync_paused_turn_state(state, pending_events, prompt_text=initial_prompt_text)
@@ -277,6 +180,12 @@ async def _stream_turn_live(
 
 
 async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: bool = False) -> None:
+    """Interactive REPL — the outer **user-turn** loop.
+
+    Each iteration is one *user turn*: read a line, dispatch slash commands or
+    hand the input to :func:`run_agent_turn` which drives the *AI turn* (model
+    streaming + tool execution) via :meth:`Agent.run`.
+    """
     ui: TerminalUI = state.console
     cfg = state.config
     ui.print_banner(cfg.provider, cfg.model_name, state.mode.value, workspace=cfg.workspace_root)
@@ -315,6 +224,7 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
 
         return _approval_response_from_answer(answer, _approval_policy_for_request(request))
 
+    # ── User-turn loop ───────────────────────────────────────────────────────
     while not state.should_exit:
         try:
             raw_input = ui.prompt_user().strip()
@@ -351,11 +261,12 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
         if not resumed_paused_turn:
             state.approval_manager.begin_turn()
         try:
-            events = await _stream_turn_live(
+            # Hand off to the AI turn — model + tools run inside run_agent_turn.
+            events = await run_agent_turn(
                 state,
                 agent,
-                effective_prompt,
-                ui,
+                prompt_text=effective_prompt,
+                ui=ui,
                 approval_callback=ask_for_approval,
             )
         except Exception as exc:  # noqa: BLE001
@@ -380,6 +291,12 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
             },
         )
     state.session_store.save(state.session)
+
+
+# ---------------------------------------------------------------------------
+# Approval helpers
+# ---------------------------------------------------------------------------
+
 def _approval_scope_for_policy(policy: ApprovalPolicy) -> ApprovalScope:
     if policy is ApprovalPolicy.APPROVE_TURN:
         return ApprovalScope.TURN
@@ -445,6 +362,10 @@ def _supports_turn_wide_approval(request: ConfirmationRequest) -> bool:
     return not (request.tool_name == "bash" and risk_level in {"high", "dangerous"})
 
 
+# ---------------------------------------------------------------------------
+# Paused-turn and telemetry helpers
+# ---------------------------------------------------------------------------
+
 def _sync_paused_turn_state(state: ReplState, events: list[AgentEvent], *, prompt_text: str) -> None:
     if _turn_finished_with_tool_call_limit(events):
         state.mark_paused_turn(prompt_text)
@@ -459,6 +380,43 @@ def _turn_finished_with_tool_call_limit(events: list[AgentEvent]) -> bool:
     )
     return bool(turn_completed and turn_completed.payload == "tool_call_limit")
 
+
+def _record_turn_telemetry(state: ReplState, events: list, *, turn_id: str, trace_id: str, duration_ms: float, status: str) -> None:
+    usage = None
+    tool_calls = 0
+    for event in events:
+        if event.kind == "model_response" and event.payload.usage is not None:
+            usage = event.payload.usage
+        elif event.kind == "tool_call_requested":
+            tool_calls += 1
+    turns = state.session.metadata.setdefault("turns", [])
+    turns.append(
+        {
+            "session_id": state.session.session_id,
+            "turn_id": turn_id,
+            "trace_id": trace_id,
+            "tool_calls": tool_calls,
+            "duration_ms": round(duration_ms, 2),
+            "status": status,
+            "usage": {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+                "estimated_cost_usd": usage.estimated_cost_usd,
+                "provider": usage.provider,
+                "model": usage.model,
+            }
+            if usage is not None
+            else None,
+        }
+    )
+    if len(turns) > 20:
+        del turns[:-20]
+
+
+# ---------------------------------------------------------------------------
+# History helpers (used by confirmation retry logic)
+# ---------------------------------------------------------------------------
 
 def _history_safe_completed_events(events: list[AgentEvent]) -> list[AgentEvent]:
     completed_tool_calls = {
@@ -482,13 +440,6 @@ def _history_safe_completed_events(events: list[AgentEvent]) -> list[AgentEvent]
                 if tool_call.call_id in completed_tool_calls
             )
             if not completed_calls:
-                # No tool calls from this response were completed before the
-                # interruption point.  The textual content (if any) is just
-                # narration that the model will regenerate on re-run.  Including
-                # it as a tool-call-free assistant message would produce an
-                # invalid message sequence (history ending with "assistant") and
-                # causes HTTP 400 on providers like Mistral that require the last
-                # message to be role user or tool.
                 continue
             committed.append(
                 AgentEvent(
@@ -523,41 +474,3 @@ def _history_safe_completed_events(events: list[AgentEvent]) -> list[AgentEvent]
         committed.append(event)
     return committed
 
-
-
-
-def _build_system_prompt(state: ReplState, prompt_text: str) -> str:
-    return state.build_system_prompt(prompt_text)
-
-
-def _record_turn_telemetry(state: ReplState, events: list, *, turn_id: str, trace_id: str, duration_ms: float, status: str) -> None:
-    usage = None
-    tool_calls = 0
-    for event in events:
-        if event.kind == "model_response" and event.payload.usage is not None:
-            usage = event.payload.usage
-        elif event.kind == "tool_call_requested":
-            tool_calls += 1
-    turns = state.session.metadata.setdefault("turns", [])
-    turns.append(
-        {
-            "session_id": state.session.session_id,
-            "turn_id": turn_id,
-            "trace_id": trace_id,
-            "tool_calls": tool_calls,
-            "duration_ms": round(duration_ms, 2),
-            "status": status,
-            "usage": {
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-                "total_tokens": usage.total_tokens,
-                "estimated_cost_usd": usage.estimated_cost_usd,
-                "provider": usage.provider,
-                "model": usage.model,
-            }
-            if usage is not None
-            else None,
-        }
-    )
-    if len(turns) > 20:
-        del turns[:-20]

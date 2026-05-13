@@ -34,7 +34,6 @@ class AgentConfig:
     log_level: str = "WARNING"
     log_format: str = "text"
     log_dir: Path = field(default_factory=Path)
-    write_note_max_bytes: int = 65_536
     project_name: str = ""
     project_description: str = ""
     allowed_tools: list[str] = field(default_factory=list)

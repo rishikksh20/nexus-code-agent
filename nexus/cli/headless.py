@@ -10,7 +10,7 @@ from nexus.ui import TerminalUI
 
 from nexus.models import ConfirmationKind, Message
 from nexus.hooks import HookEvent
-from nexus.runtime.repl import collect_turn_events, prompt_for_confirmation
+from nexus.runtime.repl import run_agent_turn, prompt_for_confirmation
 from nexus.runtime.repl_state import ReplState
 
 
@@ -59,7 +59,7 @@ async def run_headless(
     if not resumed_paused_turn:
         state.approval_manager.begin_turn()
     try:
-        events = await collect_turn_events(
+        events = await run_agent_turn(
             state,
             agent,
             prompt_text=effective_prompt,

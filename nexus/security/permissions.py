@@ -213,7 +213,7 @@ class PermissionChecker:
         arguments: dict[str, Any],
         context: ToolExecutionContext | None,
     ) -> PermissionResult | None:
-        _WRITE_TOOLS = {"write_note", "write_file", "modify_file", "replace_text"}
+        _WRITE_TOOLS = {"write_file", "modify_file"}
         if tool.name not in _WRITE_TOOLS or context is None:
             return None
 

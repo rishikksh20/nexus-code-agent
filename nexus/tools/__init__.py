@@ -16,7 +16,6 @@ from nexus.tools.builtin import (
     WebFetchTool,
     WebSearchTool,
     WriteFileTool,
-    WriteNoteTool,
     get_all_builtin_tools,
 )
 from nexus.tools.registry import create_tool_registry, get_core_tools, register_core_tools, tool_enabled
@@ -43,7 +42,6 @@ __all__ = [
     "WebFetchTool",
     "WebSearchTool",
     "WriteFileTool",
-    "WriteNoteTool",
     # Factory
     "create_tool_registry",
     "get_all_builtin_tools",

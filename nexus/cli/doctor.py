@@ -98,12 +98,6 @@ def build_doctor_report(config, registry, resources) -> DoctorReport:
                     "default_mode is auto; keep default or plan for narrower approval boundaries in production.",
                     pass_detail=f"default_mode is {config.default_mode}",
                 ),
-                _status(
-                    "write_note_limit",
-                    config.write_note_max_bytes > 0,
-                    f"write_note payload limit: {config.write_note_max_bytes} bytes",
-                    fail_detail="write_note_max_bytes must be greater than 0.",
-                ),
                 _sandbox_check(config),
             ],
         ),

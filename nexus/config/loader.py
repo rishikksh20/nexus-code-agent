@@ -236,7 +236,6 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         "max_loop_iterations",
         "max_tool_calls_per_turn",
         "max_sessions_retained",
-        "write_note_max_bytes",
         "delegation_message_history_limit",
         "sandbox_timeout_seconds",
         "context_prune_protect_tokens",

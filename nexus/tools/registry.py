@@ -8,7 +8,6 @@ from __future__ import annotations
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import (
     ApplyPatchTool,
-    CreateFileTool,
     EditTool,
     GetTimeTool,
     InsertEditIntoFileTool,
@@ -16,7 +15,6 @@ from nexus.tools.builtin import (
     TodoTool,
     WebFetchTool,
     WebSearchTool,
-    WriteNoteTool,
 )
 from nexus.tools.filesystem import (
     BashTool,
@@ -25,7 +23,6 @@ from nexus.tools.filesystem import (
     LsTool,
     ModifyFileTool,
     ReadFileTool,
-    ReplaceTextTool,
     WriteFileTool,
 )
 
@@ -43,15 +40,12 @@ def get_core_tools(config) -> list:
     """Return pre-constructed first-party coding-agent tool instances."""
     return [
         GetTimeTool(),
-        WriteNoteTool(max_bytes=int(config.write_note_max_bytes)),
         ReadFileTool(),
         WriteFileTool(),
-        CreateFileTool(),
         EditTool(),
         InsertEditIntoFileTool(),
         ApplyPatchTool(),
         ModifyFileTool(),
-        ReplaceTextTool(),
         GlobTool(),
         GrepTool(),
         LsTool(),
