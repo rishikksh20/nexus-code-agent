@@ -34,6 +34,7 @@ from nexus.extensions.plugins import PluginLoader
 from nexus.hooks import HookExecutor, setup_hooks
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.integrations.mcp import MCPServerConfig, MCPServerRuntime, MCPToolAdapter
+from nexus.integrations.ollama import OllamaModelClient, resolve_ollama_base_url
 from nexus.integrations.openai_compatible import (
     OpenAICompatibleModelClient,
     resolve_provider_api_key,
@@ -325,6 +326,11 @@ class NexusApp:
         """Construct the LLM client from the current config."""
         if self.config.provider == "fake":
             return FakeModelClient()
+        if self.config.provider == "ollama":
+            return OllamaModelClient(
+                base_url=resolve_ollama_base_url(self.config.api_base_url or None),
+                model_name=self.config.model_name,
+            )
         if self.config.provider in {"mistral", "openai-compatible", "openai"}:
             explicit_key = self.config.api_key or None
             return OpenAICompatibleModelClient(
@@ -377,6 +383,23 @@ def provider_error_message(exc: Exception, config) -> str:
 
     msg = str(exc)
     provider = config.provider
+
+    # Ollama-specific: no API key needed, but server must be running.
+    if provider == "ollama":
+        if "connection failed" in msg.lower() or "urlopen" in msg.lower() or "connection refused" in msg.lower():
+            base_url = getattr(config, "api_base_url", "http://localhost:11434") or "http://localhost:11434"
+            return (
+                f"Could not connect to Ollama at [bold]{base_url}[/bold]. "
+                "Make sure Ollama is running ([bold]ollama serve[/bold]) and the model is pulled "
+                f"([bold]ollama pull {config.model_name}[/bold])."
+            )
+        if "404" in msg:
+            return (
+                f"Model [bold]{config.model_name}[/bold] not found in Ollama. "
+                f"Run [bold]ollama pull {config.model_name}[/bold] to download it."
+            )
+        return f"Ollama error: {msg}"
+
     has_key = bool(
         config.api_key
         or environ.get("MISTRAL_API_KEY")

@@ -195,7 +195,7 @@ def _parse_scalar(raw_value: str, template: Any) -> Any:
 def _validate_config_values(values: dict[str, Any]) -> None:
     valid_modes = {"plan", "default", "auto"}
     valid_log_formats = {"text", "json"}
-    valid_providers = {"fake", "mistral", "openai", "openai-compatible"}
+    valid_providers = {"fake", "mistral", "openai", "openai-compatible", "ollama"}
     valid_approval_policies = {
         "on-request", "approve-turn", "approve-session", "auto", "plan"
     }
@@ -334,6 +334,15 @@ def _apply_provider_defaults(values: dict[str, Any]) -> dict[str, Any]:
             resolved["api_base_url"] = mistral_base_url_env
         elif not api_base_url:
             resolved["api_base_url"] = "https://api.mistral.ai/v1"
+    elif provider == "ollama":
+        # Default to localhost:11434; strip /v1 suffix if user copied it from openai-compatible.
+        if not api_base_url:
+            ollama_host = os.getenv("OLLAMA_HOST", "").strip().rstrip("/")
+            base_url_env = os.getenv("BASE_URL", "").strip().rstrip("/")
+            resolved["api_base_url"] = ollama_host or base_url_env or "http://localhost:11434"
+        # Strip /v1 suffix users may have left from switching providers.
+        if str(resolved["api_base_url"]).endswith("/v1"):
+            resolved["api_base_url"] = str(resolved["api_base_url"])[:-3]
     elif not api_base_url:
         # For openai-compatible (and openai) provider, fall back to generic BASE_URL env var.
         base_url_env = os.getenv("BASE_URL", "").strip().rstrip("/")

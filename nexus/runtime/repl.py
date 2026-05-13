@@ -196,6 +196,8 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
     ui.print_help_hint()
     if cfg.provider == "fake":
         ui.print_fake_provider_notice()
+    elif cfg.provider == "ollama":
+        pass  # local provider — no API key required
     elif cfg.provider in {"mistral", "openai", "openai-compatible"}:
         from os import environ
         has_key = bool(
