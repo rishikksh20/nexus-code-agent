@@ -1,386 +1,181 @@
 # Nexus Codebase Context
 
-This document is a working context guide for future development on Nexus. It captures the current implementation shape, code style, runtime flow, extension surfaces, and design constraints that matter when changing the codebase.
+Last updated: 2026-05-15
 
-## Project Shape
+This document is the working map for the live Nexus codebase. It intentionally excludes `reference_code/`; that directory is historical reference material and should only be opened when a user explicitly asks for it.
 
-Nexus is a CLI-first Python coding agent framework. The package is intentionally small-dependency and terminal-focused: `click` owns the CLI, `rich` owns terminal rendering, `httpx` is available but live provider calls currently use stdlib `urllib`, and tests use `pytest` plus `pytest-asyncio`.
+## Current Shape
 
-The package entry point is:
+Nexus is a CLI-first coding agent implemented as a Python package under `nexus/`.
 
-- `pyproject.toml`: publishes the `nexus` console script as `nexus.app:main`.
-- `nexus/app.py`: top-level runtime orchestrator. It loads config, initializes state directories, builds tools/resources, creates the `Agent`, dispatches headless or interactive mode, and tears down long-lived resources.
-
-Major package areas:
-
-- `nexus/models.py`: shared runtime contracts: messages, tool calls/results, stream events, confirmation requests, usage, telemetry, and tool execution context.
-- `nexus/runtime/`: session state, REPL/headless execution, slash commands, delegation, sandbox runtime wiring, and post-session updates.
-- `nexus/tools/`: tool protocol/registry and first-party built-in tools.
-- `nexus/security/`: execution modes, approval policies, permission checks, command classification, and approval scoping.
-- `nexus/context/` and `nexus/prompts/`: system prompt construction, context compaction, loop detection, and tool-output pruning.
-- `nexus/config/`: config dataclass, defaults, TOML/env/CLI merge, validation, model limits.
-- `nexus/integrations/`: fake provider, Ollama, OpenAI-compatible provider, retry helper, and MCP stdio client.
-- `nexus/memory/`, `nexus/skills/`, `nexus/extensions/`, `nexus/hooks/`, `nexus/observability/`, `nexus/sandbox/`, `nexus/ui/`: persistence, skills, plugins, hooks, logs/metrics/audit, Docker sandboxing, and terminal UI.
-
-## Coding Style
-
-Use modern Python 3.11 style:
-
-- `from __future__ import annotations` is used throughout.
-- Prefer dataclasses with `slots=True` for runtime state and value objects.
-- Prefer explicit type hints and small helper functions over dynamic dictionaries at module boundaries.
-- Keep implementation dependency-light. Most core modules use only the standard library plus the small declared project dependencies.
-- Use async for runtime/model/tool paths. Tools implement `async def execute(...) -> ToolResult`.
-- Favor narrow, explicit modules. New built-in tools should usually live in `nexus/tools/builtin/<name>.py` and be registered in `nexus/tools/registry.py`.
-- Preserve backward compatibility shims where existing tests or public imports depend on them, such as `nexus/tools/filesystem.py` re-exporting built-ins.
-- Keep comments useful and sparse. Existing comments mostly explain architectural decisions, provider quirks, safety boundaries, or non-obvious state handling.
-- Prefer exact, deterministic behavior in tests. Use `FakeModelClient`, `tmp_path`, and direct runtime objects instead of live providers.
-
-String/path conventions:
-
-- Files are read and written as UTF-8 unless a tool explicitly supports replacement/error handling.
-- Workspace-relative paths are resolved against `ToolExecutionContext.working_directory`.
-- `.nexus/` state is treated as managed runtime state. User-facing tools generally refuse to read or write it unless explicitly allowed by config and policy.
-- Hidden/private paths are hidden from discovery/read tools unless `allow_hidden_paths` is enabled. `.nexus` remains special.
+- `nexus/app.py` is the top-level runtime orchestrator. It loads config, builds the tool registry, starts optional resources, creates the model client and agent, and dispatches either interactive or headless runs.
+- `nexus/runtime/agent.py` owns model streaming, tool-call interpretation, permission checks, tool execution, hook emission, and agent events.
+- `nexus/runtime/repl.py` is the shared turn runner for both the interactive REPL and headless mode. Despite the filename, `run_agent_turn()` is the important bridge between user-facing approval UX and the lower-level event-driven agent.
+- `nexus/runtime/repl_state.py` prepares each turn: system prompt construction, history preparation, tool-output pruning, context compaction, metadata, and durable history updates.
+- `nexus/runtime/runtime_session.py` builds `ReplState` from config, sessions, skills, memory, hooks, delegation resources, and approval policy.
+- `nexus/config/` contains defaults, TOML/env/CLI merge logic, validation, and model-context limit helpers.
+- `nexus/tools/` contains the first-party tool system, registry helpers, compatibility filesystem tools, and sub-agent tool registration.
+- `nexus/security/` contains approval policies, approval state, permission checks, and shell-risk classification.
+- `nexus/integrations/` contains provider adapters: fake, OpenAI-compatible HTTP providers, native Ollama, native Anthropic, native Gemini, MCP, and retry support.
+- `nexus/extensions/`, `nexus/hooks/`, `nexus/skills/`, `nexus/memory/`, `nexus/context/`, `nexus/sandbox/`, and `nexus/observability/` provide optional runtime capabilities around the core loop.
 
 ## Runtime Flow
 
-CLI flow:
+One runtime session is created through `RuntimeSession.create()`.
 
-1. `nexus.app:main` invokes the Click CLI defined in `nexus/cli/args.py`.
-2. `_dispatch_runtime()` loads config with CLI overrides, creates a `TerminalUI`, and enters `_run_app()`.
-3. `_run_app()` ensures config/state directories exist and runs `init_workspace()` for workspace scaffolding.
-4. `NexusApp.initialize()` applies model context limits, sets up hooks, builds the tool registry/resources, creates a model client, and constructs the `Agent`.
-5. If a prompt source is present, `NexusApp.run_single()` calls `run_headless()`. Otherwise `NexusApp.run_interactive()` calls `run_repl()`.
-6. `NexusApp.close()` shuts down delegation and MCP server connections.
+1. `NexusApp.initialize()` applies model context limits, builds hooks, creates the tool registry, loads plugins, connects MCP servers, registers sandbox and sub-agent tools, and creates `Agent`.
+2. Interactive mode calls `run_repl()`. Headless mode calls `run_headless()`.
+3. Both paths append the user message, begin a new approval turn when needed, and call `run_agent_turn()`.
+4. `run_agent_turn()` asks `ReplState.prepare_turn()` for model-ready messages, context metadata, and the system prompt.
+5. `Agent.run()` streams model output, emits assistant events, evaluates tool calls, and either executes allowed tools or emits a `CONFIRMATION_REQUESTED` event.
+6. `run_agent_turn()` is the single user-facing approval callback owner. It records approval/refusal/clarification and, on approval, resumes exact pending calls through `Agent.run(..., resume_tool_calls=...)`.
+7. `ReplState.apply_events()` appends only model messages whose tool calls have matching tool results, accumulates usage, and saves the session.
 
-Registry/resource build order in `NexusApp._build_registry()` is important:
+The important invariant is provider-safe message ordering: assistant messages with `tool_calls` must not be persisted unless the corresponding tool result messages are also present. This is why pending confirmation events are handled carefully before history is committed.
 
-1. Start `DelegationRuntime` if enabled.
-2. Register core tools.
-3. Load user plugins from `plugins_dir` unless disabled.
-4. Connect MCP servers and register MCP tool adapters.
-5. Register sandbox and sub-agent tools.
+## Approval Flow
 
-User turn and agent turn:
+Approval is centralized at the turn-runner layer.
 
-- Interactive input is handled by `run_repl()` in `nexus/runtime/repl.py`.
-- Headless input is handled by `run_headless()` in `nexus/cli/headless.py`.
-- Both paths call `run_agent_turn()`, which is the shared turn runner.
-- `run_agent_turn()` prepares context, streams model events through `Agent.run()`, handles approval/clarification loops, records telemetry, and returns events.
-- `ReplState.apply_events()` is the only normal place where completed runtime events are committed back into durable session history.
+- `Agent.run()` does not accept a direct approval callback.
+- `Agent._agentic_loop()` emits `CONFIRMATION_REQUESTED` and returns when a confirmation or clarification is required.
+- `run_agent_turn()` invokes the callback provided by the REPL or headless wrapper.
+- If the user approves, `run_agent_turn()` records the approval in `ApprovalManager`, commits a narrowed assistant model event for the exact pending tool call(s), and resumes execution with `resume_tool_calls`.
+- `Agent._execute_approved_tool_calls()` executes those exact calls without asking the provider to regenerate them.
+- One-time approvals are consumed after execution. Turn-wide approval excludes high or dangerous bash calls.
+- Refusals are recorded for the current turn so the model receives a denied tool result instead of repeatedly prompting for the same invocation.
 
-Agent loop:
-
-- `Agent.run()` emits high-level start/stop events and delegates to `_agentic_loop()`.
-- `_agentic_loop()` sends a `RuntimeRequest` to the model client, accumulates text deltas and streamed tool calls, appends assistant messages, evaluates tool permissions, executes tools, appends tool result messages, prunes older tool outputs, and checks loop patterns.
-- When a tool needs approval or clarification, `_agentic_loop()` emits `CONFIRMATION_REQUESTED` and returns. It does not accept an approval callback directly.
-- It emits both newer reference-style events (`TEXT_DELTA`, `TOOL_CALL_START`, `AGENT_STOP`, etc.) and legacy Nexus event names (`model_response`, `tool_result`, `turn_completed`) for compatibility.
-- Tool batches are committed after the whole batch completes. This helps preserve provider wire-format correctness for assistant tool calls and matching tool results.
-- `max_loop_iterations` controls model/tool rounds per user turn. `max_tool_calls_per_turn` stops runaway tool use and saves a paused prompt so the user can type `continue`.
-
-History/session handling:
-
-- Sessions are JSON snapshots under `.nexus/sessions/`.
-- `SessionStore.save()` writes atomically via a temp file then updates `latest_session.txt`.
-- `sanitize_session_messages()` drops empty assistant messages and orphaned tool messages.
-- `prepare_messages_for_model()` strips trailing assistant messages that strict providers may reject, especially after interrupted approval loops.
-- `EphemeralSessionStore` is used for `--no-session`.
-
-## Context And Prompt Design
-
-System prompt construction starts in `ReplState.build_system_prompt()`:
-
-1. `nexus.prompts.build_context_sections()` creates a `ContextSections` object.
-2. `ContextBuilder().build()` renders sections into Markdown.
-3. The result is stored on `state.current_system_prompt`.
-
-Prompt sections include:
-
-- Base identity/security/tool guidance from `nexus/prompts/system.py`.
-- Environment, current task, tool list, active skills, project notes, persistent memory, and carry-over context.
-- `developer_instructions` and `user_instructions` from config when present.
-
-Context management:
-
-- `TokenEstimator` uses the rough `len(text) // 4` heuristic.
-- `ContextCompactor` summarizes older history into `CarryOverState.summarized_history` when soft limits are exceeded, then trims recent messages to hard limits.
-- `prune_tool_outputs()` replaces old tool-result bodies with a placeholder once enough old tool output can be reclaimed.
-- `_safe_recent_start()` avoids starting retained history with an orphaned tool message.
-- `NexusApp._apply_model_context_limits()` derives default compaction thresholds from `config/model_limits.py`, unless the user overrode the defaults.
-
-Design rule: preserve provider-valid message ordering before optimizing context. Assistant messages with tool calls need matching tool result messages by `tool_call_id`.
+This design prevents the previous loop where approving a tool caused the model to regenerate a similar tool call and ask again.
 
 ## Tools
 
-Tool contracts live in `nexus/tools/base.py`:
+The default core registry is built by `nexus/tools/registry.py`.
 
-- Subclass `Tool` when adding first-party tools.
-- Set `name`, `description`, `kind`, `input_schema`, and `is_mutating`.
-- Implement `execute(call_id, arguments, context)`.
-- Override `get_confirmation()` when the UI should show a command, affected paths, or file diff before execution.
-- Return `ToolResult` for both success and failure. Do not raise for expected tool errors.
-
-Core tools are assembled in `nexus/tools/registry.py`:
+Default first-party tools:
 
 - `get_time`
-- `read_file`, `write_file`, `edit`, `insert_edit`, `apply_patch`, `modify_file`
-- `glob`, `grep`, `ls`
+- `read_file`
+- `write_file`
+- `edit`
+- `insert_edit_into_file`
+- `apply_patch`
+- `glob`
+- `grep`
+- `list_dir`
 - `bash`
 - `memory`
-- `todo`
-- `web_fetch`, `web_search`
+- `todos`
+- `web_fetch`
+- `web_search`
 
-Tool design conventions:
+Compatibility classes still exist for older tests and extension boundaries, including `write_note`, `modify_file`, and `replace_text`, but they are not registered by the normal core registry. The current public default surface should be documented with the canonical tool names above.
 
-- Read tools should be non-mutating and should honor hidden/private path policy.
-- Write tools should validate workspace boundaries and refuse `.nexus/` managed state.
-- Prefer surgical editing tools (`edit`, `modify_file`, `apply_patch`) over full rewrites.
-- Tools should produce compact, useful output because tool results become model context.
-- Use `metadata` on `ToolResult` for structured details used by tests/UI/observability.
-- `write_file` is intentionally high risk and always requires confirmation outside plan denial.
-- `bash` is mutating by default; the permission layer classifies command risk.
+Tools expose:
 
-`nexus/tools/filesystem.py` is mostly a compatibility shim. New generic file tools belong under `nexus/tools/builtin/`; only Nexus-specific helpers/tools should stay in the shim.
+- `name`
+- `description`
+- `input_schema`
+- `is_mutating`
+- `kind`
+- `execute()`
+- optional `get_confirmation()` preview data such as diffs, commands, and affected paths
 
-## Safety And Approvals
+Tool metadata is used by permissions, hook payloads, terminal rendering, and prompts. Some security logic still uses explicit tool-name checks for special cases such as `write_file`, legacy write aliases, `memory`, and `bash`.
 
-Execution modes are defined by `ExecutionMode`:
+## Security
 
-- `plan`: mutating tools are denied.
-- `default`: read-only tools are allowed, mutating tools require confirmation.
-- `auto`: most mutating tools are allowed, but dangerous/high-risk bash still requires confirmation.
+Security is split between stateless decisions and stateful approvals.
 
-`PermissionChecker.evaluate()` is the central policy gate:
+- `PermissionChecker.evaluate()` returns `ALLOW`, `CONFIRM`, or `DENY`.
+- `ApprovalManager` tracks once, turn, session, turn-wide mutating, and refused approvals.
+- Plan mode denies mutating operations.
+- Auto mode allows low and medium mutating operations, but high and dangerous bash commands still require confirmation.
+- Path policy denies writes outside the workspace and direct writes under `.nexus`, including `.nexus/memory`.
+- `CommandClassifier` wraps the shell classifier and promotes catastrophic patterns to `DANGEROUS`.
 
-- It performs path hard-denials before mode/policy decisions.
-- It special-cases `bash`, `write_file`, and `memory`.
-- It allows read-only tools by default unless `auto_confirm_read_only` is disabled.
-- It denies writes outside the workspace and direct writes into `.nexus/`, including `.nexus/memory`.
+The security layer is intentionally conservative around shell and whole-file writes.
 
-Approval state:
+## Providers
 
-- `ApprovalManager` tracks per-turn/session/once approvals and refusals.
-- `run_agent_turn()` is the single callback owner for both interactive and headless approvals. It consumes `CONFIRMATION_REQUESTED` events and records approval/refusal state.
-- After approval, the runtime resumes the exact pending tool call that was shown to the user instead of asking the model to regenerate it. This prevents repeated approval prompts when a provider returns slightly different arguments on retry.
-- In headless non-TTY mode, missing approval produces exit code `3` (`EXIT_NEEDS_CONFIRM`).
-- Clarification requests are used when required tool arguments are missing.
+Provider selection is validated in `nexus/config/loader.py`.
 
-Shell safety:
+Valid providers:
 
-- `CommandClassifier` and `ShellTool` classify commands as low/medium/high/dangerous.
-- Some destructive shell fragments are blocked outright by `ShellTool`.
-- Timed-out shell commands are killed by process group on Unix.
-- Shell output is capped to protect context.
+- `anthropic`
+- `fake`
+- `gemini`
+- `mistral`
+- `openai`
+- `openai-compatible`
+- `ollama`
 
-## Config
+`nexus/app.py` builds the active client:
 
-`AgentConfig` in `nexus/config/defaults.py` is the single config schema. Add new config keys there first, then update:
+- `FakeModelClient` for tests and demos.
+- `OpenAICompatibleModelClient` for OpenAI-compatible HTTP APIs, including Mistral/OpenAI-style endpoints.
+- `OllamaModelClient` for local Ollama.
+- `AnthropicModelClient` for Anthropic.
+- `GeminiModelClient` for Gemini.
 
-- `nexus/config/loader.py` for coercion/validation if needed.
-- `nexus/cli/args.py` if the value needs a CLI override.
-- `nexus/cli/init.py` if defaults should appear in generated config files.
-- tests for default, TOML, env, and CLI behavior.
+Config supports provider-specific defaults, API-key resolution, and model context-limit adjustments.
 
-Config precedence in `load_config()`:
+## Sessions And Context
 
-1. Defaults from `build_default_config()`.
-2. Global TOML.
-3. Local workspace TOML.
-4. Environment variables and `.env`.
-5. CLI overrides.
-6. Provider-specific default adjustments.
+Sessions are stored through `SessionStore` unless `--no-session` uses `EphemeralSessionStore`.
 
-Environment notes:
+Important session behavior:
 
-- `.env` in the workspace is injected into `os.environ` before config reads.
-- Generic aliases are supported: `PROVIDER`, `MODEL`, `API_KEY`, `BASE_URL`.
-- `AGENT_<FIELD_NAME>` overrides config fields.
-- `AGENT_MAX_TOKENS` maps to `compaction_hard_limit`.
+- Existing session messages are sanitized before reuse.
+- Tool-output pruning protects recent context while shrinking large tool outputs.
+- Context compaction uses soft and hard limits and writes carry-over state.
+- Paused turns are stored in session metadata when the per-turn tool-call limit is reached.
+- The user can type `continue` to resume a paused task.
+- Usage totals are accumulated in session metadata.
 
-Validation is strict for providers, modes, approval policies, integer bounds, MCP server definitions, delegation workers/subagents, and allowed/denied tool overlap.
+## Extensions
 
-## Providers And MCP
+Optional runtime features include:
 
-Model clients satisfy the `ModelClient` protocol in `nexus/runtime/agent.py`:
+- Plugins loaded from the configured plugins directory.
+- MCP tools registered through connected MCP servers.
+- Skills from global, local, and builtin roots.
+- Delegation runtime and sub-agent tools.
+- Sandbox command execution when enabled.
+- Hooks for lifecycle, prompt submit, pre/post tool use, notifications, and stop events.
+- Post-session updates for memory/workspace learning.
 
-- Primary method: `chat_completion(request, stream=True)` yielding `StreamEvent`.
-- Legacy method: `complete()` is retained by some tests/adapters.
+These features are layered around the same `ToolRegistry`, `Agent`, and `run_agent_turn()` flow.
 
-Provider implementations:
+## Tests
 
-- `FakeModelClient`: deterministic local CI/test client.
-- `OpenAICompatibleModelClient`: OpenAI-style `/chat/completions`, streaming SSE support, tool-call accumulation, retry on transient provider errors.
-- `OllamaModelClient`: local Ollama integration.
-
-OpenAI-compatible adapter responsibilities:
-
-- Convert internal `Message` and `ToolCall` objects to provider wire format.
-- Preserve assistant `tool_calls` and tool `tool_call_id`.
-- Parse provider tool-call JSON arguments into `ToolCall.arguments`.
-- Emit normalized `RuntimeResponse`/`StreamEvent` values.
-
-MCP:
-
-- `MCPClient` speaks JSON-RPC over subprocess stdio.
-- `MCPServerRuntime.refresh()` discovers tools and reconnects if needed.
-- `MCPToolAdapter` wraps remote tools as Nexus tools and marks them mutating by default.
-- MCP tools can be prefixed per server to avoid name collisions.
-- Failed MCP servers are logged/skipped but still tracked in runtime state for status commands.
-
-## Skills, Plugins, Delegation, Sandbox
-
-Skills:
-
-- Skill roots come from builtin, global, and workspace locations.
-- `RuntimeSession.create()` loads the skill registry unless `--no-skills` is set.
-- `nexus-agent` is auto-activated when present.
-- Active skill content is injected into the system prompt.
-- Skill sub-agent tools are registered through `nexus/tools/subagents.py`.
-
-Plugins:
-
-- `PluginLoader` loads `*.py` files from `plugins_dir`.
-- A plugin module must expose `register(registry_view, hooks)`.
-- Plugin tools are registered with source `plugin` and origin equal to the plugin filename stem.
-- `allowed_tools`/`denied_tools` policy applies during plugin registration.
-- Plugin load/register failures are warnings, not fatal startup errors.
-
-Delegation:
-
-- `DelegationRuntime` owns an in-memory mailbox, task records, worker state, pending approvals, and optimistic resource versioning.
-- Workers run their own `Agent` loop using a filtered tool registry.
-- Coordinator and worker messages use typed `AgentMessage` values.
-- Slash commands under `/delegate` expose status, task spawning, mailbox history, and approval decisions.
-- Delegated work should stay narrow; workers report concise summaries to the coordinator.
-
-Sandbox:
-
-- Docker-backed sandbox tools are optional and gated by config.
-- Sandbox settings include image, timeout, memory limit, network mode, read-only workspace, and tmp size.
-- Sandbox command registration happens after core/plugin/MCP wiring.
-
-## Hooks And Observability
-
-Hooks are emitted for key lifecycle events:
-
-- User prompt submission.
-- Model usage notification.
-- Confirmation requested.
-- Tool denied.
-- Pre/post tool use.
-- Delegation mailbox events.
-- Stop/session completion.
-
-`setup_hooks()` wires runtime logging, metrics, and audit trails based on config. Mutating actions should continue to flow through tool execution and hooks so audit behavior remains centralized.
-
-Correlation IDs:
-
-- `run_repl()` and `run_headless()` create `turn_id` and `trace_id`.
-- `ToolExecutionContext.metadata` carries turn/trace/worker/approval metadata.
-- Agent hook payloads include correlation data via `_correlation_payload()`.
-
-## CLI And Slash Commands
-
-CLI options are defined in `nexus/cli/args.py`. Keep source selection mutually exclusive:
-
-- `--prompt`
-- `--prompt-file`
-- `--stdin`
-
-Headless output formats:
-
-- `text`: final response.
-- `json`: `{"response": ...}`.
-- `jsonl`: complete role/content history.
-
-Interactive slash commands are in `nexus/runtime/slash_commands.py`:
-
-- `/help`
-- `/mode`
-- `/provider`
-- `/skills`
-- `/config`
-- `/session`
-- `/tools`
-- `/memory`
-- `/context`
-- `/history`
-- `/mcp`
-- `/delegate`
-- `/quit` and `/exit`
-
-Unknown slash commands are intentionally forwarded to the agent as natural-language prompts.
-
-## Testing Guidance
-
-Run the automated suite with:
+Use:
 
 ```bash
-uv run --group dev python -m pytest -q
+uv run pytest
 ```
 
-Test layout:
+Current expected result after the latest approval-flow work: `264 passed`.
 
-- `tests/test_agent.py`: agent loop and event behavior.
-- `tests/test_repl.py`, `tests/test_cli.py`, `tests/test_terminal_ui.py`: user-facing runtime and UI behavior.
-- `tests/test_tools.py`, `tests/test_filesystem_tools.py`: tool contracts and path behavior.
-- `tests/test_security_manager.py`, `tests/test_sandbox.py`: approval/security/sandbox behavior.
-- `tests/test_context.py`, `tests/test_sessions.py`, `tests/test_memory*`-related tests: context and persistence behavior.
-- `tests/test_mcp.py`, `tests/test_plugins.py`, `tests/test_skills.py`, `tests/test_delegation.py`: extension systems.
-- Markdown files in `tests/` are manual CLI scenario guides.
+The tests cover config loading, CLI/headless flows, REPL approval behavior, session sanitation, security decisions, tools, hooks, plugins, MCP, sandbox, delegation, prompts, retry, and provider adapters.
 
-When changing a feature:
+## Review Notes
 
-- Add focused unit tests near the module behavior.
-- Add integration-style tests for CLI/session/approval flows when user-visible behavior changes.
-- Use `tmp_path` for filesystem state and avoid touching real `~/.nexus`.
-- Use `FakeModelClient` or small fake clients for provider behavior.
-- Test provider wire-format changes with assistant tool calls plus matching tool result IDs.
-- Test both confirmation-required and approval-denied paths for mutating tool changes.
+Current architectural strengths:
 
-## Change Checklist
+- One user-facing approval owner in `run_agent_turn()`.
+- Deterministic approved-tool execution through `resume_tool_calls`.
+- Provider-safe history persistence.
+- Clear default tool registry.
+- Strong config validation.
+- Conservative permission policy for writes and shell commands.
 
-Before editing:
+Current cleanup opportunities:
 
-- Read the module and the tests around it.
-- Check whether there is a compatibility shim or legacy event name that tests depend on.
-- Preserve session/message wire-format correctness.
-- Keep new behavior scoped to the relevant package area.
+- `repl.py` now contains shared turn-runner logic, not only REPL UI. A future rename or extraction to `turn_runner.py` would make ownership clearer.
+- Permission logic still has some tool-name special cases. More of this could move to `ToolKind` or richer tool metadata.
+- Compatibility tool names still appear in older tests/docs. Keep the canonical registry explicit when updating docs.
+- Config writes currently serialize plain values and may not preserve comments. That is acceptable for now, but worth revisiting if config editing becomes a first-class UX.
 
-When adding a tool:
+## Reference Code Boundary
 
-- Implement `Tool`.
-- Provide a precise JSON schema with `required` fields.
-- Set `kind` and `is_mutating` correctly.
-- Add confirmation previews/diffs for mutating file or shell behavior.
-- Register in `get_core_tools()` if first-party.
-- Add tests for success, validation failure, permission behavior, and workspace boundary behavior.
-
-When adding config:
-
-- Update `AgentConfig`.
-- Update init/config docs if user-facing.
-- Validate values in `loader.py`.
-- Add CLI override only when needed.
-- Test defaults, TOML, env, and override precedence.
-
-When changing the agent loop:
-
-- Preserve event compatibility.
-- Ensure partial approval loops do not commit unresolved assistant tool calls.
-- Keep tool results correlated by `call_id`.
-- Watch compaction/pruning behavior on long histories.
-- Verify headless and interactive paths still share behavior through `run_agent_turn()`.
-
-## Current Design North Star
-
-Nexus is designed as a conservative, inspectable coding-agent harness:
-
-- CLI-first and REPL-friendly.
-- Typed runtime boundaries.
-- Provider adapters isolated from the agent loop.
-- Tool execution centralized through registry, permissions, confirmations, hooks, and results.
-- Workspace state stored under `.nexus/`, with direct access restricted.
-- Long-session continuity via sessions, memory, skills, compaction, and post-session learning.
-- Extension support through plugins, MCP, sub-agents, and sandboxing without making the core loop depend on them.
+Do not scan, edit, test against, or document `reference_code/` during normal Nexus work. Treat it as opt-in reference material only when the user explicitly requests a comparison.

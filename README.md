@@ -2,7 +2,7 @@
 
 **Nexus** is a CLI-first AI coding agent and terminal-based pair programmer. It runs in an interactive REPL or headless one-shot mode, executes tools, manages sessions, and keeps context across long conversations through compaction and carry-over summaries.
 
-> **Status**: stable scaffold — core runtime, safety, skills, MCP, delegation, and sandboxing are implemented. Streaming provider output and OpenTelemetry export are not yet available.
+> **Status**: active scaffold — core runtime, streaming model clients, safety, skills, MCP, delegation, sandboxing, and JSON observability are implemented. OpenTelemetry export is not yet available.
 
 ---
 
@@ -32,9 +32,10 @@
 - **Interactive REPL** with readline history, arrow-key navigation, and inline confirmation prompts
 - **Headless / one-shot** execution via `--prompt`, `--prompt-file`, or `--stdin`
 - **Typed agent loop** — normalized message, tool-call, and tool-result contracts keep provider adapter logic outside the runtime
+- **Deterministic approval resume** — approved tool calls resume from the exact pending call shown to the user, avoiding provider-regenerated permission loops
 - **Built-in tools** — file read/write/edit, glob, grep, ls, bash (with risk classification), web fetch/search, memory, todos, and more
 - **Permission system** — `plan` / `default` / `auto` execution modes with per-tool risk gating
-- **Session persistence** — JSON snapshots under `.nexus/sessions/`; resumes automatically on startup
+- **Session persistence** — JSON snapshots under `.nexus/sessions/`; resume by session name or opt into latest-session resume
 - **Context compaction** — token-budget management with carry-over summaries; soft/hard limits auto-tuned to the active model's context window
 - **Skills** — Markdown skill files loaded from builtin, global, and workspace directories; activated per-session
 - **MCP integration** — tool discovery over subprocess stdio
@@ -82,8 +83,11 @@ nexus/                         # Main package
 │   └── payloads.py            # Typed payload dataclasses
 │
 ├── integrations/              # Model and protocol adapters
+│   ├── anthropic.py           # Native Anthropic client
 │   ├── fake_model.py          # Deterministic local fake client for CI
+│   ├── gemini.py              # Native Gemini client
 │   ├── mcp.py                 # MCP tool discovery over subprocess stdio
+│   ├── ollama.py              # Native Ollama client
 │   ├── openai_compatible.py   # Live OpenAI-compatible HTTP client
 │   └── retry.py               # Bounded retry helper
 │
@@ -103,7 +107,7 @@ nexus/                         # Main package
 │
 ├── runtime/                   # Core agent execution
 │   ├── agent.py               # Agent class — agentic loop, tool dispatch, hooks
-│   ├── repl.py                # Interactive REPL loop
+│   ├── repl.py                # Turn runner plus interactive REPL loop
 │   ├── repl_state.py          # ReplState — session, history, config, approval manager
 │   ├── slash_commands.py      # /command router and all slash-command handlers
 │   ├── sessions.py            # Session snapshot persistence
@@ -137,16 +141,17 @@ nexus/                         # Main package
 │   ├── subagents.py           # Skill sub-agent tool registration
 │   └── builtin/               # Individual built-in tool implementations
 │       ├── time.py            # get_time
-│       ├── note.py            # write_note
 │       ├── read_file.py       # read_file
 │       ├── write_file.py      # write_file
-│       ├── edit_file.py       # modify_file, replace_text
+│       ├── edit_file.py       # edit
+│       ├── smart_edit.py      # insert_edit_into_file
+│       ├── patch.py           # apply_patch
 │       ├── glob.py            # glob
 │       ├── grep.py            # grep
 │       ├── list_dir.py        # ls
 │       ├── shell.py           # bash
-│       ├── memory.py          # memory_save, memory_search
-│       ├── todo.py            # todo_add, todo_complete, todo_list
+│       ├── memory.py          # memory
+│       ├── todo.py            # todos
 │       ├── web_fetch.py       # web_fetch
 │       └── web_search.py      # web_search
 │
@@ -171,7 +176,7 @@ workspace/                     # Example project workspace — run nexus here
 ```bash
 # Clone and install with dev dependencies
 git clone <repo-url>
-cd nexus-code-agent
+cd build-an-ai-agent
 uv sync --group dev
 ```
 
@@ -210,10 +215,11 @@ The startup banner shows the active provider, model, and mode:
 Provider: openai-compatible  |  Model: mistral-medium-latest  |  Mode: default
 ```
 
-If a previous session exists it is resumed automatically:
+Resume a specific session with `--session`, or resume the latest saved session with `--resume-last`:
 
-```
-Resumed session abc123def (14 messages). Use /session new to start fresh.
+```bash
+uv run nexus --session abc123def
+uv run nexus --resume-last
 ```
 
 Type your question at the `>` prompt. Unknown slash commands are forwarded to the agent as natural-language queries.
@@ -306,9 +312,11 @@ uv run --directory workspace nexus --prompt "summarize this project"
 | `--prompt-file FILE` | `-f` | Read headless prompt from a file |
 | `--stdin` | | Read headless prompt from stdin |
 | `--session NAME` | `-s` | Resume or create a named session |
+| `--resume-last` | | Resume the latest saved session for this workspace |
 | `--no-session` | | Skip session persistence for this run |
 | `--model NAME` | `-m` | Override the model from config |
-| `--provider NAME` | | Override the provider (`fake`, `openai-compatible`, `openai`, `mistral`) |
+| `--provider NAME` | | Override the provider (`anthropic`, `fake`, `gemini`, `mistral`, `ollama`, `openai`, `openai-compatible`) |
+| `--allow-hidden-paths` | | Allow hidden/private path reads except `.nexus/`, which remains blocked |
 | `--mode MODE` | | Execution mode: `plan`, `default`, or `auto` |
 | `--config FILE` | `-c` | Path to a local config TOML file |
 | `--global-config FILE` | | Path to a global config TOML file |
@@ -334,7 +342,7 @@ uv run --directory workspace nexus --prompt "summarize this project"
 |---|---|
 | `nexus init [--force]` | Create `.nexus/` and `~/.nexus/` config and state directories |
 | `nexus version` | Print version and exit |
-| `nexus doctor [--output-format text\|json]` | Run production-readiness gate checks |
+| `nexus doctor [--output-format text\|json\|jsonl]` | Run production-readiness gate checks |
 | `nexus config [global\|local\|merged]` | Print a config layer |
 
 ---
@@ -382,7 +390,7 @@ Mode set to: auto
 
 > add a docstring to nexus/tools/base.py
 [read_file — auto-approved]
-[modify_file — auto-approved]
+[edit — confirmation required]
 Done. Added a module-level docstring describing the BaseTool protocol and ToolRegistry.
 
 > /context usage
@@ -417,11 +425,15 @@ uv run nexus \
   --output result.json \
   --output-format json
 
-# Use a local Ollama endpoint
+# Use native Ollama
 uv run nexus \
-  --provider openai-compatible \
+  --provider ollama \
   --model qwen2.5-coder:7b \
   --prompt "summarize this repo in bullet points"
+
+# Use native Anthropic or Gemini
+uv run nexus --provider anthropic --model claude-sonnet-4-5 --prompt "summarize this repo"
+uv run nexus --provider gemini --model gemini-2.5-pro --prompt "summarize this repo"
 
 # Activate a specific skill for this run
 uv run nexus --skill nexus-agent --prompt "how do I configure MCP servers?"
@@ -442,19 +454,32 @@ All tools pass through the permission system and lifecycle hooks. **Risk level**
 | `read_file` | low | No | Reads a file or line range within the workspace |
 | `glob` | low | No | Finds files by glob pattern within the workspace |
 | `grep` | low | No | Searches file content by regex; returns path, line number, match |
-| `ls` | low | No | Lists directory contents with file sizes |
+| `list_dir` | low | No | Lists directory contents with file sizes |
 | `web_fetch` | low | No | Fetches a URL and returns the response body |
 | `web_search` | low | No | Runs a web search and returns result snippets |
-| `memory_search` | low | No | Searches workspace memory entries by content |
-| `todo_list` | low | No | Lists current session todo items |
-| `write_note` | medium | Yes | Writes a note file inside the workspace (rejects oversized payloads and paths outside workspace or `.nexus/`) |
-| `modify_file` | medium | Yes | Replaces a specific line range in an existing file |
-| `replace_text` | medium | Yes | Replaces a literal string in a file (first match or all occurrences) |
-| `memory_save` | medium | Yes | Saves a memory entry under a key |
-| `todo_add` | medium | Yes | Adds a task to the session todo list |
-| `todo_complete` | medium | Yes | Marks a todo item complete |
+| `memory` | low/medium | Yes for writes | Saves, retrieves, lists, or searches workspace memory |
+| `todos` | low/medium | Yes for writes | Adds, lists, updates, or completes session todos |
+| `edit` | medium | Yes | Applies targeted file edits inside the workspace |
+| `insert_edit_into_file` | medium | Yes | Inserts or replaces text near an anchor in an existing file |
+| `apply_patch` | medium | Yes | Applies a unified patch with workspace-boundary checks |
 | `write_file` | **high** | Yes | Creates or fully overwrites a file — **always requires confirmation**, even in auto mode |
 | `bash` | **dynamic** | Yes | Runs a bash command; risk classified per command (see below) |
+
+Compatibility tool classes such as `write_note`, `modify_file`, and `replace_text` still exist for older tests/docs, but the normal core registry exposes the canonical tools above.
+
+### Approval Flow
+
+In `default` mode, mutating or risky tools emit a confirmation event before execution. The turn runner owns the user prompt for both interactive and headless flows. After approval, Nexus resumes `Agent.run()` with the exact pending tool call that was displayed in the confirmation panel; it does not ask the model to regenerate the call. This keeps approval behavior deterministic across providers.
+
+Approval policies:
+
+| Policy | Behavior |
+|---|---|
+| `on-request` | Ask for each confirmable invocation unless already approved |
+| `approve-turn` | Approval can cover compatible mutating calls for the current user turn |
+| `approve-session` | Approval can persist for the session and matching invocation signature |
+| `auto` | Skip confirmations allowed by policy/mode; high-risk bash still requires confirmation |
+| `plan` | Deny mutating actions |
 
 ### Bash Risk Classification
 
@@ -536,7 +561,7 @@ The simplest way to configure the provider is a `.env` file in the workspace roo
 
 ```bash
 # .env
-PROVIDER=openai-compatible          # or: mistral, openai, fake
+PROVIDER=openai-compatible          # or: mistral, openai, anthropic, gemini, ollama, fake
 MODEL=mistral-medium-latest         # any model supported by the endpoint
 API_KEY=your_api_key_here           # generic key — works for any provider
 BASE_URL=https://api.mistral.ai/v1  # any OpenAI-compatible endpoint
@@ -549,6 +574,9 @@ BASE_URL=https://api.mistral.ai/v1  # any OpenAI-compatible endpoint
 | `openai-compatible` | `API_KEY` → `NEXUS_API_KEY` → `OPENAI_API_KEY` |
 | `mistral` | `MISTRAL_API_KEY` → `NEXUS_API_KEY` → `OPENAI_API_KEY` → `API_KEY` |
 | `openai` | `OPENAI_API_KEY` → `NEXUS_API_KEY` → `API_KEY` |
+| `anthropic` | `ANTHROPIC_API_KEY` → `API_KEY` |
+| `gemini` | `GEMINI_API_KEY` → `GOOGLE_API_KEY` → `API_KEY` |
+| `ollama` | No API key required |
 
 **Env var resolution order for base URL:**
 
@@ -556,6 +584,8 @@ BASE_URL=https://api.mistral.ai/v1  # any OpenAI-compatible endpoint
 |---|---|
 | `openai-compatible` / `openai` | `BASE_URL` env var → `api_base_url` in config |
 | `mistral` | `MISTRAL_BASE_URL` → defaults to `https://api.mistral.ai/v1` |
+| `ollama` | `OLLAMA_HOST` → `BASE_URL` → defaults to `http://localhost:11434` |
+| `anthropic` / `gemini` | Native SDK providers; `api_base_url` is unused by default |
 
 ### Workspace-Level Config (`.nexus/config.toml`)
 
@@ -587,6 +617,10 @@ log_format = "text"              # text | json (json enables structured observab
 # Sessions
 save_on_every_turn = true
 max_sessions_retained = 50
+
+# Approvals and path policy
+approval_policy = "on-request"     # on-request | approve-turn | approve-session | auto | plan
+allow_hidden_paths = false         # .nexus remains blocked even when true
 
 # Tool filtering
 allowed_tools = []               # empty = all tools allowed
@@ -696,6 +730,9 @@ The compaction prompt (`nexus/prompts/compression.py`) uses a structured 7-secti
 | OpenAI-compatible | `openai-compatible` | **Default.** Any compatible endpoint — Mistral, Ollama, vLLM, LM Studio, etc. Set `BASE_URL` and `API_KEY` in `.env` |
 | Mistral | `mistral` | `api_base_url` auto-defaults to `https://api.mistral.ai/v1`; key via `MISTRAL_API_KEY` |
 | OpenAI | `openai` | Requires `BASE_URL` (or `api_base_url`) and `OPENAI_API_KEY` |
+| Ollama | `ollama` | Native local Ollama client; defaults to `http://localhost:11434`; no API key required |
+| Anthropic | `anthropic` | Native Anthropic SDK client; key via `ANTHROPIC_API_KEY` |
+| Gemini | `gemini` | Native Google GenAI SDK client; key via `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
 
 **Common endpoint examples:**
 
@@ -708,10 +745,25 @@ MODEL=mistral-medium-latest
 BASE_URL=https://api.openai.com/v1
 MODEL=gpt-4o
 
-# Local Ollama
+# Local Ollama via OpenAI-compatible
 BASE_URL=http://localhost:11434/v1
 MODEL=qwen2.5-coder:7b
 API_KEY=ollama    # Ollama accepts any non-empty key
+
+# Native Ollama
+PROVIDER=ollama
+MODEL=qwen2.5-coder:7b
+OLLAMA_HOST=http://localhost:11434
+
+# Anthropic
+PROVIDER=anthropic
+MODEL=claude-sonnet-4-5
+ANTHROPIC_API_KEY=your_key_here
+
+# Gemini
+PROVIDER=gemini
+MODEL=gemini-2.5-pro
+GEMINI_API_KEY=your_key_here
 
 # vLLM
 BASE_URL=http://localhost:8000/v1
@@ -723,6 +775,7 @@ Override at runtime:
 ```bash
 uv run nexus --provider openai-compatible --model mistral-large-latest --prompt "hello"
 uv run nexus --provider openai-compatible --model llama3.2 --prompt "hello"
+uv run nexus --provider ollama --model qwen2.5-coder:7b --prompt "hello"
 ```
 
 ---
@@ -753,5 +806,5 @@ uv run nexus doctor --output-format json
 ## Running Tests
 
 ```bash
-uv run --group dev python -m pytest -q
+uv run pytest
 ```

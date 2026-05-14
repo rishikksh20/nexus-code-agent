@@ -79,6 +79,7 @@ class Agent:
         max_output_tokens: int | None = None,
         max_turns: int = 3,
         max_tool_calls_per_turn: int = 30,
+        resume_tool_calls: tuple[ToolCall, ...] = (),
     ) -> AsyncGenerator[AgentEvent, None]:
         """Run the agentic loop, yielding :class:`AgentEvent` objects.
 
@@ -91,6 +92,15 @@ class Agent:
         history = list(messages)
         approved = approved_tools or set()
         final_response: str | None = None
+
+        if resume_tool_calls:
+            async for event in self._execute_approved_tool_calls(
+                resume_tool_calls,
+                context,
+                approval_manager=approval_manager,
+            ):
+                yield event
+            return
 
         yield AgentEvent(kind=AgentEventType.THINKING_STARTED)
         yield AgentEvent.agent_start(messages[-1].content if messages else "")
@@ -116,20 +126,38 @@ class Agent:
 
         yield AgentEvent.agent_stop(response=final_response)
 
-    async def run_approved_tool_call(
+    async def _execute_approved_tool_calls(
         self,
-        tool_call: ToolCall,
+        tool_calls: tuple[ToolCall, ...],
         context: ToolExecutionContext,
         *,
         approval_manager: ApprovalManager | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
-        """Execute a tool call that the turn runner has already approved."""
+        for tool_call in tool_calls:
+            record = self.tool_registry.record(tool_call.tool_name)
+            tool = record.tool
+            confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
+            confirmation_preview = _confirmation_preview(confirmation)
+            async for event in self._execute_tool_call(
+                record,
+                tool,
+                tool_call,
+                context,
+                approval_manager=approval_manager,
+                confirmation_preview=confirmation_preview,
+            ):
+                yield event
 
-        record = self.tool_registry.record(tool_call.tool_name)
-        tool = record.tool
-        confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
-        confirmation_preview = _confirmation_preview(confirmation)
-
+    async def _execute_tool_call(
+        self,
+        record: Any,
+        tool: Any,
+        tool_call: ToolCall,
+        context: ToolExecutionContext,
+        *,
+        approval_manager: ApprovalManager | None,
+        confirmation_preview: dict[str, Any],
+    ) -> AsyncGenerator[AgentEvent, None]:
         yield AgentEvent.tool_call_start(
             tool_call.call_id,
             tool_call.tool_name,
@@ -443,63 +471,28 @@ class Agent:
                     yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=conf_request)
                     return
 
-                # Emit both new TOOL_CALL_START and legacy TOOL_CALL_REQUESTED
-                # only once the call is actually cleared to execute.
-                yield AgentEvent.tool_call_start(
-                    tool_call.call_id,
-                    tool_call.tool_name,
-                    tool_call.arguments,
-                    preview=confirmation_preview,
-                )
-                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
-
-                await self.hooks.emit(
-                    HookEvent.PRE_TOOL_USE,
-                    {
-                        "tool_name": tool.name,
-                        "tool_source": record.source,
-                        "tool_origin": record.origin,
-                        "arguments": tool_call.arguments,
-                        "call_id": tool_call.call_id,
-                        "session_id": context.session_id,
-                        "is_mutating": tool.is_mutating,
-                        **_correlation_payload(context, tool_call_id=tool_call.call_id),
-                    },
-                )
-
-                started_at = time.perf_counter()
-                result = await tool.execute(tool_call.call_id, tool_call.arguments, context)
+                result: ToolResult | None = None
+                async for event in self._execute_tool_call(
+                    record,
+                    tool,
+                    tool_call,
+                    context,
+                    approval_manager=approval_manager,
+                    confirmation_preview=confirmation_preview,
+                ):
+                    if event.kind == AgentEventType.TOOL_RESULT:
+                        result = event.payload
+                    yield event
+                if result is None:
+                    continue
                 tool_calls_executed += 1
-                if approval_manager is not None:
-                    approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
                 tool_result_messages.append(Message(
                     role="tool",
                     content=result.output,
                     name=result.tool_name,
                     tool_call_id=result.call_id,
                 ))
-
-                await self.hooks.emit(
-                    HookEvent.POST_TOOL_USE,
-                    {
-                        "tool_name": tool.name,
-                        "tool_source": record.source,
-                        "tool_origin": record.origin,
-                        "arguments": tool_call.arguments,
-                        "call_id": tool_call.call_id,
-                        "session_id": context.session_id,
-                        "is_mutating": tool.is_mutating,
-                        "is_error": result.is_error,
-                        "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
-                        "output": result.output,
-                        **_correlation_payload(context, tool_call_id=tool_call.call_id),
-                    },
-                )
-
                 loop_detector.record_action("tool_call", tool_name=tool_call.tool_name)
-                # Emit both new TOOL_CALL_COMPLETE and legacy TOOL_RESULT events.
-                yield AgentEvent.tool_call_complete(result)
-                yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
 
             # Add all tool results to history after the complete batch, then prune
             # and check for loops — matching the reference-code execution model.

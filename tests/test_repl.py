@@ -81,7 +81,20 @@ class _ApprovalRetryAgent:
         self.calls = 0
 
     async def run(self, messages, context, **kwargs):
-        del messages, context, kwargs
+        del messages, context
+        resume_tool_calls = kwargs.get("resume_tool_calls") or ()
+        if resume_tool_calls:
+            for tool_call in resume_tool_calls:
+                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                yield AgentEvent(
+                    kind=AgentEventType.TOOL_RESULT,
+                    payload=ToolResult(
+                        call_id=tool_call.call_id,
+                        tool_name=tool_call.tool_name,
+                        output=f"Created {tool_call.arguments.get('path', 'file')}",
+                    ),
+                )
+            return
         self.calls += 1
         if self.calls == 1:
             yield AgentEvent(
@@ -139,7 +152,21 @@ class _SequentialApprovalAgent:
         self.seen_messages: list[list[Message]] = []
 
     async def run(self, messages, context, **kwargs):
-        del context, kwargs
+        del context
+        resume_tool_calls = kwargs.get("resume_tool_calls") or ()
+        if resume_tool_calls:
+            self.seen_messages.append(list(messages))
+            for tool_call in resume_tool_calls:
+                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                yield AgentEvent(
+                    kind=AgentEventType.TOOL_RESULT,
+                    payload=ToolResult(
+                        call_id=tool_call.call_id,
+                        tool_name=tool_call.tool_name,
+                        output=f"Created {tool_call.arguments.get('path', 'file')}",
+                    ),
+                )
+            return
         self.calls += 1
         self.seen_messages.append(list(messages))
 
@@ -176,22 +203,18 @@ class _SequentialApprovalAgent:
             return
 
         if self.calls == 2:
+            assert any(message.role == "tool" and message.tool_call_id == "call-calc" for message in messages)
             yield AgentEvent(
                 kind=AgentEventType.MODEL_RESPONSE,
                 payload=RuntimeResponse(
                     message=Message(
                         role="assistant",
-                        content="Creating both files.",
-                        tool_calls=(calc_call, logging_call),
+                        content="Creating logging file.",
+                        tool_calls=(logging_call,),
                     ),
-                    tool_calls=(calc_call, logging_call),
+                    tool_calls=(logging_call,),
                     finish_reason="tool_calls",
                 ),
-            )
-            yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=calc_call)
-            yield AgentEvent(
-                kind=AgentEventType.TOOL_RESULT,
-                payload=ToolResult(call_id="call-calc", tool_name="write_file", output="Created calculator.py"),
             )
             yield AgentEvent(
                 kind=AgentEventType.CONFIRMATION_REQUESTED,
@@ -206,20 +229,8 @@ class _SequentialApprovalAgent:
             return
 
         assert any(message.role == "tool" and message.tool_call_id == "call-calc" for message in messages)
-        assert not any(message.role == "tool" and message.tool_call_id == "call-logging" for message in messages)
+        assert any(message.role == "tool" and message.tool_call_id == "call-logging" for message in messages)
 
-        yield AgentEvent(
-            kind=AgentEventType.MODEL_RESPONSE,
-            payload=RuntimeResponse(
-                message=Message(role="assistant", content="Finishing logging file.", tool_calls=(logging_call,)),
-                tool_calls=(logging_call,),
-                finish_reason="tool_calls",
-            ),
-        )
-        yield AgentEvent(
-            kind=AgentEventType.TOOL_RESULT,
-            payload=ToolResult(call_id="call-logging", tool_name="write_file", output="Created logging_calculator.py"),
-        )
         yield AgentEvent(
             kind=AgentEventType.MODEL_RESPONSE,
             payload=RuntimeResponse(
@@ -414,8 +425,9 @@ async def test_collect_turn_events_discards_preapproval_batches_on_retry(tmp_pat
     model_responses = [event for event in events if event.kind == AgentEventType.MODEL_RESPONSE]
 
     assert agent.calls == 2
-    assert len(model_responses) == 1
-    assert model_responses[0].payload.message.content == "Created the file."
+    assert len(model_responses) == 2
+    assert model_responses[0].payload.message.tool_calls[0].call_id == "call-1"
+    assert model_responses[1].payload.message.content == "Created the file."
     assert not any(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events)
 
 

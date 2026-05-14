@@ -432,24 +432,20 @@ async def _execute_approved_confirmation(
         working_history.append(model_event.payload.message)
         committed_events.append(model_event)
 
-    run_approved_tool_call = getattr(agent, "run_approved_tool_call", None)
-    if run_approved_tool_call is None:
-        return
-
     execution_events: list[AgentEvent] = []
-    for approved_tool_call in tool_calls:
-        async for event in run_approved_tool_call(
-            approved_tool_call,
-            context,
-            approval_manager=state.approval_manager,
-        ):
-            if ui is not None:
-                ui.render_event(
-                    event,
-                    stream_output=state.config.stream_output,
-                    show_tool_calls=state.config.show_tool_calls,
-                )
-            execution_events.append(event)
+    async for event in agent.run(
+        working_history,
+        context,
+        approval_manager=state.approval_manager,
+        resume_tool_calls=tuple(tool_calls),
+    ):
+        if ui is not None:
+            ui.render_event(
+                event,
+                stream_output=state.config.stream_output,
+                show_tool_calls=state.config.show_tool_calls,
+            )
+        execution_events.append(event)
 
     apply_events_to_messages(working_history, execution_events)
     committed_events.extend(execution_events)
@@ -466,6 +462,8 @@ def _tool_call_for_confirmation(
         payload = cast(RuntimeResponse, event.payload)
         for tool_call in payload.tool_calls or payload.message.tool_calls:
             if request.call_id and tool_call.call_id == request.call_id:
+                return tool_call
+            if not request.call_id and tool_call.tool_name == request.tool_name and tool_call.arguments == request.arguments:
                 return tool_call
     return ToolCall(
         call_id=request.call_id,
