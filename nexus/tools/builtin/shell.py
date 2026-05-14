@@ -9,8 +9,11 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import os
+import re
 import signal
+import shlex
 import sys
+from pathlib import Path
 from typing import Any
 
 from nexus.models import ToolExecutionContext, ToolResult
@@ -18,59 +21,81 @@ from nexus.tools.base import Tool, ToolConfirmation, ToolKind
 from nexus.tools.utils import resolve_path
 
 # ---------------------------------------------------------------------------
-# Risk classification (self-contained to avoid circular imports)
+# Risk classification
 # ---------------------------------------------------------------------------
-import re as _re
-import shlex as _shlex
 
-_HIGH_PATTERNS = [
-    _re.compile(r"\brm\b.*\s-[a-zA-Z]*[rRfF][a-zA-Z]*"),
-    _re.compile(r"\bsudo\b"),
-    _re.compile(r"\bdd\b.*(if=|of=)"),
-    _re.compile(r"\b(mkfs|fdisk|parted)\b"),
-    _re.compile(r"\|\s*(sh|bash|zsh|fish)(\s|$)"),
-    _re.compile(r"\b(killall|pkill)\b"),
+_HIGH_RISK_REGEXES: list[re.Pattern[str]] = [
+    re.compile(r"\brm\b.*\s-[a-zA-Z]*[rRfF][a-zA-Z]*"),
+    re.compile(r"\bsudo\b"),
+    re.compile(r"\bsu\b(\s|$)"),
+    re.compile(r"\bdd\b.*(if=|of=)"),
+    re.compile(r"\b(mkfs|fdisk|parted)\b"),
+    re.compile(r"\|\s*(sh|bash|zsh|fish|ksh|csh)(\s|$)"),
+    re.compile(r"\bkill\s+(-9|-SIGKILL)\b"),
+    re.compile(r"\b(killall|pkill)\b"),
+    re.compile(r"\bshred\b"),
+    re.compile(r"\bchmod\b.*\s-[rR]\b"),
+    re.compile(r"\bchown\b.*\s-[rR]\b"),
+    re.compile(r">+\s*/(?:etc|usr|bin|sbin|lib|boot|sys|proc|dev)/"),
 ]
-_MEDIUM_PATTERNS = [
-    _re.compile(r"\brm\b"),
-    _re.compile(r"\bmv\b"),
-    _re.compile(r"\bcp\b"),
-    _re.compile(r"\bchmod\b"),
-    _re.compile(r"\bchown\b"),
-    _re.compile(r"\bsed\b.*-i"),
-    _re.compile(r">+\s*\S"),
-    _re.compile(r"\bgit\s+(add|commit|push|reset|rebase|merge)\b"),
-    _re.compile(r"\b(npm|pip|pip3|uv|brew|apt|apt-get)\s+install\b"),
+
+_MEDIUM_RISK_REGEXES: list[re.Pattern[str]] = [
+    re.compile(r"\brm\b"),
+    re.compile(r"\bmv\b"),
+    re.compile(r"\bcp\b"),
+    re.compile(r"\btouch\b"),
+    re.compile(r"\bmkdir\b"),
+    re.compile(r"\bchmod\b"),
+    re.compile(r"\bchown\b"),
+    re.compile(r"\bsed\b.*-i"),
+    re.compile(r"\btee\b"),
+    re.compile(r">+\s*\S"),
+    re.compile(r"\bgit\s+(add|commit|push|reset|rebase|merge)\b"),
+    re.compile(r"\bgit\s+checkout\s+-[bB]\b"),
+    re.compile(r"\b(npm|pip|pip3|uv|brew|apt|apt-get|yum|dnf|pacman|snap)\s+install\b"),
+    re.compile(r"\bpython3?\s+-m\s+pip\b"),
 ]
-_LOW_CMDS = frozenset({
-    "cat", "echo", "printf", "pwd", "date", "ls", "find", "grep", "rg",
-    "awk", "wc", "head", "tail", "sort", "uniq", "diff", "which", "type",
-    "env", "printenv", "uname", "hostname", "whoami", "id", "ps", "pgrep",
-    "file", "stat", "du", "df", "tree", "jq", "python", "python3", "node",
+
+_LOW_RISK_BASE_COMMANDS: frozenset[str] = frozenset({
+    "cat", "echo", "printf", "pwd", "date", "ls", "ll", "la",
+    "find", "locate", "grep", "rg", "ag", "awk", "wc",
+    "head", "tail", "sort", "uniq", "diff",
+    "which", "type", "command", "env", "printenv",
+    "uname", "hostname", "whoami", "id", "groups",
+    "ps", "pgrep",
+    "file", "stat", "du", "df", "lsof",
+    "tree", "less", "more", "bat",
+    "jq", "yq", "xmllint",
+    "python", "python3", "node", "ruby", "perl",
 })
-_LOW_GIT = frozenset({"status", "log", "diff", "show", "branch", "remote", "fetch", "ls-files"})
+
+_LOW_RISK_GIT_SUBCMDS: frozenset[str] = frozenset({
+    "status", "log", "diff", "show", "branch", "remote",
+    "fetch", "ls-files", "ls-tree", "describe", "tag", "--version",
+    "shortlog", "stash list",
+})
 
 
-def _classify_risk(command: str) -> str:
-    s = command.strip()
-    for p in _HIGH_PATTERNS:
-        if p.search(s):
+def classify_bash_risk(command: str) -> str:
+    """Return ``'low'``, ``'medium'``, or ``'high'`` for *command*."""
+    stripped = command.strip()
+    for pattern in _HIGH_RISK_REGEXES:
+        if pattern.search(stripped):
             return "high"
-    for p in _MEDIUM_PATTERNS:
-        if p.search(s):
+    for pattern in _MEDIUM_RISK_REGEXES:
+        if pattern.search(stripped):
             return "medium"
     try:
-        tokens = _shlex.split(s)
+        tokens = shlex.split(stripped)
     except ValueError:
         return "medium"
     if not tokens:
         return "low"
-    from pathlib import Path as _Path
-    base = _Path(tokens[0]).name
-    if base == "git":
+    base_cmd = Path(tokens[0]).name
+    if base_cmd == "git":
         sub = tokens[1] if len(tokens) > 1 else ""
-        return "low" if sub in _LOW_GIT else "medium"
-    return "low" if base in _LOW_CMDS else "medium"
+        return "low" if sub in _LOW_RISK_GIT_SUBCMDS else "medium"
+    return "low" if base_cmd in _LOW_RISK_BASE_COMMANDS else "medium"
 
 # Commands blocked outright — no confirmation, instant rejection
 BLOCKED_COMMANDS: frozenset[str] = frozenset({
@@ -225,7 +250,7 @@ class ShellTool(Tool):
             tool_name=self.name,
             output=output,
             is_error=exit_code != 0,
-            metadata={"exit_code": exit_code, "risk": _classify_risk(command)},
+            metadata={"exit_code": exit_code, "risk": classify_bash_risk(command)},
         )
 
     def _build_env(self) -> dict[str, str]:

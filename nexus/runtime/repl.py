@@ -7,11 +7,12 @@ from uuid import uuid4
 from collections.abc import Awaitable, Callable
 from typing import cast
 
-from nexus.models import AgentEvent, AgentEventType, ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message, RuntimeResponse
+from nexus.models import AgentEvent, AgentEventType, ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message, RuntimeResponse, ToolCall, ToolExecutionContext
 from nexus.runtime.agent import Agent
 from nexus.context import ContextCompactor, TokenEstimator
 from nexus.hooks import HookEvent
 from nexus.runtime.repl_state import ReplState, apply_events_to_messages
+from nexus.security import PermissionDecision
 from nexus.security.manager import ApprovalScope
 from nexus.security.policy import ApprovalPolicy
 from nexus.ui import TerminalUI
@@ -86,9 +87,6 @@ async def run_agent_turn(
             model_name=state.config.model_name,
             mode=state.mode,
             approval_manager=state.approval_manager,
-            # Let the live agent loop collect approvals so the approved tool
-            # call can execute without asking the model to regenerate it.
-            approval_callback=approval_callback,
             auto_confirm=auto_confirm,
             auto_confirm_read_only=state.config.auto_confirm_read_only,
             temperature=state.config.temperature,
@@ -133,6 +131,18 @@ async def run_agent_turn(
                 _approval_scope_for_policy(state.approval_manager.policy),
                 arguments=confirmation_request.arguments,
             )
+            await _execute_approved_confirmation(
+                state,
+                agent,
+                prepared_turn.context,
+                batch,
+                confirmation_index,
+                confirmation_request,
+                working_history,
+                committed_events,
+                ui=ui,
+                include_preapproved_batch=state.approval_manager.policy is ApprovalPolicy.APPROVE_TURN,
+            )
             continue
 
         if approval_callback is None:
@@ -147,6 +157,21 @@ async def run_agent_turn(
         response = await approval_callback(confirmation_request)
         if confirmation_request.kind is ConfirmationKind.APPROVAL and response.approved:
             _record_approval_response(state, confirmation_request, response)
+            await _execute_approved_confirmation(
+                state,
+                agent,
+                prepared_turn.context,
+                batch,
+                confirmation_index,
+                confirmation_request,
+                working_history,
+                committed_events,
+                ui=ui,
+                include_preapproved_batch=(
+                    response.scope == ApprovalScope.TURN.value
+                    and _supports_turn_wide_approval(confirmation_request)
+                ),
+            )
             continue
         if confirmation_request.kind is ConfirmationKind.APPROVAL and response.denied:
             state.approval_manager.record_refusal(
@@ -208,6 +233,17 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
             or environ.get("MISTRAL_API_KEY")
             or environ.get("NEXUS_API_KEY")
             or environ.get("OPENAI_API_KEY")
+            or environ.get("API_KEY")
+        )
+        if not has_key:
+            ui.print_no_api_key_warning(cfg.provider)
+    elif cfg.provider in {"anthropic", "gemini"}:
+        from os import environ
+        has_key = bool(
+            cfg.api_key
+            or environ.get("ANTHROPIC_API_KEY")
+            or environ.get("GEMINI_API_KEY")
+            or environ.get("GOOGLE_API_KEY")
             or environ.get("API_KEY")
         )
         if not has_key:
@@ -367,6 +403,167 @@ def _supports_turn_wide_approval(request: ConfirmationRequest) -> bool:
     return not (request.tool_name == "bash" and risk_level in {"high", "dangerous"})
 
 
+async def _execute_approved_confirmation(
+    state: ReplState,
+    agent: Agent,
+    context: ToolExecutionContext,
+    batch: list[AgentEvent],
+    confirmation_index: int,
+    request: ConfirmationRequest,
+    working_history: list[Message],
+    committed_events: list[AgentEvent],
+    *,
+    ui: TerminalUI | None,
+    include_preapproved_batch: bool,
+) -> None:
+    tool_call = _tool_call_for_confirmation(batch, confirmation_index, request)
+    tool_calls = [tool_call]
+    if include_preapproved_batch:
+        tool_calls = _preapproved_tool_calls_from_same_batch(
+            state,
+            agent,
+            context,
+            batch,
+            confirmation_index,
+            first_tool_call=tool_call,
+        )
+    model_event = _model_response_for_pending_tool_calls(batch, confirmation_index, tool_calls)
+    if model_event is not None:
+        working_history.append(model_event.payload.message)
+        committed_events.append(model_event)
+
+    run_approved_tool_call = getattr(agent, "run_approved_tool_call", None)
+    if run_approved_tool_call is None:
+        return
+
+    execution_events: list[AgentEvent] = []
+    for approved_tool_call in tool_calls:
+        async for event in run_approved_tool_call(
+            approved_tool_call,
+            context,
+            approval_manager=state.approval_manager,
+        ):
+            if ui is not None:
+                ui.render_event(
+                    event,
+                    stream_output=state.config.stream_output,
+                    show_tool_calls=state.config.show_tool_calls,
+                )
+            execution_events.append(event)
+
+    apply_events_to_messages(working_history, execution_events)
+    committed_events.extend(execution_events)
+
+
+def _tool_call_for_confirmation(
+    batch: list[AgentEvent],
+    confirmation_index: int,
+    request: ConfirmationRequest,
+) -> ToolCall:
+    for event in reversed(batch[:confirmation_index]):
+        if event.kind != AgentEventType.MODEL_RESPONSE:
+            continue
+        payload = cast(RuntimeResponse, event.payload)
+        for tool_call in payload.tool_calls or payload.message.tool_calls:
+            if request.call_id and tool_call.call_id == request.call_id:
+                return tool_call
+    return ToolCall(
+        call_id=request.call_id,
+        tool_name=request.tool_name,
+        arguments=request.arguments,
+    )
+
+
+def _preapproved_tool_calls_from_same_batch(
+    state: ReplState,
+    agent: Agent,
+    context: ToolExecutionContext,
+    batch: list[AgentEvent],
+    confirmation_index: int,
+    *,
+    first_tool_call: ToolCall,
+) -> list[ToolCall]:
+    calls = _tool_calls_from_confirmation_model_response(batch, confirmation_index)
+    if not calls:
+        return [first_tool_call]
+    start_index = next(
+        (index for index, call in enumerate(calls) if call.call_id == first_tool_call.call_id),
+        0,
+    )
+    approved_calls: list[ToolCall] = []
+    for call in calls[start_index:]:
+        try:
+            record = agent.tool_registry.record(call.tool_name)
+        except Exception:
+            continue
+        decision = agent.permission_checker.evaluate(
+            record.tool,
+            call.arguments,
+            state.mode,
+            context=context,
+            auto_confirm_read_only=state.config.auto_confirm_read_only,
+        )
+        risk_level = _risk_level_name(decision.risk_level)
+        if decision.decision is PermissionDecision.DENY:
+            continue
+        if state.approval_manager.is_pre_approved(call.tool_name, call.arguments) or state.approval_manager.is_turn_wide_mutating_preapproved(
+            call.tool_name,
+            is_mutating=record.tool.is_mutating,
+            risk_level=risk_level,
+        ):
+            approved_calls.append(call)
+    return approved_calls or [first_tool_call]
+
+
+def _tool_calls_from_confirmation_model_response(
+    batch: list[AgentEvent],
+    confirmation_index: int,
+) -> tuple[ToolCall, ...]:
+    for event in reversed(batch[:confirmation_index]):
+        if event.kind != AgentEventType.MODEL_RESPONSE:
+            continue
+        payload = cast(RuntimeResponse, event.payload)
+        return payload.tool_calls or payload.message.tool_calls
+    return ()
+
+
+def _model_response_for_pending_tool_calls(
+    batch: list[AgentEvent],
+    confirmation_index: int,
+    tool_calls: list[ToolCall],
+) -> AgentEvent | None:
+    call_ids = {tool_call.call_id for tool_call in tool_calls}
+    for event in reversed(batch[:confirmation_index]):
+        if event.kind != AgentEventType.MODEL_RESPONSE:
+            continue
+        payload = cast(RuntimeResponse, event.payload)
+        source_message = payload.message
+        if not any(call.call_id in call_ids for call in payload.tool_calls or source_message.tool_calls):
+            continue
+        message = Message(
+            role=source_message.role,
+            content=source_message.content,
+            name=source_message.name,
+            tool_calls=tuple(tool_calls),
+            tool_call_id=source_message.tool_call_id,
+        )
+        return AgentEvent(
+            kind=AgentEventType.MODEL_RESPONSE,
+            payload=RuntimeResponse(
+                message=message,
+                tool_calls=tuple(tool_calls),
+                usage=payload.usage,
+                finish_reason="tool_calls",
+            ),
+        )
+    return None
+
+
+def _risk_level_name(value) -> str:
+    raw_value = getattr(value, "value", value)
+    return str(raw_value).strip().lower().split(".")[-1]
+
+
 # ---------------------------------------------------------------------------
 # Paused-turn and telemetry helpers
 # ---------------------------------------------------------------------------
@@ -483,24 +680,9 @@ def _history_safe_completed_events(events: list[AgentEvent]) -> list[AgentEvent]
 def _first_unresolved_confirmation_index(
     events: list[AgentEvent],
 ) -> int | None:
-    """Return the first confirmation that still needs the turn runner to act.
-
-    When an approval callback is passed into ``Agent.run()``, approval prompts
-    are rendered as events and answered inside the live agent loop so the
-    original tool call can continue without asking the model to regenerate it.
-    Those consumed approvals have a later tool terminal event for the same call
-    id, so the turn runner can leave them alone.
-    """
-    terminal_call_ids = {
-        event.payload.call_id
-        for event in events
-        if event.kind in {AgentEventType.TOOL_CALL_COMPLETE, AgentEventType.TOOL_RESULT}
-    }
+    """Return the first confirmation emitted by the agent event stream."""
     for index, event in enumerate(events):
         if event.kind != AgentEventType.CONFIRMATION_REQUESTED:
-            continue
-        request = cast(ConfirmationRequest, event.payload)
-        if request.call_id and request.call_id in terminal_call_ids:
             continue
         return index
     return None

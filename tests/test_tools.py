@@ -28,6 +28,10 @@ def test_core_tools_do_not_register_legacy_write_note_alias(tmp_path):
     tool_names = [tool.name for tool in get_core_tools(config)]
 
     assert "write_file" in tool_names
+    assert "edit" in tool_names
+    assert "insert_edit_into_file" in tool_names
+    assert "apply_patch" in tool_names
+    assert "modify_file" not in tool_names
     assert "write_note" not in tool_names
     assert len(tool_names) == len(set(tool_names))
 

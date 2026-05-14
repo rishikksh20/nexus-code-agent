@@ -74,6 +74,7 @@ Agent loop:
 
 - `Agent.run()` emits high-level start/stop events and delegates to `_agentic_loop()`.
 - `_agentic_loop()` sends a `RuntimeRequest` to the model client, accumulates text deltas and streamed tool calls, appends assistant messages, evaluates tool permissions, executes tools, appends tool result messages, prunes older tool outputs, and checks loop patterns.
+- When a tool needs approval or clarification, `_agentic_loop()` emits `CONFIRMATION_REQUESTED` and returns. It does not accept an approval callback directly.
 - It emits both newer reference-style events (`TEXT_DELTA`, `TOOL_CALL_START`, `AGENT_STOP`, etc.) and legacy Nexus event names (`model_response`, `tool_result`, `turn_completed`) for compatibility.
 - Tool batches are committed after the whole batch completes. This helps preserve provider wire-format correctness for assistant tool calls and matching tool results.
 - `max_loop_iterations` controls model/tool rounds per user turn. `max_tool_calls_per_turn` stops runaway tool use and saves a paused prompt so the user can type `continue`.
@@ -160,7 +161,8 @@ Execution modes are defined by `ExecutionMode`:
 Approval state:
 
 - `ApprovalManager` tracks per-turn/session/once approvals and refusals.
-- `run_agent_turn()` handles approval callback loops for both interactive and headless modes.
+- `run_agent_turn()` is the single callback owner for both interactive and headless approvals. It consumes `CONFIRMATION_REQUESTED` events and records approval/refusal state.
+- After approval, the runtime resumes the exact pending tool call that was shown to the user instead of asking the model to regenerate it. This prevents repeated approval prompts when a provider returns slightly different arguments on retry.
 - In headless non-TTY mode, missing approval produces exit code `3` (`EXIT_NEEDS_CONFIRM`).
 - Clarification requests are used when required tool arguments are missing.
 
@@ -382,4 +384,3 @@ Nexus is designed as a conservative, inspectable coding-agent harness:
 - Workspace state stored under `.nexus/`, with direct access restricted.
 - Long-session continuity via sessions, memory, skills, compaction, and post-session learning.
 - Extension support through plugins, MCP, sub-agents, and sandboxing without making the core loop depend on them.
-

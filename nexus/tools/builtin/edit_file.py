@@ -63,6 +63,19 @@ class EditTool(Tool):
     ) -> ToolConfirmation | None:
         raw_path = str(arguments.get("path", "")).strip()
         path = resolve_path(context.working_directory, raw_path)
+        workspace = context.working_directory.resolve()
+        try:
+            path.relative_to(workspace)
+        except ValueError:
+            return None
+
+        nexus_root = (workspace / ".nexus").resolve()
+        try:
+            path.relative_to(nexus_root)
+            return None
+        except ValueError:
+            pass
+
         old_string = str(arguments.get("old_string", ""))
         new_string = str(arguments.get("new_string", ""))
         replace_all = bool(arguments.get("replace_all", False))
@@ -97,10 +110,34 @@ class EditTool(Tool):
         if not raw_path:
             return ToolResult(call_id=call_id, tool_name=self.name, output="Missing required argument: path", is_error=True)
 
-        path = resolve_path(context.working_directory, raw_path)
+        workspace = context.working_directory.resolve()
+        path = resolve_path(workspace, raw_path)
         old_string = str(arguments.get("old_string", ""))
         new_string = str(arguments.get("new_string", ""))
         replace_all = bool(arguments.get("replace_all", False))
+        replace_first = bool(arguments.get("_replace_first", False))
+
+        try:
+            path.relative_to(workspace)
+        except ValueError:
+            return ToolResult(
+                call_id=call_id,
+                tool_name=self.name,
+                output="Refusing to write outside the current workspace.",
+                is_error=True,
+            )
+
+        nexus_root = (workspace / ".nexus").resolve()
+        try:
+            path.relative_to(nexus_root)
+            return ToolResult(
+                call_id=call_id,
+                tool_name=self.name,
+                output="Refusing to write into .nexus managed state directory.",
+                is_error=True,
+            )
+        except ValueError:
+            pass
 
         # --- Create new file ---
         if not path.exists():
@@ -139,7 +176,7 @@ class EditTool(Tool):
                 is_error=True,
             )
 
-        if count > 1 and not replace_all:
+        if count > 1 and not replace_all and not replace_first:
             return ToolResult(
                 call_id=call_id, tool_name=self.name,
                 output=(

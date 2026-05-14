@@ -53,7 +53,7 @@ def test_config_rejects_invalid_provider(tmp_path):
     workspace.mkdir()
     global_root = tmp_path / "global"
     init_workspace(workspace, global_root=global_root, project_name="workspace")
-    (workspace / ".nexus" / "config.toml").write_text('provider = "anthropic"\n', encoding="utf-8")
+    (workspace / ".nexus" / "config.toml").write_text('provider = "bad-provider"\n', encoding="utf-8")
 
     try:
         load_config(workspace, global_root=global_root)
@@ -92,6 +92,27 @@ def test_config_accepts_mistral_provider_with_default_base_url(tmp_path):
 
     assert config.provider == "mistral"
     assert config.api_base_url == "https://api.mistral.ai/v1"
+
+
+def test_config_accepts_native_sdk_providers_without_base_url(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+
+    anthropic = load_config(
+        workspace,
+        global_root=global_root,
+        cli_overrides={"provider": "anthropic", "api_base_url": ""},
+    )
+    gemini = load_config(
+        workspace,
+        global_root=global_root,
+        cli_overrides={"provider": "gemini", "api_base_url": ""},
+    )
+
+    assert anthropic.api_base_url == ""
+    assert gemini.api_base_url == ""
 
 
 def test_config_uses_mistral_base_url_env_override(tmp_path, monkeypatch):
@@ -373,4 +394,3 @@ def test_config_dotenv_provides_both_model_and_provider(tmp_path):
 
     assert config.model_name == "claude-3-sonnet"
     assert config.provider == "openai-compatible"
-

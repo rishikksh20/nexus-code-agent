@@ -32,7 +32,9 @@ from nexus.config.loader import ConfigError
 from nexus.config.model_limits import get_model_context_limit
 from nexus.extensions.plugins import PluginLoader
 from nexus.hooks import HookExecutor, setup_hooks
+from nexus.integrations.anthropic import AnthropicModelClient, resolve_anthropic_api_key
 from nexus.integrations.fake_model import FakeModelClient
+from nexus.integrations.gemini import GeminiModelClient, resolve_gemini_api_key
 from nexus.integrations.mcp import MCPServerConfig, MCPServerRuntime, MCPToolAdapter
 from nexus.integrations.ollama import OllamaModelClient, resolve_ollama_base_url
 from nexus.integrations.openai_compatible import (
@@ -331,6 +333,12 @@ class NexusApp:
                 base_url=resolve_ollama_base_url(self.config.api_base_url or None),
                 model_name=self.config.model_name,
             )
+        if self.config.provider == "anthropic":
+            explicit_key = self.config.api_key or None
+            return AnthropicModelClient(api_key=resolve_anthropic_api_key(explicit_key))
+        if self.config.provider == "gemini":
+            explicit_key = self.config.api_key or None
+            return GeminiModelClient(api_key=resolve_gemini_api_key(explicit_key))
         if self.config.provider in {"mistral", "openai-compatible", "openai"}:
             explicit_key = self.config.api_key or None
             return OpenAICompatibleModelClient(
@@ -402,6 +410,9 @@ def provider_error_message(exc: Exception, config) -> str:
 
     has_key = bool(
         config.api_key
+        or environ.get("ANTHROPIC_API_KEY")
+        or environ.get("GEMINI_API_KEY")
+        or environ.get("GOOGLE_API_KEY")
         or environ.get("MISTRAL_API_KEY")
         or environ.get("NEXUS_API_KEY")
         or environ.get("OPENAI_API_KEY")

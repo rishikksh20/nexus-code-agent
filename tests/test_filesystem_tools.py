@@ -333,6 +333,20 @@ class TestReplaceTextTool:
         assert result.is_error
         assert "outside" in result.output.lower()
 
+    @pytest.mark.asyncio
+    async def test_rejects_nexus_state_via_edit_wrapper(self, tool_context):
+        (tool_context.working_directory / ".nexus").mkdir(exist_ok=True)
+        (tool_context.working_directory / ".nexus" / "state.txt").write_text("old")
+
+        result = await ReplaceTextTool().execute(
+            "c5",
+            {"path": ".nexus/state.txt", "old_text": "old", "new_text": "new"},
+            tool_context,
+        )
+
+        assert result.is_error
+        assert ".nexus" in result.output
+
 
 # ---------------------------------------------------------------------------
 # GlobTool
@@ -559,6 +573,12 @@ class TestBashTool:
     async def test_risk_metadata_attached(self, tool_context):
         result = await BashTool().execute("c4", {"command": "rm file.txt"}, tool_context)
         assert result.metadata["risk"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_risk_metadata_uses_shared_classifier(self, tool_context):
+        command = "echo ok | sh"
+        result = await BashTool().execute("c7", {"command": command}, tool_context)
+        assert result.metadata["risk"] == classify_bash_risk(command)
 
     @pytest.mark.asyncio
     async def test_runs_in_workspace_root(self, tool_context):

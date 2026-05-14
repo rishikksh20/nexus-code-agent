@@ -336,7 +336,9 @@ def _print_provider_list(state: ReplState) -> None:
     table.add_column("Description")
     table.add_column("Active")
     rows: tuple[tuple[str, str], ...] = (
+        ("anthropic", "Anthropic Messages API (requires ANTHROPIC_API_KEY)."),
         ("fake", "Deterministic local fake client. No API key required."),
+        ("gemini", "Google Gemini API (requires GEMINI_API_KEY or GOOGLE_API_KEY)."),
         ("mistral", "Mistral AI API endpoint (requires MISTRAL_API_KEY)."),
         ("openai", "OpenAI API endpoint (requires api_base_url and API key)."),
         ("openai-compatible", "Any OpenAI-compatible API endpoint (Ollama, vLLM, etc.)."),

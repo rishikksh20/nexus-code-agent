@@ -29,7 +29,7 @@ The largest confirmed issue was in the approval flow. Nexus had two different ow
 - `Agent._agentic_loop()` could call `approval_callback` directly.
 - `run_agent_turn()` also expected to own confirmation, retry, scoped approval, and history-safe event commits.
 
-That split caused subtle logical bugs around turn-wide approval, duplicate tool execution, and denied invocations. The fix makes `run_agent_turn()` the owner of user-facing confirmation for REPL/headless flows, matching the reference design where the session loop controls message state and approval boundaries.
+That split caused subtle logical bugs around turn-wide approval, duplicate tool execution, and denied invocations. The fix makes `run_agent_turn()` the only owner of user-facing confirmation callbacks. `Agent.run()` now emits `CONFIRMATION_REQUESTED` and returns; callers that need approvals must consume the event and re-enter through the shared turn runner.
 
 ## Confirmed Issues Fixed
 
@@ -73,7 +73,7 @@ Approving a first mutating tool with scope `turn` still led to repeated confirma
 
 Fix:
 
-`run_agent_turn()` now passes `approval_callback=None` into `Agent.run()` and handles `CONFIRMATION_REQUESTED` events itself.
+`Agent.run()` no longer accepts `approval_callback`. It emits `CONFIRMATION_REQUESTED` and stops. `run_agent_turn()` handles the callback, records approval or refusal in `ApprovalManager`, resumes the exact pending tool call after approval, and then continues the event stream with the resulting tool message in history.
 
 Reference comparison:
 
@@ -89,7 +89,7 @@ When `Agent._agentic_loop()` consumed an approval callback directly, a denied ap
 
 Fix:
 
-For the direct callback path, the agent still records refusal and appends model-facing tool-result history when needed, but does not emit the first denied result as a public event. In normal REPL/headless flow, this path is bypassed because `run_agent_turn()` owns approval.
+The direct callback path has been removed from `Agent.run()`. Denials are recorded in `run_agent_turn()`, and any later regenerated matching tool call is blocked by `ApprovalManager` without prompting again.
 
 ### 4. Write Path Policy Missed Compatibility Tools
 
@@ -195,21 +195,21 @@ If deprecating, do it in stages:
 
 Current state:
 
-- REPL/headless flows correctly centralize approval in `run_agent_turn()`.
-- `Agent._agentic_loop()` still supports direct `approval_callback` for lower-level callers.
+- Fixed. `Agent.run()` and `Agent._agentic_loop()` no longer accept an `approval_callback`.
+- REPL/headless flows centralize approval callbacks in `run_agent_turn()`.
+- Lower-level callers must consume `CONFIRMATION_REQUESTED` events instead of passing a callback into the agent.
 
 Risk:
 
-Future contributors may accidentally use direct `Agent.run(..., approval_callback=...)` and reintroduce different behavior from the main runtime.
+The previous risk was that future contributors could accidentally use direct `Agent.run(..., approval_callback=...)` and reintroduce different behavior from the main runtime. That call path is now impossible.
 
-Recommendation:
+Resolution:
 
-Either:
+Removed direct callback approval from `Agent.run()` and made confirmation event consumption the only approval path.
 
-- document direct `approval_callback` as a low-level/testing-only API, or
-- remove it from `Agent.run()` and make all callers consume `CONFIRMATION_REQUESTED` events.
+Follow-up fix:
 
-The second option is cleaner and closer to a single event-driven design.
+The first event-only implementation retried the model after approval before executing the pending tool. Some providers regenerated a similar but not identical mutating call, causing repeated approval prompts. The runtime now executes the already-approved pending tool call directly, so the approved action is deterministic and does not depend on provider regeneration.
 
 ### 3. Permission Policy Is Name-Based In Places
 
@@ -384,7 +384,6 @@ High value:
 
 - Remove or formally deprecate duplicate edit/write tools after updating skills/docs/tests.
 - Make command risk classification single-source.
-- Move direct `Agent.run(... approval_callback=...)` toward event-only confirmation.
 - Add metadata-driven policy for path-affecting mutating tools.
 
 Medium value:
@@ -399,4 +398,3 @@ Lower value:
 - Preserve TOML comments in slash-command config writes.
 - Add lightweight static analysis to CI for unused constants/imports.
 - Create an extension lifecycle matrix for MCP/plugins/skills/delegation/sandbox.
-

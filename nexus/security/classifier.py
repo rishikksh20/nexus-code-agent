@@ -1,7 +1,7 @@
 """Command and tool risk classification.
 
 ``RiskLevel`` mirrors the three tiers used by the bash classifier in
-``nexus/tools/filesystem.py`` but adds a fourth ``DANGEROUS`` tier for
+``nexus/tools/builtin/shell.py`` but adds a fourth ``DANGEROUS`` tier for
 commands that are outright catastrophic (irreversible data loss, privilege
 escalation, remote code execution, etc.).
 
@@ -66,7 +66,7 @@ class CommandClassifier:
     @classmethod
     def classify(cls, command: str) -> RiskLevel:
         """Return the risk level for *command*."""
-        from nexus.tools.filesystem import classify_bash_risk
+        from nexus.tools.builtin.shell import classify_bash_risk
 
         level = classify_bash_risk(command)
         if level == "high" and cls._is_catastrophic(command):

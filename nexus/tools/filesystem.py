@@ -8,18 +8,16 @@ to ``nexus.tools.builtin`` where each tool lives in its own module.
 - :class:`ModifyFileTool` — line-range replacement (targets a specific range)
 - :class:`ReplaceTextTool` — literal text find-and-replace in a file
 
-``classify_bash_risk`` and the workspace path helpers also remain here because
-the permission / approval system imports them directly from this module.
+``classify_bash_risk`` is re-exported here for compatibility with older imports.
 """
 from __future__ import annotations
 
-import re
-import shlex
 from pathlib import Path
 from typing import Any
 
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import FileDiff, ToolConfirmation, ToolKind
+from nexus.tools.builtin.edit_file import EditTool
 
 # ---------------------------------------------------------------------------
 # Re-exports from nexus.tools.builtin (backward-compat imports)
@@ -28,7 +26,7 @@ from nexus.tools.builtin.glob import GlobTool
 from nexus.tools.builtin.grep import GrepTool
 from nexus.tools.builtin.list_dir import ListDirTool, LsTool
 from nexus.tools.builtin.read_file import ReadFileTool
-from nexus.tools.builtin.shell import BashTool, ShellTool
+from nexus.tools.builtin.shell import BashTool, ShellTool, classify_bash_risk
 from nexus.tools.builtin.write_file import WriteFileTool
 
 __all__ = [
@@ -46,84 +44,6 @@ __all__ = [
     "ReplaceTextTool",
     "classify_bash_risk",
 ]
-
-
-# ---------------------------------------------------------------------------
-# Bash risk classifier — used by the permission / approval system
-# ---------------------------------------------------------------------------
-
-_HIGH_RISK_REGEXES: list[re.Pattern[str]] = [
-    re.compile(r"\brm\b.*\s-[a-zA-Z]*[rRfF][a-zA-Z]*"),
-    re.compile(r"\bsudo\b"),
-    re.compile(r"\bsu\b(\s|$)"),
-    re.compile(r"\bdd\b.*(if=|of=)"),
-    re.compile(r"\b(mkfs|fdisk|parted)\b"),
-    re.compile(r"\|\s*(sh|bash|zsh|fish|ksh|csh)(\s|$)"),
-    re.compile(r"\bkill\s+(-9|-SIGKILL)\b"),
-    re.compile(r"\b(killall|pkill)\b"),
-    re.compile(r"\bshred\b"),
-    re.compile(r"\bchmod\b.*\s-[rR]\b"),
-    re.compile(r"\bchown\b.*\s-[rR]\b"),
-    re.compile(r">+\s*/(?:etc|usr|bin|sbin|lib|boot|sys|proc|dev)/"),
-]
-
-_MEDIUM_RISK_REGEXES: list[re.Pattern[str]] = [
-    re.compile(r"\brm\b"),
-    re.compile(r"\bmv\b"),
-    re.compile(r"\bcp\b"),
-    re.compile(r"\btouch\b"),
-    re.compile(r"\bmkdir\b"),
-    re.compile(r"\bchmod\b"),
-    re.compile(r"\bchown\b"),
-    re.compile(r"\bsed\b.*-i"),
-    re.compile(r"\btee\b"),
-    re.compile(r">+\s*\S"),
-    re.compile(r"\bgit\s+(add|commit|push|reset|rebase|merge)\b"),
-    re.compile(r"\bgit\s+checkout\s+-[bB]\b"),
-    re.compile(r"\b(npm|pip|pip3|uv|brew|apt|apt-get|yum|dnf|pacman|snap)\s+install\b"),
-    re.compile(r"\bpython3?\s+-m\s+pip\b"),
-]
-
-_LOW_RISK_BASE_COMMANDS: frozenset[str] = frozenset({
-    "cat", "echo", "printf", "pwd", "date", "ls", "ll", "la",
-    "find", "locate", "grep", "rg", "ag", "awk", "wc",
-    "head", "tail", "sort", "uniq", "diff",
-    "which", "type", "command", "env", "printenv",
-    "uname", "hostname", "whoami", "id", "groups",
-    "ps", "pgrep",
-    "file", "stat", "du", "df", "lsof",
-    "tree", "less", "more", "bat",
-    "jq", "yq", "xmllint",
-    "python", "python3", "node", "ruby", "perl",
-})
-
-_LOW_RISK_GIT_SUBCMDS: frozenset[str] = frozenset({
-    "status", "log", "diff", "show", "branch", "remote",
-    "fetch", "ls-files", "ls-tree", "describe", "tag", "--version",
-    "shortlog", "stash list",
-})
-
-
-def classify_bash_risk(command: str) -> str:
-    """Return ``'low'``, ``'medium'``, or ``'high'`` for *command*."""
-    stripped = command.strip()
-    for pattern in _HIGH_RISK_REGEXES:
-        if pattern.search(stripped):
-            return "high"
-    for pattern in _MEDIUM_RISK_REGEXES:
-        if pattern.search(stripped):
-            return "medium"
-    try:
-        tokens = shlex.split(stripped)
-    except ValueError:
-        return "medium"
-    if not tokens:
-        return "low"
-    base_cmd = Path(tokens[0]).name
-    if base_cmd == "git":
-        sub = tokens[1] if len(tokens) > 1 else ""
-        return "low" if sub in _LOW_RISK_GIT_SUBCMDS else "medium"
-    return "low" if base_cmd in _LOW_RISK_BASE_COMMANDS else "medium"
 
 
 # ---------------------------------------------------------------------------
@@ -313,15 +233,13 @@ class ModifyFileTool:
 # ---------------------------------------------------------------------------
 
 
-class ReplaceTextTool:
+class ReplaceTextTool(EditTool):
     name = "replace_text"
     description = (
         "Replace literal text in an existing file within the workspace. "
         "By default only the first occurrence is replaced; set replace_all=true "
-        "to replace every occurrence. Cannot modify files outside the workspace "
-        "or in .nexus/ managed state."
+        "to replace every occurrence. Compatibility wrapper around the edit tool."
     )
-    kind = ToolKind.WRITE
     input_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -333,7 +251,15 @@ class ReplaceTextTool:
         "required": ["path", "old_text", "new_text"],
         "additionalProperties": False,
     }
-    is_mutating = True
+
+    def _edit_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "path": arguments.get("path", ""),
+            "old_string": arguments.get("old_text", ""),
+            "new_string": arguments.get("new_text", ""),
+            "replace_all": bool(arguments.get("replace_all", False)),
+            "_replace_first": True,
+        }
 
     async def get_confirmation(
         self,
@@ -341,36 +267,11 @@ class ReplaceTextTool:
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolConfirmation | None:
-        del call_id
-        raw_path = str(arguments.get("path", "")).strip()
-        old_text = str(arguments.get("old_text", ""))
-        if not raw_path or not old_text:
-            return None
-
-        workspace = context.working_directory.resolve()
-        target = _resolve_path(workspace, raw_path)
-        if _workspace_write_check(target, workspace) or not target.exists() or not target.is_file():
-            return None
-
-        try:
-            original = target.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return None
-
-        new_text = str(arguments.get("new_text", ""))
-        replace_all = bool(arguments.get("replace_all", False))
-        updated = (
-            original.replace(old_text, new_text)
-            if replace_all
-            else original.replace(old_text, new_text, 1)
-        )
-        return ToolConfirmation(
-            tool_name=self.name,
-            params=arguments,
-            description=f"Replace text in {target}",
-            diff=FileDiff(path=target, old_content=original, new_content=updated),
-            affected_paths=[target],
-        )
+        confirmation = await super().get_confirmation(call_id, self._edit_arguments(arguments), context)
+        if confirmation is not None:
+            confirmation.tool_name = self.name
+            confirmation.params = arguments
+        return confirmation
 
     async def execute(
         self,
@@ -378,55 +279,11 @@ class ReplaceTextTool:
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
-        raw_path = str(arguments.get("path", "")).strip()
-        old_text = str(arguments.get("old_text", ""))
-        new_text = str(arguments.get("new_text", ""))
-        replace_all = bool(arguments.get("replace_all", False))
-
-        if not raw_path:
-            return ToolResult(call_id=call_id, tool_name=self.name, output="Missing required argument: path", is_error=True)
-        if not old_text:
+        if not str(arguments.get("old_text", "")):
             return ToolResult(call_id=call_id, tool_name=self.name, output="Missing required argument: old_text", is_error=True)
-
-        workspace = context.working_directory.resolve()
-        target = _resolve_path(workspace, raw_path)
-        if err := _workspace_write_check(target, workspace):
-            return ToolResult(call_id=call_id, tool_name=self.name, output=err, is_error=True)
-        if not target.exists():
-            return ToolResult(call_id=call_id, tool_name=self.name, output=f"File not found: {raw_path}", is_error=True)
-        if not target.is_file():
-            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Not a file: {raw_path}", is_error=True)
-
-        try:
-            original = target.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Read error: {exc}", is_error=True)
-
-        count = original.count(old_text)
-        if count == 0:
-            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Text not found in {raw_path}", is_error=True)
-
-        replaced = count if replace_all else 1
-        updated = (
-            original.replace(old_text, new_text)
-            if replace_all
-            else original.replace(old_text, new_text, 1)
-        )
-        try:
-            target.write_text(updated, encoding="utf-8")
-        except OSError as exc:
-            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Write error: {exc}", is_error=True)
-
-        return ToolResult(
-            call_id=call_id,
-            tool_name=self.name,
-            output=f"Replaced {replaced} of {count} occurrence(s) in {target.relative_to(workspace)}",
-            metadata={
-                "path": str(target.relative_to(workspace)),
-                "occurrences_found": count,
-                "occurrences_replaced": replaced,
-            },
-        )
+        result = await super().execute(call_id, self._edit_arguments(arguments), context)
+        result.tool_name = self.name
+        return result
 
 
 # ---------------------------------------------------------------------------

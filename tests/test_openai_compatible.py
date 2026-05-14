@@ -7,9 +7,11 @@ import pytest
 
 from nexus.app import _build_model_client
 from nexus.config import load_config
+from nexus.integrations.anthropic import AnthropicAdapter, AnthropicModelClient
 from nexus.integrations.fake_model import FakeModelClient
+from nexus.integrations.gemini import GeminiAdapter, GeminiModelClient
 from nexus.integrations.openai_compatible import OpenAICompatibleAdapter, OpenAICompatibleModelClient
-from nexus.models import Message, RuntimeRequest
+from nexus.models import Message, RuntimeRequest, ToolCall
 
 
 class _FakeHTTPResponse:
@@ -185,6 +187,20 @@ def test_build_model_client_uses_provider_config(tmp_path):
     assert mistral_client.provider_name == "mistral"
     assert mistral_client.api_base_url == "https://api.mistral.ai/v1"
 
+    anthropic_config = load_config(
+        tmp_path,
+        global_root=tmp_path / "global",
+        cli_overrides={"provider": "anthropic", "api_base_url": "", "api_key": "secret"},
+    )
+    gemini_config = load_config(
+        tmp_path,
+        global_root=tmp_path / "global",
+        cli_overrides={"provider": "gemini", "api_base_url": "", "api_key": "secret"},
+    )
+
+    assert isinstance(_build_model_client(anthropic_config), AnthropicModelClient)
+    assert isinstance(_build_model_client(gemini_config), GeminiModelClient)
+
 
 def test_openai_adapter_skips_invalid_legacy_assistant_and_tool_messages():
     adapter = OpenAICompatibleAdapter(provider_name="openai-compatible")
@@ -206,3 +222,61 @@ def test_openai_adapter_skips_invalid_legacy_assistant_and_tool_messages():
         {"role": "user", "content": "hello"},
     ]
 
+
+def test_anthropic_adapter_converts_tools_and_messages():
+    tool_schema = {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+    }
+
+    tools = AnthropicAdapter.tools((tool_schema,))
+    messages = AnthropicAdapter.messages(
+        (
+            Message(role="user", content="read README"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=(ToolCall("call-1", "read_file", {"path": "README.md"}),),
+            ),
+            Message(role="tool", content="done", name="read_file", tool_call_id="call-1"),
+        )
+    )
+
+    assert tools == [
+        {
+            "name": "read_file",
+            "description": "Read a file",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }
+    ]
+    assert messages[1]["content"][0]["type"] == "tool_use"
+    assert messages[2]["content"][0]["type"] == "tool_result"
+
+
+def test_gemini_adapter_converts_tools_and_messages():
+    tool_schema = {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search text",
+            "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}},
+        },
+    }
+
+    tools = GeminiAdapter.tools((tool_schema,))
+    contents = GeminiAdapter.contents(
+        (
+            Message(role="user", content="search"),
+            Message(role="assistant", content="", tool_calls=(ToolCall("call-1", "grep", {"pattern": "x"}),)),
+            Message(role="tool", content="match", name="grep", tool_call_id="call-1"),
+        )
+    )
+
+    assert tools[0]["function_declarations"][0]["name"] == "grep"
+    assert contents[1]["role"] == "model"
+    assert contents[1]["parts"][0]["function_call"]["name"] == "grep"
+    assert contents[2]["parts"][0]["function_response"]["response"] == {"result": "match"}

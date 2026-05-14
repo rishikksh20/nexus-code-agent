@@ -654,6 +654,9 @@ class TerminalUI:
             return
         has_key = bool(
             config.api_key
+            or environ.get("ANTHROPIC_API_KEY")
+            or environ.get("GEMINI_API_KEY")
+            or environ.get("GOOGLE_API_KEY")
             or environ.get("MISTRAL_API_KEY")
             or environ.get("NEXUS_API_KEY")
             or environ.get("OPENAI_API_KEY")

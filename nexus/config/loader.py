@@ -195,7 +195,7 @@ def _parse_scalar(raw_value: str, template: Any) -> Any:
 def _validate_config_values(values: dict[str, Any]) -> None:
     valid_modes = {"plan", "default", "auto"}
     valid_log_formats = {"text", "json"}
-    valid_providers = {"fake", "mistral", "openai", "openai-compatible", "ollama"}
+    valid_providers = {"anthropic", "fake", "gemini", "mistral", "openai", "openai-compatible", "ollama"}
     valid_approval_policies = {
         "on-request", "approve-turn", "approve-session", "auto", "plan"
     }
@@ -334,6 +334,10 @@ def _apply_provider_defaults(values: dict[str, Any]) -> dict[str, Any]:
             resolved["api_base_url"] = mistral_base_url_env
         elif not api_base_url:
             resolved["api_base_url"] = "https://api.mistral.ai/v1"
+    elif provider in {"anthropic", "gemini"}:
+        # Native SDK providers do not use api_base_url by default.
+        if not api_base_url:
+            resolved["api_base_url"] = ""
     elif provider == "ollama":
         # Default to localhost:11434; strip /v1 suffix if user copied it from openai-compatible.
         if not api_base_url:
@@ -349,4 +353,3 @@ def _apply_provider_defaults(values: dict[str, Any]) -> dict[str, Any]:
         if base_url_env:
             resolved["api_base_url"] = base_url_env
     return resolved
-

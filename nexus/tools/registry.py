@@ -8,21 +8,18 @@ from __future__ import annotations
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import (
     ApplyPatchTool,
+    BashTool,
     EditTool,
     GetTimeTool,
+    GlobTool,
+    GrepTool,
     InsertEditIntoFileTool,
+    LsTool,
     MemoryTool,
+    ReadFileTool,
     TodoTool,
     WebFetchTool,
     WebSearchTool,
-)
-from nexus.tools.filesystem import (
-    BashTool,
-    GlobTool,
-    GrepTool,
-    LsTool,
-    ModifyFileTool,
-    ReadFileTool,
     WriteFileTool,
 )
 
@@ -45,7 +42,6 @@ def get_core_tools(config) -> list:
         EditTool(),
         InsertEditIntoFileTool(),
         ApplyPatchTool(),
-        ModifyFileTool(),
         GlobTool(),
         GrepTool(),
         LsTool(),

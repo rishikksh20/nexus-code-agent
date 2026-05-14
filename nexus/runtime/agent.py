@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator
 from typing import Any, Protocol, cast, runtime_checkable
 
 from nexus.models import (
@@ -10,7 +10,6 @@ from nexus.models import (
     AgentEventType,
     ConfirmationKind,
     ConfirmationRequest,
-    ConfirmationResponse,
     Message,
     RuntimeRequest,
     RuntimeResponse,
@@ -25,12 +24,11 @@ from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
-from nexus.security.manager import ApprovalManager, ApprovalScope
+from nexus.security.manager import ApprovalManager
 from nexus.tools.base import FileDiff, ToolConfirmation, ToolRegistry
 
 
 TOOL_CALL_LIMIT_FINISH_REASON = "tool_call_limit"
-_ApprovalCallback = Callable[[ConfirmationRequest], Awaitable[ConfirmationResponse]] | None
 
 
 @runtime_checkable
@@ -75,7 +73,6 @@ class Agent:
         mode: ExecutionMode = ExecutionMode.DEFAULT,
         approved_tools: set[str] | None = None,
         approval_manager: ApprovalManager | None = None,
-        approval_callback: _ApprovalCallback = None,
         auto_confirm: bool = False,
         auto_confirm_read_only: bool = True,
         temperature: float = 0.0,
@@ -106,7 +103,6 @@ class Agent:
             mode=mode,
             approved_tools=approved,
             approval_manager=approval_manager,
-            approval_callback=approval_callback,
             auto_confirm=auto_confirm,
             auto_confirm_read_only=auto_confirm_read_only,
             temperature=temperature,
@@ -120,6 +116,67 @@ class Agent:
 
         yield AgentEvent.agent_stop(response=final_response)
 
+    async def run_approved_tool_call(
+        self,
+        tool_call: ToolCall,
+        context: ToolExecutionContext,
+        *,
+        approval_manager: ApprovalManager | None = None,
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """Execute a tool call that the turn runner has already approved."""
+
+        record = self.tool_registry.record(tool_call.tool_name)
+        tool = record.tool
+        confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
+        confirmation_preview = _confirmation_preview(confirmation)
+
+        yield AgentEvent.tool_call_start(
+            tool_call.call_id,
+            tool_call.tool_name,
+            tool_call.arguments,
+            preview=confirmation_preview,
+        )
+        yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+
+        await self.hooks.emit(
+            HookEvent.PRE_TOOL_USE,
+            {
+                "tool_name": tool.name,
+                "tool_source": record.source,
+                "tool_origin": record.origin,
+                "arguments": tool_call.arguments,
+                "call_id": tool_call.call_id,
+                "session_id": context.session_id,
+                "is_mutating": tool.is_mutating,
+                **_correlation_payload(context, tool_call_id=tool_call.call_id),
+            },
+        )
+
+        started_at = time.perf_counter()
+        result = await tool.execute(tool_call.call_id, tool_call.arguments, context)
+        if approval_manager is not None:
+            approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
+
+        await self.hooks.emit(
+            HookEvent.POST_TOOL_USE,
+            {
+                "tool_name": tool.name,
+                "tool_source": record.source,
+                "tool_origin": record.origin,
+                "arguments": tool_call.arguments,
+                "call_id": tool_call.call_id,
+                "session_id": context.session_id,
+                "is_mutating": tool.is_mutating,
+                "is_error": result.is_error,
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                "output": result.output,
+                **_correlation_payload(context, tool_call_id=tool_call.call_id),
+            },
+        )
+
+        yield AgentEvent.tool_call_complete(result)
+        yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
+
     async def _agentic_loop(
         self,
         history: list[Message],
@@ -130,7 +187,6 @@ class Agent:
         mode: ExecutionMode,
         approved_tools: set[str],
         approval_manager: ApprovalManager | None,
-        approval_callback: _ApprovalCallback,
         auto_confirm: bool,
         auto_confirm_read_only: bool,
         temperature: float,
@@ -384,41 +440,8 @@ class Agent:
                             **_correlation_payload(context, tool_call_id=tool_call.call_id),
                         },
                     )
-                    if approval_callback is None:
-                        yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=conf_request)
-                        return
                     yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=conf_request)
-                    response = await approval_callback(conf_request)
-                    if response.denied:
-                        refused_result = _denied_tool_result(
-                            tool_call.call_id, tool.name,
-                            "User denied the tool call.",
-                            risk_level=_risk_level_name(decision.risk_level),
-                        )
-                        tool_calls_executed += 1
-                        tool_result_messages.append(Message(
-                            role="tool",
-                            content=refused_result.output,
-                            name=refused_result.tool_name,
-                            tool_call_id=refused_result.call_id,
-                        ))
-                        if approval_manager is not None:
-                            approval_manager.record_refusal(tool.name, arguments=tool_call.arguments)
-                        loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="refused")
-                        yield AgentEvent.tool_call_complete(refused_result)
-                        yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=refused_result)
-                        continue
-                    if not response.approved:
-                        return
-                    if approval_manager is not None:
-                        if response.scope == ApprovalScope.TURN.value and _supports_turn_wide_approval(
-                            tool.name,
-                            _risk_level_name(decision.risk_level),
-                        ):
-                            approval_manager.record_turn_wide_mutating_approval()
-                        else:
-                            scope = _approval_scope_from_response(response)
-                            approval_manager.record_approval(tool.name, scope, arguments=tool_call.arguments)
+                    return
 
                 # Emit both new TOOL_CALL_START and legacy TOOL_CALL_REQUESTED
                 # only once the call is actually cleared to execute.
@@ -525,17 +548,6 @@ def _is_tool_preapproved(
             risk_level=risk_level,
         )
     return tool_name in approved_tools
-
-
-def _approval_scope_from_response(response: ConfirmationResponse) -> ApprovalScope:
-    try:
-        return ApprovalScope(response.scope or ApprovalScope.ONCE.value)
-    except ValueError:
-        return ApprovalScope.ONCE
-
-
-def _supports_turn_wide_approval(tool_name: str, risk_level: str) -> bool:
-    return not (tool_name == "bash" and risk_level in {"high", "dangerous"})
 
 
 def _tool_call_limit_pause_message(max_tool_calls_per_turn: int) -> str:
