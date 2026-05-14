@@ -12,7 +12,7 @@ from nexus.sandbox.agent_tool import SubagentDefinition
 from nexus.tools.filesystem import WriteFileTool
 from nexus.skills import Skill, SkillRegistry
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool, MemoryTool, WriteNoteTool
+from nexus.tools.builtin import GetTimeTool, MemoryTool, PythonLspTool, WriteNoteTool
 from nexus.tools.registry import get_core_tools
 from nexus.tools.subagents import (
     load_subagent_definitions,
@@ -31,6 +31,7 @@ def test_core_tools_do_not_register_legacy_write_note_alias(tmp_path):
     assert "edit" in tool_names
     assert "insert_edit_into_file" in tool_names
     assert "apply_patch" in tool_names
+    assert "lsp" in tool_names
     assert "modify_file" not in tool_names
     assert "write_note" not in tool_names
     assert len(tool_names) == len(set(tool_names))
@@ -244,3 +245,100 @@ async def test_register_skill_subagent_tools_registers_skill_backed_workers():
         assert record.origin == "review"
     finally:
         await delegation.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_python_lsp_document_symbols_and_hover(tool_context):
+    source = tool_context.working_directory / "sample.py"
+    source.write_text(
+        'class Greeter:\n'
+        '    """Friendly class."""\n'
+        '    greeting = "hi"\n'
+        '\n'
+        '    def greet(self, name):\n'
+        '        """Return a greeting."""\n'
+        '        return format_name(name)\n'
+        '\n'
+        'def format_name(value):\n'
+        '    return value.title()\n',
+        encoding="utf-8",
+    )
+    tool = PythonLspTool()
+
+    symbols = await tool.execute("call-lsp-1", {"operation": "document_symbol", "file_path": "sample.py"}, tool_context)
+    hover = await tool.execute(
+        "call-lsp-2",
+        {"operation": "hover", "file_path": "sample.py", "symbol": "greet"},
+        tool_context,
+    )
+
+    assert symbols.is_error is False
+    assert "class Greeter - sample.py:1:1" in symbols.output
+    assert "function Greeter.greet - sample.py:5:5" in symbols.output
+    assert "variable Greeter.greeting - sample.py:3:5" in symbols.output
+    assert hover.is_error is False
+    assert "function Greeter.greet" in hover.output
+    assert "docstring: Return a greeting." in hover.output
+
+
+@pytest.mark.asyncio
+async def test_python_lsp_workspace_definition_and_references(tool_context):
+    (tool_context.working_directory / "lib.py").write_text(
+        "def helper(value):\n"
+        "    return value + 1\n",
+        encoding="utf-8",
+    )
+    (tool_context.working_directory / "main.py").write_text(
+        "from lib import helper\n"
+        "\n"
+        "result = helper(41)\n",
+        encoding="utf-8",
+    )
+    tool = PythonLspTool()
+
+    workspace_symbols = await tool.execute(
+        "call-lsp-3",
+        {"operation": "workspace_symbol", "query": "help"},
+        tool_context,
+    )
+    definition = await tool.execute(
+        "call-lsp-4",
+        {"operation": "go_to_definition", "file_path": "main.py", "line": 3, "character": 10},
+        tool_context,
+    )
+    references = await tool.execute(
+        "call-lsp-5",
+        {"operation": "find_references", "file_path": "main.py", "symbol": "helper"},
+        tool_context,
+    )
+
+    assert workspace_symbols.is_error is False
+    assert "function helper - lib.py:1:1" in workspace_symbols.output
+    assert definition.is_error is False
+    assert "function helper - lib.py:1:1" in definition.output
+    assert references.is_error is False
+    assert "lib.py:1:def helper(value):" in references.output
+    assert "main.py:3:result = helper(41)" in references.output
+
+
+@pytest.mark.asyncio
+async def test_python_lsp_rejects_outside_and_non_python_paths(tool_context):
+    tool = PythonLspTool()
+    text_file = tool_context.working_directory / "notes.txt"
+    text_file.write_text("hello", encoding="utf-8")
+
+    outside = await tool.execute(
+        "call-lsp-6",
+        {"operation": "document_symbol", "file_path": "../escape.py"},
+        tool_context,
+    )
+    non_python = await tool.execute(
+        "call-lsp-7",
+        {"operation": "document_symbol", "file_path": "notes.txt"},
+        tool_context,
+    )
+
+    assert outside.is_error is True
+    assert "outside the current workspace" in outside.output
+    assert non_python.is_error is True
+    assert "Python files only" in non_python.output

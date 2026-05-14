@@ -33,7 +33,7 @@
 - **Headless / one-shot** execution via `--prompt`, `--prompt-file`, or `--stdin`
 - **Typed agent loop** — normalized message, tool-call, and tool-result contracts keep provider adapter logic outside the runtime
 - **Deterministic approval resume** — approved tool calls resume from the exact pending call shown to the user, avoiding provider-regenerated permission loops
-- **Built-in tools** — file read/write/edit, glob, grep, ls, bash (with risk classification), web fetch/search, memory, todos, and more
+- **Built-in tools** — file read/write/edit, glob, grep, Python LSP-style code intelligence, ls, bash (with risk classification), web fetch/search, memory, todos, and more
 - **Permission system** — `plan` / `default` / `auto` execution modes with per-tool risk gating
 - **Session persistence** — JSON snapshots under `.nexus/sessions/`; resume by session name or opt into latest-session resume
 - **Context compaction** — token-budget management with carry-over summaries; soft/hard limits auto-tuned to the active model's context window
@@ -148,6 +148,7 @@ nexus/                         # Main package
 │       ├── patch.py           # apply_patch
 │       ├── glob.py            # glob
 │       ├── grep.py            # grep
+│       ├── lsp.py             # lsp
 │       ├── list_dir.py        # ls
 │       ├── shell.py           # bash
 │       ├── memory.py          # memory
@@ -454,6 +455,7 @@ All tools pass through the permission system and lifecycle hooks. **Risk level**
 | `read_file` | low | No | Reads a file or line range within the workspace |
 | `glob` | low | No | Finds files by glob pattern within the workspace |
 | `grep` | low | No | Searches file content by regex; returns path, line number, match |
+| `lsp` | low | No | Inspects Python symbols, definitions, references, and hover details |
 | `list_dir` | low | No | Lists directory contents with file sizes |
 | `web_fetch` | low | No | Fetches a URL and returns the response body |
 | `web_search` | low | No | Runs a web search and returns result snippets |

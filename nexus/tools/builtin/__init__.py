@@ -17,6 +17,7 @@ from nexus.tools.builtin.edit_file import EditTool
 from nexus.tools.builtin.glob import GlobTool
 from nexus.tools.builtin.grep import GrepTool
 from nexus.tools.builtin.list_dir import ListDirTool, LsTool
+from nexus.tools.builtin.lsp import PythonLspTool
 from nexus.tools.builtin.memory import MemoryTool
 from nexus.tools.builtin.patch import ApplyPatchTool
 from nexus.tools.builtin.read_file import ReadFileTool
@@ -42,6 +43,7 @@ __all__ = [
     "GrepTool",
     "ListDirTool",
     "LsTool",
+    "PythonLspTool",
     # Execution
     "ShellTool",
     "BashTool",
@@ -66,6 +68,7 @@ def get_all_builtin_tools(*, memory_dir=None) -> list[Any]:
         GlobTool(),
         GrepTool(),
         ListDirTool(),
+        PythonLspTool(),
         ShellTool(),
         MemoryTool(memory_dir=memory_dir),
         TodoTool(),
