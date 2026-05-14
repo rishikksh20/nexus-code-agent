@@ -38,12 +38,7 @@ def build_context_sections(
 
     skills: list[str] = []
     if skill_registry is not None and skill_registry.all():
-        skills.append(skill_registry.summary())
-        for skill_name in active_skills or []:
-            skill = skill_registry.get(skill_name)
-            if skill is None:
-                continue
-            skills.append(f"Active Skill: {skill.name}\n\n{skill.content.strip()}")
+        skills.append(skill_registry.summary(active=set(active_skills or [])))
 
     carry_over_notes: list[str] = []
     if carry_over is not None:
@@ -60,10 +55,7 @@ def build_context_sections(
             f"Mode: {execution_mode or config.default_mode}",
             f"Provider adapter: {config.provider}",
         ],
-        tools=[
-            f"[{record.source}] {record.name}: {record.tool.description}"
-            for record in tool_registry.records()
-        ],
+        tools=[],
         skills=skills,
         project_notes=project_notes,
         carry_over=carry_over_notes,
@@ -82,4 +74,3 @@ def _read_knowledge_summary(path: Path) -> list[str]:
 
 def _current_utc_time() -> str:
     return datetime.now(UTC).isoformat()
-

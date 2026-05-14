@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+from rich.console import Console
+
+from nexus.app import RuntimeResources
+from nexus.config import load_config
+from nexus.runtime.runtime_session import RuntimeSession
 from nexus.skills import BUILTIN_SKILLS_DIR, load_skill_registry
+from nexus.tools.base import ToolRegistry
 
 
 def test_builtin_skills_dir_exists():
@@ -49,3 +55,26 @@ def test_local_skill_overrides_builtin(tmp_path):
     skill = registry.get("nexus-agent")
     assert skill is not None
     assert "Local version." in skill.content
+
+
+def test_builtin_nexus_agent_is_discoverable_but_not_auto_active(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+
+    runtime_session = RuntimeSession.create(
+        config=config,
+        console=Console(record=True, no_color=True),
+        params={
+            "no_session": True,
+            "session": None,
+            "resume_last": False,
+            "no_skills": False,
+            "skills": (),
+            "deny_mutating": False,
+        },
+        tool_registry=ToolRegistry(),
+        hooks=None,
+        resources=RuntimeResources(),
+    )
+
+    assert runtime_session.state.skill_registry.get("nexus-agent") is not None
+    assert runtime_session.state.active_skills == []

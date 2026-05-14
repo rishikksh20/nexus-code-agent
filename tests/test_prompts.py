@@ -86,7 +86,8 @@ def test_build_context_includes_active_skill_and_carry_over(tmp_path):
         carry_over=CarryOverState(summarized_history=["Earlier context compacted."], active_constraints=["Stay concise."]),
     )
 
-    assert any("Active Skill: review" in item for item in sections.skills)
+    assert any("review: Review skill (active)" in item for item in sections.skills)
+    assert not any("Always review carefully." in item for item in sections.skills)
     assert "Earlier context compacted." in sections.carry_over
 
 
@@ -102,8 +103,7 @@ def test_base_instruction_prefers_read_only_tools_for_repo_explanations(tmp_path
         task_input="scan this repo and explain the structure",
     )
 
-    assert "treat the task as read-only by default" in sections.base_instruction
-    assert "Do **not** call mutating tools unless the user explicitly asks" in sections.base_instruction
+    assert "stay read-only unless the user asks for changes" in sections.base_instruction
 
 
 def test_base_instruction_mentions_hidden_path_read_restrictions(tmp_path):
@@ -117,11 +117,11 @@ def test_base_instruction_mentions_hidden_path_read_restrictions(tmp_path):
         task_input="inspect config files",
     )
 
-    assert "Hidden/private dot-path reads are blocked by default" in sections.base_instruction
-    assert "Never rely on reading `.nexus`" in sections.base_instruction
+    assert "respect hidden-path restrictions" in sections.base_instruction
+    assert "do not rely on direct `.nexus` reads" in sections.base_instruction
 
 
-def test_context_tools_label_read_only_vs_mutating(tmp_path):
+def test_context_does_not_duplicate_tool_descriptions(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
     registry.register(GetTimeTool())
@@ -129,5 +129,5 @@ def test_context_tools_label_read_only_vs_mutating(tmp_path):
 
     sections = build_context_sections(config, registry, task_input="describe tools")
 
-    assert any("[core] [read-only] get_time" in entry for entry in sections.tools)
-    assert any("[core] [mutating] write_file" in entry for entry in sections.tools)
+    assert sections.tools == []
+    assert "Tool schemas describe the available tools" in sections.base_instruction

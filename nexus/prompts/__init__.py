@@ -91,12 +91,8 @@ def build_context_sections(
     # --- skills ---
     skills: list[str] = []
     if skill_registry is not None and skill_registry.all():
-        skills.append(skill_registry.summary())
-        for skill_name in (active_skills or []):
-            skill = skill_registry.get(skill_name)
-            if skill is None:
-                continue
-            skills.append(f"Active Skill: {skill.name}\n\n{skill.content.strip()}")
+        active = set(active_skills or [])
+        skills.append(skill_registry.summary(active=active))
 
     # --- carry-over notes ---
     carry_over_notes: list[str] = []
@@ -123,10 +119,7 @@ def build_context_sections(
             f"Provider adapter: {config.provider}",
             f"Model: {config.model_name}",
         ],
-        tools=[
-            f"[{record.source}] [{'mutating' if record.tool.is_mutating else 'read-only'}] {record.name}: {record.tool.description}"
-            for record in tool_registry.records()
-        ],
+        tools=[],
         skills=skills,
         project_notes=project_notes,
         memory=list(memory_entries) if memory_entries else [],

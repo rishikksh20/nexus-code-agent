@@ -50,12 +50,7 @@ class RuntimeSession:
             if no_skills
             else load_skill_registry(*get_skill_roots(config))
         )
-        builtin_active = (
-            []
-            if no_skills
-            else (["nexus-agent"] if skill_registry.get("nexus-agent") is not None else [])
-        )
-        active_skills = builtin_active + [
+        active_skills = [
             name
             for name in params.get("skills", ())
             if skill_registry.get(name) is not None

@@ -16,8 +16,12 @@ class SkillRegistry:
     def all(self) -> list[Skill]:
         return sorted(self._skills.values(), key=lambda item: item.name)
 
-    def summary(self) -> str:
+    def summary(self, *, active: set[str] | None = None) -> str:
         if not self._skills:
             return ""
-        items = [f"- {skill.name}: {skill.description}" for skill in self.all()]
+        active = active or set()
+        items = [
+            f"- {skill.name}: {skill.description}" + (" (active)" if skill.name in active else "")
+            for skill in self.all()
+        ]
         return "Available skills:\n" + "\n".join(items)
