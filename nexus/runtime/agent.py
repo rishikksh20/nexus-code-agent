@@ -249,15 +249,6 @@ class Agent:
                     yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload=TOOL_CALL_LIMIT_FINISH_REASON)
                     return
 
-                # Emit both new TOOL_CALL_START and legacy TOOL_CALL_REQUESTED.
-                yield AgentEvent.tool_call_start(
-                    tool_call.call_id,
-                    tool_call.tool_name,
-                    tool_call.arguments,
-                    preview=confirmation_preview,
-                )
-                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
-
                 missing_fields = _missing_required_fields(tool.input_schema, tool_call.arguments)
                 if missing_fields:
                     missing_field = missing_fields[0]
@@ -274,18 +265,19 @@ class Agent:
                             **_correlation_payload(context, tool_call_id=tool_call.call_id),
                         },
                     )
+                    clarification_request = ConfirmationRequest(
+                        kind=ConfirmationKind.CLARIFICATION,
+                        tool_name=tool.name,
+                        prompt=f"Provide a value for '{missing_field}' before running '{tool.name}'.",
+                        reason="Required tool argument is missing.",
+                        call_id=tool_call.call_id,
+                        payload={"tool_name": tool.name, "field": missing_field},
+                        arguments=tool_call.arguments,
+                        preview=confirmation_preview,
+                    )
                     yield AgentEvent(
                         kind=AgentEventType.CONFIRMATION_REQUESTED,
-                        payload=ConfirmationRequest(
-                            kind=ConfirmationKind.CLARIFICATION,
-                            tool_name=tool.name,
-                            prompt=f"Provide a value for '{missing_field}' before running '{tool.name}'.",
-                            reason="Required tool argument is missing.",
-                            call_id=tool_call.call_id,
-                            payload={"tool_name": tool.name, "field": missing_field},
-                            arguments=tool_call.arguments,
-                            preview=confirmation_preview,
-                        ),
+                        payload=clarification_request,
                     )
                     return
 
@@ -395,6 +387,7 @@ class Agent:
                     if approval_callback is None:
                         yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=conf_request)
                         return
+                    yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=conf_request)
                     response = await approval_callback(conf_request)
                     if response.denied:
                         refused_result = _denied_tool_result(
@@ -411,14 +404,31 @@ class Agent:
                         ))
                         if approval_manager is not None:
                             approval_manager.record_refusal(tool.name, arguments=tool_call.arguments)
+                        loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="refused")
                         yield AgentEvent.tool_call_complete(refused_result)
                         yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=refused_result)
-                        loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="refused")
                         continue
                     if not response.approved:
                         return
                     if approval_manager is not None:
-                        approval_manager.record_approval(tool.name, ApprovalScope.ONCE, arguments=tool_call.arguments)
+                        if response.scope == ApprovalScope.TURN.value and _supports_turn_wide_approval(
+                            tool.name,
+                            _risk_level_name(decision.risk_level),
+                        ):
+                            approval_manager.record_turn_wide_mutating_approval()
+                        else:
+                            scope = _approval_scope_from_response(response)
+                            approval_manager.record_approval(tool.name, scope, arguments=tool_call.arguments)
+
+                # Emit both new TOOL_CALL_START and legacy TOOL_CALL_REQUESTED
+                # only once the call is actually cleared to execute.
+                yield AgentEvent.tool_call_start(
+                    tool_call.call_id,
+                    tool_call.tool_name,
+                    tool_call.arguments,
+                    preview=confirmation_preview,
+                )
+                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
 
                 await self.hooks.emit(
                     HookEvent.PRE_TOOL_USE,
@@ -517,6 +527,17 @@ def _is_tool_preapproved(
     return tool_name in approved_tools
 
 
+def _approval_scope_from_response(response: ConfirmationResponse) -> ApprovalScope:
+    try:
+        return ApprovalScope(response.scope or ApprovalScope.ONCE.value)
+    except ValueError:
+        return ApprovalScope.ONCE
+
+
+def _supports_turn_wide_approval(tool_name: str, risk_level: str) -> bool:
+    return not (tool_name == "bash" and risk_level in {"high", "dangerous"})
+
+
 def _tool_call_limit_pause_message(max_tool_calls_per_turn: int) -> str:
     return (
         "Tool call limit reached for this turn "
@@ -597,5 +618,3 @@ def _denied_tool_result(
             "risk_level": risk_level,
         },
     )
-
-

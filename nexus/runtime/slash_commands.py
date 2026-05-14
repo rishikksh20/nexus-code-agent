@@ -26,8 +26,6 @@ from nexus.tools.subagents import register_skill_subagent_tools
 
 CommandHandler = Callable[[ReplState, list[str]], Awaitable[None]]
 
-VALID_PROVIDERS: tuple[str, ...] = ("fake", "openai", "openai-compatible")
-
 # Only these parameters can be updated live via /provider set.
 # This prevents arbitrary config key injection (unlike /config set which is unguarded).
 PROVIDER_SETTABLE_PARAMS: frozenset[str] = frozenset({
@@ -303,6 +301,7 @@ async def handle_provider(state: ReplState, args: list[str]) -> None:
             global_root=state.config.global_root,
             local_config_path=state.config.local_config_file,
             global_config_path=state.config.global_config_file,
+            cli_overrides={key: _coerce_toml_value(value)},
         )
         state.console.print(f"Updated {key} = {getattr(state.config, key)!r}")
         return
@@ -341,6 +340,7 @@ def _print_provider_list(state: ReplState) -> None:
         ("mistral", "Mistral AI API endpoint (requires MISTRAL_API_KEY)."),
         ("openai", "OpenAI API endpoint (requires api_base_url and API key)."),
         ("openai-compatible", "Any OpenAI-compatible API endpoint (Ollama, vLLM, etc.)."),
+        ("ollama", "Local Ollama server (no API key required)."),
     )
     for provider, description in rows:
         table.add_row(provider, description, "yes" if state.config.provider == provider else "no")

@@ -43,6 +43,7 @@ __all__ = [
     "BashTool",
     # Nexus-specific, defined here
     "ModifyFileTool",
+    "ReplaceTextTool",
     "classify_bash_risk",
 ]
 
@@ -308,6 +309,126 @@ class ModifyFileTool:
 
 
 # ---------------------------------------------------------------------------
-# End of Nexus-specific tools
+# Tool: replace_text   [Nexus-specific — literal find-and-replace]
 # ---------------------------------------------------------------------------
 
+
+class ReplaceTextTool:
+    name = "replace_text"
+    description = (
+        "Replace literal text in an existing file within the workspace. "
+        "By default only the first occurrence is replaced; set replace_all=true "
+        "to replace every occurrence. Cannot modify files outside the workspace "
+        "or in .nexus/ managed state."
+    )
+    kind = ToolKind.WRITE
+    input_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "old_text": {"type": "string", "minLength": 1},
+            "new_text": {"type": "string"},
+            "replace_all": {"type": "boolean"},
+        },
+        "required": ["path", "old_text", "new_text"],
+        "additionalProperties": False,
+    }
+    is_mutating = True
+
+    async def get_confirmation(
+        self,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolConfirmation | None:
+        del call_id
+        raw_path = str(arguments.get("path", "")).strip()
+        old_text = str(arguments.get("old_text", ""))
+        if not raw_path or not old_text:
+            return None
+
+        workspace = context.working_directory.resolve()
+        target = _resolve_path(workspace, raw_path)
+        if _workspace_write_check(target, workspace) or not target.exists() or not target.is_file():
+            return None
+
+        try:
+            original = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+        new_text = str(arguments.get("new_text", ""))
+        replace_all = bool(arguments.get("replace_all", False))
+        updated = (
+            original.replace(old_text, new_text)
+            if replace_all
+            else original.replace(old_text, new_text, 1)
+        )
+        return ToolConfirmation(
+            tool_name=self.name,
+            params=arguments,
+            description=f"Replace text in {target}",
+            diff=FileDiff(path=target, old_content=original, new_content=updated),
+            affected_paths=[target],
+        )
+
+    async def execute(
+        self,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        raw_path = str(arguments.get("path", "")).strip()
+        old_text = str(arguments.get("old_text", ""))
+        new_text = str(arguments.get("new_text", ""))
+        replace_all = bool(arguments.get("replace_all", False))
+
+        if not raw_path:
+            return ToolResult(call_id=call_id, tool_name=self.name, output="Missing required argument: path", is_error=True)
+        if not old_text:
+            return ToolResult(call_id=call_id, tool_name=self.name, output="Missing required argument: old_text", is_error=True)
+
+        workspace = context.working_directory.resolve()
+        target = _resolve_path(workspace, raw_path)
+        if err := _workspace_write_check(target, workspace):
+            return ToolResult(call_id=call_id, tool_name=self.name, output=err, is_error=True)
+        if not target.exists():
+            return ToolResult(call_id=call_id, tool_name=self.name, output=f"File not found: {raw_path}", is_error=True)
+        if not target.is_file():
+            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Not a file: {raw_path}", is_error=True)
+
+        try:
+            original = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Read error: {exc}", is_error=True)
+
+        count = original.count(old_text)
+        if count == 0:
+            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Text not found in {raw_path}", is_error=True)
+
+        replaced = count if replace_all else 1
+        updated = (
+            original.replace(old_text, new_text)
+            if replace_all
+            else original.replace(old_text, new_text, 1)
+        )
+        try:
+            target.write_text(updated, encoding="utf-8")
+        except OSError as exc:
+            return ToolResult(call_id=call_id, tool_name=self.name, output=f"Write error: {exc}", is_error=True)
+
+        return ToolResult(
+            call_id=call_id,
+            tool_name=self.name,
+            output=f"Replaced {replaced} of {count} occurrence(s) in {target.relative_to(workspace)}",
+            metadata={
+                "path": str(target.relative_to(workspace)),
+                "occurrences_found": count,
+                "occurrences_replaced": replaced,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# End of Nexus-specific tools
+# ---------------------------------------------------------------------------

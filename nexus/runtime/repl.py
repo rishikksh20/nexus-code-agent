@@ -86,6 +86,8 @@ async def run_agent_turn(
             model_name=state.config.model_name,
             mode=state.mode,
             approval_manager=state.approval_manager,
+            # Let the live agent loop collect approvals so the approved tool
+            # call can execute without asking the model to regenerate it.
             approval_callback=approval_callback,
             auto_confirm=auto_confirm,
             auto_confirm_read_only=state.config.auto_confirm_read_only,
@@ -103,10 +105,7 @@ async def run_agent_turn(
             batch.append(event)
 
         # ── confirmation / clarification handling ────────────────────────────
-        confirmation_index = next(
-            (index for index, event in enumerate(batch) if event.kind == "confirmation_requested"),
-            None,
-        )
+        confirmation_index = _first_unresolved_confirmation_index(batch)
 
         if confirmation_index is not None:
             committed_prefix = _history_safe_completed_events(batch[:confirmation_index])
@@ -177,6 +176,10 @@ async def run_agent_turn(
 
     _sync_paused_turn_state(state, committed_events, prompt_text=initial_prompt_text)
     return []
+
+
+# Backward-compatible name used by existing tests and earlier docs.
+collect_turn_events = run_agent_turn
 
 
 async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: bool = False) -> None:
@@ -476,3 +479,28 @@ def _history_safe_completed_events(events: list[AgentEvent]) -> list[AgentEvent]
         committed.append(event)
     return committed
 
+
+def _first_unresolved_confirmation_index(
+    events: list[AgentEvent],
+) -> int | None:
+    """Return the first confirmation that still needs the turn runner to act.
+
+    When an approval callback is passed into ``Agent.run()``, approval prompts
+    are rendered as events and answered inside the live agent loop so the
+    original tool call can continue without asking the model to regenerate it.
+    Those consumed approvals have a later tool terminal event for the same call
+    id, so the turn runner can leave them alone.
+    """
+    terminal_call_ids = {
+        event.payload.call_id
+        for event in events
+        if event.kind in {AgentEventType.TOOL_CALL_COMPLETE, AgentEventType.TOOL_RESULT}
+    }
+    for index, event in enumerate(events):
+        if event.kind != AgentEventType.CONFIRMATION_REQUESTED:
+            continue
+        request = cast(ConfirmationRequest, event.payload)
+        if request.call_id and request.call_id in terminal_call_ids:
+            continue
+        return index
+    return None

@@ -54,6 +54,16 @@ class _CaptureModelClient:
         )
 
 
+class _CountingFakeModelClient(FakeModelClient):
+    def __init__(self, scripted):
+        super().__init__(scripted=scripted)
+        self.calls = 0
+
+    async def complete(self, request: RuntimeRequest) -> RuntimeResponse:
+        self.calls += 1
+        return await super().complete(request)
+
+
 class _RecordingAgent:
     def __init__(self) -> None:
         self.messages: list[Message] = []
@@ -440,6 +450,46 @@ async def test_collect_turn_events_requires_confirmation_for_each_mutating_call(
 
 
 @pytest.mark.asyncio
+async def test_collect_turn_events_executes_approved_call_without_model_retry(tmp_path):
+    state = _build_state(tmp_path)
+    state.history.append(Message(role="user", content="write hello.py"))
+    state.tool_registry.register(WriteNoteTool())
+    tool_call = ToolCall(
+        call_id="note-1",
+        tool_name="write_note",
+        arguments={"path": "hello.txt", "content": "hello"},
+    )
+    model = _CountingFakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Writing hello.", tool_calls=(tool_call,)),
+                tool_calls=(tool_call,),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Done.")),
+        ]
+    )
+    agent = Agent(model_client=model, tool_registry=state.tool_registry)
+    seen_requests: list[ConfirmationRequest] = []
+
+    async def _approve(request):
+        seen_requests.append(request)
+        return ConfirmationResponse(approved=True)
+
+    events = await collect_turn_events(
+        state,
+        agent,
+        prompt_text="write hello.py",
+        approval_callback=_approve,
+    )
+
+    assert model.calls == 2
+    assert [request.call_id for request in seen_requests] == ["note-1"]
+    assert (tmp_path / "hello.txt").read_text(encoding="utf-8") == "hello"
+    assert [event.payload.call_id for event in events if event.kind == AgentEventType.TOOL_RESULT] == ["note-1"]
+
+
+@pytest.mark.asyncio
 async def test_collect_turn_events_yes_turn_skips_later_non_dangerous_mutating_confirmations(tmp_path):
     state = _build_state(tmp_path)
     state.tool_registry.register(WriteNoteTool())
@@ -457,11 +507,6 @@ async def test_collect_turn_events_yes_turn_skips_later_non_dangerous_mutating_c
     )
     model = FakeModelClient(
         scripted=[
-            RuntimeResponse(
-                message=Message(role="assistant", content="Creating notes."),
-                tool_calls=(note_one, note_two),
-                finish_reason="tool_calls",
-            ),
             RuntimeResponse(
                 message=Message(role="assistant", content="Creating notes."),
                 tool_calls=(note_one, note_two),
@@ -491,7 +536,7 @@ async def test_collect_turn_events_yes_turn_skips_later_non_dangerous_mutating_c
     assert [result.call_id for result in tool_results] == ["note-1", "note-2"]
     assert (tmp_path / "notes" / "one.txt").read_text(encoding="utf-8") == "one"
     assert (tmp_path / "notes" / "two.txt").read_text(encoding="utf-8") == "two"
-    assert not any(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events)
+    assert sum(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events) == 1
 
 
 @pytest.mark.asyncio
@@ -589,16 +634,17 @@ async def test_collect_turn_events_denied_memory_write_is_not_reprompted_same_tu
     tool_results = [event.payload for event in events if event.kind == AgentEventType.TOOL_RESULT]
 
     assert len(seen_requests) == 1
-    assert len(tool_results) == 1
-    assert tool_results[0].call_id == "call-memory-2"
+    assert len(tool_results) == 2
+    assert tool_results[0].call_id == "call-memory-1"
     assert tool_results[0].is_error is True
-    assert "previously denied" in tool_results[0].output.lower()
+    assert "user denied" in tool_results[0].output.lower()
+    assert tool_results[1].call_id == "call-memory-2"
+    assert tool_results[1].is_error is True
+    assert "previously denied" in tool_results[1].output.lower()
     assert not (state.config.memory_dir / "user_memory.json").exists()
     assert any(
         event.kind == AgentEventType.MODEL_RESPONSE
         and event.payload.message.content == "Okay, I won't store it right now. What's next?"
         for event in events
     )
-    assert not any(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events)
-
-
+    assert sum(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events) == 1

@@ -119,7 +119,7 @@ def classify_danger(tool_name: str, arguments: dict[str, Any]) -> DangerLevel:
     del arguments
     if tool_name in {"get_time", "read_file", "glob", "search_memory", "skill"}:
         return DangerLevel.SAFE
-    if tool_name in {"write_file"}:
+    if tool_name in {"write_file", "write_note"}:
         return DangerLevel.HIGH
     if tool_name in {"bash", "run_command", "delete_file"}:
         return DangerLevel.CRITICAL
@@ -127,4 +127,11 @@ def classify_danger(tool_name: str, arguments: dict[str, Any]) -> DangerLevel:
 
 
 def rollback_plan(tool_name: str, arguments: dict[str, Any]) -> RollbackPlan:
+    if tool_name in {"write_file", "write_note", "modify_file", "replace_text"}:
+        path = str(arguments.get("path", "")).strip()
+        target = f" for {path}" if path else ""
+        return RollbackPlan(
+            supported=True,
+            summary=f"File edit rollback can be prepared from the confirmation diff or VCS state{target}.",
+        )
     return RollbackPlan(supported=False, summary="No rollback plan is currently available.")

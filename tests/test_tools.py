@@ -13,12 +13,23 @@ from nexus.tools.filesystem import WriteFileTool
 from nexus.skills import Skill, SkillRegistry
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import GetTimeTool, MemoryTool, WriteNoteTool
+from nexus.tools.registry import get_core_tools
 from nexus.tools.subagents import (
     load_subagent_definitions,
     load_subagent_definitions_from_skills,
     register_skill_subagent_tools,
     register_subagent_tools,
 )
+
+
+def test_core_tools_do_not_register_legacy_write_note_alias(tmp_path):
+    config = SimpleNamespace(memory_dir=tmp_path / "memory")
+
+    tool_names = [tool.name for tool in get_core_tools(config)]
+
+    assert "write_file" in tool_names
+    assert "write_note" not in tool_names
+    assert len(tool_names) == len(set(tool_names))
 
 
 @pytest.mark.asyncio

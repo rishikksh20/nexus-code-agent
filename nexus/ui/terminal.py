@@ -79,11 +79,11 @@ class TerminalUI:
         self._console.print(*args, **kwargs)
 
     def input(self, prompt: str = "") -> str:
-        return self._console.input(prompt)
+        return input(Text.from_markup(prompt).plain if prompt else "")
 
     def prompt_user(self) -> str:
         self.end_assistant()
-        return self._console.input("[primary]>[/primary] ")
+        return input("> ")
 
     def print_version(self, version: str) -> None:
         self._console.print(version, style="version")

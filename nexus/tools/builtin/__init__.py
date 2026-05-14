@@ -26,7 +26,7 @@ from nexus.tools.builtin.time import GetTimeTool
 from nexus.tools.builtin.todo import TodoTool
 from nexus.tools.builtin.web_fetch import WebFetchTool
 from nexus.tools.builtin.web_search import WebSearchTool
-from nexus.tools.builtin.write_file import WriteFileTool
+from nexus.tools.builtin.write_file import WriteFileTool, WriteNoteTool
 
 __all__ = [
     "GetTimeTool",

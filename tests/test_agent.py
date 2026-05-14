@@ -116,13 +116,12 @@ async def test_agent_confirmation_request_includes_file_diff_preview(tool_contex
         )
     ]
 
-    tool_start = next(event for event in events if event.kind == "TOOL_CALL_START")
     confirmation = next(event for event in events if event.kind == "confirmation_requested")
 
-    assert tool_start.payload["preview"]["diff"]["path"].endswith("calculator.py")
-    assert "+print('calculator')" in tool_start.payload["preview"]["diff"]["unified_diff"]
+    assert not any(event.kind == "TOOL_CALL_START" for event in events)
     assert confirmation.payload.call_id == "wf-1"
     assert confirmation.payload.preview["diff"]["path"].endswith("calculator.py")
+    assert "+print('calculator')" in confirmation.payload.preview["diff"]["unified_diff"]
 
 
 @pytest.mark.asyncio
@@ -364,4 +363,3 @@ async def test_agent_does_not_emit_empty_assistant_message(tool_context):
 
     assert not any(event.kind == "model_response" for event in events)
     assert any(event.kind == "turn_completed" for event in events)
-
