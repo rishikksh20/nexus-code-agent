@@ -19,6 +19,19 @@ def _build_ui() -> TerminalUI:
     return ui
 
 
+def test_terminal_ui_startup_banner_includes_ascii_wordmark():
+    ui = _build_ui()
+
+    ui.print_banner("fake", "demo-model", "default", workspace="/workspace")
+    output = ui.console.export_text()
+
+    assert "Nexus Coding Agent" in output
+    assert "███    ██ ███████" in output
+    assert "██   ████ ███████" in output
+    assert "Provider" in output
+    assert "demo-model" in output
+
+
 def test_terminal_ui_renders_inline_approval_inside_tool_panel():
     ui = _build_ui()
     diff_preview = {
@@ -103,4 +116,3 @@ def test_terminal_ui_tool_result_reuses_stored_preview_diff():
     assert output.count("diff") >= 2
     assert "+print('new')" in output
     assert "done" in output
-

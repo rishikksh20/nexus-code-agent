@@ -55,6 +55,40 @@ NEXUS_THEME = Theme(
 )
 
 _MAX_PREVIEW_CHARS = 150
+_NEXUS_ASCII_BANNER = r"""
+███    ██ ███████ ██   ██ ██   ██ ███████      █████  ██
+████   ██ ██       ██ ██  ██   ██ ██          ██   ██ ██
+██ ██  ██ █████     ███   ██   ██ ███████     ███████ ██
+██  ██ ██ ██       ██ ██  ██   ██      ██     ██   ██ ██
+██   ████ ███████ ██   ██  █████  ███████     ██   ██ ██
+""".strip("\n")
+_BANNER_PALETTE = (
+    "yellow",
+    "bright_green",
+    "magenta",
+    "bright_yellow",
+    "green",
+    "bright_magenta",
+)
+
+
+def _ascii_banner_text() -> str:
+    return _NEXUS_ASCII_BANNER
+
+
+def _solid_ascii_banner() -> Text:
+    banner = Text(overflow="fold", no_wrap=False)
+    color_index = 0
+    for char in _ascii_banner_text():
+        if char == "\n":
+            banner.append(char)
+            continue
+        if char == " ":
+            banner.append(char)
+            continue
+        banner.append(char, style=_BANNER_PALETTE[color_index % len(_BANNER_PALETTE)])
+        color_index += 1
+    return banner
 
 
 class TerminalUI:
@@ -168,6 +202,7 @@ class TerminalUI:
         workspace: str | Path | None = None,
     ) -> None:
         self._workspace_root = Path(workspace).resolve() if workspace is not None else None
+        wordmark = _solid_ascii_banner()
         body = Table.grid(expand=True)
         body.add_column(style="muted", width=12)
         body.add_column(style="primary")
@@ -179,7 +214,7 @@ class TerminalUI:
         body.add_row("Quick help", "/help  •  /skills  •  /session  •  /quit")
         self._console.print(
             Panel(
-                body,
+                Group(wordmark, "", body),
                 title=Text("Nexus Coding Agent", style="banner.title"),
                 title_align="left",
                 border_style="border",
