@@ -10,8 +10,8 @@ from nexus.ui import TerminalUI
 
 from nexus.models import ConfirmationKind, Message
 from nexus.hooks import HookEvent
-from nexus.runtime.repl import run_agent_turn, prompt_for_confirmation
 from nexus.runtime.repl_state import ReplState
+from nexus.runtime.turn_runner import prompt_for_confirmation, run_agent_turn
 
 
 EXIT_OK = 0
@@ -162,4 +162,3 @@ def _headless_approval_callback():
         return prompt_for_confirmation(request)
 
     return ask_for_approval
-

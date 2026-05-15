@@ -10,7 +10,8 @@ Nexus is a CLI-first coding agent implemented as a Python package under `nexus/`
 
 - `nexus/app.py` is the top-level runtime orchestrator. It loads config, builds the tool registry, starts optional resources, creates the model client and agent, and dispatches either interactive or headless runs.
 - `nexus/runtime/agent.py` owns model streaming, tool-call interpretation, permission checks, tool execution, hook emission, and agent events.
-- `nexus/runtime/repl.py` is the shared turn runner for both the interactive REPL and headless mode. Despite the filename, `run_agent_turn()` is the important bridge between user-facing approval UX and the lower-level event-driven agent.
+- `nexus/runtime/repl.py` owns the interactive REPL loop: terminal setup, prompt reading, slash-command dispatch, and interactive approval input.
+- `nexus/runtime/turn_runner.py` owns the shared turn runner used by both interactive and headless mode. `run_agent_turn()` is the bridge between user-facing approval UX and the lower-level event-driven agent.
 - `nexus/runtime/repl_state.py` prepares each turn: system prompt construction, history preparation, tool-output pruning, context compaction, metadata, and durable history updates.
 - `nexus/runtime/runtime_session.py` builds `ReplState` from config, sessions, skills, memory, hooks, delegation resources, and approval policy.
 - `nexus/config/` contains defaults, TOML/env/CLI merge logic, validation, and model-context limit helpers.
@@ -25,10 +26,10 @@ One runtime session is created through `RuntimeSession.create()`.
 
 1. `NexusApp.initialize()` applies model context limits, builds hooks, creates the tool registry, loads plugins, connects MCP servers, registers sandbox and sub-agent tools, and creates `Agent`.
 2. Interactive mode calls `run_repl()`. Headless mode calls `run_headless()`.
-3. Both paths append the user message, begin a new approval turn when needed, and call `run_agent_turn()`.
+3. Both paths append the user message, begin a new approval turn when needed, and call `turn_runner.run_agent_turn()`.
 4. `run_agent_turn()` asks `ReplState.prepare_turn()` for model-ready messages, context metadata, and the system prompt.
 5. `Agent.run()` streams model output, emits assistant events, evaluates tool calls, and either executes allowed tools or emits a `CONFIRMATION_REQUESTED` event.
-6. `run_agent_turn()` is the single user-facing approval callback owner. It records approval/refusal/clarification and, on approval, resumes exact pending calls through `Agent.run(..., resume_tool_calls=...)`.
+6. `turn_runner.run_agent_turn()` is the single user-facing approval callback owner. It records approval/refusal/clarification and, on approval, resumes exact pending calls through `Agent.run(..., resume_tool_calls=...)`.
 7. `ReplState.apply_events()` appends only model messages whose tool calls have matching tool results, accumulates usage, and saves the session.
 
 The important invariant is provider-safe message ordering: assistant messages with `tool_calls` must not be persisted unless the corresponding tool result messages are also present. This is why pending confirmation events are handled carefully before history is committed.
@@ -39,7 +40,7 @@ Approval is centralized at the turn-runner layer.
 
 - `Agent.run()` does not accept a direct approval callback.
 - `Agent._agentic_loop()` emits `CONFIRMATION_REQUESTED` and returns when a confirmation or clarification is required.
-- `run_agent_turn()` invokes the callback provided by the REPL or headless wrapper.
+- `turn_runner.run_agent_turn()` invokes the callback provided by the REPL or headless wrapper.
 - If the user approves, `run_agent_turn()` records the approval in `ApprovalManager`, commits a narrowed assistant model event for the exact pending tool call(s), and resumes execution with `resume_tool_calls`.
 - `Agent._execute_approved_tool_calls()` executes those exact calls without asking the provider to regenerate them.
 - One-time approvals are consumed after execution. Turn-wide approval excludes high or dangerous bash calls.
@@ -144,7 +145,7 @@ Optional runtime features include:
 - Hooks for lifecycle, prompt submit, pre/post tool use, notifications, and stop events.
 - Post-session updates for memory/workspace learning.
 
-These features are layered around the same `ToolRegistry`, `Agent`, and `run_agent_turn()` flow.
+These features are layered around the same `ToolRegistry`, `Agent`, and `turn_runner.run_agent_turn()` flow.
 
 ## Tests
 
@@ -154,7 +155,7 @@ Use:
 uv run pytest
 ```
 
-Current expected result after the latest approval-flow work: `264 passed`.
+Current expected result after the latest approval-planning cleanup: `273 passed`.
 
 The tests cover config loading, CLI/headless flows, REPL approval behavior, session sanitation, security decisions, tools, hooks, plugins, MCP, sandbox, delegation, prompts, retry, and provider adapters.
 
@@ -162,7 +163,7 @@ The tests cover config loading, CLI/headless flows, REPL approval behavior, sess
 
 Current architectural strengths:
 
-- One user-facing approval owner in `run_agent_turn()`.
+- One user-facing approval owner in `turn_runner.run_agent_turn()`.
 - Deterministic approved-tool execution through `resume_tool_calls`.
 - Provider-safe history persistence.
 - Clear default tool registry.
@@ -171,7 +172,7 @@ Current architectural strengths:
 
 Current cleanup opportunities:
 
-- `repl.py` now contains shared turn-runner logic, not only REPL UI. A future rename or extraction to `turn_runner.py` would make ownership clearer.
+- Same-batch approval planning now goes through `Agent.preapproved_tool_calls_from_batch()`, keeping registry and permission details out of the turn runner.
 - Permission logic still has some tool-name special cases. More of this could move to `ToolKind` or richer tool metadata.
 - Compatibility tool names still appear in older tests/docs. Keep the canonical registry explicit when updating docs.
 - Config writes currently serialize plain values and may not preserve comments. That is acceptable for now, but worth revisiting if config editing becomes a first-class UX.

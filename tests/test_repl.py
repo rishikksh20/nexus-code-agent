@@ -22,9 +22,9 @@ from nexus.models import (
 )
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.repl import collect_turn_events, prompt_for_confirmation
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import EphemeralSessionStore, new_snapshot
+from nexus.runtime.turn_runner import collect_turn_events, prompt_for_confirmation
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import GetTimeTool, MemoryTool, WriteNoteTool
 
@@ -318,9 +318,9 @@ async def test_collect_turn_events_does_not_apply_second_compaction_pass(tmp_pat
         Message(role="tool", content="compacted tool", name="get_time"),
     ]
 
-    monkeypatch.setattr("nexus.runtime.repl.ContextCompactor.should_compact", lambda self, messages: True)
+    monkeypatch.setattr("nexus.runtime.turn_runner.ContextCompactor.should_compact", lambda self, messages: True)
     monkeypatch.setattr(
-        "nexus.runtime.repl.ContextCompactor.compact",
+        "nexus.runtime.turn_runner.ContextCompactor.compact",
         lambda self, messages, carry_over, keep_recent: (list(expected_messages), carry_over),
     )
     agent = _RecordingAgent()

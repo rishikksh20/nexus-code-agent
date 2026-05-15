@@ -148,6 +148,50 @@ class Agent:
             ):
                 yield event
 
+    def preapproved_tool_calls_from_batch(
+        self,
+        tool_calls: tuple[ToolCall, ...],
+        *,
+        first_tool_call: ToolCall,
+        mode: ExecutionMode,
+        context: ToolExecutionContext,
+        approval_manager: ApprovalManager,
+        auto_confirm_read_only: bool,
+    ) -> tuple[ToolCall, ...]:
+        """Return same-batch calls executable under the current approval state."""
+        if not tool_calls:
+            return (first_tool_call,)
+        start_index = next(
+            (index for index, call in enumerate(tool_calls) if call.call_id == first_tool_call.call_id),
+            0,
+        )
+        approved_calls: list[ToolCall] = []
+        for call in tool_calls[start_index:]:
+            try:
+                record = self.tool_registry.record(call.tool_name)
+            except Exception:
+                continue
+            decision = self.permission_checker.evaluate(
+                record.tool,
+                call.arguments,
+                mode,
+                context=context,
+                auto_confirm_read_only=auto_confirm_read_only,
+            )
+            risk_level = _risk_level_name(decision.risk_level)
+            if decision.decision is PermissionDecision.DENY:
+                continue
+            if approval_manager.is_pre_approved(
+                call.tool_name,
+                call.arguments,
+            ) or approval_manager.is_turn_wide_mutating_preapproved(
+                call.tool_name,
+                is_mutating=record.tool.is_mutating,
+                risk_level=risk_level,
+            ):
+                approved_calls.append(call)
+        return tuple(approved_calls or (first_tool_call,))
+
     async def _execute_tool_call(
         self,
         record: Any,

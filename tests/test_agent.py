@@ -196,6 +196,41 @@ async def test_agent_turn_wide_approval_still_requires_confirmation_for_dangerou
     assert confirmation.payload.payload["risk_level"] == "dangerous"
 
 
+def test_agent_plans_same_batch_preapproved_tool_calls(tool_context):
+    registry = ToolRegistry()
+    registry.register(WriteNoteTool())
+    registry.register(BashTool())
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    approval_manager = ApprovalManager()
+    approval_manager.record_turn_wide_mutating_approval()
+    note_one = ToolCall(
+        call_id="note-1",
+        tool_name="write_note",
+        arguments={"path": "notes/one.txt", "content": "one"},
+    )
+    note_two = ToolCall(
+        call_id="note-2",
+        tool_name="write_note",
+        arguments={"path": "notes/two.txt", "content": "two"},
+    )
+    dangerous_shell = ToolCall(
+        call_id="sh-danger",
+        tool_name="bash",
+        arguments={"command": "rm -rf build"},
+    )
+
+    planned = agent.preapproved_tool_calls_from_batch(
+        (note_one, note_two, dangerous_shell),
+        first_tool_call=note_one,
+        mode=ExecutionMode.DEFAULT,
+        context=tool_context,
+        approval_manager=approval_manager,
+        auto_confirm_read_only=True,
+    )
+
+    assert planned == (note_one, note_two)
+
+
 @pytest.mark.asyncio
 async def test_agent_stops_with_continue_message_when_tool_call_limit_is_reached(tool_context):
     model = FakeModelClient(

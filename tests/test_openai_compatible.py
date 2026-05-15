@@ -10,8 +10,9 @@ from nexus.config import load_config
 from nexus.integrations.anthropic import AnthropicAdapter, AnthropicModelClient
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.integrations.gemini import GeminiAdapter, GeminiModelClient
+from nexus.integrations.ollama import OllamaModelClient
 from nexus.integrations.openai_compatible import OpenAICompatibleAdapter, OpenAICompatibleModelClient
-from nexus.models import Message, RuntimeRequest, ToolCall
+from nexus.models import Message, RuntimeRequest, StreamEventType, ToolCall
 
 
 class _FakeHTTPResponse:
@@ -20,6 +21,20 @@ class _FakeHTTPResponse:
 
     def read(self) -> bytes:
         return json.dumps(self._payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _FakeStreamingHTTPResponse:
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+
+    def __iter__(self):
+        return iter(line.encode("utf-8") for line in self._lines)
 
     def __enter__(self):
         return self
@@ -158,6 +173,62 @@ async def test_openai_compatible_client_retries_transient_errors(monkeypatch):
     assert response.message.content == "recovered"
 
 
+@pytest.mark.asyncio
+async def test_openai_compatible_stream_accumulates_partial_tool_calls_without_usage(monkeypatch):
+    lines = [
+        'data: {"model":"demo-model","choices":[{"delta":{"content":"checking "}}]}\n',
+        (
+            'data: {"model":"demo-model","choices":[{"delta":{"tool_calls":'
+            '[{"index":0,"id":"call-1","function":{"name":"read_"}}]}}]}\n'
+        ),
+        (
+            'data: {"model":"demo-model","choices":[{"delta":{"tool_calls":'
+            '[{"index":0,"function":{"name":"file","arguments":"{\\"path\\":"}}]}}]}\n'
+        ),
+        (
+            'data: {"model":"demo-model","choices":[{"delta":{"tool_calls":'
+            '[{"index":0,"function":{"arguments":"\\"README.md\\"}"}}]},'
+            '"finish_reason":"tool_calls"}]}\n'
+        ),
+        "data: [DONE]\n",
+    ]
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return _FakeStreamingHTTPResponse(lines)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = OpenAICompatibleModelClient(
+        api_base_url="https://example.test/v1",
+        api_key="secret",
+        provider_name="openai-compatible",
+    )
+
+    events = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="demo-model",
+                system_prompt="system",
+                messages=(Message(role="user", content="read README"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert [event.type for event in events] == [
+        StreamEventType.TEXT_DELTA,
+        StreamEventType.TOOL_CALL_COMPLETE,
+        StreamEventType.MESSAGE_COMPLETE,
+    ]
+    assert events[0].text_delta is not None
+    assert events[0].text_delta.content == "checking "
+    assert events[1].tool_call == ToolCall("call-1", "read_file", {"path": "README.md"})
+    assert events[2].finish_reason == "tool_calls"
+    assert events[2].usage is None
+
+
 def test_build_model_client_uses_provider_config(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global", cli_overrides={"provider": "fake"})
 
@@ -257,6 +328,82 @@ def test_anthropic_adapter_converts_tools_and_messages():
     assert messages[2]["content"][0]["type"] == "tool_result"
 
 
+class _FakeAnthropicStreamContext:
+    def __init__(self, events: list[dict[str, object]]) -> None:
+        self._events = events
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+    def __aiter__(self):
+        return self._iter_events()
+
+    async def _iter_events(self):
+        for event in self._events:
+            yield event
+
+
+class _FakeAnthropicMessages:
+    def __init__(self, events: list[dict[str, object]]) -> None:
+        self._events = events
+
+    def stream(self, **kwargs):
+        del kwargs
+        return _FakeAnthropicStreamContext(self._events)
+
+
+class _FakeAnthropicClient:
+    def __init__(self, events: list[dict[str, object]]) -> None:
+        self.messages = _FakeAnthropicMessages(events)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_handles_text_partial_tool_json_and_missing_usage(monkeypatch):
+    events = [
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "checking "}},
+        {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "tool_use", "id": "tool-1", "name": "read_file"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": '{"path":'},
+        },
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+    ]
+    client = AnthropicModelClient(api_key="secret")
+
+    monkeypatch.setattr(client, "_client", lambda: _FakeAnthropicClient(events))
+
+    streamed = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="claude-demo",
+                system_prompt="system",
+                messages=(Message(role="user", content="read"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert [event.type for event in streamed] == [
+        StreamEventType.TEXT_DELTA,
+        StreamEventType.TOOL_CALL_COMPLETE,
+        StreamEventType.MESSAGE_COMPLETE,
+    ]
+    assert streamed[0].text_delta is not None
+    assert streamed[0].text_delta.content == "checking "
+    assert streamed[1].tool_call == ToolCall("tool-1", "read_file", {"_raw": '{"path":'})
+    assert streamed[2].finish_reason == "tool_use"
+    assert streamed[2].usage is None
+
+
 def test_gemini_adapter_converts_tools_and_messages():
     tool_schema = {
         "type": "function",
@@ -280,3 +427,46 @@ def test_gemini_adapter_converts_tools_and_messages():
     assert contents[1]["role"] == "model"
     assert contents[1]["parts"][0]["function_call"]["name"] == "grep"
     assert contents[2]["parts"][0]["function_response"]["response"] == {"result": "match"}
+
+
+def test_gemini_response_events_allow_mixed_text_tool_calls_without_usage():
+    client = GeminiModelClient(api_key="secret")
+
+    events = client._events_from_response(
+        {
+            "candidates": [
+                {
+                    "finish_reason": "STOP",
+                    "content": {
+                        "parts": [
+                            {"text": "checking "},
+                            {"function_call": {"name": "grep", "args": {"pattern": "needle"}}},
+                        ]
+                    },
+                }
+            ]
+        },
+        "gemini-demo",
+        final=True,
+    )
+
+    assert [event.type for event in events] == [
+        StreamEventType.TEXT_DELTA,
+        StreamEventType.TOOL_CALL_COMPLETE,
+        StreamEventType.MESSAGE_COMPLETE,
+    ]
+    assert events[0].text_delta is not None
+    assert events[0].text_delta.content == "checking "
+    assert events[1].tool_call == ToolCall("gemini-0001", "grep", {"pattern": "needle"})
+    assert events[2].finish_reason == "stop"
+    assert events[2].usage is None
+
+
+def test_ollama_parse_tool_call_preserves_malformed_arguments_as_raw():
+    client = OllamaModelClient(base_url="http://localhost:11434", model_name="demo")
+
+    tool_call = client._parse_tool_call(
+        {"function": {"name": "read_file", "arguments": '{"path":'}}
+    )
+
+    assert tool_call == ToolCall("ollama-0001", "read_file", {"_raw": '{"path":'})
