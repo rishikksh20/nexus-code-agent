@@ -37,7 +37,7 @@ def register_subagent_tools(
     if tool_enabled(config, default_tool.name):
         registry.register(default_tool, source="agent")
         count += 1
-    for definition in definitions:
+    for definition in _merge_builtin_definitions(definitions):
         tool = SubAgentTool(delegation, definition)
         if tool_enabled(config, tool.name):
             registry.register(tool, source="agent", origin=definition.name)
@@ -108,6 +108,58 @@ def load_subagent_definitions(config) -> list[SubagentDefinition]:
     return definitions
 
 
+def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
+    """Return conservative built-in specialist personas for multi-agent flows."""
+    return [
+        SubagentDefinition(
+            name="research",
+            description="Investigate repo structure and summarize findings without modifying files.",
+            goal_prompt=(
+                "You are a read-only Nexus research agent. Investigate the requested codebase slice, "
+                "trace relevant files and symbols, and return a compressed summary with related paths. "
+                "Do not modify files."
+            ),
+            allowed_tools=["read_file", "glob", "grep", "list_dir", "lsp"],
+            max_turns=12,
+            timeout_seconds=300,
+        ),
+        SubagentDefinition(
+            name="review",
+            description="Review code changes for bugs, regressions, and maintainability risks.",
+            goal_prompt=(
+                "You are a senior Nexus code reviewer. Inspect diffs and targeted source files, "
+                "prioritize concrete bugs and regressions, and return findings with file references. "
+                "Do not modify files."
+            ),
+            allowed_tools=["git_diff", "read_file", "grep", "lsp"],
+            max_turns=10,
+            timeout_seconds=300,
+        ),
+        SubagentDefinition(
+            name="test",
+            description="Run structured verification and summarize failures.",
+            goal_prompt=(
+                "You are a Nexus verification agent. Run focused tests, lint, type/syntax checks, "
+                "and git status inspection. Return a concise validation summary and failures. "
+                "Do not modify files."
+            ),
+            allowed_tools=["run_tests", "run_linter", "run_typecheck", "git_status"],
+            max_turns=8,
+            timeout_seconds=600,
+        ),
+    ]
+
+
+def _merge_builtin_definitions(definitions: "Iterable[SubagentDefinition]") -> list[SubagentDefinition]:
+    merged = list(definitions)
+    existing = {definition.name for definition in merged}
+    for definition in get_builtin_subagent_definitions():
+        if definition.name not in existing:
+            merged.append(definition)
+            existing.add(definition.name)
+    return merged
+
+
 def _skill_subagent_name(skill_name: str) -> str | None:
     prefixes = ("subagent-", "subagent_")
     for prefix in prefixes:
@@ -134,4 +186,5 @@ __all__ = [
     "register_agent_tool",
     "register_skill_subagent_tools",
     "register_subagent_tools",
+    "get_builtin_subagent_definitions",
 ]

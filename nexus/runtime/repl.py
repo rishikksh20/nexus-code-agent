@@ -17,6 +17,7 @@ from nexus.runtime.turn_runner import (
     prompt_for_confirmation,
     run_agent_turn,
 )
+from nexus.runtime.orchestration import run_orchestrated_turn
 from nexus.ui import TerminalUI
 
 
@@ -69,7 +70,7 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
         if not resumed_paused_turn:
             state.approval_manager.begin_turn()
         try:
-            events = await run_agent_turn(
+            events = await run_orchestrated_turn(
                 state,
                 agent,
                 prompt_text=effective_prompt,

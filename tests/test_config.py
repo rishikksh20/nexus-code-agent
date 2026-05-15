@@ -48,6 +48,36 @@ def test_config_rejects_invalid_mode(tmp_path):
         raise AssertionError("Expected ConfigError for invalid default_mode")
 
 
+def test_config_accepts_multi_agent_defaults(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.multi_agent_mode == "off"
+    assert config.multi_agent_show_plan is True
+    assert config.multi_agent_max_parallel_tasks == 3
+    assert config.multi_agent_max_repair_iterations == 2
+    assert config.multi_agent_complexity_threshold == "medium"
+
+
+def test_config_rejects_invalid_multi_agent_mode(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text('multi_agent_mode = "swarm"\n', encoding="utf-8")
+
+    try:
+        load_config(workspace, global_root=global_root)
+    except ConfigError as exc:
+        assert "Invalid multi_agent_mode" in str(exc)
+    else:
+        raise AssertionError("Expected ConfigError for invalid multi_agent_mode")
+
+
 def test_config_rejects_invalid_provider(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

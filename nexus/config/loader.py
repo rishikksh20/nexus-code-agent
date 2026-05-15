@@ -196,6 +196,8 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     valid_modes = {"plan", "default", "auto"}
     valid_log_formats = {"text", "json"}
     valid_providers = {"anthropic", "fake", "gemini", "mistral", "openai", "openai-compatible", "ollama"}
+    valid_multi_agent_modes = {"off", "auto", "always"}
+    valid_complexity_thresholds = {"simple", "medium", "large"}
     valid_approval_policies = {
         "on-request", "approve-turn", "approve-session", "auto", "plan"
     }
@@ -228,6 +230,20 @@ def _validate_config_values(values: dict[str, Any]) -> None:
             f"Invalid log_format '{log_format}'. Expected one of: {', '.join(sorted(valid_log_formats))}."
         )
 
+    multi_agent_mode = values["multi_agent_mode"]
+    if multi_agent_mode not in valid_multi_agent_modes:
+        raise ConfigError(
+            f"Invalid multi_agent_mode '{multi_agent_mode}'. "
+            f"Expected one of: {', '.join(sorted(valid_multi_agent_modes))}."
+        )
+
+    complexity_threshold = values["multi_agent_complexity_threshold"]
+    if complexity_threshold not in valid_complexity_thresholds:
+        raise ConfigError(
+            f"Invalid multi_agent_complexity_threshold '{complexity_threshold}'. "
+            f"Expected one of: {', '.join(sorted(valid_complexity_thresholds))}."
+        )
+
     integer_fields = (
         "max_output_tokens",
         "compaction_soft_limit",
@@ -240,6 +256,8 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         "sandbox_timeout_seconds",
         "context_prune_protect_tokens",
         "context_prune_minimum_tokens",
+        "multi_agent_max_parallel_tasks",
+        "multi_agent_max_repair_iterations",
     )
     for field_name in integer_fields:
         if values[field_name] < 1:

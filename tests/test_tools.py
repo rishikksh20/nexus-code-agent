@@ -128,11 +128,14 @@ async def test_register_subagent_tools_registers_default_and_specialist_tools():
 
         count = register_subagent_tools(registry, delegation, config, definitions=definitions)
 
-        assert count == 2
+        assert count == 5
         assert registry.record("delegate_task").source == "agent"
         specialist = registry.record("subagent_explore")
         assert specialist.source == "agent"
         assert specialist.origin == "explore"
+        assert registry.record("subagent_research").origin == "research"
+        assert registry.record("subagent_review").origin == "review"
+        assert registry.record("subagent_test").origin == "test"
     finally:
         await delegation.shutdown()
 

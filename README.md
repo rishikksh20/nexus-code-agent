@@ -357,6 +357,7 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 | `/help` | Show all available slash commands |
 | `/mode [plan\|default\|auto]` | Show or switch execution mode |
 | `/context [show\|usage]` | Print system prompt or show token/context-window usage stats |
+| `/context agents\|agent \<id\>\|usage \<id\>` | Inspect per-agent context isolation, handoffs, and usage |
 | `/provider [list\|set \<param\> \<value\>]` | Show or update provider, model, temperature, and session parameters |
 | `/config [show\|set\|reset\|reload\|reinit [local\|global]]` | Inspect or edit configuration; `reinit` rewrites to clean defaults |
 | `/skills [list\|show\|add\|remove\|reload]` | Manage session skills |
@@ -366,6 +367,7 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 | `/history [n]` | Show recent conversation messages |
 | `/mcp [status\|tools\|refresh [server]]` | Inspect MCP server status and discovered tools |
 | `/delegate [status\|workers\|tasks\|spawn\|messages\|approvals\|approve\|reject]` | Multi-agent delegation controls |
+| `/multi-agent [status\|plan\|state]` | Supervisor plan, shared state, and repair decision visibility |
 | `/quit` or `/exit` | Save session and exit |
 
 ---
@@ -456,6 +458,15 @@ All tools pass through the permission system and lifecycle hooks. **Risk level**
 | `glob` | low | No | Finds files by glob pattern within the workspace |
 | `grep` | low | No | Searches file content by regex; returns path, line number, match |
 | `lsp` | low | No | Inspects Python symbols, definitions, references, and hover details |
+| `find_references` | low | No | Finds Python symbol references through the LSP implementation |
+| `code_index` | low | No | Builds a lightweight Python AST/import/symbol index |
+| `semantic_search` | low | No | Searches Python code by concept using lexical and symbol matches |
+| `git_status` | low | No | Returns structured branch and working tree status |
+| `git_diff` | low | No | Returns working, staged, file, or ref diffs |
+| `run_tests` | low/medium | No | Runs tests with structured pass/fail metadata |
+| `run_linter` | low/medium | No | Runs structured lint-style verification |
+| `run_typecheck` | low/medium | No | Runs structured type/syntax verification |
+| `run_formatter` | medium | Yes | Runs the formatter command with approval |
 | `list_dir` | low | No | Lists directory contents with file sizes |
 | `web_fetch` | low | No | Fetches a URL and returns the response body |
 | `web_search` | low | No | Runs a web search and returns result snippets |
@@ -642,8 +653,15 @@ mcp_servers = [
 ]
 
 # Delegation
+multi_agent_mode = "off" # off | auto | always
+multi_agent_show_plan = true
+multi_agent_max_parallel_tasks = 3
+multi_agent_max_repair_iterations = 2
+multi_agent_complexity_threshold = "medium"
 delegation_enabled = false
 delegation_workers = ["worker-1", "worker-2"]
+# Built-in delegation tools when enabled: delegate_task, subagent_research,
+# subagent_review, subagent_test
 
 # Sandbox
 sandbox_commands = false

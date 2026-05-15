@@ -14,6 +14,7 @@ from nexus.config.model_limits import get_model_context_limit
 from nexus.cli.init import _global_config_toml, _local_config_toml
 from nexus.memory.store import MemoryEntry
 from nexus.context import CarryOverState, TokenEstimator
+from nexus.runtime.context_state import get_context_payload
 from nexus.runtime.delegation import DelegationRequest
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
@@ -96,6 +97,7 @@ class SlashCommandRouter:
 def build_router() -> SlashCommandRouter:
     router = SlashCommandRouter()
     router.register(SlashCommand("delegate", "Manage delegated worker tasks.", handle_delegate))
+    router.register(SlashCommand("multi-agent", "Inspect multi-agent supervisor state.", handle_multi_agent))
     router.register(SlashCommand("help", "Show available slash commands.", handle_help))
     router.register(SlashCommand("mcp", "Inspect MCP server status and tools.", handle_mcp))
     router.register(SlashCommand("mode", "Show or switch execution mode.", handle_mode))
@@ -119,6 +121,7 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
     table.add_column("Description")
     for name, description in (
         ("/delegate <subcommand>", "Manage worker tasks, approvals, and mailbox inspection."),
+        ("/multi-agent [status|plan|state]", "Inspect supervisor mode, latest plan, and shared state."),
         ("/help", "Show command help."),
         ("/mcp [status|tools|refresh [server]]", "Inspect MCP server connections and registered tools."),
         ("/mode [plan|default|auto]", "Show or switch execution mode."),
@@ -137,6 +140,32 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
     state.console.print(table)
 
 
+async def handle_multi_agent(state: ReplState, args: list[str]) -> None:
+    subcommand = args[0].lower() if args else "status"
+    if subcommand == "help":
+        _print_subcommand_help(
+            state, "multi-agent", "Inspect multi-agent supervisor state.",
+            (
+                ("status", "Show current mode, delegation state, and last repair decision.", "/multi-agent status"),
+                ("plan",   "Show the latest supervisor task DAG.",                          "/multi-agent plan"),
+                ("state",  "Show the full latest shared state JSON.",                       "/multi-agent state"),
+                ("help",   "Show this help.",                                              "/multi-agent help"),
+            ),
+        )
+        return
+    payload = _multi_agent_payload(state)
+    if subcommand == "status":
+        _print_multi_agent_status(state, payload)
+        return
+    if subcommand == "plan":
+        _print_multi_agent_plan(state, payload)
+        return
+    if subcommand == "state":
+        state.console.print(json.dumps(payload, indent=2))
+        return
+    state.console.print("Usage: /multi-agent [status|plan|state|help]")
+
+
 async def handle_delegate(state: ReplState, args: list[str]) -> None:
     runtime = state.delegation
     if runtime is None:
@@ -151,6 +180,7 @@ async def handle_delegate(state: ReplState, args: list[str]) -> None:
                 ("tasks",               "List all delegated tasks.",                                          "/delegate tasks"),
                 ("tasks active",         "List only running tasks.",                                           "/delegate tasks active"),
                 ('spawn "T" "I"',        "Submit a new task with title T and instructions I.",                  '/delegate spawn "Review" "Summarise README."'),
+                ("spawn ... --context C", "Attach shared handoff context to the isolated worker.",              '/delegate spawn "Test" "Run checks." --context "Changed auth.py"'),
                 ("messages [who] [n]",   "Inspect the mailbox (optional filter + limit).",                     "/delegate messages worker-1 10"),
                 ("approvals",           "List pending permission decisions.",                                 "/delegate approvals"),
                 ("approve <id>",        "Approve a pending decision.",                                        "/delegate approve abc123"),
@@ -192,14 +222,14 @@ async def handle_delegate(state: ReplState, args: list[str]) -> None:
         except ValueError as exc:
             state.console.print(str(exc))
             state.console.print(
-                "Usage: /delegate spawn <title> <instructions> [--worker id] [--resource name] [--permission-action tool] [--permission-reason text]"
+                "Usage: /delegate spawn <title> <instructions> [--worker id] [--resource name] [--tool name] [--context text] [--permission-action tool] [--permission-reason text]"
             )
             return
         task = await runtime.submit(request)
         state.console.print(f"Delegated task {task.task_id} to {task.assigned_worker}.")
         return
     state.console.print(
-        "Usage: /delegate status|workers|tasks [active]|spawn <title> <instructions> [--worker id] [--resource name] [--permission-action tool] [--permission-reason text]|messages [agent] [limit]|approvals|approve <decision_id>|reject <decision_id>"
+        "Usage: /delegate status|workers|tasks [active]|spawn <title> <instructions> [--worker id] [--resource name] [--tool name] [--context text] [--permission-action tool] [--permission-reason text]|messages [agent] [limit]|approvals|approve <decision_id>|reject <decision_id>"
     )
 
 
@@ -683,12 +713,18 @@ async def handle_context(state: ReplState, args: list[str]) -> None:
                 ("(no args) / show", "Print the current assembled system prompt.",                              "/context"),
                 ("usage",            "Show token usage table: model, context window, history tokens,",          "/context usage"),
                 ("",                 "compaction thresholds, and % of context consumed.",                       ""),
+                ("usage <agent>",     "Show context usage for a supervisor or worker agent.",                    "/context usage supervisor"),
+                ("agents",           "List known supervisor, planner, execution, and worker contexts.",          "/context agents"),
+                ("agent <id>",        "Show one recorded agent context snapshot.",                              "/context agent supervisor"),
                 ("help",             "Show this help.",                                                         "/context help"),
             ),
         )
         return
 
     if subcommand == "usage":
+        if len(args) > 1:
+            _print_agent_context_usage(state, args[1])
+            return
         estimator = TokenEstimator()
         history_tokens = sum(estimator.estimate(m.content) for m in state.history)
         system_tokens = estimator.estimate(state.current_system_prompt or "")
@@ -710,6 +746,14 @@ async def handle_context(state: ReplState, args: list[str]) -> None:
         table.add_row("Compaction soft limit", f"{soft:,} tokens  ({round(soft/ctx_limit*100,1)}%)")
         table.add_row("Compaction hard limit", f"{hard:,} tokens  ({round(hard/ctx_limit*100,1)}%)")
         state.console.print(table)
+        return
+
+    if subcommand == "agents":
+        _print_context_agents(state)
+        return
+
+    if subcommand == "agent" and len(args) > 1:
+        _print_agent_context(state, args[1])
         return
 
     # Default: show system prompt
@@ -758,6 +802,126 @@ def _print_delegate_status(state: ReplState) -> None:
             indent=2,
         )
     )
+
+
+def _context_agent_records(state: ReplState) -> dict[str, dict]:
+    records: dict[str, dict] = {}
+    payload = get_context_payload(state.session.metadata)
+    agents = payload.get("agents", {})
+    if isinstance(agents, dict):
+        for agent_id, record in agents.items():
+            if isinstance(record, dict):
+                records[str(agent_id)] = record
+    if state.delegation is not None:
+        for task in state.delegation.list_tasks():
+            snapshot = getattr(task, "context_snapshot", {})
+            if isinstance(snapshot, dict) and snapshot:
+                agent_id = str(snapshot.get("agent_id") or f"worker-{task.assigned_worker}-{task.task_id}")
+                records[agent_id] = snapshot
+    return records
+
+
+def _print_context_agents(state: ReplState) -> None:
+    records = _context_agent_records(state)
+    if not records:
+        state.console.print("No agent context snapshots recorded yet.")
+        return
+    table = Table(title="Agent Contexts")
+    table.add_column("Agent")
+    table.add_column("Role")
+    table.add_column("Scope")
+    table.add_column("Tokens")
+    table.add_column("Messages")
+    table.add_column("Tools")
+    for agent_id, record in sorted(records.items()):
+        tools = record.get("allowed_tools", [])
+        table.add_row(
+            agent_id,
+            str(record.get("role", "-")),
+            str(record.get("scope", "-")),
+            str(record.get("token_estimate", "-")),
+            str(record.get("message_count", "-")),
+            ", ".join(str(tool) for tool in tools) if isinstance(tools, list) and tools else "-",
+        )
+    state.console.print(table)
+
+
+def _print_agent_context(state: ReplState, agent_id: str) -> None:
+    records = _context_agent_records(state)
+    record = records.get(agent_id)
+    if record is None:
+        state.console.print(f"Agent context not found: {agent_id}")
+        return
+    state.console.print(json.dumps(record, indent=2))
+
+
+def _print_agent_context_usage(state: ReplState, agent_id: str) -> None:
+    records = _context_agent_records(state)
+    record = records.get(agent_id)
+    if record is None:
+        state.console.print(f"Agent context not found: {agent_id}")
+        return
+    ctx_limit = get_model_context_limit(state.config.model_name)
+    tokens = int(record.get("token_estimate", 0) or 0)
+    pct = round(tokens / ctx_limit * 100, 1) if ctx_limit else 0.0
+    table = Table(title=f"Context Usage: {agent_id}")
+    table.add_column("Field")
+    table.add_column("Value", justify="right")
+    table.add_row("Role", str(record.get("role", "-")))
+    table.add_row("Scope", str(record.get("scope", "-")))
+    table.add_row("Token estimate", f"{tokens:,} tokens")
+    table.add_row("Context window", f"{ctx_limit:,} tokens")
+    table.add_row("Used", f"{pct}%")
+    table.add_row("Messages", str(record.get("message_count", "-")))
+    table.add_row("Tool calls", str(record.get("tool_call_count", "-")))
+    state.console.print(table)
+
+
+def _multi_agent_payload(state: ReplState) -> dict:
+    payload = state.session.metadata.get("multi_agent")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _print_multi_agent_status(state: ReplState, payload: dict) -> None:
+    shared_state = payload.get("shared_state") if isinstance(payload.get("shared_state"), dict) else {}
+    repair = shared_state.get("repair_decision") if isinstance(shared_state.get("repair_decision"), dict) else {}
+    table = Table(title="Multi-Agent Supervisor")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("Mode", str(getattr(state.config, "multi_agent_mode", "off")))
+    table.add_row("Threshold", str(getattr(state.config, "multi_agent_complexity_threshold", "medium")))
+    table.add_row("Delegation", "enabled" if state.delegation is not None else "disabled")
+    table.add_row("Last complexity", str(payload.get("complexity", "-")))
+    table.add_row("Repair needed", str(repair.get("retry", "-")))
+    table.add_row("Repair reason", str(repair.get("reason", "-")))
+    state.console.print(table)
+
+
+def _print_multi_agent_plan(state: ReplState, payload: dict) -> None:
+    shared_state = payload.get("shared_state") if isinstance(payload.get("shared_state"), dict) else {}
+    dag = shared_state.get("dag") if isinstance(shared_state.get("dag"), dict) else {}
+    if not dag:
+        state.console.print("No multi-agent plan has been recorded in this session.")
+        return
+    table = Table(title="Latest Multi-Agent Plan")
+    table.add_column("Task")
+    table.add_column("Role")
+    table.add_column("Depends On")
+    table.add_column("Objective")
+    nodes = dag.get("nodes", [])
+    if not isinstance(nodes, list):
+        nodes = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        deps = node.get("dependencies", [])
+        table.add_row(
+            str(node.get("id", "-")),
+            str(node.get("role", "-")),
+            ", ".join(str(dep) for dep in deps) if isinstance(deps, list) and deps else "-",
+            str(node.get("objective", "-")),
+        )
+    state.console.print(table)
 
 
 def _print_delegate_workers(state: ReplState) -> None:
@@ -853,6 +1017,7 @@ def _parse_delegate_spawn_args(args: list[str]) -> DelegationRequest:
     worker: str | None = None
     allowed_tools: list[str] = []
     claimed_resources: list[str] = []
+    shared_context: list[str] = []
     permission_action: str | None = None
     permission_reason: str | None = None
 
@@ -871,6 +1036,10 @@ def _parse_delegate_spawn_args(args: list[str]) -> DelegationRequest:
             claimed_resources.append(args[index + 1])
             index += 2
             continue
+        if token == "--context" and index + 1 < len(args):
+            shared_context.append(args[index + 1])
+            index += 2
+            continue
         if token == "--permission-action" and index + 1 < len(args):
             permission_action = args[index + 1]
             index += 2
@@ -887,6 +1056,7 @@ def _parse_delegate_spawn_args(args: list[str]) -> DelegationRequest:
         assigned_worker=worker,
         allowed_tools=tuple(allowed_tools),
         claimed_resources=tuple(claimed_resources),
+        shared_context=tuple(shared_context),
         permission_action=permission_action,
         permission_reason=permission_reason,
     )

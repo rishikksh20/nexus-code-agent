@@ -58,6 +58,37 @@ async def test_delegation_runtime_runs_inner_agent_with_restricted_tools():
 
 
 @pytest.mark.asyncio
+async def test_delegation_records_isolated_worker_context_with_shared_inputs():
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    runtime = DelegationRuntime(
+        worker_ids=["worker-1"],
+        poll_interval=0.01,
+        base_tool_registry=registry,
+    )
+    await runtime.start()
+    try:
+        task = await runtime.submit(
+            DelegationRequest(
+                title="Check time with context",
+                instructions="Please check the time and report it.",
+                allowed_tools=("get_time",),
+                shared_context=("Execution changed nexus/app.py",),
+            )
+        )
+        completed = await runtime.wait_for_task(task.task_id, timeout=1.0)
+
+        assert completed is not None
+        assert completed.status is TaskStatus.COMPLETED
+        assert completed.context_snapshot["scope"] == "isolated"
+        assert completed.context_snapshot["allowed_tools"] == ["get_time"]
+        assert completed.context_snapshot["shared_inputs"] == ["Execution changed nexus/app.py"]
+        assert completed.context_snapshot["token_estimate"] > 0
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_delegation_runtime_routes_permission_through_coordinator():
     runtime = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01)
     await runtime.start()
@@ -350,4 +381,3 @@ async def test_delegation_worker_requests_fresh_approval_for_each_mutating_call(
         assert (tmp_path / "notes" / "two.txt").read_text(encoding="utf-8") == "two"
     finally:
         await runtime.shutdown()
-

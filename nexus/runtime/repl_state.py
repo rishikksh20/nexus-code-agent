@@ -8,6 +8,7 @@ from nexus.memory.store import MemoryStore
 from nexus.models import AgentEvent, Message, ToolExecutionContext
 from nexus.prompts import build_context_sections
 from nexus.context import CarryOverState, ContextBuilder, ContextCompactor, TokenEstimator, prune_tool_outputs
+from nexus.runtime.context_state import multi_agent_carry_over_lines
 from nexus.runtime.delegation import DelegationRuntime
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookExecutor
@@ -89,6 +90,7 @@ class ReplState:
             carry_over=self.carry_over,
             memory_entries=_load_all_memory(self.memory_store),
         )
+        sections.carry_over.extend(multi_agent_carry_over_lines(self.session.metadata))
         self.current_system_prompt = ContextBuilder().build(sections)
         return self.current_system_prompt
 
@@ -224,5 +226,4 @@ def _load_all_memory(store: MemoryStore) -> list[str]:
         if content:
             entries.append(f"{key}: {content}")
     return entries
-
 

@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import AgentEventType, ConfirmationKind, Message, ToolExecutionContext
+from nexus.runtime.context_state import AgentContextRecord, ContextScope, estimate_messages
 from nexus.runtime.agent import Agent
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.security.manager import ApprovalManager, ApprovalScope
@@ -64,6 +65,7 @@ class AgentMessage:
         title: str,
         instructions: str,
         allowed_tools: list[str] | None = None,
+        shared_context: list[str] | None = None,
         permission_action: str | None = None,
         permission_reason: str | None = None,
     ) -> "AgentMessage":
@@ -79,6 +81,8 @@ class AgentMessage:
             payload["permission_action"] = permission_action
         if permission_reason:
             payload["permission_reason"] = permission_reason
+        if shared_context:
+            payload["shared_context"] = list(shared_context)
         return cls(
             sender=sender,
             recipient=recipient,
@@ -112,13 +116,17 @@ class AgentMessage:
         task_id: str,
         success: bool,
         summary: str,
+        context_snapshot: dict[str, Any] | None = None,
     ) -> "AgentMessage":
+        payload: dict[str, Any] = {"success": success, "summary": summary}
+        if context_snapshot is not None:
+            payload["context_snapshot"] = context_snapshot
         return cls(
             sender=sender,
             recipient="coordinator",
             kind=MessageKind.RESULT,
             task_id=task_id,
-            payload={"success": success, "summary": summary},
+            payload=payload,
         )
 
     @classmethod
@@ -241,6 +249,7 @@ class DelegationRequest:
     assigned_worker: str | None = None
     allowed_tools: tuple[str, ...] = ()
     claimed_resources: tuple[str, ...] = ()
+    shared_context: tuple[str, ...] = ()
     permission_action: str | None = None
     permission_reason: str | None = None
 
@@ -259,6 +268,8 @@ class TaskRecord:
     claimed_resources: tuple[str, ...] = ()
     resource_versions: dict[str, int] = field(default_factory=dict)
     pending_decision_id: str | None = None
+    shared_context: tuple[str, ...] = ()
+    context_snapshot: dict[str, Any] = field(default_factory=dict)
     version: int = 0
 
     def append_note(self, note: str) -> None:
@@ -383,7 +394,13 @@ class WorkerAgent:
             )
         )
 
-    async def _complete(self, message: AgentMessage, *, summary: str | None = None) -> None:
+    async def _complete(
+        self,
+        message: AgentMessage,
+        *,
+        summary: str | None = None,
+        context_snapshot: dict[str, Any] | None = None,
+    ) -> None:
         task_id = message.task_id or "unknown"
         title = str(message.payload.get("title", task_id))
         instructions = str(message.payload.get("instructions", "")).strip()
@@ -396,6 +413,7 @@ class WorkerAgent:
                 task_id=task_id,
                 success=True,
                 summary=summary or f"Finished {title}: {instructions}",
+                context_snapshot=context_snapshot,
             )
         )
 
@@ -406,6 +424,7 @@ class WorkerAgent:
         permission_action = str(command_message.payload.get("permission_action", "")).strip()
         permission_reason = str(command_message.payload.get("permission_reason", "Need coordinator approval.")).strip()
         allowed_tools = tuple(str(tool_name) for tool_name in command_message.payload.get("allowed_tools", []))
+        shared_context = tuple(str(item) for item in command_message.payload.get("shared_context", []) if str(item).strip())
 
         try:
             if permission_action:
@@ -434,7 +453,10 @@ class WorkerAgent:
                 working_directory=self._workspace_root,
                 metadata={"worker_id": self.worker_id, "task_id": task_id},
             )
-            system_prompt = _worker_system_prompt(title, instructions, allowed_tools)
+            context.metadata["allowed_tools"] = list(allowed_tools)
+            context.metadata["context_scope"] = ContextScope.ISOLATED.value
+            context.metadata["shared_context"] = list(shared_context)
+            system_prompt = _worker_system_prompt(title, instructions, allowed_tools, shared_context=shared_context)
 
             while True:
                 events = [
@@ -539,7 +561,19 @@ class WorkerAgent:
 
                 break
 
-            await self._complete(command_message, summary=f"Finished {title}: {assistant_summary or instructions}")
+            context_snapshot = _worker_context_snapshot(
+                worker_id=self.worker_id,
+                task_id=task_id,
+                title=title,
+                history=history,
+                allowed_tools=allowed_tools,
+                shared_context=shared_context,
+            )
+            await self._complete(
+                command_message,
+                summary=f"Finished {title}: {assistant_summary or instructions}",
+                context_snapshot=context_snapshot,
+            )
         except asyncio.CancelledError:
             self.state.status = "idle"
             self.state.current_task_id = None
@@ -667,6 +701,7 @@ class DelegationRuntime:
             assigned_worker=worker_id,
             allowed_tools=request.allowed_tools,
             claimed_resources=request.claimed_resources,
+            shared_context=request.shared_context,
             resource_versions=self.resource_versions.snapshot(request.claimed_resources),
         )
         task.append_note(f"Assigned to {worker_id}.")
@@ -679,6 +714,7 @@ class DelegationRuntime:
                 title=request.title,
                 instructions=request.instructions,
                 allowed_tools=list(request.allowed_tools),
+                shared_context=list(request.shared_context),
                 permission_action=request.permission_action,
                 permission_reason=request.permission_reason,
             )
@@ -768,6 +804,9 @@ class DelegationRuntime:
         if message.kind is MessageKind.RESULT:
             success = bool(message.payload.get("success", False))
             summary = str(message.payload.get("summary", "")).strip()
+            snapshot = message.payload.get("context_snapshot")
+            if isinstance(snapshot, dict):
+                task.context_snapshot = snapshot
             if success:
                 committed, conflict_resource = self.resource_versions.try_commit(
                     task.claimed_resources,
@@ -806,11 +845,47 @@ class DelegationRuntime:
         return registry
 
 
-def _worker_system_prompt(title: str, instructions: str, allowed_tools: tuple[str, ...]) -> str:
+def _worker_system_prompt(
+    title: str,
+    instructions: str,
+    allowed_tools: tuple[str, ...],
+    *,
+    shared_context: tuple[str, ...] = (),
+) -> str:
     tools_text = ", ".join(allowed_tools) if allowed_tools else "all currently enabled tools"
+    shared_text = (
+        " Shared handoff context from dependent agents: "
+        + " | ".join(item[:500] for item in shared_context)
+        if shared_context
+        else ""
+    )
     return (
         "You are a delegated Nexus worker. Execute only the assigned task, keep the scope narrow, "
         "and return a concise final answer for the coordinator. "
         f"Available tools for this task: {tools_text}. "
-        f"Task title: {title}. Task instructions: {instructions}"
+        f"Task title: {title}. Task instructions: {instructions}.{shared_text}"
     )
+
+
+def _worker_context_snapshot(
+    *,
+    worker_id: str,
+    task_id: str,
+    title: str,
+    history: list[Message],
+    allowed_tools: tuple[str, ...],
+    shared_context: tuple[str, ...],
+) -> dict[str, Any]:
+    tool_calls = sum(len(message.tool_calls) for message in history if message.tool_calls)
+    record = AgentContextRecord(
+        agent_id=f"worker-{worker_id}-{task_id}",
+        role="worker",
+        scope=ContextScope.ISOLATED,
+        summary=f"Worker completed '{title}'. Local context is isolated; only this snapshot is shared.",
+        token_estimate=estimate_messages(history),
+        message_count=len(history),
+        shared_inputs=shared_context,
+        allowed_tools=allowed_tools,
+        tool_call_count=tool_calls,
+    )
+    return record.to_dict()

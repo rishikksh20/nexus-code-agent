@@ -14,6 +14,8 @@ from __future__ import annotations
 from typing import Any
 
 from nexus.tools.builtin.edit_file import EditTool
+from nexus.tools.builtin.code_search import CodeIndexTool, FindReferencesTool, SemanticSearchTool
+from nexus.tools.builtin.git import GitDiffTool, GitStatusTool
 from nexus.tools.builtin.glob import GlobTool
 from nexus.tools.builtin.grep import GrepTool
 from nexus.tools.builtin.list_dir import ListDirTool, LsTool
@@ -28,6 +30,7 @@ from nexus.tools.builtin.todo import TodoTool
 from nexus.tools.builtin.web_fetch import WebFetchTool
 from nexus.tools.builtin.web_search import WebSearchTool
 from nexus.tools.builtin.write_file import WriteFileTool, WriteNoteTool
+from nexus.tools.builtin.verification import RunFormatterTool, RunLinterTool, RunTestsTool, RunTypecheckTool
 
 __all__ = [
     "GetTimeTool",
@@ -44,6 +47,15 @@ __all__ = [
     "ListDirTool",
     "LsTool",
     "PythonLspTool",
+    "FindReferencesTool",
+    "CodeIndexTool",
+    "SemanticSearchTool",
+    "GitStatusTool",
+    "GitDiffTool",
+    "RunTestsTool",
+    "RunLinterTool",
+    "RunTypecheckTool",
+    "RunFormatterTool",
     # Execution
     "ShellTool",
     "BashTool",
@@ -69,6 +81,15 @@ def get_all_builtin_tools(*, memory_dir=None) -> list[Any]:
         GrepTool(),
         ListDirTool(),
         PythonLspTool(),
+        FindReferencesTool(),
+        CodeIndexTool(),
+        SemanticSearchTool(),
+        GitStatusTool(),
+        GitDiffTool(),
+        RunTestsTool(),
+        RunLinterTool(),
+        RunTypecheckTool(),
+        RunFormatterTool(),
         ShellTool(),
         MemoryTool(memory_dir=memory_dir),
         TodoTool(),

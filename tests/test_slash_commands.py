@@ -116,6 +116,57 @@ async def test_mcp_status_slash_command_shows_server_state(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_multi_agent_status_and_plan_slash_commands_show_session_state(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    session = new_snapshot("slash-multi-agent")
+    session.metadata["multi_agent"] = {
+        "mode": "always",
+        "complexity": "large",
+        "shared_state": {
+            "dag": {
+                "goal": "Implement feature",
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "role": "execution",
+                        "dependencies": [],
+                        "objective": "Make the change",
+                    }
+                ],
+                "execution_order": ["execute"],
+            },
+            "repair_decision": {
+                "retry": False,
+                "reason": "Post-execution checks did not find blocking issues.",
+            },
+        },
+    }
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=session,
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    router = build_router()
+    status_handled = await router.dispatch(state, "/multi-agent status")
+    plan_handled = await router.dispatch(state, "/multi-agent plan")
+
+    assert status_handled is True
+    assert plan_handled is True
+    output = console.export_text()
+    assert "Multi-Agent Supervisor" in output
+    assert "Latest Multi-Agent Plan" in output
+    assert "execute" in output
+
+
+@pytest.mark.asyncio
 async def test_mcp_refresh_slash_command_updates_discovered_tools(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
@@ -604,6 +655,37 @@ async def test_context_show_is_default_subcommand(tmp_path):
     output = console.export_text()
     assert "You are Nexus." in output
     assert "Context window" not in output
+
+
+@pytest.mark.asyncio
+async def test_context_agents_and_agent_usage_show_multi_agent_records(tmp_path):
+    state, console = _make_state(tmp_path)
+    state.session.metadata["multi_agent_context"] = {
+        "agents": {
+            "supervisor": {
+                "agent_id": "supervisor",
+                "role": "supervisor",
+                "scope": "shared",
+                "summary": "Supervising the DAG.",
+                "token_estimate": 42,
+                "message_count": 3,
+                "tool_call_count": 0,
+                "allowed_tools": [],
+            }
+        },
+        "packets": [],
+    }
+    router = build_router()
+
+    await router.dispatch(state, "/context agents")
+    await router.dispatch(state, "/context agent supervisor")
+    await router.dispatch(state, "/context usage supervisor")
+
+    output = console.export_text()
+    assert "Agent Contexts" in output
+    assert "Supervising the DAG" in output
+    assert "Context Usage: supervisor" in output
+    assert "42" in output
 
 
 # ── /help subcommand ──────────────────────────────────────────────────────────
