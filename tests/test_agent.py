@@ -48,6 +48,7 @@ async def test_agent_executes_read_only_tool(tool_context):
     ]
 
     assert any(event.kind == "tool_result" for event in events)
+    assert sum(1 for event in events if event.kind == "thinking_started") >= 2
     # AGENT_STOP is the final event; turn_completed precedes it
     assert events[-1].kind == "AGENT_STOP"
     assert any(event.kind == "turn_completed" for event in events)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from nexus.models import Message
-from nexus.context import CarryOverState, ContextCompactor, TokenEstimator, compact_messages
+from nexus.context import CarryOverState, ContextCompactor, TokenEstimator, compact_messages, prune_tool_outputs
 from nexus.runtime.context_state import (
     AgentSessionState,
     TaskContext,
@@ -62,6 +62,20 @@ def test_context_compactor_summarizes_only_messages_before_safe_recent_boundary(
     assert [message.role for message in compacted] == ["assistant", "tool", "tool", "user"]
     assert updated.summarized_history
     assert "1 messages" in updated.summarized_history[-1]
+
+
+def test_prune_tool_outputs_replaces_frozen_messages_in_place():
+    messages = [
+        Message(role="user", content="older request"),
+        Message(role="assistant", content="calling tool"),
+        Message(role="tool", content="x" * 120, name="read_file", tool_call_id="call-1"),
+        Message(role="user", content="latest request"),
+    ]
+
+    pruned = prune_tool_outputs(messages, protect_tokens=0, minimum_tokens=1)
+
+    assert pruned == 1
+    assert messages[2].content.startswith("[Tool output cleared")
 
 
 def test_multi_agent_state_helpers_create_stable_packet_ids_and_records():

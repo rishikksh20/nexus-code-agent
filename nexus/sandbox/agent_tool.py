@@ -13,6 +13,7 @@ from typing import Any
 from nexus.models import AgentEventType, ConfirmationKind, Message, ToolCall, ToolExecutionContext, ToolResult
 from nexus.runtime.execution import ExecutionMode
 from nexus.security.manager import ApprovalScope
+from nexus.security.policy import ApprovalPolicy
 from nexus.tools.base import ToolKind
 
 # ---------------------------------------------------------------------------
@@ -443,11 +444,7 @@ async def _handle_inner_confirmation(request, outer_context: ToolExecutionContex
     if request.kind is ConfirmationKind.APPROVAL:
         if response.approved:
             if approval_manager is not None:
-                approval_manager.record_approval(
-                    request.tool_name,
-                    ApprovalScope.ONCE,
-                    arguments=request.arguments,
-                )
+                _record_inner_approval(approval_manager, request, response)
             return "approved"
         if response.denied:
             if approval_manager is not None:
@@ -457,6 +454,43 @@ async def _handle_inner_confirmation(request, outer_context: ToolExecutionContex
                 )
             return "denied"
     return ""
+
+
+def _record_inner_approval(approval_manager, request, response) -> None:
+    scope = _approval_scope_from_response(request, response)
+    request_policy = ApprovalPolicy(str(request.payload.get("approval_policy", ApprovalPolicy.ON_REQUEST.value)))
+    if scope is ApprovalScope.TURN and request_policy is ApprovalPolicy.ON_REQUEST:
+        if _supports_turn_wide_approval(request):
+            approval_manager.record_turn_wide_mutating_approval()
+            return
+        approval_manager.record_approval(
+            request.tool_name,
+            ApprovalScope.ONCE,
+            arguments=request.arguments,
+        )
+        return
+    approval_manager.record_approval(
+        request.tool_name,
+        scope,
+        arguments=request.arguments,
+    )
+
+
+def _approval_scope_from_response(request, response) -> ApprovalScope:
+    raw_scope = response.scope
+    if not raw_scope:
+        request_policy = ApprovalPolicy(str(request.payload.get("approval_policy", ApprovalPolicy.ON_REQUEST.value)))
+        if request_policy is ApprovalPolicy.APPROVE_TURN:
+            return ApprovalScope.TURN
+        if request_policy is ApprovalPolicy.APPROVE_SESSION:
+            return ApprovalScope.SESSION
+        return ApprovalScope.ONCE
+    return ApprovalScope(str(raw_scope))
+
+
+def _supports_turn_wide_approval(request) -> bool:
+    risk_level = str(request.payload.get("risk_level", "medium")).strip().lower().split(".")[-1]
+    return not (request.tool_name == "bash" and risk_level in {"high", "dangerous"})
 
 
 def _subagent_result_envelope(

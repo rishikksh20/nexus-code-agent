@@ -5,9 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from nexus.security import PermissionChecker, PermissionDecision
+from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResponse
+from nexus.security import ApprovalManager, ApprovalPolicy, ApprovalScope, PermissionChecker, PermissionDecision
 from nexus.runtime.execution import ExecutionMode
-from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
+from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition, _record_inner_approval
 from nexus.tools.filesystem import WriteFileTool
 from nexus.skills import Skill, SkillRegistry
 from nexus.tools.base import ToolRegistry
@@ -190,6 +191,32 @@ async def test_subagent_tool_requires_registry_for_direct_execution(tool_context
 
     assert result.is_error is True
     assert "not attached to a tool registry" in result.output
+
+
+def test_subagent_inner_approval_turn_scope_matches_supervisor_behavior():
+    manager = ApprovalManager(policy=ApprovalPolicy.ON_REQUEST)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow tool 'write_file'?",
+        reason="write_file replaces the entire file.",
+        call_id="call-1",
+        payload={"approval_policy": "on-request", "risk_level": "medium"},
+        arguments={"path": "one.txt", "content": "one"},
+    )
+
+    _record_inner_approval(
+        manager,
+        request,
+        ConfirmationResponse(approved=True, scope=ApprovalScope.TURN.value),
+    )
+
+    assert manager.is_turn_wide_mutating_preapproved(
+        "write_file",
+        is_mutating=True,
+        risk_level="medium",
+    )
+    assert manager.is_pre_approved("write_file", {"path": "two.txt", "content": "two"}) is False
 
 
 @pytest.mark.asyncio

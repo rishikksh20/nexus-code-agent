@@ -300,7 +300,9 @@ class Agent:
         tool_calls_executed = 0
         loop_detector = LoopDetector()
 
-        for _ in range(max_turns):
+        for turn_index in range(max_turns):
+            if turn_index > 0:
+                yield AgentEvent(kind=AgentEventType.THINKING_STARTED)
             request = RuntimeRequest(
                 model_name=model_name,
                 system_prompt=system_prompt,

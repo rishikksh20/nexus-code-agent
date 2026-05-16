@@ -15,7 +15,7 @@ message history within the model's context window:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 from nexus.models import Message
@@ -203,9 +203,10 @@ def prune_tool_outputs(
 
     estimator = TokenEstimator()
     cumulative = 0
-    to_prune: list[Message] = []
+    to_prune: list[int] = []
 
-    for msg in reversed(messages):
+    for index in range(len(messages) - 1, -1, -1):
+        msg = messages[index]
         if msg.role != "tool" or not msg.tool_call_id:
             continue
         # Skip already-pruned messages.
@@ -214,17 +215,17 @@ def prune_tool_outputs(
         tokens = estimator.estimate(msg.content)
         cumulative += tokens
         if cumulative > protect_tokens:
-            to_prune.append(msg)
+            to_prune.append(index)
 
     if not to_prune:
         return 0
 
-    freed = sum(estimator.estimate(m.content) for m in to_prune)
+    freed = sum(estimator.estimate(messages[index].content) for index in to_prune)
     if freed < minimum_tokens:
         return 0
 
-    for msg in to_prune:
-        msg.content = _PRUNED_PLACEHOLDER
+    for index in to_prune:
+        messages[index] = replace(messages[index], content=_PRUNED_PLACEHOLDER)
     return len(to_prune)
 
 
