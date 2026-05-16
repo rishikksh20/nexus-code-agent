@@ -139,7 +139,7 @@ python - <<'PY'
 from pathlib import Path
 path = Path('.nexus/config.toml')
 existing = path.read_text(encoding='utf-8') if path.exists() else ''
-path.write_text(existing + '\ndelegation_enabled = true\n', encoding='utf-8')
+path.write_text(existing + '\nagent_mode = "advanced"\n', encoding='utf-8')
 PY
 ```
 
@@ -369,6 +369,5 @@ When you finish all five chapters, summarize findings under these headings:
 6. **feature gaps or missing commands**
 
 That report will be much more useful than a raw terminal transcript because it distinguishes implementation bugs from documentation or onboarding gaps.
-
 
 

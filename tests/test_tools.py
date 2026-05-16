@@ -7,8 +7,7 @@ import pytest
 
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.delegation import DelegationRuntime
-from nexus.sandbox.agent_tool import SubagentDefinition
+from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.tools.filesystem import WriteFileTool
 from nexus.skills import Skill, SkillRegistry
 from nexus.tools.base import ToolRegistry
@@ -114,38 +113,107 @@ def test_permission_checker_denies_direct_nexus_memory_file_writes_with_memory_h
 @pytest.mark.asyncio
 async def test_register_subagent_tools_registers_default_and_specialist_tools():
     registry = ToolRegistry()
-    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01, base_tool_registry=registry)
-    await delegation.start()
-    try:
-        config = SimpleNamespace(delegation_enabled=True)
-        definitions = [
-            SubagentDefinition(
-                name="explore",
-                description="Investigate a focused codebase question.",
-                goal_prompt="Explore the requested slice and summarize the result.",
-            )
-        ]
+    config = SimpleNamespace(agent_mode="advanced", delegation_enabled=True)
+    definitions = [
+        SubagentDefinition(
+            name="explore",
+            description="Investigate a focused codebase question.",
+            goal_prompt="Explore the requested slice and summarize the result.",
+        )
+    ]
 
-        count = register_subagent_tools(registry, delegation, config, definitions=definitions)
+    count = register_subagent_tools(registry, config, definitions=definitions)
 
-        assert count == 5
-        assert registry.record("delegate_task").source == "agent"
-        specialist = registry.record("subagent_explore")
-        assert specialist.source == "agent"
-        assert specialist.origin == "explore"
-        assert registry.record("subagent_research").origin == "research"
-        assert registry.record("subagent_review").origin == "review"
-        assert registry.record("subagent_test").origin == "test"
-    finally:
-        await delegation.shutdown()
+    assert count == 5
+    specialist = registry.record("subagent_explore")
+    assert specialist.source == "agent"
+    assert specialist.origin == "explore"
+    assert specialist.tool.is_mutating is False
+    assert registry.record("subagent_planning_analysis").origin == "planning_analysis"
+    assert registry.record("subagent_execution").origin == "execution"
+    assert registry.record("subagent_review").origin == "review"
+    assert registry.record("subagent_verification").origin == "verification"
 
 
 @pytest.mark.asyncio
-async def test_register_subagent_tools_skips_when_delegation_disabled():
+async def test_subagent_tool_returns_structured_supervisor_envelope(tool_context):
     registry = ToolRegistry()
-    config = SimpleNamespace(delegation_enabled=False)
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="planning_analysis",
+            description="Analyze and plan.",
+            goal_prompt="Return a plan.",
+            allowed_tools=["get_time"],
+        ),
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
 
-    count = register_subagent_tools(registry, None, config)
+    result = await tool.execute(
+        "call-1",
+        {
+            "title": "Plan focused change",
+            "instructions": "Inspect the task and summarize next steps.",
+            "input_packet_ids": ["packet-0001"],
+        },
+        tool_context,
+    )
+
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == 1
+    assert payload["status"] == "completed"
+    assert payload["agent"] == "subagent_planning_analysis"
+    assert payload["role"] == "planning_analysis"
+    assert payload["context"]["scope"] == "isolated"
+    assert payload["context"]["input_packet_ids"] == ["packet-0001"]
+    assert payload["raw_result"]
+    assert result.metadata["context_snapshot"]["scope"] == "isolated"
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_requires_registry_for_direct_execution(tool_context):
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="planning_analysis",
+            description="Analyze and plan.",
+            goal_prompt="Return a plan.",
+            allowed_tools=["get_time"],
+        )
+    )
+
+    result = await tool.execute(
+        "call-1",
+        {"title": "Plan focused change", "instructions": "Inspect the task."},
+        tool_context,
+    )
+
+    assert result.is_error is True
+    assert "not attached to a tool registry" in result.output
+
+
+@pytest.mark.asyncio
+async def test_register_subagent_tools_advanced_mode_does_not_require_delegation_flag():
+    registry = ToolRegistry()
+    config = SimpleNamespace(agent_mode="advanced", delegation_enabled=False)
+
+    count = register_subagent_tools(registry, config)
+
+    assert count == 4
+    assert {record.name for record in registry.records()} == {
+        "subagent_planning_analysis",
+        "subagent_execution",
+        "subagent_review",
+        "subagent_verification",
+    }
+
+
+@pytest.mark.asyncio
+async def test_register_subagent_tools_skips_unless_advanced_mode():
+    registry = ToolRegistry()
+    config = SimpleNamespace(agent_mode="basic", delegation_enabled=True)
+
+    count = register_subagent_tools(registry, config)
 
     assert count == 0
     assert registry.records() == []
@@ -200,54 +268,45 @@ def test_load_subagent_definitions_from_skills_uses_subagent_prefix():
 @pytest.mark.asyncio
 async def test_register_subagent_tools_respects_tool_filters():
     registry = ToolRegistry()
-    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01, base_tool_registry=registry)
-    await delegation.start()
-    try:
-        config = SimpleNamespace(
-            delegation_enabled=True,
-            allowed_tools=["subagent_explore"],
-            denied_tools=[],
+    config = SimpleNamespace(
+        agent_mode="advanced",
+        delegation_enabled=False,
+        allowed_tools=["subagent_explore"],
+        denied_tools=[],
+    )
+    definitions = [
+        SubagentDefinition(
+            name="explore",
+            description="Investigate a focused codebase question.",
+            goal_prompt="Explore the requested slice and summarize the result.",
         )
-        definitions = [
-            SubagentDefinition(
-                name="explore",
-                description="Investigate a focused codebase question.",
-                goal_prompt="Explore the requested slice and summarize the result.",
-            )
-        ]
+    ]
 
-        count = register_subagent_tools(registry, delegation, config, definitions=definitions)
+    count = register_subagent_tools(registry, config, definitions=definitions)
 
-        assert count == 1
-        assert registry.records()[0].name == "subagent_explore"
-    finally:
-        await delegation.shutdown()
+    assert count == 1
+    assert registry.records()[0].name == "subagent_explore"
 
 
 @pytest.mark.asyncio
-async def test_register_skill_subagent_tools_registers_skill_backed_workers():
+async def test_register_skill_subagent_tools_registers_skill_backed_cognitive_tools():
     registry = ToolRegistry()
-    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01, base_tool_registry=registry)
-    await delegation.start()
-    try:
-        config = SimpleNamespace(delegation_enabled=True, allowed_tools=[], denied_tools=[])
-        skill_registry = SkillRegistry()
-        skill_registry.register(
-            Skill(
-                name="subagent-review",
-                description="Review a focused code slice.",
-                content="Inspect the selected code and report issues.",
-            )
+    config = SimpleNamespace(agent_mode="advanced", delegation_enabled=False, allowed_tools=[], denied_tools=[])
+    skill_registry = SkillRegistry()
+    skill_registry.register(
+        Skill(
+            name="subagent-review",
+            description="Review a focused code slice.",
+            content="Inspect the selected code and report issues.",
         )
+    )
 
-        count = register_skill_subagent_tools(registry, delegation, config, skill_registry)
+    count = register_skill_subagent_tools(registry, None, config, skill_registry)
 
-        assert count == 1
-        record = registry.record("subagent_review")
-        assert record.source == "agent-skill"
-        assert record.origin == "review"
-    finally:
-        await delegation.shutdown()
+    assert count == 1
+    record = registry.record("subagent_review")
+    assert record.source == "agent-skill"
+    assert record.origin == "review"
 
 
 @pytest.mark.asyncio

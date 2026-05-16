@@ -1,6 +1,6 @@
 # Nexus AI Coding Agent Reference
 
-Use this skill only for questions about Nexus itself: commands, config, providers, tools, skills, sessions, memory, MCP, delegation, sandboxing, observability, and runtime behavior.
+Use this skill only for questions about Nexus itself: commands, config, providers, tools, skills, sessions, memory, MCP, cognitive sub-agents, sandboxing, observability, and runtime behavior.
 
 Key facts:
 
@@ -13,7 +13,7 @@ Key facts:
 - `/mode plan`, `/mode default`, and `/mode auto` control permission behavior.
 - Persistent memory should be accessed through `/memory` or the `memory` tool, not by reading `.nexus` files directly.
 - Sessions are managed with `/session`; history is inspected with `/history`.
-- MCP status is inspected with `/mcp`; delegation is inspected and controlled with `/delegate` when enabled.
+- MCP status is inspected with `/mcp`; cognitive sub-agent availability is inspected with `/tools` in advanced mode.
 
 When answering Nexus questions:
 

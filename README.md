@@ -40,7 +40,7 @@
 - **Skills** — Markdown skill files loaded from builtin, global, and workspace directories; activated per-session
 - **MCP integration** — tool discovery over subprocess stdio
 - **Plugin system** — drop `.py` files into `~/.nexus/plugins/` to register custom tools
-- **Delegation** — typed coordinator ↔ worker mailboxes with approval flow
+- **Cognitive sub-agents** — specialized agent tools with isolated context and normal nested tool permissions
 - **Sandbox** — Docker-backed command execution with resource and network limits
 - **Lifecycle hooks** — JSONL runtime logs, aggregated metrics, and audit trail for mutating actions
 - **Post-session learning** — workspace knowledge and user profile updated out of band after each session
@@ -113,14 +113,14 @@ nexus/                         # Main package
 │   ├── sessions.py            # Session snapshot persistence
 │   ├── runtime_session.py     # RuntimeSession assembly
 │   ├── execution.py           # ExecutionMode enum
-│   ├── delegation.py          # DelegationRuntime — coordinator/worker orchestration
+│   ├── delegation.py          # Legacy worker runtime kept for compatibility tests
 │   ├── post_session.py        # Post-session workspace and profile learning
 │   └── sandbox.py             # Sandbox runtime wiring
 │
 ├── sandbox/                   # Docker sandbox execution
 │   ├── docker.py              # Docker client wrapper
 │   ├── tool.py                # SandboxedBashTool
-│   ├── agent_tool.py          # SubAgentTool wrapping DelegationRuntime
+│   ├── agent_tool.py          # Cognitive SubAgentTool implementation
 │   └── factory.py             # Sandbox factory
 │
 ├── security/                  # Permission and approval system
@@ -366,8 +366,6 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 | `/tools [reload]` | List registered tools or reload the tool registry |
 | `/history [n]` | Show recent conversation messages |
 | `/mcp [status\|tools\|refresh [server]]` | Inspect MCP server status and discovered tools |
-| `/delegate [status\|workers\|tasks\|spawn\|messages\|approvals\|approve\|reject]` | Multi-agent delegation controls |
-| `/multi-agent [status\|plan\|state]` | Supervisor plan, shared state, and repair decision visibility |
 | `/quit` or `/exit` | Save session and exit |
 
 ---
@@ -652,16 +650,19 @@ mcp_servers = [
   { name = "filesystem", command = ["uvx", "mcp-server-filesystem", "."], prefix = "fs_" }
 ]
 
-# Delegation
-multi_agent_mode = "off" # off | auto | always
-multi_agent_show_plan = true
-multi_agent_max_parallel_tasks = 3
-multi_agent_max_repair_iterations = 2
-multi_agent_complexity_threshold = "medium"
-delegation_enabled = false
-delegation_workers = ["worker-1", "worker-2"]
-# Built-in delegation tools when enabled: delegate_task, subagent_research,
-# subagent_review, subagent_test
+# Agent profile
+config_version = 2
+agent_mode = "basic" # basic | advanced
+# basic = single-LLM execution with no cognitive sub-agent tools.
+# advanced = supervisor LLM with cognitive sub-agent tools.
+# Built-in cognitive tools in advanced mode: subagent_planning_analysis,
+# subagent_execution, subagent_review, subagent_verification
+
+When an interactive session starts, Nexus checks the workspace `.nexus/config.toml`
+against the current template. If keys are missing, deprecated keys are present,
+or the config version is old, Nexus asks before upgrading. Legacy keys are
+accepted for compatibility; `/config upgrade local` removes deprecated keys and
+adds the current schema version.
 
 # Sandbox
 sandbox_commands = false

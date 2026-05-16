@@ -22,7 +22,7 @@ Nexus already has the right foundation for multi-agent context management:
 - `nexus/runtime/orchestration.py` adds a conservative supervisor wrapper around the existing turn runner.
 - `nexus/runtime/context_state.py` records compact agent context snapshots and handoff packets in session metadata.
 - `nexus/runtime/delegation.py` provides in-memory coordinator/worker mailboxes, worker task records, restricted tool registries, and coordinator-routed approvals.
-- `nexus/tools/subagents.py` registers built-in `subagent_research`, `subagent_review`, and `subagent_test` tools when delegation is enabled.
+- `nexus/tools/subagents.py` registers built-in `subagent_planning_analysis`, `subagent_execution`, `subagent_review`, and `subagent_verification` tools in advanced mode.
 - Structured inspection tools now exist for `git_status`, `git_diff`, `run_tests`, `run_linter`, `run_typecheck`, `run_formatter`, `find_references`, `code_index`, and `semantic_search`.
 
 The current implementation is a good v0. It records context boundaries and post-execution review state, but it does not yet execute a full dependency-aware task graph across durable specialist agents.
@@ -78,7 +78,7 @@ Important files:
   - blocks until the worker task reaches a terminal state;
   - truncates large worker outputs before returning them to the main context.
 - `nexus/runtime/slash_commands.py`
-  - exposes `/multi-agent status`, `/multi-agent plan`, `/multi-agent state`;
+  - exposes advanced delegation state through `/delegate` and typed context state through `/context`;
   - exposes `/context agents`, `/context agent <id>`, `/context usage <id>`;
   - folds completed delegated worker snapshots into the `/context` view.
 
@@ -110,7 +110,7 @@ Key gaps:
 - `ContextPacket.packet_id` uses Python `hash()`, which is process-randomized and not stable across sessions.
 - Worker local history exists only while the in-memory worker task is running. There is no durable `AgentSessionState` for repair loops.
 - Repair currently records a `RepairDecision`; it does not resume the previous execution agent with an injected failure summary.
-- Post-execution checks are lightweight and sequential. They do not yet use `subagent_test` or `subagent_review` as first-class DAG nodes.
+- Post-execution checks are lightweight and sequential. They do not yet use `subagent_verification` or `subagent_review` as first-class DAG nodes.
 - Delegation mailboxes are in-memory. They are useful for a live session but are not restart-safe.
 - Artifacts such as diffs, command output, test logs, and review reports are not stored as first-class records.
 - Compaction is still mostly message-level carry-over. Multi-agent summaries are not versioned rolling summaries yet.
@@ -610,7 +610,7 @@ Current behavior:
 post-execution check fails
   -> RepairDecision(retry=True)
   -> stored in session metadata
-  -> visible in /multi-agent status
+  -> visible in /delegate status and /context summary
   -> carried into future prompt context
 ```
 
@@ -731,7 +731,7 @@ Success gates:
 
 - A DAG with independent read-only tasks can schedule up to `multi_agent_max_parallel_tasks`.
 - A task cannot start until dependency packet requirements are satisfied.
-- Failed dependency handling is visible in `/multi-agent state`.
+- Failed dependency handling is visible in typed context state.
 
 ### Phase 3: First-Class Handoff Packets
 
@@ -797,8 +797,8 @@ Goal: make research, test, and review nodes real workers instead of only a displ
 
 Changes:
 
-- For read-only research nodes, use `subagent_research` when delegation is enabled.
-- For verification nodes, use structured tools directly or `subagent_test`.
+- For planning and analysis nodes, use `subagent_planning_analysis` when advanced delegation is enabled.
+- For verification nodes, use structured tools directly or `subagent_verification`.
 - For review nodes, use `summarize_review_findings()` initially, then optionally `subagent_review`.
 - Convert each worker result into a typed packet.
 - Keep execution edits in the main agent at first to preserve approval visibility.
@@ -1031,9 +1031,9 @@ Do not load:
 
 Existing:
 
-- `/multi-agent status`
-- `/multi-agent plan`
-- `/multi-agent state`
+- `/delegate status`
+- `/delegate tasks`
+- `/context summary`
 - `/context agents`
 - `/context agent <id>`
 - `/context usage <id>`
@@ -1043,12 +1043,9 @@ Existing:
 
 Recommended additions:
 
-- `/multi-agent tasks`
-- `/multi-agent packets`
-- `/multi-agent packet <id>`
-- `/multi-agent artifacts`
-- `/multi-agent artifact <id>`
-- `/multi-agent repair`
+- `/context task <id>`
+- `/context summary`
+- `/context agents`
 - `/context task <id>`
 - `/context summary`
 
@@ -1058,7 +1055,7 @@ These commands should display structured summaries first and require explicit us
 
 Automated test targets:
 
-- `multi_agent_mode = "off"` delegates to `run_agent_turn()` unchanged.
+- `agent_mode = "basic"` delegates to `run_agent_turn()` unchanged.
 - Planner receives no tool schemas.
 - Invalid planner JSON fails before execution.
 - DAG dependency order is enforced.
@@ -1095,8 +1092,7 @@ uv run pytest
 Keep defaults conservative:
 
 ```toml
-multi_agent_mode = "off"
-delegation_enabled = false
+agent_mode = "basic"
 multi_agent_show_plan = true
 multi_agent_max_parallel_tasks = 3
 multi_agent_max_repair_iterations = 2

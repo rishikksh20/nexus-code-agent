@@ -5,6 +5,7 @@ from pathlib import Path
 from nexus.config import load_config
 from nexus.prompts import build_context_sections
 from nexus.context import CarryOverState
+from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.skills import load_skill_registry
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import GetTimeTool, WriteFileTool
@@ -23,6 +24,33 @@ def test_build_context_uses_live_execution_mode(tmp_path):
     )
 
     assert "Mode: plan" in sections.environment
+
+
+def test_build_context_describes_cognitive_subagent_contract(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(
+        SubAgentTool(
+            delegation=None,  # type: ignore[arg-type]
+            definition=SubagentDefinition(
+                name="planning_analysis",
+                description="Analyze the repo and plan.",
+                goal_prompt="Read only.",
+                allowed_tools=["read_file", "grep"],
+            ),
+        ),
+        source="agent",
+        origin="planning_analysis",
+    )
+
+    sections = build_context_sections(config, registry, task_input="plan this")
+
+    assert "Cognitive Sub-Agent Contract" in sections.base_instruction
+    assert "`subagent_planning_analysis`" in sections.base_instruction
+    assert '"input_packet_ids"' in sections.base_instruction
+    assert "status: needs_clarification" in sections.base_instruction
+    assert "local conversation and tool history as isolated private context" in sections.base_instruction
+    assert "Do not do substantial repo research or coding directly" in sections.base_instruction
 
 
 def test_build_context_includes_current_time_and_working_directory(tmp_path, monkeypatch):

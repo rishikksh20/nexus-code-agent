@@ -93,17 +93,17 @@ class MCPClient:
             return
         process = self._process
         self._process = None
-        if process.stdin is not None and not process.stdin.is_closing():
-            process.stdin.close()
+        await _close_stream_writer(process.stdin)
         try:
             await asyncio.wait_for(process.wait(), timeout=1.0)
         except asyncio.TimeoutError:
-            process.terminate()
+            _terminate_process(process)
             try:
                 await asyncio.wait_for(process.wait(), timeout=1.0)
             except asyncio.TimeoutError:
-                process.kill()
+                _kill_process(process)
                 await process.wait()
+        await asyncio.sleep(0)
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         await self._write_message(
@@ -243,3 +243,34 @@ def mcp_server_example_for_workspace(workspace_root: Path) -> str:
         '{ name = "filesystem", command = ["uvx", "mcp-server-filesystem", '
         f'"{workspace_root.as_posix()}"], prefix = "fs_" }}'
     )
+
+
+async def _close_stream_writer(writer) -> None:
+    if writer is None or writer.is_closing():
+        return
+    writer.close()
+    wait_closed = getattr(writer, "wait_closed", None)
+    if wait_closed is None:
+        return
+    try:
+        await asyncio.wait_for(wait_closed(), timeout=1.0)
+    except (BrokenPipeError, ConnectionResetError, asyncio.TimeoutError):
+        return
+
+
+def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+
+
+def _kill_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        process.kill()
+    except ProcessLookupError:
+        return

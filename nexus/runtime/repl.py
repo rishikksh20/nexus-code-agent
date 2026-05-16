@@ -5,6 +5,9 @@ from os import environ
 from uuid import uuid4
 
 from nexus.hooks import HookEvent
+from nexus.cli.init import _local_config_toml
+from nexus.config import load_config
+from nexus.config.upgrade import inspect_config_upgrade, upgrade_config_file
 from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message
 from nexus.runtime.agent import Agent
 from nexus.runtime.repl_state import ReplState
@@ -40,6 +43,7 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
         ui.print_muted("A previous task was paused after hitting the tool-call limit. Type `continue` to resume it, or enter a new prompt to start something else.")
     ui.print_help_hint()
     _print_provider_notice_or_warning(state)
+    _maybe_prompt_config_upgrade(state)
 
     approval_callback = _interactive_approval_callback(ui)
 
@@ -135,6 +139,46 @@ def _print_provider_notice_or_warning(state: ReplState) -> None:
         has_key = True
     if not has_key:
         state.console.print_no_api_key_warning(cfg.provider)
+
+
+def _maybe_prompt_config_upgrade(state: ReplState) -> None:
+    cfg = state.config
+    template = _local_config_toml(
+        workspace_root=cfg.workspace_root,
+        project_name=cfg.project_name or cfg.workspace_root.name,
+        project_description=cfg.project_description,
+    )
+    report = inspect_config_upgrade(cfg.local_config_file, template)
+    if not report.needs_upgrade:
+        return
+
+    state.console.print("[bold yellow]Workspace Nexus config can be upgraded for this build.[/bold yellow]")
+    if report.current_version != report.target_version:
+        state.console.print(f"  version: {report.current_version or 'missing'} -> {report.target_version}")
+    for key in report.deprecated_keys:
+        state.console.print(f"  remove deprecated key: {key}")
+    if report.missing_keys:
+        state.console.print(f"  add missing key(s): {', '.join(report.missing_keys)}")
+    state.console.print("Options: [bold]yes[/bold]/[bold]y[/bold], [bold]no[/bold]/[bold]n[/bold], or [bold]later[/bold].")
+    try:
+        answer = state.console.input("Upgrade workspace .nexus/config.toml now? ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        state.console.print_muted("Skipping config upgrade prompt.")
+        return
+    if answer in {"", "n", "no", "later"}:
+        state.console.print_muted("Skipping config upgrade. You can run /config upgrade local later.")
+        return
+    if answer not in {"y", "yes"}:
+        state.console.print_muted("Unrecognized answer. Skipping config upgrade. You can run /config upgrade local later.")
+        return
+    upgrade_config_file(cfg.local_config_file, template)
+    state.config = load_config(
+        cfg.workspace_root,
+        global_root=cfg.global_root,
+        local_config_path=cfg.local_config_file,
+        global_config_path=cfg.global_config_file,
+    )
+    state.console.print("[green]Workspace config upgraded and reloaded.[/green]")
 
 
 async def _emit_prompt_submit(

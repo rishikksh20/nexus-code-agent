@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
 from nexus.models import (
@@ -25,7 +26,7 @@ from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
 from nexus.security.manager import ApprovalManager
-from nexus.tools.base import FileDiff, ToolConfirmation, ToolRegistry
+from nexus.tools.base import FileDiff, ToolConfirmation, ToolRegistry, tool_to_schema
 
 
 TOOL_CALL_LIMIT_FINISH_REASON = "tool_call_limit"
@@ -133,11 +134,21 @@ class Agent:
         *,
         approval_manager: ApprovalManager | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
+        mutating_paths_this_batch: set[str] = set()
         for tool_call in tool_calls:
             record = self.tool_registry.record(tool_call.tool_name)
             tool = record.tool
             confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
             confirmation_preview = _confirmation_preview(confirmation)
+            affected_paths = _affected_file_paths(tool, tool_call.arguments, confirmation, context)
+            duplicate_paths = affected_paths & mutating_paths_this_batch if tool.is_mutating else set()
+            if duplicate_paths:
+                blocked_result = _same_file_mutation_result(tool_call, duplicate_paths)
+                yield AgentEvent.tool_call_complete(blocked_result)
+                yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=blocked_result)
+                continue
+            if tool.is_mutating:
+                mutating_paths_this_batch.update(affected_paths)
             async for event in self._execute_tool_call(
                 record,
                 tool,
@@ -145,6 +156,7 @@ class Agent:
                 context,
                 approval_manager=approval_manager,
                 confirmation_preview=confirmation_preview,
+                affected_paths=affected_paths,
             ):
                 yield event
 
@@ -166,10 +178,14 @@ class Agent:
             0,
         )
         approved_calls: list[ToolCall] = []
+        mutating_paths_this_batch: set[str] = set()
         for call in tool_calls[start_index:]:
             try:
                 record = self.tool_registry.record(call.tool_name)
             except Exception:
+                continue
+            affected_paths = _affected_file_paths(record.tool, call.arguments, None, context)
+            if record.tool.is_mutating and affected_paths & mutating_paths_this_batch:
                 continue
             decision = self.permission_checker.evaluate(
                 record.tool,
@@ -190,6 +206,8 @@ class Agent:
                 risk_level=risk_level,
             ):
                 approved_calls.append(call)
+                if record.tool.is_mutating:
+                    mutating_paths_this_batch.update(affected_paths)
         return tuple(approved_calls or (first_tool_call,))
 
     async def _execute_tool_call(
@@ -201,12 +219,15 @@ class Agent:
         *,
         approval_manager: ApprovalManager | None,
         confirmation_preview: dict[str, Any],
+        affected_paths: set[str] | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
+        actor = _tool_actor(context)
         yield AgentEvent.tool_call_start(
             tool_call.call_id,
             tool_call.tool_name,
             tool_call.arguments,
             preview=confirmation_preview,
+            actor=actor,
         )
         yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
 
@@ -226,6 +247,14 @@ class Agent:
 
         started_at = time.perf_counter()
         result = await tool.execute(tool_call.call_id, tool_call.arguments, context)
+        if actor:
+            result.metadata = {**result.metadata, "actor": actor}
+        if tool.is_mutating:
+            result = _with_post_mutation_refresh(
+                result,
+                affected_paths or set(),
+                context,
+            )
         if approval_manager is not None:
             approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
 
@@ -276,7 +305,7 @@ class Agent:
                 model_name=model_name,
                 system_prompt=system_prompt,
                 messages=tuple(history),
-                tool_schemas=self.tool_registry.schemas(),
+                tool_schemas=_tool_schemas_for_context(self.tool_registry, context),
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
             )
@@ -358,11 +387,13 @@ class Agent:
             # Tool execution
             # ----------------------------------------------------------------
             tool_result_messages: list[Message] = []
+            mutating_paths_this_batch: set[str] = set()
             for tool_call in tool_calls:
                 record = self.tool_registry.record(tool_call.tool_name)
                 tool = record.tool
                 confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
                 confirmation_preview = _confirmation_preview(confirmation)
+                affected_paths = _affected_file_paths(tool, tool_call.arguments, confirmation, context)
 
                 if tool_calls_executed >= max_tool_calls_per_turn:
                     pause_message = _tool_call_limit_pause_message(max_tool_calls_per_turn)
@@ -399,7 +430,7 @@ class Agent:
                         prompt=f"Provide a value for '{missing_field}' before running '{tool.name}'.",
                         reason="Required tool argument is missing.",
                         call_id=tool_call.call_id,
-                        payload={"tool_name": tool.name, "field": missing_field},
+                        payload={"tool_name": tool.name, "field": missing_field, "actor": _tool_actor(context)},
                         arguments=tool_call.arguments,
                         preview=confirmation_preview,
                     )
@@ -471,6 +502,21 @@ class Agent:
                     loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="refused")
                     continue
 
+                duplicate_paths = affected_paths & mutating_paths_this_batch if tool.is_mutating else set()
+                if duplicate_paths:
+                    blocked_result = _same_file_mutation_result(tool_call, duplicate_paths)
+                    tool_calls_executed += 1
+                    tool_result_messages.append(Message(
+                        role="tool",
+                        content=blocked_result.output,
+                        name=blocked_result.tool_name,
+                        tool_call_id=blocked_result.call_id,
+                    ))
+                    yield AgentEvent.tool_call_complete(blocked_result)
+                    yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=blocked_result)
+                    loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="same_file_blocked")
+                    continue
+
                 if (
                     decision.decision is PermissionDecision.CONFIRM
                     and not auto_confirm
@@ -494,6 +540,7 @@ class Agent:
                             "reason": decision.reason,
                             "approval_policy": str(context.metadata.get("approval_policy", "on-request")),
                             "risk_level": _risk_level_name(decision.risk_level),
+                            "actor": _tool_actor(context),
                         },
                         arguments=tool_call.arguments,
                         preview=confirmation_preview,
@@ -515,6 +562,8 @@ class Agent:
                     yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=conf_request)
                     return
 
+                if tool.is_mutating:
+                    mutating_paths_this_batch.update(affected_paths)
                 result: ToolResult | None = None
                 async for event in self._execute_tool_call(
                     record,
@@ -523,6 +572,7 @@ class Agent:
                     context,
                     approval_manager=approval_manager,
                     confirmation_preview=confirmation_preview,
+                    affected_paths=affected_paths,
                 ):
                     if event.kind == AgentEventType.TOOL_RESULT:
                         result = event.payload
@@ -610,6 +660,21 @@ def _correlation_payload(context: ToolExecutionContext, *, tool_call_id: str | N
     return {key: value for key, value in payload.items() if value}
 
 
+def _tool_actor(context: ToolExecutionContext) -> str:
+    actor = context.metadata.get("tool_display_prefix") or context.metadata.get("subagent")
+    return str(actor).strip() if actor else ""
+
+
+def _tool_schemas_for_context(registry: ToolRegistry, context: ToolExecutionContext) -> tuple[dict[str, Any], ...]:
+    if not context.metadata.get("supervisor_cognitive_tools_only"):
+        return registry.schemas()
+    return tuple(
+        tool_to_schema(record.tool)
+        for record in registry.records()
+        if record.name.startswith("subagent_")
+    )
+
+
 async def _get_tool_confirmation(
     tool: Any,
     call_id: str,
@@ -636,6 +701,155 @@ def _confirmation_preview(confirmation: ToolConfirmation | None) -> dict[str, An
     if confirmation.diff is not None:
         preview["diff"] = _serialize_file_diff(confirmation.diff)
     return preview
+
+
+def _affected_file_paths(
+    tool: Any,
+    arguments: dict[str, Any],
+    confirmation: ToolConfirmation | None,
+    context: ToolExecutionContext,
+) -> set[str]:
+    if not getattr(tool, "is_mutating", False):
+        return set()
+
+    workspace = context.working_directory.resolve()
+    candidates: list[Path] = []
+    if confirmation is not None:
+        candidates.extend(confirmation.affected_paths)
+
+    raw_path = arguments.get("path")
+    if raw_path:
+        candidates.append(_resolve_workspace_path(workspace, str(raw_path)))
+
+    if getattr(tool, "name", "") == "apply_patch":
+        candidates.extend(_paths_from_patch_argument(workspace, str(arguments.get("patch", "")), int(arguments.get("strip", 1))))
+
+    paths: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate.absolute()
+        try:
+            rel = resolved.relative_to(workspace)
+            paths.add(str(rel))
+        except ValueError:
+            paths.add(str(resolved))
+    return paths
+
+
+def _resolve_workspace_path(workspace: Path, raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    return path.resolve() if path.is_absolute() else (workspace / path).resolve()
+
+
+def _paths_from_patch_argument(workspace: Path, patch_text: str, strip: int) -> list[Path]:
+    paths: list[Path] = []
+    pending_old_path: str | None = None
+    for line in patch_text.splitlines():
+        if line.startswith("--- "):
+            pending_old_path = _clean_patch_path(line[4:])
+            continue
+        if line.startswith("+++ ") and pending_old_path is not None:
+            new_path = _clean_patch_path(line[4:])
+            raw_path = pending_old_path if new_path == "/dev/null" else new_path
+            pending_old_path = None
+            if raw_path == "/dev/null":
+                continue
+            parts = Path(raw_path).parts
+            if strip > 0 and len(parts) > strip:
+                raw_path = str(Path(*parts[strip:]))
+            paths.append(_resolve_workspace_path(workspace, raw_path))
+    return paths
+
+
+def _clean_patch_path(raw_path: str) -> str:
+    path = raw_path.split("\t")[0].strip()
+    for prefix in ("a/", "b/"):
+        if path.startswith(prefix):
+            return path[len(prefix):]
+    return path
+
+
+def _same_file_mutation_result(tool_call: ToolCall, duplicate_paths: set[str]) -> ToolResult:
+    paths = ", ".join(sorted(duplicate_paths))
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=tool_call.tool_name,
+        output=(
+            "Skipped mutating tool call: another mutating tool call in the same model response "
+            f"already targeted {paths}. Read the file again after the prior mutation and issue a fresh edit."
+        ),
+        is_error=True,
+        metadata={
+            "same_file_mutation_blocked": True,
+            "paths": sorted(duplicate_paths),
+        },
+    )
+
+
+def _with_post_mutation_refresh(
+    result: ToolResult,
+    affected_paths: set[str],
+    context: ToolExecutionContext,
+) -> ToolResult:
+    if not affected_paths or (result.is_error and int(result.metadata.get("files_patched", 0) or 0) <= 0):
+        return result
+
+    workspace = context.working_directory.resolve()
+    refreshes: list[dict[str, Any]] = []
+    output_parts = [result.output]
+    for path_text in sorted(affected_paths):
+        path = _resolve_workspace_path(workspace, path_text)
+        try:
+            rel = str(path.relative_to(workspace))
+        except ValueError:
+            rel = str(path)
+
+        if not path.exists():
+            refreshes.append({"path": rel, "exists": False, "content": "", "truncated": False})
+            output_parts.append(f"\n[Post-mutation refresh]\nRead {rel} after mutation: file no longer exists.")
+            continue
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            refreshes.append({"path": rel, "exists": True, "error": str(exc)})
+            output_parts.append(f"\n[Post-mutation refresh]\nCould not read {rel} after mutation: {exc}")
+            continue
+
+        max_chars = int(context.metadata.get("post_mutation_read_max_chars", 12_000) or 12_000)
+        clipped = content[:max_chars]
+        truncated = len(content) > max_chars
+        refreshes.append(
+            {
+                "path": rel,
+                "exists": True,
+                "content": clipped,
+                "truncated": truncated,
+                "line_count": len(content.splitlines()),
+            }
+        )
+        suffix = "\n...[truncated]" if truncated else ""
+        output_parts.append(
+            f"\n[Post-mutation refresh]\nRead {rel} after mutation ({len(content.splitlines())} lines):\n"
+            f"```text\n{clipped}{suffix}\n```"
+        )
+
+    if not refreshes:
+        return result
+
+    metadata = dict(result.metadata)
+    metadata["post_mutation_reads"] = refreshes
+    metadata["affected_paths"] = sorted(affected_paths)
+    return ToolResult(
+        call_id=result.call_id,
+        tool_name=result.tool_name,
+        output="\n".join(output_parts),
+        is_error=result.is_error,
+        metadata=metadata,
+    )
 
 
 def _serialize_file_diff(diff: FileDiff) -> dict[str, Any]:

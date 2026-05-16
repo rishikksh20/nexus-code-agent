@@ -77,6 +77,17 @@ async def run_agent_turn(
             compactor_factory=ContextCompactor,
             estimator_factory=TokenEstimator,
         )
+        prepared_turn.context.metadata["approval_callback"] = approval_callback
+        prepared_turn.context.metadata["approval_manager"] = state.approval_manager
+        prepared_turn.context.metadata["execution_mode"] = state.mode.value
+        prepared_turn.context.metadata["auto_confirm"] = auto_confirm
+        prepared_turn.context.metadata["auto_confirm_read_only"] = state.config.auto_confirm_read_only
+        prepared_turn.context.metadata["ui"] = ui
+        prepared_turn.context.metadata["stream_output"] = state.config.stream_output
+        prepared_turn.context.metadata["show_tool_calls"] = state.config.show_tool_calls
+        prepared_turn.context.metadata["supervisor_cognitive_tools_only"] = (
+            str(getattr(state.config, "agent_mode", "basic")).strip().lower() == "advanced"
+        )
 
         batch = await _run_model_batch(
             state,
@@ -294,6 +305,7 @@ def _render_event(ui: TerminalUI | None, state: ReplState, event: AgentEvent) ->
         event,
         stream_output=state.config.stream_output,
         show_tool_calls=state.config.show_tool_calls,
+        show_thinking_indicator=state.config.show_thinking_indicator,
     )
 
 

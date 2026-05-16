@@ -7,14 +7,10 @@ package remains self-contained.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 
 from nexus.sandbox.docker import DockerSandbox, SandboxConfig, docker_available, docker_image_available
 from nexus.sandbox.tool import SandboxedCommandTool
 from nexus.tools.base import ToolRegistry
-
-if TYPE_CHECKING:
-    from nexus.runtime.delegation import DelegationRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -73,33 +69,16 @@ def register_sandbox_tool(registry: ToolRegistry, config) -> bool:
 
 def register_agent_tool(
     registry: ToolRegistry,
-    delegation: "DelegationRuntime | None",
+    delegation,
     config,
 ) -> bool:
-    """Conditionally register :class:`~nexus.sandbox.agent_tool.SubAgentTool`.
+    """Compatibility wrapper for cognitive sub-agent registration.
 
-    Parameters
-    ----------
-    registry:
-        The :class:`~nexus.tools.base.ToolRegistry` to register into.
-    delegation:
-        A live :class:`~nexus.runtime.delegation.DelegationRuntime`.  When
-        ``None`` the tool is not registered.
-    config:
-        An :class:`~nexus.config.defaults.AgentConfig` with a
-        ``delegation_enabled`` field.
-
-    Returns
-    -------
-    bool
-        ``True`` if the tool was registered; ``False`` if it was skipped.
+    The ``delegation`` argument is ignored for old callers; cognitive
+    sub-agents are normal tools and do not require a worker runtime.
     """
-    if delegation is None:
-        return False
-    if not getattr(config, "delegation_enabled", False):
-        return False
+    del delegation
 
-    from nexus.sandbox.agent_tool import SubAgentTool
+    from nexus.tools.subagents import register_subagent_tools
 
-    registry.register(SubAgentTool(delegation), source="agent")
-    return True
+    return register_subagent_tools(registry, config) > 0

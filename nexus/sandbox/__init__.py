@@ -7,15 +7,14 @@ This package encapsulates all Docker-sandbox machinery and the higher-level
 * :class:`~nexus.sandbox.tool.SandboxedCommandTool` — ``ToolKind.SANDBOX``
   tool that exposes the sandbox to the LLM.
 * :class:`~nexus.sandbox.agent_tool.SubAgentTool` — ``ToolKind.AGENT``
-  tool that delegates a sub-task to a worker via
-  :class:`~nexus.runtime.delegation.DelegationRuntime`.
+  non-mutating cognitive tool that runs a focused inner agent loop.
 
 Public integration surface (what :mod:`nexus.app` imports):
 
 * :func:`~nexus.sandbox.factory.register_sandbox_tool` — checks Docker
   availability then registers :class:`~nexus.sandbox.tool.SandboxedCommandTool`.
-* :func:`~nexus.sandbox.factory.register_agent_tool` — registers
-  :class:`~nexus.sandbox.agent_tool.SubAgentTool` when delegation is live.
+* :func:`~nexus.sandbox.factory.register_agent_tool` — compatibility wrapper
+  for registering cognitive sub-agent tools.
 """
 
 from nexus.sandbox.agent_tool import SubAgentTool

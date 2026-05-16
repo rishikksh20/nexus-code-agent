@@ -7,6 +7,7 @@ from typing import Any
 
 @dataclass(slots=True)
 class AgentConfig:
+    config_version: int = 2
     provider: str = "openai-compatible"
     model_name: str = "mistral-medium-latest"
     api_base_url: str = "https://api.mistral.ai/v1"
@@ -46,12 +47,12 @@ class AgentConfig:
     context_prune_enabled: bool = True
     context_prune_protect_tokens: int = 40_000
     context_prune_minimum_tokens: int = 20_000
+    agent_mode: str = "basic"
     delegation_enabled: bool = False
     delegation_workers: list[str] = field(default_factory=lambda: ["worker-1", "worker-2"])
     delegation_subagents: list[dict[str, Any]] = field(default_factory=list)
     delegation_poll_interval_seconds: float = 0.05
     delegation_message_history_limit: int = 200
-    multi_agent_mode: str = "off"
     multi_agent_show_plan: bool = True
     multi_agent_max_parallel_tasks: int = 3
     multi_agent_max_repair_iterations: int = 2

@@ -66,6 +66,7 @@ class AgentMessage:
         instructions: str,
         allowed_tools: list[str] | None = None,
         shared_context: list[str] | None = None,
+        input_packet_ids: list[str] | None = None,
         permission_action: str | None = None,
         permission_reason: str | None = None,
     ) -> "AgentMessage":
@@ -83,6 +84,8 @@ class AgentMessage:
             payload["permission_reason"] = permission_reason
         if shared_context:
             payload["shared_context"] = list(shared_context)
+        if input_packet_ids:
+            payload["input_packet_ids"] = list(input_packet_ids)
         return cls(
             sender=sender,
             recipient=recipient,
@@ -250,6 +253,7 @@ class DelegationRequest:
     allowed_tools: tuple[str, ...] = ()
     claimed_resources: tuple[str, ...] = ()
     shared_context: tuple[str, ...] = ()
+    input_packet_ids: tuple[str, ...] = ()
     permission_action: str | None = None
     permission_reason: str | None = None
 
@@ -269,6 +273,7 @@ class TaskRecord:
     resource_versions: dict[str, int] = field(default_factory=dict)
     pending_decision_id: str | None = None
     shared_context: tuple[str, ...] = ()
+    input_packet_ids: tuple[str, ...] = ()
     context_snapshot: dict[str, Any] = field(default_factory=dict)
     version: int = 0
 
@@ -289,9 +294,24 @@ class WorkerState:
 class ResourceVersionStore:
     def __init__(self) -> None:
         self._versions: dict[str, int] = {}
+        self._reservations: dict[str, str] = {}
 
     def snapshot(self, resources: tuple[str, ...]) -> dict[str, int]:
         return {resource: self._versions.get(resource, 0) for resource in resources}
+
+    def try_reserve(self, task_id: str, resources: tuple[str, ...]) -> tuple[bool, str | None]:
+        for resource in resources:
+            owner = self._reservations.get(resource)
+            if owner is not None and owner != task_id:
+                return False, resource
+        for resource in resources:
+            self._reservations[resource] = task_id
+        return True, None
+
+    def release(self, task_id: str, resources: tuple[str, ...]) -> None:
+        for resource in resources:
+            if self._reservations.get(resource) == task_id:
+                self._reservations.pop(resource, None)
 
     def try_commit(self, resources: tuple[str, ...], expected_versions: dict[str, int]) -> tuple[bool, str | None]:
         for resource in resources:
@@ -313,6 +333,7 @@ class WorkerAgent:
         tool_registry_factory,
         model_client_factory,
         workspace_root: Path | None = None,
+        model_name: str = "",
         temperature: float = 0.0,
         max_output_tokens: int | None = None,
         auto_confirm_read_only: bool = True,
@@ -323,6 +344,7 @@ class WorkerAgent:
         self._tool_registry_factory = tool_registry_factory
         self._model_client_factory = model_client_factory
         self._workspace_root = (workspace_root or Path.cwd()).resolve()
+        self._model_name = model_name
         self._temperature = temperature
         self._max_output_tokens = max_output_tokens
         self._auto_confirm_read_only = auto_confirm_read_only
@@ -425,6 +447,11 @@ class WorkerAgent:
         permission_reason = str(command_message.payload.get("permission_reason", "Need coordinator approval.")).strip()
         allowed_tools = tuple(str(tool_name) for tool_name in command_message.payload.get("allowed_tools", []))
         shared_context = tuple(str(item) for item in command_message.payload.get("shared_context", []) if str(item).strip())
+        input_packet_ids = tuple(
+            str(item)
+            for item in command_message.payload.get("input_packet_ids", [])
+            if str(item).strip()
+        )
 
         try:
             if permission_action:
@@ -456,7 +483,14 @@ class WorkerAgent:
             context.metadata["allowed_tools"] = list(allowed_tools)
             context.metadata["context_scope"] = ContextScope.ISOLATED.value
             context.metadata["shared_context"] = list(shared_context)
-            system_prompt = _worker_system_prompt(title, instructions, allowed_tools, shared_context=shared_context)
+            context.metadata["input_packet_ids"] = list(input_packet_ids)
+            system_prompt = _worker_system_prompt(
+                title,
+                instructions,
+                allowed_tools,
+                shared_context=shared_context,
+                input_packet_ids=input_packet_ids,
+            )
 
             while True:
                 events = [
@@ -465,7 +499,7 @@ class WorkerAgent:
                         history,
                         context,
                         system_prompt=system_prompt,
-                        model_name=f"worker-{self.worker_id}",
+                        model_name=self._model_name or f"worker-{self.worker_id}",
                         approval_manager=approval_manager,
                         auto_confirm_read_only=self._auto_confirm_read_only,
                         temperature=self._temperature,
@@ -568,6 +602,7 @@ class WorkerAgent:
                 history=history,
                 allowed_tools=allowed_tools,
                 shared_context=shared_context,
+                input_packet_ids=input_packet_ids,
             )
             await self._complete(
                 command_message,
@@ -635,6 +670,7 @@ class DelegationRuntime:
         base_tool_registry: ToolRegistry | None = None,
         model_client_factory=None,
         workspace_root: Path | None = None,
+        model_name: str = "",
         temperature: float = 0.0,
         max_output_tokens: int | None = None,
         auto_confirm_read_only: bool = True,
@@ -647,6 +683,7 @@ class DelegationRuntime:
         self.base_tool_registry = base_tool_registry or ToolRegistry()
         self._model_client_factory = model_client_factory or (lambda: FakeModelClient())
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
+        self.model_name = model_name
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         self.auto_confirm_read_only = auto_confirm_read_only
@@ -659,6 +696,7 @@ class DelegationRuntime:
                 tool_registry_factory=self._build_worker_registry,
                 model_client_factory=self._model_client_factory,
                 workspace_root=self.workspace_root,
+                model_name=self.model_name,
                 temperature=self.temperature,
                 max_output_tokens=self.max_output_tokens,
                 auto_confirm_read_only=self.auto_confirm_read_only,
@@ -702,10 +740,17 @@ class DelegationRuntime:
             allowed_tools=request.allowed_tools,
             claimed_resources=request.claimed_resources,
             shared_context=request.shared_context,
+            input_packet_ids=request.input_packet_ids,
             resource_versions=self.resource_versions.snapshot(request.claimed_resources),
         )
         task.append_note(f"Assigned to {worker_id}.")
         self.tasks[task_id] = task
+        reserved, conflict_resource = self.resource_versions.try_reserve(task_id, request.claimed_resources)
+        if not reserved:
+            task.status = TaskStatus.FAILED
+            task.error = f"Resource '{conflict_resource}' is already reserved by another worker task."
+            task.append_note(task.error)
+            return task
         await self.mailbox.send(
             AgentMessage.command(
                 sender="coordinator",
@@ -715,6 +760,7 @@ class DelegationRuntime:
                 instructions=request.instructions,
                 allowed_tools=list(request.allowed_tools),
                 shared_context=list(request.shared_context),
+                input_packet_ids=list(request.input_packet_ids),
                 permission_action=request.permission_action,
                 permission_reason=request.permission_reason,
             )
@@ -812,6 +858,7 @@ class DelegationRuntime:
                     task.claimed_resources,
                     task.resource_versions,
                 )
+                self.resource_versions.release(task.task_id, task.claimed_resources)
                 if not committed:
                     task.status = TaskStatus.FAILED
                     error = f"Optimistic concurrency conflict for resource '{conflict_resource}'."
@@ -822,6 +869,7 @@ class DelegationRuntime:
                 task.result_summary = summary
                 task.append_note(summary)
                 return
+            self.resource_versions.release(task.task_id, task.claimed_resources)
             task.status = TaskStatus.FAILED
             error = summary or "Worker failed."
             task.error = error
@@ -851,6 +899,7 @@ def _worker_system_prompt(
     allowed_tools: tuple[str, ...],
     *,
     shared_context: tuple[str, ...] = (),
+    input_packet_ids: tuple[str, ...] = (),
 ) -> str:
     tools_text = ", ".join(allowed_tools) if allowed_tools else "all currently enabled tools"
     shared_text = (
@@ -859,11 +908,22 @@ def _worker_system_prompt(
         if shared_context
         else ""
     )
+    packet_text = (
+        " Input handoff packet ids: " + ", ".join(input_packet_ids)
+        if input_packet_ids
+        else ""
+    )
     return (
         "You are a delegated Nexus worker. Execute only the assigned task, keep the scope narrow, "
-        "and return a concise final answer for the coordinator. "
+        "and return a concise final answer for the coordinator. Your local conversation and tool history "
+        "are isolated; only your final structured summary and context snapshot are shared back. "
+        "Do not ask the user directly. If the task is blocked by missing information, return "
+        "`status: needs_clarification` in your final JSON. "
         f"Available tools for this task: {tools_text}. "
-        f"Task title: {title}. Task instructions: {instructions}.{shared_text}"
+        "Final answer format: JSON object with keys `status`, `summary`, `findings`, "
+        "`changed_files`, `related_files`, `tests_run`, `risks`, `clarifications_needed`, "
+        "and `recommended_next_action`. "
+        f"Task title: {title}. Task instructions: {instructions}.{shared_text}{packet_text}"
     )
 
 
@@ -875,6 +935,7 @@ def _worker_context_snapshot(
     history: list[Message],
     allowed_tools: tuple[str, ...],
     shared_context: tuple[str, ...],
+    input_packet_ids: tuple[str, ...],
 ) -> dict[str, Any]:
     tool_calls = sum(len(message.tool_calls) for message in history if message.tool_calls)
     record = AgentContextRecord(
@@ -884,8 +945,16 @@ def _worker_context_snapshot(
         summary=f"Worker completed '{title}'. Local context is isolated; only this snapshot is shared.",
         token_estimate=estimate_messages(history),
         message_count=len(history),
-        shared_inputs=shared_context,
+        shared_inputs=input_packet_ids,
         allowed_tools=allowed_tools,
         tool_call_count=tool_calls,
     )
-    return record.to_dict()
+    payload = record.to_dict()
+    payload["input_packet_ids"] = list(input_packet_ids)
+    payload["shared_context"] = list(shared_context)
+    payload["isolation"] = {
+        "local_history_shared": False,
+        "shared_inputs": list(input_packet_ids),
+        "shared_outputs": "final_summary_and_context_snapshot_only",
+    }
+    return payload

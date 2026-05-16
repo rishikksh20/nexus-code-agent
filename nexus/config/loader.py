@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from nexus.config.defaults import AgentConfig, build_default_config, config_to_plain_dict
+from nexus.config.upgrade import normalize_legacy_config_values
 
 
 PATH_FIELDS = {
@@ -49,11 +50,19 @@ def load_config(
     global_path = (global_config_path or defaults.global_config_file).expanduser()
     local_path = local_config_path or defaults.local_config_file
 
+    global_values = _read_toml(global_path)
+    local_values = _read_toml(local_path)
+    cli_values = cli_overrides or {}
+    global_values = normalize_legacy_config_values(global_values)
+    local_values = normalize_legacy_config_values(local_values)
+    cli_values = normalize_legacy_config_values(cli_values)
+
     merged = dict(base)
-    merged.update(_read_toml(global_path))
-    merged.update(_read_toml(local_path))
+    merged.update(global_values)
+    merged.update(local_values)
     merged.update(_read_environment(defaults))
-    merged.update(cli_overrides or {})
+    merged.update(cli_values)
+    merged = _apply_agent_mode_profile(merged)
     merged = _apply_provider_defaults(merged)
 
     merged["workspace_root"] = str(defaults.workspace_root)
@@ -194,9 +203,9 @@ def _parse_scalar(raw_value: str, template: Any) -> Any:
 
 def _validate_config_values(values: dict[str, Any]) -> None:
     valid_modes = {"plan", "default", "auto"}
+    valid_agent_modes = {"basic", "advanced"}
     valid_log_formats = {"text", "json"}
     valid_providers = {"anthropic", "fake", "gemini", "mistral", "openai", "openai-compatible", "ollama"}
-    valid_multi_agent_modes = {"off", "auto", "always"}
     valid_complexity_thresholds = {"simple", "medium", "large"}
     valid_approval_policies = {
         "on-request", "approve-turn", "approve-session", "auto", "plan"
@@ -217,6 +226,12 @@ def _validate_config_values(values: dict[str, Any]) -> None:
             f"Invalid default_mode '{default_mode}'. Expected one of: {', '.join(sorted(valid_modes))}."
         )
 
+    agent_mode = values["agent_mode"]
+    if agent_mode not in valid_agent_modes:
+        raise ConfigError(
+            f"Invalid agent_mode '{agent_mode}'. Expected one of: {', '.join(sorted(valid_agent_modes))}."
+        )
+
     approval_policy = values.get("approval_policy", "on-request")
     if approval_policy not in valid_approval_policies:
         raise ConfigError(
@@ -228,13 +243,6 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     if log_format not in valid_log_formats:
         raise ConfigError(
             f"Invalid log_format '{log_format}'. Expected one of: {', '.join(sorted(valid_log_formats))}."
-        )
-
-    multi_agent_mode = values["multi_agent_mode"]
-    if multi_agent_mode not in valid_multi_agent_modes:
-        raise ConfigError(
-            f"Invalid multi_agent_mode '{multi_agent_mode}'. "
-            f"Expected one of: {', '.join(sorted(valid_multi_agent_modes))}."
         )
 
     complexity_threshold = values["multi_agent_complexity_threshold"]
@@ -371,3 +379,29 @@ def _apply_provider_defaults(values: dict[str, Any]) -> dict[str, Any]:
         if base_url_env:
             resolved["api_base_url"] = base_url_env
     return resolved
+
+
+def _apply_agent_mode_profile(values: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(values)
+    agent_mode = str(resolved.get("agent_mode", "basic")).strip().lower()
+    resolved["agent_mode"] = agent_mode
+    if agent_mode == "basic":
+        resolved["delegation_enabled"] = False
+    elif agent_mode == "advanced":
+        resolved["delegation_enabled"] = True
+        allowed_tools = resolved.get("allowed_tools")
+        if isinstance(allowed_tools, list) and allowed_tools:
+            for tool_name in _builtin_cognitive_tool_names():
+                if tool_name not in allowed_tools:
+                    allowed_tools.append(tool_name)
+            resolved["allowed_tools"] = allowed_tools
+    return resolved
+
+
+def _builtin_cognitive_tool_names() -> tuple[str, ...]:
+    return (
+        "subagent_planning_analysis",
+        "subagent_execution",
+        "subagent_review",
+        "subagent_verification",
+    )

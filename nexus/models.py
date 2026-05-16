@@ -256,15 +256,19 @@ class AgentEvent:
         arguments: dict[str, Any],
         *,
         preview: dict[str, Any] | None = None,
+        actor: str | None = None,
     ) -> AgentEvent:
+        payload = {
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+            "preview": preview or {},
+        }
+        if actor:
+            payload["actor"] = actor
         return cls(
             kind=AgentEventType.TOOL_CALL_START,
-            payload={
-                "call_id": call_id,
-                "name": name,
-                "arguments": arguments,
-                "preview": preview or {},
-            },
+            payload=payload,
         )
 
     @classmethod

@@ -74,6 +74,7 @@ async def test_delegation_records_isolated_worker_context_with_shared_inputs():
                 instructions="Please check the time and report it.",
                 allowed_tools=("get_time",),
                 shared_context=("Execution changed nexus/app.py",),
+                input_packet_ids=("packet-0001",),
             )
         )
         completed = await runtime.wait_for_task(task.task_id, timeout=1.0)
@@ -82,7 +83,9 @@ async def test_delegation_records_isolated_worker_context_with_shared_inputs():
         assert completed.status is TaskStatus.COMPLETED
         assert completed.context_snapshot["scope"] == "isolated"
         assert completed.context_snapshot["allowed_tools"] == ["get_time"]
-        assert completed.context_snapshot["shared_inputs"] == ["Execution changed nexus/app.py"]
+        assert completed.context_snapshot["input_packet_ids"] == ["packet-0001"]
+        assert completed.context_snapshot["shared_inputs"] == ["packet-0001"]
+        assert completed.context_snapshot["shared_context"] == ["Execution changed nexus/app.py"]
         assert completed.context_snapshot["token_estimate"] > 0
     finally:
         await runtime.shutdown()
@@ -150,7 +153,7 @@ async def test_delegation_runtime_detects_resource_conflict_via_versions():
         pending = None
         for _ in range(50):
             approvals = runtime.list_pending_permissions()
-            if len(approvals) == 2:
+            if approvals:
                 pending = approvals
                 break
             await runtime.wait_for_task(first.task_id, timeout=0.02)
@@ -166,7 +169,7 @@ async def test_delegation_runtime_detects_resource_conflict_via_versions():
         assert TaskStatus.COMPLETED in statuses
         assert TaskStatus.FAILED in statuses
         failed = completed_first if completed_first.status is TaskStatus.FAILED else completed_second
-        assert "Optimistic concurrency conflict" in (failed.error or "")
+        assert "reserved" in (failed.error or "")
     finally:
         await runtime.shutdown()
 

@@ -1,9 +1,4 @@
-"""Subagent tool helpers exposed from the tools package.
-
-This keeps delegation-oriented tool wiring under ``nexus.tools`` so the app can
-register specialist worker tools from the same package surface as the rest of
-the coding-agent toolchain.
-"""
+"""Cognitive sub-agent tool helpers exposed from the tools package."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -14,31 +9,29 @@ from nexus.tools.registry import tool_enabled
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from nexus.runtime.delegation import DelegationRuntime
     from nexus.skills import SkillRegistry
     from nexus.tools.base import ToolRegistry
 
 
 def register_subagent_tools(
     registry: "ToolRegistry",
-    delegation: "DelegationRuntime | None",
     config,
     *,
+    model_client_factory=None,
     definitions: "Iterable[SubagentDefinition]" = (),
 ) -> int:
-    """Register the default delegation tool and optional specialist workers."""
-    if delegation is None:
-        return 0
-    if not getattr(config, "delegation_enabled", False):
+    """Register cognitive sub-agent tools."""
+    if str(getattr(config, "agent_mode", "basic")).strip().lower() != "advanced":
         return 0
 
     count = 0
-    default_tool = SubAgentTool(delegation)
-    if tool_enabled(config, default_tool.name):
-        registry.register(default_tool, source="agent")
-        count += 1
     for definition in _merge_builtin_definitions(definitions):
-        tool = SubAgentTool(delegation, definition)
+        tool = SubAgentTool(
+            definition=definition,
+            model_client_factory=model_client_factory,
+            base_tool_registry=registry,
+            config=config,
+        )
         if tool_enabled(config, tool.name):
             registry.register(tool, source="agent", origin=definition.name)
             count += 1
@@ -49,7 +42,7 @@ def load_subagent_definitions_from_skills(skill_registry: "SkillRegistry") -> li
     """Build specialist subagent definitions from loaded skills.
 
     Any skill whose name starts with ``subagent-`` or ``subagent_`` is treated
-    as a specialist worker definition.
+    as a cognitive sub-agent definition.
     """
     definitions: list[SubagentDefinition] = []
     for skill in skill_registry.all():
@@ -68,20 +61,26 @@ def load_subagent_definitions_from_skills(skill_registry: "SkillRegistry") -> li
 
 def register_skill_subagent_tools(
     registry: "ToolRegistry",
-    delegation: "DelegationRuntime | None",
+    delegation,
     config,
     skill_registry: "SkillRegistry",
+    *,
+    model_client_factory=None,
 ) -> int:
-    """Register specialist worker tools discovered from loaded skills."""
-    if delegation is None:
-        return 0
-    if not getattr(config, "delegation_enabled", False):
+    """Register cognitive sub-agent tools discovered from loaded skills."""
+    del delegation
+    if str(getattr(config, "agent_mode", "basic")).strip().lower() != "advanced":
         return 0
 
     count = 0
     existing_names = {record.name for record in registry.records()}
     for definition in load_subagent_definitions_from_skills(skill_registry):
-        tool = SubAgentTool(delegation, definition)
+        tool = SubAgentTool(
+            definition=definition,
+            model_client_factory=model_client_factory,
+            base_tool_registry=registry,
+            config=config,
+        )
         if tool.name in existing_names:
             continue
         if tool_enabled(config, tool.name):
@@ -109,19 +108,30 @@ def load_subagent_definitions(config) -> list[SubagentDefinition]:
 
 
 def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
-    """Return conservative built-in specialist personas for multi-agent flows."""
+    """Return conservative built-in cognitive specialist personas."""
     return [
         SubagentDefinition(
-            name="research",
-            description="Investigate repo structure and summarize findings without modifying files.",
+            name="planning_analysis",
+            description="Analyze the repo, detect ambiguity, and produce a focused execution plan without modifying files.",
             goal_prompt=(
-                "You are a read-only Nexus research agent. Investigate the requested codebase slice, "
-                "trace relevant files and symbols, and return a compressed summary with related paths. "
-                "Do not modify files."
+                "You are a read-only Nexus planning and analysis agent. Research the requested codebase slice, "
+                "trace relevant files and symbols, detect ambiguity, and return a compact implementation plan "
+                "with dependencies, risks, clarification needs, and related paths. Do not modify files."
             ),
             allowed_tools=["read_file", "glob", "grep", "list_dir", "lsp"],
             max_turns=12,
             timeout_seconds=300,
+        ),
+        SubagentDefinition(
+            name="execution",
+            description="Implement a focused coding task using the normal workspace tools.",
+            goal_prompt=(
+                "You are a Nexus execution agent. Implement only the assigned task, follow existing project "
+                "patterns, use tools for edits and validation, and return changed files, tests run, and blockers."
+            ),
+            allowed_tools=["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_tests", "run_linter", "run_typecheck", "bash"],
+            max_turns=20,
+            timeout_seconds=600,
         ),
         SubagentDefinition(
             name="review",
@@ -136,7 +146,7 @@ def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
             timeout_seconds=300,
         ),
         SubagentDefinition(
-            name="test",
+            name="verification",
             description="Run structured verification and summarize failures.",
             goal_prompt=(
                 "You are a Nexus verification agent. Run focused tests, lint, type/syntax checks, "
@@ -171,11 +181,12 @@ def _skill_subagent_name(skill_name: str) -> str | None:
 
 def register_agent_tool(
     registry: "ToolRegistry",
-    delegation: "DelegationRuntime | None",
+    delegation,
     config,
 ) -> bool:
     """Compatibility wrapper for the legacy single-tool registration path."""
-    return register_subagent_tools(registry, delegation, config) > 0
+    del delegation
+    return register_subagent_tools(registry, config) > 0
 
 
 __all__ = [

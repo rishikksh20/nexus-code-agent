@@ -97,8 +97,11 @@ class TerminalUI:
     def __init__(self, *, color: bool = True) -> None:
         self._console = Console(theme=NEXUS_THEME, no_color=not color, highlight=False)
         self._assistant_stream_open = False
+        self._thinking_status = None
+        self._tool_status = None
         self._tool_args_by_call_id: dict[str, dict[str, Any]] = {}
         self._tool_preview_by_call_id: dict[str, dict[str, Any]] = {}
+        self._tool_actor_by_call_id: dict[str, str] = {}
         self._workspace_root: Path | None = None
 
     @property
@@ -181,6 +184,8 @@ class TerminalUI:
         return table
 
     def begin_assistant(self) -> None:
+        self.stop_thinking()
+        self.stop_tool_wait()
         if self._assistant_stream_open:
             return
         self._console.print()
@@ -188,10 +193,35 @@ class TerminalUI:
         self._assistant_stream_open = True
 
     def end_assistant(self) -> None:
+        self.stop_thinking()
         if self._assistant_stream_open:
             self._console.print()
             self._console.print()
         self._assistant_stream_open = False
+
+    def start_thinking(self) -> None:
+        if self._thinking_status is not None:
+            return
+        self._thinking_status = self._console.status("[muted]Thinking…[/muted]", spinner="dots")
+        self._thinking_status.start()
+
+    def stop_thinking(self) -> None:
+        if self._thinking_status is None:
+            return
+        self._thinking_status.stop()
+        self._thinking_status = None
+
+    def start_tool_wait(self, label: str) -> None:
+        self.stop_thinking()
+        self.stop_tool_wait()
+        self._tool_status = self._console.status(f"[muted]{label}…[/muted]", spinner="dots")
+        self._tool_status.start()
+
+    def stop_tool_wait(self) -> None:
+        if self._tool_status is None:
+            return
+        self._tool_status.stop()
+        self._tool_status = None
 
     def print_banner(
         self,
@@ -457,6 +487,12 @@ class TerminalUI:
             return "tool.agent"
         return "tool"
 
+    def _tool_display_name(self, tool_name: str, actor: str = "") -> str:
+        actor = actor.strip()
+        if not actor:
+            return tool_name
+        return f"{actor} - {tool_name}"
+
     def _preview_block(self, text: str, *, path: str | None = None) -> Syntax | Text:
         cleaned = text.rstrip() or "(no tool output)"
         if len(cleaned) > 4000:
@@ -522,24 +558,29 @@ class TerminalUI:
         *,
         stream_output: bool,
         show_tool_calls: bool,
+        show_thinking_indicator: bool = True,
     ) -> None:
         from nexus.models import AgentEventType, ConfirmationKind
 
         if event.kind == AgentEventType.AGENT_START:
             return
 
-        if event.kind == AgentEventType.THINKING_STARTED and show_tool_calls:
+        if event.kind == AgentEventType.THINKING_STARTED and show_thinking_indicator:
             self.end_assistant()
-            self._console.print("[muted]⋯ thinking…[/muted]")
+            self.start_thinking()
             return
 
         if event.kind == AgentEventType.TEXT_DELTA:
+            self.stop_thinking()
+            self.stop_tool_wait()
             if stream_output and event.payload:
                 self.begin_assistant()
                 self._console.print(event.payload, end="", markup=False, highlight=False)
             return
 
         if event.kind == AgentEventType.TEXT_COMPLETE:
+            self.stop_thinking()
+            self.stop_tool_wait()
             if stream_output:
                 self.end_assistant()
             elif event.payload:
@@ -553,14 +594,18 @@ class TerminalUI:
             payload = event.payload or {}
             call_id = str(payload.get("call_id", ""))
             tool_name = str(payload.get("name", "tool"))
+            actor = str(payload.get("actor", "") or "").strip()
+            display_name = self._tool_display_name(tool_name, actor)
             arguments = payload.get("arguments", {}) if isinstance(payload.get("arguments", {}), dict) else {}
             preview = payload.get("preview", {}) if isinstance(payload.get("preview", {}), dict) else {}
             self._tool_args_by_call_id[call_id] = dict(arguments)
             self._tool_preview_by_call_id[call_id] = dict(preview)
+            if actor:
+                self._tool_actor_by_call_id[call_id] = actor
             self._console.print(
                 Panel(
-                    self._render_tool_panel_body(tool_name, arguments, preview=preview),
-                    title=Text(f"{tool_name}  #{call_id[:8] or 'pending'}", style="tool"),
+                    self._render_tool_panel_body(display_name, arguments, preview=preview),
+                    title=Text(f"{display_name}  #{call_id[:8] or 'pending'}", style="tool"),
                     title_align="left",
                     subtitle=Text("running", style="muted"),
                     subtitle_align="right",
@@ -569,18 +614,22 @@ class TerminalUI:
                     padding=(1, 2),
                 )
             )
+            self.start_tool_wait(f"{display_name} running")
             return
 
         if event.kind == AgentEventType.TOOL_CALL_COMPLETE and show_tool_calls:
+            self.stop_tool_wait()
             self.end_assistant()
             result = cast("ToolResult", event.payload)
             if result is None:
                 return
             preview = self._tool_preview_by_call_id.get(result.call_id, {})
+            actor = str(result.metadata.get("actor") or self._tool_actor_by_call_id.get(result.call_id, "")).strip()
+            display_name = self._tool_display_name(result.tool_name, actor)
             self._console.print(
                 Panel(
                     self._render_tool_result_body(result, preview=preview),
-                    title=Text(f"{result.tool_name}  #{result.call_id[:8]}", style="tool"),
+                    title=Text(f"{display_name}  #{result.call_id[:8]}", style="tool"),
                     title_align="left",
                     subtitle=Text("failed" if result.is_error else "done", style="error" if result.is_error else "success"),
                     subtitle_align="right",
@@ -591,9 +640,11 @@ class TerminalUI:
             )
             self._tool_args_by_call_id.pop(result.call_id, None)
             self._tool_preview_by_call_id.pop(result.call_id, None)
+            self._tool_actor_by_call_id.pop(result.call_id, None)
             return
 
         if event.kind == AgentEventType.TOOL_DENIED:
+            self.stop_tool_wait()
             self.end_assistant()
             self._console.print(
                 Panel(
@@ -608,22 +659,27 @@ class TerminalUI:
             return
 
         if event.kind == AgentEventType.CONFIRMATION_REQUESTED:
+            self.stop_tool_wait()
             self.end_assistant()
             req = cast("ConfirmationRequest", event.payload)
             self._console.print()
             if req.kind is ConfirmationKind.APPROVAL:
                 self._tool_args_by_call_id[req.call_id] = {str(key): value for key, value in req.arguments.items()}
                 self._tool_preview_by_call_id[req.call_id] = {str(key): value for key, value in req.preview.items()}
+                actor = str(req.payload.get("actor", "") or "").strip()
+                if actor:
+                    self._tool_actor_by_call_id[req.call_id] = actor
+                display_name = self._tool_display_name(req.tool_name, actor)
                 self._console.print(
                     Panel(
                         self._render_tool_panel_body(
-                            req.tool_name,
+                            display_name,
                             req.arguments,
                             preview=req.preview,
                             reason=req.reason,
                             approval_policy=str(req.payload.get("approval_policy", "on-request")),
                         ),
-                        title=Text(f"{req.tool_name}  #{req.call_id[:8] or 'pending'}", style="tool"),
+                        title=Text(f"{display_name}  #{req.call_id[:8] or 'pending'}", style="tool"),
                         title_align="left",
                         subtitle=Text("approval required", style="warning"),
                         subtitle_align="right",
@@ -633,16 +689,18 @@ class TerminalUI:
                     )
                 )
             else:
+                actor = str(req.payload.get("actor", "") or "").strip()
+                display_name = self._tool_display_name(req.tool_name, actor)
                 self._console.print(
                     Panel(
                         self._render_tool_panel_body(
-                            req.tool_name,
+                            display_name,
                             req.arguments,
                             preview=req.preview,
                             clarification_prompt=req.prompt,
                             reason=req.reason,
                         ),
-                        title=Text(f"{req.tool_name}  #{req.call_id[:8] or 'pending'}", style="tool"),
+                        title=Text(f"{display_name}  #{req.call_id[:8] or 'pending'}", style="tool"),
                         title_align="left",
                         subtitle=Text("clarification needed", style="info"),
                         subtitle_align="right",
@@ -655,6 +713,8 @@ class TerminalUI:
             return
 
         if event.kind == AgentEventType.AGENT_ERROR:
+            self.stop_thinking()
+            self.stop_tool_wait()
             payload = event.payload or {}
             error = payload.get("error") if isinstance(payload, dict) else str(payload)
             self.print_error(str(error or "Unknown provider error."))
@@ -677,9 +737,15 @@ class TerminalUI:
         *,
         stream_output: bool,
         show_tool_calls: bool,
+        show_thinking_indicator: bool = True,
     ) -> None:
         for event in events:
-            self.render_event(event, stream_output=stream_output, show_tool_calls=show_tool_calls)
+            self.render_event(
+                event,
+                stream_output=stream_output,
+                show_tool_calls=show_tool_calls,
+                show_thinking_indicator=show_thinking_indicator,
+            )
 
     def print_provider_setup_reminder(self, config) -> None:
         from os import environ

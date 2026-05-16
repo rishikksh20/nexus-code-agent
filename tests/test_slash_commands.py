@@ -5,11 +5,19 @@ import json
 import pytest
 from rich.console import Console
 
+from nexus.cli.init import init_workspace
 from nexus.config import load_config
 from nexus.integrations.mcp import MCPServerConfig, MCPServerRuntime, MCPToolSpec
 from nexus.memory.store import MemoryStore
 from nexus.models import Message, ToolCall
-from nexus.runtime.delegation import DelegationRuntime, TaskStatus
+from nexus.runtime.context_state import (
+    TaskContext,
+    append_artifact_record,
+    append_context_packet,
+    make_artifact_record,
+    make_context_packet,
+    upsert_task_context,
+)
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
@@ -116,34 +124,13 @@ async def test_mcp_status_slash_command_shows_server_state(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_multi_agent_status_and_plan_slash_commands_show_session_state(tmp_path):
+async def test_multi_agent_slash_command_is_not_registered(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")
     console = Console(record=True, no_color=True, width=200)
     session = new_snapshot("slash-multi-agent")
-    session.metadata["multi_agent"] = {
-        "mode": "always",
-        "complexity": "large",
-        "shared_state": {
-            "dag": {
-                "goal": "Implement feature",
-                "nodes": [
-                    {
-                        "id": "execute",
-                        "role": "execution",
-                        "dependencies": [],
-                        "objective": "Make the change",
-                    }
-                ],
-                "execution_order": ["execute"],
-            },
-            "repair_decision": {
-                "retry": False,
-                "reason": "Post-execution checks did not find blocking issues.",
-            },
-        },
-    }
+    session.metadata["multi_agent"] = {"mode": "advanced", "complexity": "large"}
     state = ReplState(
         config=config,
         mode=ExecutionMode.DEFAULT,
@@ -156,14 +143,10 @@ async def test_multi_agent_status_and_plan_slash_commands_show_session_state(tmp
 
     router = build_router()
     status_handled = await router.dispatch(state, "/multi-agent status")
-    plan_handled = await router.dispatch(state, "/multi-agent plan")
 
-    assert status_handled is True
-    assert plan_handled is True
+    assert status_handled is False
     output = console.export_text()
-    assert "Multi-Agent Supervisor" in output
-    assert "Latest Multi-Agent Plan" in output
-    assert "execute" in output
+    assert "Multi-Agent Supervisor" not in output
 
 
 @pytest.mark.asyncio
@@ -199,121 +182,24 @@ async def test_mcp_refresh_slash_command_updates_discovered_tools(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_delegate_spawn_slash_command_creates_task(tmp_path):
+async def test_delegate_slash_command_is_not_registered(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")
     console = Console(record=True, no_color=True, width=200)
-    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01)
-    await delegation.start()
-    try:
-        state = ReplState(
-            config=config,
-            mode=ExecutionMode.DEFAULT,
-            session=new_snapshot("delegate-slash"),
-            session_store=SessionStore(config.session_dir),
-            tool_registry=registry,
-            memory_store=MemoryStore(config.memory_dir),
-            console=console,
-            delegation=delegation,
-        )
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("delegate-slash"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
 
-        router = build_router()
-        handled = await router.dispatch(
-            state,
-            '/delegate spawn "Review docs" "Summarize the key sections." --worker worker-1 --resource docs/README.md',
-        )
+    handled = await build_router().dispatch(state, "/delegate status")
 
-        assert handled is True
-        tasks = delegation.list_tasks()
-        assert len(tasks) == 1
-        assert tasks[0].assigned_worker == "worker-1"
-        assert tasks[0].allowed_tools == ()
-        assert tasks[0].claimed_resources == ("docs/README.md",)
-    finally:
-        await delegation.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_delegate_spawn_slash_command_supports_tool_restrictions(tmp_path):
-    config = load_config(tmp_path, global_root=tmp_path / "global")
-    registry = ToolRegistry()
-    registry.register(GetTimeTool(), source="core", origin="builtin")
-    console = Console(record=True, no_color=True, width=200)
-    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01, base_tool_registry=registry)
-    await delegation.start()
-    try:
-        state = ReplState(
-            config=config,
-            mode=ExecutionMode.DEFAULT,
-            session=new_snapshot("delegate-tool-scope"),
-            session_store=SessionStore(config.session_dir),
-            tool_registry=registry,
-            memory_store=MemoryStore(config.memory_dir),
-            console=console,
-            delegation=delegation,
-        )
-
-        router = build_router()
-        handled = await router.dispatch(
-            state,
-            '/delegate spawn "Check time" "Please check the time." --tool get_time --worker worker-1',
-        )
-
-        assert handled is True
-        tasks = delegation.list_tasks()
-        assert len(tasks) == 1
-        assert tasks[0].allowed_tools == ("get_time",)
-    finally:
-        await delegation.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_delegate_approve_slash_command_resolves_permission(tmp_path):
-    config = load_config(tmp_path, global_root=tmp_path / "global")
-    registry = ToolRegistry()
-    registry.register(GetTimeTool(), source="core", origin="builtin")
-    console = Console(record=True, no_color=True, width=200)
-    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01)
-    await delegation.start()
-    try:
-        task = await delegation.submit(
-            __import__("nexus.runtime.delegation", fromlist=["DelegationRequest"]).DelegationRequest(
-                title="Persist findings",
-                instructions="Write results.",
-                permission_action="write_note",
-                permission_reason="Need to persist findings",
-            )
-        )
-        decision_id = None
-        for _ in range(50):
-            approvals = delegation.list_pending_permissions()
-            if approvals:
-                decision_id = approvals[0].correlation_id or approvals[0].message_id
-                break
-            await delegation.wait_for_task(task.task_id, timeout=0.02)
-        assert decision_id is not None
-
-        state = ReplState(
-            config=config,
-            mode=ExecutionMode.DEFAULT,
-            session=new_snapshot("delegate-approve"),
-            session_store=SessionStore(config.session_dir),
-            tool_registry=registry,
-            memory_store=MemoryStore(config.memory_dir),
-            console=console,
-            delegation=delegation,
-        )
-
-        router = build_router()
-        handled = await router.dispatch(state, f"/delegate approve {decision_id}")
-        completed = await delegation.wait_for_task(task.task_id, timeout=1.0)
-
-        assert handled is True
-        assert completed is not None
-        assert completed.status is TaskStatus.COMPLETED
-    finally:
-        await delegation.shutdown()
+    assert handled is False
 
 
 @pytest.mark.asyncio
@@ -498,6 +384,72 @@ async def test_provider_set_slash_command_rejects_restricted_key(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_config_upgrade_reloads_config_and_workspace_dotenv(tmp_path, monkeypatch):
+    monkeypatch.delenv("MODEL", raising=False)
+    monkeypatch.delenv("AGENT_MODEL_NAME", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    config = load_config(workspace, global_root=global_root)
+    assert config.model_name != "env-after-upgrade"
+
+    (workspace / ".env").write_text("MODEL=env-after-upgrade\n", encoding="utf-8")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("config-upgrade-reload"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/config upgrade local")
+
+    assert handled is True
+    assert state.config.model_name == "env-after-upgrade"
+    assert "reloaded" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_config_upgrade_removes_deprecated_multi_agent_mode(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    local_config.write_text(
+        'project_name = "workspace"\nmulti_agent_mode = "always"\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=global_root)
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("config-upgrade-legacy"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/config upgrade local")
+
+    assert handled is True
+    content = local_config.read_text(encoding="utf-8")
+    assert "multi_agent_mode" not in content
+    assert "config_version = 2" in content
+    assert "removed deprecated multi_agent_mode" in console.export_text()
+
+
+@pytest.mark.asyncio
 async def test_session_export_slash_command_writes_json(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
@@ -586,6 +538,7 @@ def _make_state(tmp_path, *, extra_history=None):
 @pytest.mark.asyncio
 async def test_skills_reload_registers_skill_backed_subagent_tools(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
     config.delegation_enabled = True
     skill_dir = config.local_root / "skills" / "subagent-review"
     skill_dir.mkdir(parents=True)
@@ -596,28 +549,22 @@ async def test_skills_reload_registers_skill_backed_subagent_tools(tmp_path):
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")
     console = Console(record=True, no_color=True, width=200)
-    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01, base_tool_registry=registry)
-    await delegation.start()
-    try:
-        state = ReplState(
-            config=config,
-            mode=ExecutionMode.DEFAULT,
-            session=new_snapshot("skills-reload"),
-            session_store=SessionStore(config.session_dir),
-            tool_registry=registry,
-            memory_store=MemoryStore(config.memory_dir),
-            console=console,
-            skill_registry=load_skill_registry(*get_skill_roots(config)),
-            delegation=delegation,
-        )
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("skills-reload"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        skill_registry=load_skill_registry(*get_skill_roots(config)),
+    )
 
-        router = build_router()
-        handled = await router.dispatch(state, "/skills reload")
+    router = build_router()
+    handled = await router.dispatch(state, "/skills reload")
 
-        assert handled is True
-        assert state.tool_registry.record("subagent_review").source == "agent-skill"
-    finally:
-        await delegation.shutdown()
+    assert handled is True
+    assert state.tool_registry.record("subagent_review").source == "agent-skill"
 
 
 @pytest.mark.asyncio
@@ -686,6 +633,50 @@ async def test_context_agents_and_agent_usage_show_multi_agent_records(tmp_path)
     assert "Supervising the DAG" in output
     assert "Context Usage: supervisor" in output
     assert "42" in output
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_typed_state_is_not_exposed_by_slash_command(tmp_path):
+    state, console = _make_state(tmp_path)
+    upsert_task_context(
+        state.session.metadata,
+        TaskContext(
+            task_id="verify",
+            role="test",
+            objective="Run focused checks.",
+            status="failed",
+            repair_iteration=1,
+        ),
+    )
+    packet = make_context_packet(
+        metadata=state.session.metadata,
+        source_agent="test",
+        target_agent="execution",
+        packet_type="repair_request",
+        task_id="verify",
+        summary="Repair needed.",
+        failure_summary="Typecheck failed.",
+    )
+    append_context_packet(state.session.metadata, packet)
+    artifact = make_artifact_record(
+        metadata=state.session.metadata,
+        artifact_type="typecheck_output",
+        task_id="verify",
+        producer_agent="test",
+        summary="Typecheck failed.",
+        content="full typecheck output",
+    )
+    append_artifact_record(state.session.metadata, artifact)
+    router = build_router()
+
+    handled = await router.dispatch(state, "/multi-agent tasks")
+    await router.dispatch(state, "/context task verify")
+    await router.dispatch(state, "/context summary")
+
+    assert handled is False
+    output = console.export_text()
+    assert "Multi-Agent Tasks" not in output
+    assert "Repair needed" in output
 
 
 # ── /help subcommand ──────────────────────────────────────────────────────────

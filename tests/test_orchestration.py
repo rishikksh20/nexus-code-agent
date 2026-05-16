@@ -7,6 +7,7 @@ import pytest
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import Message, RuntimeResponse, ToolExecutionContext, ToolResult
 from nexus.runtime.agent import Agent
+from nexus.runtime.context_state import load_multi_agent_state
 from nexus.runtime.orchestration import (
     AgentRole,
     SharedState,
@@ -23,8 +24,8 @@ from nexus.tools.base import ToolRegistry
 
 
 @pytest.mark.asyncio
-async def test_multi_agent_off_calls_existing_turn_runner_path():
-    state = SimpleNamespace(config=SimpleNamespace(multi_agent_mode="off"), session=SimpleNamespace(metadata={}))
+async def test_basic_agent_mode_calls_existing_turn_runner_path():
+    state = SimpleNamespace(config=SimpleNamespace(agent_mode="basic"), session=SimpleNamespace(metadata={}))
     agent = Agent(FakeModelClient(), ToolRegistry())
     calls = []
 
@@ -45,17 +46,11 @@ async def test_multi_agent_off_calls_existing_turn_runner_path():
 
 
 @pytest.mark.asyncio
-async def test_multi_agent_complex_path_validates_and_stores_dag_without_tools():
-    planner_json = (
-        '{"goal":"Add feature","tasks":[{"id":"research","agent":"research",'
-        '"objective":"Inspect code","depends_on":[]},{"id":"execute","agent":"execution",'
-        '"objective":"Make change","depends_on":["research"]}],'
-        '"execution_order":["research","execute"]}'
-    )
+async def test_advanced_agent_mode_uses_normal_turn_runner_with_cognitive_tools():
     registry = ToolRegistry()
     state = SimpleNamespace(
         config=SimpleNamespace(
-            multi_agent_mode="always",
+            agent_mode="advanced",
             multi_agent_show_plan=False,
             multi_agent_complexity_threshold="medium",
             model_name="fake",
@@ -63,28 +58,25 @@ async def test_multi_agent_complex_path_validates_and_stores_dag_without_tools()
         ),
         session=SimpleNamespace(metadata={}),
         tool_registry=registry,
+        delegation=None,
     )
-    agent = Agent(
-        FakeModelClient(scripted=[RuntimeResponse(message=Message(role="assistant", content=planner_json))]),
-        registry,
-    )
+    agent = Agent(FakeModelClient(), registry)
     prompts = []
 
     async def fake_turn_runner(*args, **kwargs):
         prompts.append(kwargs["prompt_text"])
-        return []
+        return ["normal-supervisor-path"]
 
-    await run_orchestrated_turn(
+    result = await run_orchestrated_turn(
         state,
         agent,
         prompt_text="Implement this complex plan",
         turn_runner=fake_turn_runner,
     )
 
-    metadata = state.session.metadata["multi_agent"]
-    assert metadata["complexity"] == "large"
-    assert metadata["shared_state"]["dag"]["execution_order"] == ["research", "execute"]
-    assert "[Nexus multi-agent supervisor plan]" in prompts[0]
+    assert result == ["normal-supervisor-path"]
+    assert prompts == ["Implement this complex plan"]
+    assert state.session.metadata == {}
 
 
 def test_parse_task_dag_rejects_invalid_json():
@@ -154,6 +146,10 @@ async def test_post_execution_checks_store_changed_files_and_repair_decision(tmp
     assert shared_state.changed_files == ("nexus/app.py",)
     assert shared_state.repair_decision is not None
     assert shared_state.repair_decision.retry is True
+    typed_state = load_multi_agent_state(state.session.metadata)
+    assert typed_state.artifacts
+    assert any(packet.packet_type == "test_failure" for packet in typed_state.packets)
+    assert any(packet.packet_type == "repair_request" for packet in typed_state.packets)
 
 
 class _StaticTool:

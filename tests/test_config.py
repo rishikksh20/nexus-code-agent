@@ -48,7 +48,7 @@ def test_config_rejects_invalid_mode(tmp_path):
         raise AssertionError("Expected ConfigError for invalid default_mode")
 
 
-def test_config_accepts_multi_agent_defaults(tmp_path):
+def test_config_accepts_advanced_agent_defaults(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     global_root = tmp_path / "global"
@@ -56,26 +56,112 @@ def test_config_accepts_multi_agent_defaults(tmp_path):
 
     config = load_config(workspace, global_root=global_root)
 
-    assert config.multi_agent_mode == "off"
     assert config.multi_agent_show_plan is True
     assert config.multi_agent_max_parallel_tasks == 3
     assert config.multi_agent_max_repair_iterations == 2
     assert config.multi_agent_complexity_threshold == "medium"
+    assert config.agent_mode == "basic"
+    assert config.delegation_enabled is False
+    assert config.config_version == 2
 
 
-def test_config_rejects_invalid_multi_agent_mode(tmp_path):
+def test_config_accepts_legacy_multi_agent_mode_without_breaking_repo(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     global_root = tmp_path / "global"
     init_workspace(workspace, global_root=global_root, project_name="workspace")
-    (workspace / ".nexus" / "config.toml").write_text('multi_agent_mode = "swarm"\n', encoding="utf-8")
+    (workspace / ".nexus" / "config.toml").write_text('multi_agent_mode = "always"\n', encoding="utf-8")
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.agent_mode == "advanced"
+    assert config.delegation_enabled is True
+
+
+def test_config_normalizes_legacy_subagent_tool_names(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'agent_mode = "advanced"\n'
+        'allowed_tools = ["delegate_task", "subagent_research", "subagent_review", "subagent_test"]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert "delegate_task" not in config.allowed_tools
+    assert "subagent_research" not in config.allowed_tools
+    assert "subagent_test" not in config.allowed_tools
+    assert "subagent_planning_analysis" in config.allowed_tools
+    assert "subagent_execution" in config.allowed_tools
+    assert "subagent_review" in config.allowed_tools
+    assert "subagent_verification" in config.allowed_tools
+
+
+def test_config_agent_mode_advanced_activates_multi_agent_profile(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text('agent_mode = "advanced"\n', encoding="utf-8")
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.agent_mode == "advanced"
+    assert config.delegation_enabled is True
+
+
+def test_config_agent_mode_advanced_adds_cognitive_tools_to_legacy_allowlist(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'agent_mode = "advanced"\nallowed_tools = ["get_time", "read_file"]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert "get_time" in config.allowed_tools
+    assert "read_file" in config.allowed_tools
+    assert "subagent_planning_analysis" in config.allowed_tools
+    assert "subagent_execution" in config.allowed_tools
+    assert "subagent_review" in config.allowed_tools
+    assert "subagent_verification" in config.allowed_tools
+
+
+def test_config_agent_mode_basic_forces_single_agent_profile(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'agent_mode = "basic"\ndelegation_enabled = true\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.agent_mode == "basic"
+    assert config.delegation_enabled is False
+
+
+def test_config_rejects_invalid_agent_mode(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text('agent_mode = "busy"\n', encoding="utf-8")
 
     try:
         load_config(workspace, global_root=global_root)
     except ConfigError as exc:
-        assert "Invalid multi_agent_mode" in str(exc)
+        assert "Invalid agent_mode" in str(exc)
     else:
-        raise AssertionError("Expected ConfigError for invalid multi_agent_mode")
+        raise AssertionError("Expected ConfigError for invalid agent_mode")
 
 
 def test_config_rejects_invalid_provider(tmp_path):

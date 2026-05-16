@@ -11,11 +11,15 @@ from rich.table import Table
 
 from nexus.config import config_to_plain_dict, load_config
 from nexus.config.model_limits import get_model_context_limit
+from nexus.config.upgrade import inspect_config_upgrade, upgrade_config_file
 from nexus.cli.init import _global_config_toml, _local_config_toml
 from nexus.memory.store import MemoryEntry
 from nexus.context import CarryOverState, TokenEstimator
-from nexus.runtime.context_state import get_context_payload
-from nexus.runtime.delegation import DelegationRequest
+from nexus.runtime.context_state import (
+    get_context_payload,
+    load_multi_agent_state,
+    render_context_packet,
+)
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import message_to_dict, new_snapshot
@@ -96,8 +100,6 @@ class SlashCommandRouter:
 
 def build_router() -> SlashCommandRouter:
     router = SlashCommandRouter()
-    router.register(SlashCommand("delegate", "Manage delegated worker tasks.", handle_delegate))
-    router.register(SlashCommand("multi-agent", "Inspect multi-agent supervisor state.", handle_multi_agent))
     router.register(SlashCommand("help", "Show available slash commands.", handle_help))
     router.register(SlashCommand("mcp", "Inspect MCP server status and tools.", handle_mcp))
     router.register(SlashCommand("mode", "Show or switch execution mode.", handle_mode))
@@ -120,8 +122,6 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
     table.add_column("Command")
     table.add_column("Description")
     for name, description in (
-        ("/delegate <subcommand>", "Manage worker tasks, approvals, and mailbox inspection."),
-        ("/multi-agent [status|plan|state]", "Inspect supervisor mode, latest plan, and shared state."),
         ("/help", "Show command help."),
         ("/mcp [status|tools|refresh [server]]", "Inspect MCP server connections and registered tools."),
         ("/mode [plan|default|auto]", "Show or switch execution mode."),
@@ -138,99 +138,6 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
     ):
         table.add_row(name, description)
     state.console.print(table)
-
-
-async def handle_multi_agent(state: ReplState, args: list[str]) -> None:
-    subcommand = args[0].lower() if args else "status"
-    if subcommand == "help":
-        _print_subcommand_help(
-            state, "multi-agent", "Inspect multi-agent supervisor state.",
-            (
-                ("status", "Show current mode, delegation state, and last repair decision.", "/multi-agent status"),
-                ("plan",   "Show the latest supervisor task DAG.",                          "/multi-agent plan"),
-                ("state",  "Show the full latest shared state JSON.",                       "/multi-agent state"),
-                ("help",   "Show this help.",                                              "/multi-agent help"),
-            ),
-        )
-        return
-    payload = _multi_agent_payload(state)
-    if subcommand == "status":
-        _print_multi_agent_status(state, payload)
-        return
-    if subcommand == "plan":
-        _print_multi_agent_plan(state, payload)
-        return
-    if subcommand == "state":
-        state.console.print(json.dumps(payload, indent=2))
-        return
-    state.console.print("Usage: /multi-agent [status|plan|state|help]")
-
-
-async def handle_delegate(state: ReplState, args: list[str]) -> None:
-    runtime = state.delegation
-    if runtime is None:
-        state.console.print("Delegation is disabled. Set delegation_enabled = true in .nexus/config.toml.")
-        return
-    if not args or args[0].lower() == "help":
-        _print_subcommand_help(
-            state, "delegate", "Manage delegated worker tasks.",
-            (
-                ("status",                "Show coordination summary (worker count, tasks, pending approvals).", "/delegate status"),
-                ("workers",              "List all worker states.",                                             "/delegate workers"),
-                ("tasks",               "List all delegated tasks.",                                          "/delegate tasks"),
-                ("tasks active",         "List only running tasks.",                                           "/delegate tasks active"),
-                ('spawn "T" "I"',        "Submit a new task with title T and instructions I.",                  '/delegate spawn "Review" "Summarise README."'),
-                ("spawn ... --context C", "Attach shared handoff context to the isolated worker.",              '/delegate spawn "Test" "Run checks." --context "Changed auth.py"'),
-                ("messages [who] [n]",   "Inspect the mailbox (optional filter + limit).",                     "/delegate messages worker-1 10"),
-                ("approvals",           "List pending permission decisions.",                                 "/delegate approvals"),
-                ("approve <id>",        "Approve a pending decision.",                                        "/delegate approve abc123"),
-                ("reject <id>",         "Reject a pending decision.",                                         "/delegate reject abc123"),
-                ("help",                "Show this help.",                                                    "/delegate help"),
-            ),
-        )
-        return
-
-    subcommand = args[0].lower()
-    if subcommand == "status":
-        _print_delegate_status(state)
-        return
-    if subcommand == "workers":
-        _print_delegate_workers(state)
-        return
-    if subcommand == "tasks":
-        _print_delegate_tasks(state, only_active=len(args) > 1 and args[1].lower() == "active")
-        return
-    if subcommand == "messages":
-        participant = args[1] if len(args) > 1 else None
-        limit = int(args[2]) if len(args) > 2 else 20
-        _print_delegate_messages(state, participant=participant, limit=limit)
-        return
-    if subcommand == "approvals":
-        _print_delegate_approvals(state)
-        return
-    if subcommand == "approve" and len(args) > 1:
-        approved = await runtime.decide_permission(args[1], approved=True)
-        state.console.print("Permission approved." if approved else f"Decision not found: {args[1]}")
-        return
-    if subcommand == "reject" and len(args) > 1:
-        rejected = await runtime.decide_permission(args[1], approved=False)
-        state.console.print("Permission rejected." if rejected else f"Decision not found: {args[1]}")
-        return
-    if subcommand == "spawn" and len(args) > 2:
-        try:
-            request = _parse_delegate_spawn_args(args[1:])
-        except ValueError as exc:
-            state.console.print(str(exc))
-            state.console.print(
-                "Usage: /delegate spawn <title> <instructions> [--worker id] [--resource name] [--tool name] [--context text] [--permission-action tool] [--permission-reason text]"
-            )
-            return
-        task = await runtime.submit(request)
-        state.console.print(f"Delegated task {task.task_id} to {task.assigned_worker}.")
-        return
-    state.console.print(
-        "Usage: /delegate status|workers|tasks [active]|spawn <title> <instructions> [--worker id] [--resource name] [--tool name] [--context text] [--permission-action tool] [--permission-reason text]|messages [agent] [limit]|approvals|approve <decision_id>|reject <decision_id>"
-    )
 
 
 async def handle_mcp(state: ReplState, args: list[str]) -> None:
@@ -388,9 +295,10 @@ async def handle_config(state: ReplState, args: list[str]) -> None:
                 ("show local",              "Print .nexus/config.toml (local workspace config).",              "/config show local"),
                 ("show global",             "Print ~/.nexus/config.toml (global user config).",                "/config show global"),
                 ("set <key> <value>",       "Write a key to local config and reload immediately.",             "/config set show_tool_calls false"),
+                ("",                        "Profile shortcut: /config set agent_mode advanced",                ""),
                 ("",                        "Example hidden-path override: /config set allow_hidden_paths true", ""),
                 ("reset <key>",             "Remove a key from local config and reload.",                      "/config reset temperature"),
-                ("reload",                  "Reload all config layers from disk without restarting.",          "/config reload"),
+                ("reload",                  "Reload config plus workspace .env/environment values.",            "/config reload"),
                 ("upgrade [local|global]",  "Add new config keys introduced in latest Nexus version without changing existing values. Does not touch memory or sessions.", "/config upgrade"),
                 ("reinit [local|global]",   "Rewrite local (default) or global config to clean Nexus defaults.  Clears provider/model overrides. Does not touch sessions or memory.","/config reinit"),
                 ("help",                    "Show this help.",                                                 "/config help"),
@@ -403,12 +311,7 @@ async def handle_config(state: ReplState, args: list[str]) -> None:
     if not args or args[0].lower() == "show":
         scope = args[1].lower() if len(args) > 1 else "merged"
     elif args[0].lower() == "reload":
-        state.config = load_config(
-            state.config.workspace_root,
-            global_root=state.config.global_root,
-            local_config_path=state.config.local_config_file,
-            global_config_path=state.config.global_config_file,
-        )
+        _reload_config(state)
         state.console.print("Config reloaded.")
         return
     elif args[0].lower() == "reinit":
@@ -430,33 +333,18 @@ async def handle_config(state: ReplState, args: list[str]) -> None:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(new_content, encoding="utf-8")
-        state.config = load_config(
-            state.config.workspace_root,
-            global_root=state.config.global_root,
-            local_config_path=state.config.local_config_file,
-            global_config_path=state.config.global_config_file,
-        )
+        _reload_config(state)
         state.console.print(f"[green]Reinitialized {label} config at {path}[/green]")
         state.console.print("Use [bold]/config reload[/bold] or restart to apply all changes.")
         return
     elif args[0].lower() == "set" and len(args) > 2:
         _update_toml_value(state.config.local_config_file, args[1], " ".join(args[2:]))
-        state.config = load_config(
-            state.config.workspace_root,
-            global_root=state.config.global_root,
-            local_config_path=state.config.local_config_file,
-            global_config_path=state.config.global_config_file,
-        )
+        _reload_config(state)
         state.console.print(f"Updated local config: {args[1]}")
         return
     elif args[0].lower() == "reset" and len(args) > 1:
         _remove_toml_key(state.config.local_config_file, args[1])
-        state.config = load_config(
-            state.config.workspace_root,
-            global_root=state.config.global_root,
-            local_config_path=state.config.local_config_file,
-            global_config_path=state.config.global_config_file,
-        )
+        _reload_config(state)
         state.console.print(f"Removed local config override: {args[1]}")
         return
     else:
@@ -716,6 +604,8 @@ async def handle_context(state: ReplState, args: list[str]) -> None:
                 ("usage <agent>",     "Show context usage for a supervisor or worker agent.",                    "/context usage supervisor"),
                 ("agents",           "List known supervisor, planner, execution, and worker contexts.",          "/context agents"),
                 ("agent <id>",        "Show one recorded agent context snapshot.",                              "/context agent supervisor"),
+                ("task <id>",         "Show one typed multi-agent task context.",                               "/context task execute"),
+                ("summary",           "Show typed multi-agent session summary.",                                "/context summary"),
                 ("help",             "Show this help.",                                                         "/context help"),
             ),
         )
@@ -756,6 +646,14 @@ async def handle_context(state: ReplState, args: list[str]) -> None:
         _print_agent_context(state, args[1])
         return
 
+    if subcommand == "task" and len(args) > 1:
+        _print_context_task(state, args[1])
+        return
+
+    if subcommand == "summary":
+        _print_context_summary(state)
+        return
+
     # Default: show system prompt
     state.console.print(state.current_system_prompt or "Context not built yet.")
 
@@ -786,24 +684,6 @@ async def handle_quit(state: ReplState, args: list[str]) -> None:
     state.console.print("Saving session and exiting.")
 
 
-def _print_delegate_status(state: ReplState) -> None:
-    runtime = state.delegation
-    assert runtime is not None
-    active_tasks = len([task for task in runtime.list_tasks() if not task.status.is_terminal])
-    state.console.print(
-        json.dumps(
-            {
-                "workers": len(runtime.list_worker_states()),
-                "tasks": len(runtime.list_tasks()),
-                "active_tasks": active_tasks,
-                "pending_approvals": len(runtime.list_pending_permissions()),
-                "mailbox_messages": len(runtime.mailbox.history(limit=runtime.mailbox.pending_count("coordinator") + 200)),
-            },
-            indent=2,
-        )
-    )
-
-
 def _context_agent_records(state: ReplState) -> dict[str, dict]:
     records: dict[str, dict] = {}
     payload = get_context_payload(state.session.metadata)
@@ -812,12 +692,6 @@ def _context_agent_records(state: ReplState) -> dict[str, dict]:
         for agent_id, record in agents.items():
             if isinstance(record, dict):
                 records[str(agent_id)] = record
-    if state.delegation is not None:
-        for task in state.delegation.list_tasks():
-            snapshot = getattr(task, "context_snapshot", {})
-            if isinstance(snapshot, dict) and snapshot:
-                agent_id = str(snapshot.get("agent_id") or f"worker-{task.assigned_worker}-{task.task_id}")
-                records[agent_id] = snapshot
     return records
 
 
@@ -883,27 +757,39 @@ def _multi_agent_payload(state: ReplState) -> dict:
 
 
 def _print_multi_agent_status(state: ReplState, payload: dict) -> None:
+    typed = load_multi_agent_state(state.session.metadata)
     shared_state = payload.get("shared_state") if isinstance(payload.get("shared_state"), dict) else {}
     repair = shared_state.get("repair_decision") if isinstance(shared_state.get("repair_decision"), dict) else {}
+    repair_packets = [packet for packet in typed.packets if packet.packet_type == "repair_request"]
+    if repair_packets:
+        latest_repair = repair_packets[-1]
+        repair = {
+            "retry": True,
+            "reason": latest_repair.failure_summary or latest_repair.summary,
+        }
     table = Table(title="Multi-Agent Supervisor")
     table.add_column("Field")
     table.add_column("Value")
-    table.add_row("Mode", str(getattr(state.config, "multi_agent_mode", "off")))
+    table.add_row("Mode", str(getattr(state.config, "agent_mode", "basic")))
     table.add_row("Threshold", str(getattr(state.config, "multi_agent_complexity_threshold", "medium")))
     table.add_row("Delegation", "enabled" if state.delegation is not None else "disabled")
     table.add_row("Last complexity", str(payload.get("complexity", "-")))
+    table.add_row("Objective", typed.objective or "-")
+    table.add_row("Tasks", str(len(typed.tasks)))
+    table.add_row("Packets", str(len(typed.packets)))
     table.add_row("Repair needed", str(repair.get("retry", "-")))
     table.add_row("Repair reason", str(repair.get("reason", "-")))
     state.console.print(table)
 
 
 def _print_multi_agent_plan(state: ReplState, payload: dict) -> None:
+    typed = load_multi_agent_state(state.session.metadata)
     shared_state = payload.get("shared_state") if isinstance(payload.get("shared_state"), dict) else {}
-    dag = shared_state.get("dag") if isinstance(shared_state.get("dag"), dict) else {}
+    dag = typed.dag or (shared_state.get("dag") if isinstance(shared_state.get("dag"), dict) else {})
     if not dag:
-        state.console.print("No multi-agent plan has been recorded in this session.")
+        state.console.print("No legacy coordination plan has been recorded in this session.")
         return
-    table = Table(title="Latest Multi-Agent Plan")
+    table = Table(title="Latest Legacy Coordination Plan")
     table.add_column("Task")
     table.add_column("Role")
     table.add_column("Depends On")
@@ -924,142 +810,196 @@ def _print_multi_agent_plan(state: ReplState, payload: dict) -> None:
     state.console.print(table)
 
 
-def _print_delegate_workers(state: ReplState) -> None:
-    runtime = state.delegation
-    assert runtime is not None
-    table = Table(title="Delegation Workers")
-    table.add_column("Worker")
-    table.add_column("Status")
-    table.add_column("Current Task")
-    table.add_column("Processed")
-    table.add_column("Last Error")
-    for worker in runtime.list_worker_states():
-        table.add_row(
-            worker.worker_id,
-            worker.status,
-            worker.current_task_id or "-",
-            str(worker.processed_messages),
-            worker.last_error or "-",
-        )
-    state.console.print(table)
-
-
-def _print_delegate_tasks(state: ReplState, *, only_active: bool) -> None:
-    runtime = state.delegation
-    assert runtime is not None
-    table = Table(title="Delegated Tasks")
+def _print_multi_agent_tasks(state: ReplState) -> None:
+    typed = load_multi_agent_state(state.session.metadata)
+    if not typed.tasks:
+        state.console.print("No typed multi-agent tasks recorded yet.")
+        return
+    table = Table(title="Multi-Agent Tasks")
     table.add_column("Task")
-    table.add_column("Worker")
+    table.add_column("Role")
     table.add_column("Status")
-    table.add_column("Resources")
-    table.add_column("Allowed Tools")
-    table.add_column("Decision")
-    table.add_column("Summary")
-    tasks = runtime.list_tasks(only_active=only_active)
-    for task in tasks:
+    table.add_column("Depends On")
+    table.add_column("Packets")
+    table.add_column("Artifacts")
+    table.add_column("Repair")
+    for task in sorted(typed.tasks.values(), key=lambda item: item.task_id):
         table.add_row(
             task.task_id,
-            task.assigned_worker or "-",
-            task.status.value,
-            ", ".join(task.claimed_resources) or "-",
-            ", ".join(task.allowed_tools) or "all",
-            task.pending_decision_id or "-",
-            task.result_summary or task.error or "-",
+            task.role,
+            task.status,
+            ", ".join(task.dependencies) or "-",
+            ", ".join((*task.input_packet_ids, *task.output_packet_ids)) or "-",
+            ", ".join(task.artifact_ids) or "-",
+            str(task.repair_iteration),
         )
     state.console.print(table)
 
 
-def _print_delegate_messages(state: ReplState, *, participant: str | None, limit: int) -> None:
-    runtime = state.delegation
-    assert runtime is not None
-    table = Table(title="Delegation Messages")
-    table.add_column("Id")
-    table.add_column("Sender")
-    table.add_column("Recipient")
-    table.add_column("Kind")
+def _print_multi_agent_packets(state: ReplState) -> None:
+    typed = load_multi_agent_state(state.session.metadata)
+    if not typed.packets:
+        state.console.print("No structured handoff packets recorded yet.")
+        return
+    table = Table(title="Multi-Agent Packets")
+    table.add_column("Packet")
+    table.add_column("Type")
+    table.add_column("Source")
+    table.add_column("Target")
     table.add_column("Task")
-    table.add_column("Decision")
-    for message in runtime.mailbox.history(participant=participant, limit=limit):
+    table.add_column("Artifacts")
+    table.add_column("Summary")
+    for packet in typed.packets:
         table.add_row(
-            message.message_id,
-            message.sender,
-            message.recipient,
-            message.kind.value,
-            message.task_id or "-",
-            message.correlation_id or "-",
+            packet.packet_id,
+            packet.packet_type,
+            packet.source_agent,
+            packet.target_agent,
+            packet.task_id or "-",
+            ", ".join(packet.artifact_ids) or "-",
+            packet.summary,
         )
     state.console.print(table)
 
 
-def _print_delegate_approvals(state: ReplState) -> None:
-    runtime = state.delegation
-    assert runtime is not None
-    table = Table(title="Pending Approvals")
-    table.add_column("Decision")
-    table.add_column("Worker")
+def _print_multi_agent_packet(state: ReplState, packet_id: str) -> None:
+    typed = load_multi_agent_state(state.session.metadata)
+    packet = next((item for item in typed.packets if item.packet_id == packet_id), None)
+    if packet is None:
+        state.console.print(f"Packet not found: {packet_id}")
+        return
+    state.console.print(json.dumps(_public_packet_dict(packet.to_dict()), indent=2))
+
+
+def _print_multi_agent_artifacts(state: ReplState) -> None:
+    typed = load_multi_agent_state(state.session.metadata)
+    if not typed.artifacts:
+        state.console.print("No multi-agent artifacts recorded yet.")
+        return
+    table = Table(title="Multi-Agent Artifacts")
+    table.add_column("Artifact")
+    table.add_column("Type")
     table.add_column("Task")
-    table.add_column("Action")
+    table.add_column("Producer")
+    table.add_column("Tokens")
+    table.add_column("Summary")
+    for artifact in typed.artifacts.values():
+        table.add_row(
+            artifact.artifact_id,
+            artifact.artifact_type,
+            artifact.task_id or "-",
+            artifact.producer_agent,
+            str(artifact.token_estimate),
+            artifact.summary,
+        )
+    state.console.print(table)
+
+
+def _print_multi_agent_artifact(state: ReplState, artifact_id: str) -> None:
+    typed = load_multi_agent_state(state.session.metadata)
+    artifact = typed.artifacts.get(artifact_id)
+    if artifact is None:
+        state.console.print(f"Artifact not found: {artifact_id}")
+        return
+    state.console.print(json.dumps(_public_artifact_dict(artifact.to_dict()), indent=2))
+
+
+def _print_multi_agent_repair(state: ReplState, payload: dict) -> None:
+    typed = load_multi_agent_state(state.session.metadata)
+    repair_packets = [packet for packet in typed.packets if packet.packet_type == "repair_request"]
+    repair_tasks = [task for task in typed.tasks.values() if task.repair_iteration > 0]
+    if not repair_packets and not repair_tasks:
+        _print_multi_agent_status(state, payload)
+        return
+    table = Table(title="Multi-Agent Repair")
+    table.add_column("Task")
+    table.add_column("Iteration")
+    table.add_column("Status")
+    table.add_column("Latest Packet")
     table.add_column("Reason")
-    for message in runtime.list_pending_permissions():
+    latest_packet = repair_packets[-1] if repair_packets else None
+    for task in repair_tasks or []:
         table.add_row(
-            message.correlation_id or message.message_id,
-            message.sender,
-            message.task_id or "-",
-            str(message.payload.get("action", "-")),
-            str(message.payload.get("reason", "-")),
+            task.task_id,
+            str(task.repair_iteration),
+            task.status,
+            latest_packet.packet_id if latest_packet else "-",
+            (latest_packet.failure_summary or latest_packet.summary) if latest_packet else "-",
         )
     state.console.print(table)
 
 
-def _parse_delegate_spawn_args(args: list[str]) -> DelegationRequest:
-    title = args[0]
-    instructions = args[1]
-    worker: str | None = None
-    allowed_tools: list[str] = []
-    claimed_resources: list[str] = []
-    shared_context: list[str] = []
-    permission_action: str | None = None
-    permission_reason: str | None = None
+def _print_context_task(state: ReplState, task_id: str) -> None:
+    typed = load_multi_agent_state(state.session.metadata)
+    task = typed.tasks.get(task_id)
+    if task is None:
+        state.console.print(f"Task context not found: {task_id}")
+        return
+    state.console.print(json.dumps(task.to_dict(), indent=2))
 
-    index = 2
-    while index < len(args):
-        token = args[index]
-        if token == "--worker" and index + 1 < len(args):
-            worker = args[index + 1]
-            index += 2
-            continue
-        if token == "--tool" and index + 1 < len(args):
-            allowed_tools.append(args[index + 1])
-            index += 2
-            continue
-        if token == "--resource" and index + 1 < len(args):
-            claimed_resources.append(args[index + 1])
-            index += 2
-            continue
-        if token == "--context" and index + 1 < len(args):
-            shared_context.append(args[index + 1])
-            index += 2
-            continue
-        if token == "--permission-action" and index + 1 < len(args):
-            permission_action = args[index + 1]
-            index += 2
-            continue
-        if token == "--permission-reason" and index + 1 < len(args):
-            permission_reason = args[index + 1]
-            index += 2
-            continue
-        raise ValueError(f"Unknown delegate spawn option: {token}")
 
-    return DelegationRequest(
-        title=title,
-        instructions=instructions,
-        assigned_worker=worker,
-        allowed_tools=tuple(allowed_tools),
-        claimed_resources=tuple(claimed_resources),
-        shared_context=tuple(shared_context),
-        permission_action=permission_action,
-        permission_reason=permission_reason,
-    )
+def _public_packet_dict(packet: dict) -> dict:
+    public = dict(packet)
+    if public.get("artifacts"):
+        public["artifact_summaries"] = [str(item)[:300] for item in public.get("artifacts", [])]
+    public.pop("artifacts", None)
+    return public
+
+
+def _public_artifact_dict(artifact: dict) -> dict:
+    public = dict(artifact)
+    content = str(public.pop("content", "") or "")
+    public["has_content"] = bool(content)
+    public["content_chars"] = len(content)
+    if content:
+        public["content_preview"] = content[:2000]
+        if len(content) > 2000:
+            public["content_truncated"] = True
+    return public
+
+
+def _print_context_summary(state: ReplState) -> None:
+    typed = load_multi_agent_state(state.session.metadata)
+    summary = {
+        "objective": typed.objective,
+        "tasks": len(typed.tasks),
+        "agents": len(typed.agents),
+        "packets": len(typed.packets),
+        "artifacts": len(typed.artifacts),
+        "events": len(typed.events),
+        "latest_packets": [render_context_packet(packet) for packet in typed.packets[-3:]],
+    }
+    if typed.latest_summary is not None:
+        summary["rolling_summary"] = typed.latest_summary.to_dict()
+    state.console.print(json.dumps(summary, indent=2))
+
+
+def _public_multi_agent_state(state: ReplState) -> dict:
+    typed = load_multi_agent_state(state.session.metadata)
+    payload = state.session.metadata.get("multi_agent")
+    public = dict(payload) if isinstance(payload, dict) else {}
+    typed_payload = typed.to_dict()
+    typed_payload["packets"] = [_public_packet_dict(packet) for packet in typed_payload.get("packets", [])]
+    typed_payload["artifacts"] = {
+        artifact_id: _public_artifact_dict(artifact)
+        for artifact_id, artifact in typed_payload.get("artifacts", {}).items()
+        if isinstance(artifact, dict)
+    }
+    public["state"] = typed_payload
+    if isinstance(public.get("shared_state"), dict):
+        shared = dict(public["shared_state"])
+        shared["context_packets"] = [
+            _public_packet_dict(packet)
+            for packet in shared.get("context_packets", [])
+            if isinstance(packet, dict)
+        ]
+        for key in ("verification_results", "review_findings"):
+            if isinstance(shared.get(key), list):
+                shared[key] = [str(item)[:500] for item in shared[key]]
+        public["shared_state"] = shared
+    return public
+
+
 
 
 def _print_mcp_status(state: ReplState) -> None:
@@ -1128,60 +1068,32 @@ async def _handle_config_upgrade(state: ReplState, scope: str) -> None:
         state.console.print(f"[red]Unknown scope '{scope}'. Use 'local' or 'global'.[/red]")
         return
 
-    # Parse existing file and canonical template.  We intentionally skip keys
-    # that are not explicitly present in the template (e.g. computed path keys)
-    # so the upgrade is minimal and predictable.
-    existing: dict[str, object] = (
-        tomllib.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    )
-    try:
-        template_parsed: dict[str, object] = tomllib.loads(template_str)
-    except Exception as exc:  # noqa: BLE001
-        state.console.print(f"[red]Failed to parse template: {exc}[/red]")
-        return
-
-    # Keys present in the template but absent from the current file.
-    missing: dict[str, object] = {
-        k: v for k, v in template_parsed.items() if k not in existing
-    }
-
-    if not missing:
+    report = inspect_config_upgrade(path, template_str)
+    if not report.needs_upgrade:
+        _reload_config(state)
         state.console.print(
-            f"[green]{label.capitalize()} config is already up to date — no new keys to add.[/green]"
+            f"[green]{label.capitalize()} config is already up to date — no new keys to add. Config and .env reloaded.[/green]"
         )
         return
 
-    # Append missing keys to the file (preserving all existing content + comments).
-    lines_to_add: list[str] = [
-        f"\n# Added by /config upgrade",
-    ]
-    for key, value in missing.items():
-        if isinstance(value, bool):
-            rendered = "true" if value else "false"
-        elif isinstance(value, (int, float)):
-            rendered = str(value)
-        elif isinstance(value, list):
-            rendered = "[" + ", ".join(json.dumps(item) for item in value) + "]"
-        else:
-            rendered = json.dumps(value)
-        lines_to_add.append(f"{key} = {rendered}")
+    upgrade_config_file(path, template_str)
+    _reload_config(state)
+    state.console.print(
+        f"[green]Upgraded {label} config at {path}, then reloaded config and .env:[/green]"
+    )
+    for key in report.deprecated_keys:
+        state.console.print(f"  [bold]-[/bold] removed deprecated {key}")
+    for key in report.missing_keys:
+        state.console.print(f"  [bold]+[/bold] {key}")
 
-    current_content = path.read_text(encoding="utf-8") if path.exists() else ""
-    separator = "" if current_content.endswith("\n") else "\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(current_content + separator + "\n".join(lines_to_add) + "\n", encoding="utf-8")
 
+def _reload_config(state: ReplState) -> None:
     state.config = load_config(
         state.config.workspace_root,
         global_root=state.config.global_root,
         local_config_path=state.config.local_config_file,
         global_config_path=state.config.global_config_file,
     )
-    state.console.print(
-        f"[green]Upgraded {label} config at {path} — added {len(missing)} new key(s):[/green]"
-    )
-    for key in missing:
-        state.console.print(f"  [bold]+[/bold] {key}")
 
 
 def _update_toml_value(path: Path, key: str, value: str) -> None:

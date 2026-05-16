@@ -141,9 +141,49 @@ def _get_tool_guidelines_section(tool_registry: "ToolRegistry") -> str:
     ]
 
     if any(record.name.startswith("subagent") for record in records):
-        lines.append("- Use sub-agents only for bounded work that benefits from delegation.")
+        lines.extend(_subagent_guidance_lines(records))
 
     return "\n".join(lines)
+
+
+def _subagent_guidance_lines(records) -> list[str]:
+    subagents = [
+        record
+        for record in records
+        if record.name.startswith("subagent_")
+    ]
+    if not subagents:
+        return []
+
+    lines = [
+        "",
+        "## Cognitive Sub-Agent Contract",
+        "",
+        "- In advanced mode, delegate non-trivial research, planning, coding, verification, and review to the matching cognitive sub-agent tool.",
+        "- Do not do substantial repo research or coding directly when a matching sub-agent exists; call the specialist and integrate its structured result.",
+        "- For implementation requests, prefer `subagent_planning_analysis` first, then `subagent_execution`; use `subagent_verification` and `subagent_review` after changes when available.",
+        "- Use direct supervisor tool calls only for tiny checks, user communication, or simple follow-up glue.",
+        "- You are the only agent that talks to the user; sub-agents return findings, blockers, and clarification requests to you.",
+        "- Treat sub-agent local conversation and tool history as isolated private context.",
+        "- Share context with sub-agents only through focused `instructions` and relevant `input_packet_ids`; do not copy the full conversation.",
+        "- Prefer packet ids over pasted summaries when packet ids are available in context.",
+        "- A sub-agent result is a JSON envelope with `status`, `agent`, `task_id`, `summary`, `raw_result`, `context`, and `recommended_next_action`.",
+        "- If a sub-agent reports `status: needs_clarification`, ask the user yourself and then resume the appropriate workflow.",
+        "",
+        "Sub-agent input shape:",
+        '```json',
+        '{"title": "Short task title", "instructions": "Role-specific objective, constraints, expected output, and stop condition", "input_packet_ids": ["packet-..."], "allowed_tools": ["optional", "override"]}',
+        '```',
+        "",
+        "Available cognitive tools:",
+    ]
+    for record in subagents:
+        tool = record.tool
+        allowed_tools = getattr(getattr(tool, "_definition", None), "allowed_tools", None)
+        allowed_text = ", ".join(allowed_tools) if allowed_tools else "task-scoped registry"
+        origin = f" ({record.origin})" if record.origin else ""
+        lines.append(f"- `{record.name}`{origin}: {tool.description} Allowed tools: {allowed_text}.")
+    return lines
 
 
 def _get_developer_instructions_section(instructions: str) -> str:
