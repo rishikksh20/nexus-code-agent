@@ -391,11 +391,32 @@ def _apply_agent_mode_profile(values: dict[str, Any]) -> dict[str, Any]:
         resolved["delegation_enabled"] = True
         allowed_tools = resolved.get("allowed_tools")
         if isinstance(allowed_tools, list) and allowed_tools:
-            for tool_name in _builtin_cognitive_tool_names():
+            for tool_name in _advanced_mode_required_tool_names():
                 if tool_name not in allowed_tools:
                     allowed_tools.append(tool_name)
             resolved["allowed_tools"] = allowed_tools
     return resolved
+
+
+def _advanced_mode_required_tool_names() -> tuple[str, ...]:
+    return (
+        *_builtin_cognitive_tool_names(),
+        "read_file",
+        "glob",
+        "grep",
+        "list_dir",
+        "lsp",
+        "write_file",
+        "edit",
+        "insert_edit_into_file",
+        "apply_patch",
+        "git_status",
+        "git_diff",
+        "run_tests",
+        "run_linter",
+        "run_typecheck",
+        "bash",
+    )
 
 
 def _builtin_cognitive_tool_names() -> tuple[str, ...]:

@@ -5,13 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResponse
+from nexus.integrations.fake_model import FakeModelClient
+from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message, RuntimeResponse, ToolCall, ToolResult
 from nexus.security import ApprovalManager, ApprovalPolicy, ApprovalScope, PermissionChecker, PermissionDecision
 from nexus.runtime.execution import ExecutionMode
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition, _record_inner_approval
 from nexus.tools.filesystem import WriteFileTool
 from nexus.skills import Skill, SkillRegistry
-from nexus.tools.base import ToolRegistry
+from nexus.tools.base import Tool, ToolKind, ToolRegistry
 from nexus.tools.builtin import GetTimeTool, MemoryTool, PythonLspTool, WriteNoteTool
 from nexus.tools.registry import get_core_tools
 from nexus.tools.subagents import (
@@ -20,6 +21,23 @@ from nexus.tools.subagents import (
     register_skill_subagent_tools,
     register_subagent_tools,
 )
+
+
+class FailingRunTestsTool(Tool):
+    name = "run_tests"
+    description = "Failing test runner for regression coverage."
+    kind = ToolKind.READ
+    is_mutating = False
+    input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+    async def execute(self, call_id, arguments, context):
+        return ToolResult(
+            call_id=call_id,
+            tool_name=self.name,
+            output="tests/test_app.py::test_read_main FAILED\nE TypeError: unhashable type: 'dict'\nExit code: 1",
+            is_error=True,
+            metadata={"exit_code": 1},
+        )
 
 
 def test_core_tools_do_not_register_legacy_write_note_alias(tmp_path):
@@ -134,6 +152,8 @@ async def test_register_subagent_tools_registers_default_and_specialist_tools():
     assert registry.record("subagent_execution").origin == "execution"
     assert registry.record("subagent_review").origin == "review"
     assert registry.record("subagent_verification").origin == "verification"
+    verification_tools = registry.record("subagent_verification").tool._definition.allowed_tools
+    assert "bash" in verification_tools
 
 
 @pytest.mark.asyncio
@@ -170,6 +190,53 @@ async def test_subagent_tool_returns_structured_supervisor_envelope(tool_context
     assert payload["context"]["input_packet_ids"] == ["packet-0001"]
     assert payload["raw_result"]
     assert result.metadata["context_snapshot"]["scope"] == "isolated"
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_preserves_failed_test_output_after_vague_final_response(tool_context):
+    registry = ToolRegistry()
+    registry.register(FailingRunTestsTool(), source="core", origin="test")
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Running the focused tests."),
+                tool_calls=(
+                    ToolCall(call_id="call-tests", tool_name="run_tests", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(
+                message=Message(
+                    role="assistant",
+                    content="It seems I'm having difficulty accessing the necessary tools to proceed.",
+                ),
+            ),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Implement and validate.",
+            goal_prompt="Run tests and report the result.",
+            allowed_tools=["run_tests"],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+
+    result = await tool.execute(
+        "call-1",
+        {"title": "Validate app", "instructions": "Run focused tests and report failures."},
+        tool_context,
+    )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "failed"
+    assert payload["runtime_status"] == "failed"
+    assert payload["recommended_next_action"] == "continue"
+    assert "tests/test_app.py::test_read_main FAILED" in payload["raw_result"]
+    assert "difficulty accessing the necessary tools" in payload["raw_result"]
 
 
 @pytest.mark.asyncio

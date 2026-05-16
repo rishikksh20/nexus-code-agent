@@ -218,6 +218,8 @@ class SubAgentTool:
         tool_call_count = 0
         status = "completed"
         error = None
+        failed_tool_outputs: list[dict[str, str]] = []
+        modified_files: list[str] = []
 
         for _ in range(int(getattr(self._definition, "max_turns", 20) or 20)):
             events = [
@@ -276,6 +278,10 @@ class SubAgentTool:
                     for event in resume_events:
                         if event.kind == AgentEventType.TOOL_RESULT:
                             tool_call_count += 1
+                            if event.payload.is_error:
+                                status = "failed"
+                                failed_tool_outputs.append(_failed_tool_output(event.payload))
+                            modified_files.extend(_modified_files_from_result(event.payload))
                             history.append(
                                 Message(
                                     role="tool",
@@ -303,6 +309,10 @@ class SubAgentTool:
                         final_response = message.content
                 elif event.kind == AgentEventType.TOOL_RESULT:
                     tool_call_count += 1
+                    if event.payload.is_error:
+                        status = "failed"
+                        failed_tool_outputs.append(_failed_tool_output(event.payload))
+                    modified_files.extend(_modified_files_from_result(event.payload))
                     history.append(
                         Message(
                             role="tool",
@@ -326,13 +336,14 @@ class SubAgentTool:
             "tool_call_count": tool_call_count,
             "message_count": len(history),
             "token_estimate": 0,
+            "modified_files": list(dict.fromkeys(modified_files)),
             "isolation": {
                 "local_history_shared": False,
                 "shared_outputs": "final_summary_and_context_snapshot_only",
             },
         }
         is_failed = status in {"failed", "needs_approval"}
-        raw_output = final_response or error or "(no output)"
+        raw_output = _raw_output_with_failed_tools(final_response or error or "(no output)", failed_tool_outputs)
         output = _subagent_result_envelope(
             tool_name=self.name,
             definition=self._definition,
@@ -533,6 +544,45 @@ def _subagent_result_envelope(
         "runtime_status": status,
     }
     return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _failed_tool_output(result: ToolResult) -> dict[str, str]:
+    return {
+        "tool_name": result.tool_name,
+        "call_id": result.call_id,
+        "output": result.output,
+    }
+
+
+def _raw_output_with_failed_tools(raw_output: str, failed_tool_outputs: list[dict[str, str]]) -> str:
+    if not failed_tool_outputs:
+        return raw_output
+
+    blocks: list[str] = []
+    for failure in failed_tool_outputs:
+        output = failure["output"].strip() or "(no output)"
+        blocks.append(
+            f"[Failed tool: {failure['tool_name']} #{failure['call_id']}]\n"
+            f"{output}"
+        )
+    if raw_output.strip() and raw_output.strip() != blocks[-1].split("\n", 1)[-1].strip():
+        blocks.append(f"[Sub-agent final response]\n{raw_output.strip()}")
+    return "\n\n".join(blocks)
+
+
+def _modified_files_from_result(result: ToolResult) -> list[str]:
+    metadata = result.metadata or {}
+    files: list[str] = []
+    path = metadata.get("path")
+    if isinstance(path, str) and path.strip():
+        files.append(path)
+    affected_paths = metadata.get("affected_paths")
+    if isinstance(affected_paths, list):
+        files.extend(str(item) for item in affected_paths if str(item).strip())
+    patched_paths = metadata.get("patched_paths")
+    if isinstance(patched_paths, list):
+        files.extend(str(item) for item in patched_paths if str(item).strip())
+    return list(dict.fromkeys(files))
 
 
 def _infer_result_status(raw_result: str, *, is_error: bool) -> str:

@@ -153,7 +153,7 @@ def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
                 "and git status inspection. Return a concise validation summary and failures. "
                 "Do not modify files."
             ),
-            allowed_tools=["run_tests", "run_linter", "run_typecheck", "git_status"],
+            allowed_tools=["run_tests", "run_linter", "run_typecheck", "git_status", "bash"],
             max_turns=8,
             timeout_seconds=600,
         ),

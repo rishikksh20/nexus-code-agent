@@ -98,6 +98,11 @@ def test_config_normalizes_legacy_subagent_tool_names(tmp_path):
     assert "subagent_execution" in config.allowed_tools
     assert "subagent_review" in config.allowed_tools
     assert "subagent_verification" in config.allowed_tools
+    assert "run_tests" in config.allowed_tools
+    assert "run_linter" in config.allowed_tools
+    assert "run_typecheck" in config.allowed_tools
+    assert "git_status" in config.allowed_tools
+    assert "bash" in config.allowed_tools
 
 
 def test_config_agent_mode_advanced_activates_multi_agent_profile(tmp_path):
