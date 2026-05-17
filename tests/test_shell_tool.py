@@ -1,0 +1,38 @@
+from __future__ import annotations
+
+import pytest
+
+from nexus.models import ToolExecutionContext
+from nexus.tools.builtin.shell import BashTool
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_streams_live_output_to_ui_callback(tmp_path):
+    chunks: list[tuple[str, str, str, str]] = []
+
+    class StreamingUI:
+        def stream_tool_output(self, call_id, tool_name, stream_name, chunk):
+            chunks.append((call_id, tool_name, stream_name, chunk))
+
+    context = ToolExecutionContext(
+        session_id="s",
+        working_directory=tmp_path,
+        metadata={"ui": StreamingUI()},
+    )
+
+    result = await BashTool().execute(
+        "c-stream",
+        {"command": "printf hello && printf err >&2"},
+        context,
+    )
+
+    assert not result.is_error
+    assert "hello" in result.output
+    assert any(
+        call_id == "c-stream" and stream_name == "stdout" and "hello" in chunk
+        for call_id, _tool_name, stream_name, chunk in chunks
+    )
+    assert any(
+        call_id == "c-stream" and stream_name == "stderr" and "err" in chunk
+        for call_id, _tool_name, stream_name, chunk in chunks
+    )

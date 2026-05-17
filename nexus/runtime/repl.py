@@ -35,6 +35,15 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
     :mod:`nexus.runtime.turn_runner`.
     """
     ui: TerminalUI = state.console
+    if _should_run_textual_ui(state):
+        # Keep one-off migration prompts line-oriented so config writes happen before
+        # Textual takes over the terminal. The main chat loop runs in the TUI.
+        _maybe_prompt_config_upgrade(state)
+        from nexus.ui.textual_app import run_textual_repl
+
+        await run_textual_repl(state, agent, router, session_resumed=session_resumed)
+        return
+
     cfg = state.config
     ui.print_banner(cfg.provider, cfg.model_name, state.mode.value, workspace=cfg.workspace_root)
     if session_resumed:
@@ -93,6 +102,14 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
 
     await _emit_stop(state)
     state.session_store.save(state.session)
+
+
+def _should_run_textual_ui(state: ReplState) -> bool:
+    try:
+        from nexus.ui.textual_app import can_use_textual_ui
+    except Exception:  # noqa: BLE001
+        return False
+    return can_use_textual_ui(state.config)
 
 
 def _interactive_approval_callback(ui: TerminalUI) -> ConfirmationCallback:

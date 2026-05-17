@@ -41,6 +41,12 @@ def test_args_to_config_overrides_maps_allow_hidden_paths_flag():
     assert overrides["allow_hidden_paths"] is True
 
 
+def test_args_to_config_overrides_maps_no_tui_flag():
+    overrides = args_to_config_overrides(no_tui=True)
+
+    assert overrides["textual_ui"] is False
+
+
 def test_cli_rejects_stream_and_no_stream_together():
     exit_code = main(["--stream", "--no-stream", "--prompt", "hello"])
 
