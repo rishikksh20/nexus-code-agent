@@ -248,13 +248,21 @@ class SubAgentTool:
                             final_response = pending_message.content
                 decision = await _handle_inner_confirmation(confirmation.payload, outer_context)
                 if decision == "approved":
-                    if pending_message is not None:
-                        history.append(pending_message)
                     resume_call = ToolCall(
                         call_id=confirmation.payload.call_id,
                         tool_name=confirmation.payload.tool_name,
                         arguments=confirmation.payload.arguments,
                     )
+                    if pending_message is not None:
+                        history.append(
+                            Message(
+                                role=pending_message.role,
+                                content=pending_message.content,
+                                name=pending_message.name,
+                                tool_calls=(resume_call,),
+                                tool_call_id=pending_message.tool_call_id,
+                            )
+                        )
                     resume_events = [
                         event
                         async for event in agent.run(
