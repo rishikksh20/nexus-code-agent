@@ -7,7 +7,6 @@ from typing import Any
 from uuid import uuid4
 
 from nexus.context import TokenEstimator
-from nexus.models import Message
 
 
 _METADATA_KEY = "multi_agent_context"
@@ -465,19 +464,6 @@ def get_context_payload(metadata: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {"agents": {}, "packets": []}
 
 
-def summarize_messages(messages: list[Message], *, limit: int = 240) -> str:
-    if not messages:
-        return "No local messages yet."
-    recent = messages[-4:]
-    text = " | ".join(f"{message.role}: {message.content.strip()[:120]}" for message in recent if message.content)
-    return text[:limit] if text else "No text content in recent messages."
-
-
-def estimate_messages(messages: list[Message]) -> int:
-    estimator = TokenEstimator()
-    return sum(estimator.estimate(message.content) for message in messages)
-
-
 def make_context_packet(
     *,
     source_agent: str,
@@ -548,11 +534,6 @@ def make_review_findings_packet(**kwargs: Any) -> ContextPacket:
 
 def make_repair_request_packet(**kwargs: Any) -> ContextPacket:
     return make_context_packet(packet_type="repair_request", source_agent="supervisor", target_agent="execution", **kwargs)
-
-
-def make_repair_complete_packet(**kwargs: Any) -> ContextPacket:
-    return make_context_packet(packet_type="repair_complete", source_agent="execution", target_agent="test", **kwargs)
-
 
 def make_artifact_record(
     *,
@@ -689,23 +670,6 @@ def render_context_packet(packet: ContextPacket) -> str:
     if packet.artifact_ids:
         parts.append("artifacts=" + ", ".join(packet.artifact_ids[:8]))
     return " | ".join(part for part in parts if part)
-
-
-def render_packet_summaries(
-    metadata: dict[str, Any],
-    packet_ids: tuple[str, ...] | list[str],
-    *,
-    limit: int = 8,
-) -> tuple[str, ...]:
-    state = load_multi_agent_state(metadata)
-    by_id = {packet.packet_id: packet for packet in state.packets}
-    rendered = []
-    for packet_id in packet_ids:
-        packet = by_id.get(str(packet_id))
-        if packet is not None:
-            rendered.append(render_context_packet(packet))
-    return tuple(rendered[:limit])
-
 
 def multi_agent_carry_over_lines(metadata: dict[str, Any]) -> list[str]:
     state = load_multi_agent_state(metadata)

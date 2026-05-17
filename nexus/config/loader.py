@@ -206,7 +206,6 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     valid_agent_modes = {"basic", "advanced"}
     valid_log_formats = {"text", "json"}
     valid_providers = {"anthropic", "fake", "gemini", "mistral", "openai", "openai-compatible", "ollama"}
-    valid_complexity_thresholds = {"simple", "medium", "large"}
     valid_approval_policies = {
         "on-request", "approve-turn", "approve-session", "auto", "plan"
     }
@@ -245,13 +244,6 @@ def _validate_config_values(values: dict[str, Any]) -> None:
             f"Invalid log_format '{log_format}'. Expected one of: {', '.join(sorted(valid_log_formats))}."
         )
 
-    complexity_threshold = values["multi_agent_complexity_threshold"]
-    if complexity_threshold not in valid_complexity_thresholds:
-        raise ConfigError(
-            f"Invalid multi_agent_complexity_threshold '{complexity_threshold}'. "
-            f"Expected one of: {', '.join(sorted(valid_complexity_thresholds))}."
-        )
-
     integer_fields = (
         "max_output_tokens",
         "compaction_soft_limit",
@@ -260,19 +252,13 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         "max_loop_iterations",
         "max_tool_calls_per_turn",
         "max_sessions_retained",
-        "delegation_message_history_limit",
         "sandbox_timeout_seconds",
         "context_prune_protect_tokens",
         "context_prune_minimum_tokens",
-        "multi_agent_max_parallel_tasks",
-        "multi_agent_max_repair_iterations",
     )
     for field_name in integer_fields:
         if values[field_name] < 1:
             raise ConfigError(f"{field_name} must be greater than 0.")
-
-    if values["delegation_poll_interval_seconds"] <= 0:
-        raise ConfigError("delegation_poll_interval_seconds must be greater than 0.")
 
     if values["compaction_hard_limit"] < values["compaction_soft_limit"]:
         raise ConfigError("compaction_hard_limit must be greater than or equal to compaction_soft_limit.")
@@ -293,14 +279,6 @@ def _validate_config_values(values: dict[str, Any]) -> None:
             raise ConfigError("Each mcp_servers entry must define a non-empty name.")
         if not isinstance(command, list) or not command:
             raise ConfigError(f"mcp_servers entry '{name}' must define a non-empty command list.")
-
-    delegation_workers = values["delegation_workers"]
-    if not isinstance(delegation_workers, list) or not delegation_workers:
-        raise ConfigError("delegation_workers must define at least one worker id.")
-    if any(not str(worker_id).strip() for worker_id in delegation_workers):
-        raise ConfigError("delegation_workers entries must be non-empty strings.")
-    if len({str(worker_id).strip() for worker_id in delegation_workers}) != len(delegation_workers):
-        raise ConfigError("delegation_workers must not contain duplicate worker ids.")
 
     delegation_subagents = values["delegation_subagents"]
     if not isinstance(delegation_subagents, list):
@@ -385,10 +363,7 @@ def _apply_agent_mode_profile(values: dict[str, Any]) -> dict[str, Any]:
     resolved = dict(values)
     agent_mode = str(resolved.get("agent_mode", "basic")).strip().lower()
     resolved["agent_mode"] = agent_mode
-    if agent_mode == "basic":
-        resolved["delegation_enabled"] = False
-    elif agent_mode == "advanced":
-        resolved["delegation_enabled"] = True
+    if agent_mode == "advanced":
         allowed_tools = resolved.get("allowed_tools")
         if isinstance(allowed_tools, list) and allowed_tools:
             for tool_name in _advanced_mode_required_tool_names():

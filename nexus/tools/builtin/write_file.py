@@ -119,37 +119,3 @@ class WriteFileTool(Tool):
             output=f"{action} {path.relative_to(workspace)} — {lines} lines",
             metadata={"path": str(path.relative_to(workspace)), "is_new_file": is_new, "lines": lines},
         )
-
-
-class WriteNoteTool(WriteFileTool):
-    """Backward-compatible workspace file writer used by tests and docs.
-
-    ``write_note`` predates ``write_file``.  Keep it as a thin first-party tool
-    because existing prompts, skills, manual tests, and plugin examples still
-    reference the old name.
-    """
-
-    name = "write_note"
-    description = (
-        "Write a text note/file inside the workspace. Creates parent directories, "
-        "refuses paths outside the workspace or under .nexus/, and enforces a maximum content size."
-    )
-
-    def __init__(self, *, max_bytes: int = 65_536) -> None:
-        self.max_bytes = max_bytes
-
-    async def execute(
-        self,
-        call_id: str,
-        arguments: dict[str, Any],
-        context: ToolExecutionContext,
-    ) -> ToolResult:
-        content = str(arguments.get("content", ""))
-        if len(content.encode("utf-8")) > self.max_bytes:
-            return ToolResult(
-                call_id=call_id,
-                tool_name=self.name,
-                output=f"Content is larger than {self.max_bytes} bytes.",
-                is_error=True,
-            )
-        return await super().execute(call_id, arguments, context)

@@ -7,8 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from nexus.runtime.sandbox import docker_available, docker_image_available
-from nexus.ui import TerminalUI
+from nexus.sandbox import docker_available, docker_image_available
 
 
 logger = logging.getLogger(__name__)
@@ -143,10 +142,6 @@ def build_doctor_report(config, registry, resources) -> DoctorReport:
             for runtime in resources.mcp_servers
         ],
     )
-
-
-def render_doctor_report(ui: TerminalUI, report: DoctorReport, *, output_format: str) -> None:
-    ui.print_doctor_report(report, output_format=output_format)
 
 
 def exit_code_for_report(report: DoctorReport) -> int:

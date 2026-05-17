@@ -432,7 +432,7 @@ async def handle_skills(state: ReplState, args: list[str]) -> None:
     subcommand = args[0].lower() if args else "list"
     if subcommand == "help":
         _print_subcommand_help(
-            state, "skills", "Inspect and activate session skills. Skills named subagent-* register specialist worker tools when delegation is enabled.",
+            state, "skills", "Inspect and activate session skills. Skills named subagent-* register specialist cognitive tools in advanced mode.",
             (
                 ("(no args) / list",  "List all loaded skills with name, type, description, and active status.", "/skills"),
                 ("show <name>",      "Print the full content of a skill file.",                          "/skills show nexus-agent"),
@@ -488,7 +488,6 @@ async def handle_skills(state: ReplState, args: list[str]) -> None:
             state.tool_registry.register(record.tool, source=record.source, origin=record.origin)
         register_skill_subagent_tools(
             state.tool_registry,
-            state.delegation,
             state.config,
             state.skill_registry,
         )
@@ -771,8 +770,7 @@ def _print_multi_agent_status(state: ReplState, payload: dict) -> None:
     table.add_column("Field")
     table.add_column("Value")
     table.add_row("Mode", str(getattr(state.config, "agent_mode", "basic")))
-    table.add_row("Threshold", str(getattr(state.config, "multi_agent_complexity_threshold", "medium")))
-    table.add_row("Delegation", "enabled" if state.delegation is not None else "disabled")
+    table.add_row("Cognitive tools", "enabled" if str(getattr(state.config, "agent_mode", "basic")) == "advanced" else "disabled")
     table.add_row("Last complexity", str(payload.get("complexity", "-")))
     table.add_row("Objective", typed.objective or "-")
     table.add_row("Tasks", str(len(typed.tasks)))

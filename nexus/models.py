@@ -145,15 +145,6 @@ class CorrelationContext:
 
 
 @dataclass(slots=True, frozen=True)
-class TurnTelemetry:
-    correlation: CorrelationContext
-    usage: UsageSnapshot | None
-    tool_calls: int
-    duration_ms: float
-    status: str
-
-
-@dataclass(slots=True, frozen=True)
 class RuntimeRequest:
     model_name: str
     system_prompt: str

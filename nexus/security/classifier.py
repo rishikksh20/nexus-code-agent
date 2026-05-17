@@ -1,7 +1,7 @@
 """Command and tool risk classification.
 
-``RiskLevel`` mirrors the three tiers used by the bash classifier in
-``nexus/tools/builtin/shell.py`` but adds a fourth ``DANGEROUS`` tier for
+``RiskLevel`` mirrors the tiers used by the bash classifier in
+``nexus.tools.builtin.shell`` but adds a fourth ``DANGEROUS`` tier for
 commands that are outright catastrophic (irreversible data loss, privilege
 escalation, remote code execution, etc.).
 
@@ -58,7 +58,7 @@ _SAFE_PATTERNS: tuple[re.Pattern[str], ...] = (
 class CommandClassifier:
     """Classify a shell command by risk level.
 
-    Uses the three-tier bash classifier from ``nexus/tools/filesystem.py``
+    Uses the bash classifier from ``nexus.tools.builtin.shell``
     as the foundation and promotes ambiguous HIGH classifications to
     DANGEROUS when they match known-catastrophic patterns.
     """

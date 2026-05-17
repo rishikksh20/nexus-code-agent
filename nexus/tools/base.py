@@ -17,12 +17,12 @@ class ToolKind(str, Enum):
     """
 
     READ = "read"        # Non-mutating reads (files, time, memory lookups)
-    WRITE = "write"      # Persistent writes (files, notes)
+    WRITE = "write"      # Persistent writes
     SHELL = "shell"      # Arbitrary shell / process execution
     NETWORK = "network"  # Outbound network calls
     MEMORY = "memory"    # Agent memory store operations
     MCP = "mcp"          # Remote MCP server tools
-    AGENT = "agent"      # Sub-agent / delegation
+    AGENT = "agent"      # Cognitive sub-agent tools
     SANDBOX = "sandbox"  # Isolated container execution
 
 

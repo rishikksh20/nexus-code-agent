@@ -61,14 +61,12 @@ def load_subagent_definitions_from_skills(skill_registry: "SkillRegistry") -> li
 
 def register_skill_subagent_tools(
     registry: "ToolRegistry",
-    delegation,
     config,
     skill_registry: "SkillRegistry",
     *,
     model_client_factory=None,
 ) -> int:
     """Register cognitive sub-agent tools discovered from loaded skills."""
-    del delegation
     if str(getattr(config, "agent_mode", "basic")).strip().lower() != "advanced":
         return 0
 
@@ -178,23 +176,11 @@ def _skill_subagent_name(skill_name: str) -> str | None:
             return suffix or None
     return None
 
-
-def register_agent_tool(
-    registry: "ToolRegistry",
-    delegation,
-    config,
-) -> bool:
-    """Compatibility wrapper for the legacy single-tool registration path."""
-    del delegation
-    return register_subagent_tools(registry, config) > 0
-
-
 __all__ = [
     "SubAgentTool",
     "SubagentDefinition",
     "load_subagent_definitions",
     "load_subagent_definitions_from_skills",
-    "register_agent_tool",
     "register_skill_subagent_tools",
     "register_subagent_tools",
     "get_builtin_subagent_definitions",

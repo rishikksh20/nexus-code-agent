@@ -106,9 +106,7 @@ class SubAgentTool:
         model_client_factory=None,
         base_tool_registry=None,
         config=None,
-        delegation=None,
     ) -> None:
-        del delegation
         self._definition = definition
         self._model_client_factory = model_client_factory
         self._base_tool_registry = base_tool_registry

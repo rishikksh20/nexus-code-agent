@@ -65,20 +65,3 @@ def register_sandbox_tool(registry: ToolRegistry, config) -> bool:
     )
     registry.register(SandboxedCommandTool(sandbox), source="sandbox", origin=image)
     return True
-
-
-def register_agent_tool(
-    registry: ToolRegistry,
-    delegation,
-    config,
-) -> bool:
-    """Compatibility wrapper for cognitive sub-agent registration.
-
-    The ``delegation`` argument is ignored for old callers; cognitive
-    sub-agents are normal tools and do not require a worker runtime.
-    """
-    del delegation
-
-    from nexus.tools.subagents import register_subagent_tools
-
-    return register_subagent_tools(registry, config) > 0

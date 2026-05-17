@@ -44,7 +44,6 @@ class ReplState:
     active_skills: list[str] = field(default_factory=list)
     disabled_tools: set[str] = field(default_factory=set)
     mcp_servers: list[MCPServerRuntime] = field(default_factory=list)
-    delegation: object | None = None
     carry_over: CarryOverState = field(default_factory=CarryOverState)
     current_turn_id: str = ""
     current_trace_id: str = ""

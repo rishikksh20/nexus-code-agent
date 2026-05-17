@@ -13,13 +13,11 @@ Public integration surface (what :mod:`nexus.app` imports):
 
 * :func:`~nexus.sandbox.factory.register_sandbox_tool` — checks Docker
   availability then registers :class:`~nexus.sandbox.tool.SandboxedCommandTool`.
-* :func:`~nexus.sandbox.factory.register_agent_tool` — compatibility wrapper
-  for registering cognitive sub-agent tools.
 """
 
 from nexus.sandbox.agent_tool import SubAgentTool
 from nexus.sandbox.docker import DockerSandbox, SandboxConfig, docker_available, docker_image_available
-from nexus.sandbox.factory import register_agent_tool, register_sandbox_tool
+from nexus.sandbox.factory import register_sandbox_tool
 from nexus.sandbox.tool import SandboxedCommandTool
 
 __all__ = [
@@ -29,6 +27,5 @@ __all__ = [
     "SubAgentTool",
     "docker_available",
     "docker_image_available",
-    "register_agent_tool",
     "register_sandbox_tool",
 ]

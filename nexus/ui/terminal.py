@@ -339,7 +339,6 @@ class TerminalUI:
         preferred = {
             "read_file": ["path", "offset", "limit"],
             "write_file": ["path", "content"],
-            "modify_file": ["path", "start_line", "end_line", "new_content"],
             "insert_edit_into_file": ["path", "code"],
             "apply_patch": ["patch", "strip"],
             "bash": ["command", "timeout", "cwd"],
@@ -475,7 +474,7 @@ class TerminalUI:
     def _tool_border_style(self, tool_name: str) -> str:
         if tool_name in {"read_file", "glob", "grep", "ls", "get_time"}:
             return "tool.read"
-        if tool_name in {"write_file", "modify_file", "insert_edit_into_file", "apply_patch"}:
+        if tool_name in {"write_file", "insert_edit_into_file", "apply_patch"}:
             return "tool.write"
         if tool_name == "bash":
             return "tool.shell"

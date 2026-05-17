@@ -9,8 +9,7 @@ They are composed in :func:`build_base_instruction` to produce the
 ``base_instruction`` field of :class:`~nexus.context.ContextSections`.
 
 Additionally, :func:`create_loop_breaker_prompt` provides a corrective
-injection prompt for loop detection, and :func:`get_compression_prompt` is
-re-exported here for convenience (canonical source: :mod:`nexus.prompts.compression`).
+injection prompt for loop detection.
 """
 from __future__ import annotations
 

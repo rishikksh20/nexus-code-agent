@@ -119,7 +119,7 @@ def classify_danger(tool_name: str, arguments: dict[str, Any]) -> DangerLevel:
     del arguments
     if tool_name in {"get_time", "read_file", "glob", "search_memory", "skill"}:
         return DangerLevel.SAFE
-    if tool_name in {"write_file", "write_note"}:
+    if tool_name == "write_file":
         return DangerLevel.HIGH
     if tool_name in {"bash", "run_command", "delete_file"}:
         return DangerLevel.CRITICAL
@@ -127,7 +127,7 @@ def classify_danger(tool_name: str, arguments: dict[str, Any]) -> DangerLevel:
 
 
 def rollback_plan(tool_name: str, arguments: dict[str, Any]) -> RollbackPlan:
-    if tool_name in {"write_file", "write_note", "modify_file", "replace_text"}:
+    if tool_name == "write_file":
         path = str(arguments.get("path", "")).strip()
         target = f" for {path}" if path else ""
         return RollbackPlan(

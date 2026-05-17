@@ -101,7 +101,7 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             '#   basic = single LLM execution, no cognitive sub-agent tools',
             '#   advanced = supervisor LLM with cognitive sub-agent tools',
             'agent_mode = "basic"',
-            'delegation_subagents = [] # Legacy key name for custom cognitive sub-agent definitions.',
+            'delegation_subagents = [] # Custom cognitive sub-agent definitions.',
             '# Optional specialists for advanced mode:',
             '# delegation_subagents = [',
             '#   { name = "planning_analysis", description = "Analyze repo structure and produce an implementation plan.", goal_prompt = "Read-only planning and analysis agent. Do not modify files.", allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp"] },',

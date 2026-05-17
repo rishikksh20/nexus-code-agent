@@ -67,7 +67,6 @@ class RuntimeResources:
     """Holds async resources that must be shut down cleanly."""
 
     mcp_servers: list[MCPServerRuntime] = field(default_factory=list)
-    delegation: object | None = None
 
 
 # ---------------------------------------------------------------------------

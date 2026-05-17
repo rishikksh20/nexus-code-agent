@@ -7,7 +7,6 @@ Public surface
 - :func:`_current_utc_time` — exposed at package level so tests can monkeypatch it.
 - :mod:`nexus.prompts.system` — static base-instruction sections (including
   :func:`~nexus.prompts.system.create_loop_breaker_prompt`).
-- :mod:`nexus.prompts.compression` — LLM-based compaction prompt.
 """
 from __future__ import annotations
 
