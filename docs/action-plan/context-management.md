@@ -4,6 +4,9 @@ This document explains how Mistral Vibe manages context across the main agent,
 subagents, tools, scratchpad files, session logs, compaction, and persistent
 configuration.
 
+For detailed file freshness and stale-context behavior, see
+[Conflict And File Freshness Management](conflict-file-management.md).
+
 ## Context Layers
 
 Vibe has multiple kinds of context. They are related, but they are not the same
@@ -97,6 +100,40 @@ Examples:
 - `exit_plan_mode` uses `agent_manager`, `user_input_callback`,
   `plan_file_path`, and `switch_agent_callback`.
 - MCP tools use `sampling_callback` when a server requests sampling.
+
+## Tool Results In Active Context
+
+After a tool call completes, the main agent context does not receive every raw
+execution detail. The active conversation receives a `role="tool"` message
+containing the final tool result converted to text.
+
+The flow is:
+
+```text
+tool emits optional stream/progress events
+  -> tool yields one final Pydantic result model
+  -> AgentLoop converts result_model.model_dump() to key/value text
+  -> optional tool.get_result_extra() text is appended
+  -> APIToolFormatHandler creates a role="tool" message
+  -> that tool message is appended to MessageList
+```
+
+So the LLM sees the tool name, tool call id, and final result text. It does not
+automatically see every progress event, UI rendering detail, subprocess lifecycle
+detail, or internal tool state.
+
+The final result text can still be large because some tools intentionally return
+useful data:
+
+- `read_file` returns file content, capped by `max_read_bytes`.
+- `bash` returns stdout and stderr, capped by `max_output_bytes`.
+- `write_file` returns the written content.
+- `search_replace` returns the edit block content and warnings.
+- failed tools return an error message wrapped as a tool response.
+
+`ToolStreamEvent`s are mainly for the UI or ACP client. They are not appended as
+individual conversation messages unless a tool also includes that information in
+its final result.
 
 ## System Prompt Context
 
@@ -293,8 +330,21 @@ summary-as-user-message
 7. Count tokens for the compacted context.
 8. Save the compacted session.
 
-Compaction intentionally loses low-level detail in exchange for keeping the
-session usable within the model context window.
+Compaction is summarization, not lossless pruning. Before compaction, Vibe saves
+the detailed session to local session logs. Then the active LLM context is
+replaced with the system message plus the generated summary. The summary may
+preserve important tool outcomes, decisions, file paths, errors, and next steps,
+but it does not guarantee verbatim preservation of all tool output.
+
+That means detailed tool observations have two different lifetimes:
+
+- **Durable record**: the old full conversation remains in session logs.
+- **Working context**: the active model context keeps only the compacted summary.
+
+Tool outputs may therefore be compressed, omitted, or generalized in the active
+context after compaction. If exact details matter later, the agent must recover
+them by reading files again, rerunning a command, inspecting session logs, or
+using another available source.
 
 ## Rewind Context
 
