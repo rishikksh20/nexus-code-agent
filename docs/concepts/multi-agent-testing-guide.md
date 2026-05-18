@@ -1,8 +1,8 @@
-# Multi-Agent Testing Guide
+# Cognitive Sub-Agent Testing Guide
 
-Last updated: 2026-05-15
+Last updated: 2026-05-18
 
-This guide splits multi-agent validation into safe layers. Start with the automated tests, then run the fake-provider smoke test, then try a real provider only after the first two pass.
+This guide validates the current advanced-mode model: one supervisor turn loop with optional cognitive `subagent_*` tools. Nexus no longer has a separate worker runtime, mailbox command surface, or automatic planning scheduler.
 
 ## 1. Automated Regression Tests
 
@@ -12,43 +12,42 @@ Run the full suite:
 uv run pytest
 ```
 
-Focused multi-agent tests:
+Focused advanced-mode tests:
 
 ```bash
-uv run pytest tests/test_orchestration.py tests/test_structured_tools.py
-uv run pytest tests/test_slash_commands.py -k multi_agent
+uv run pytest tests/test_orchestration.py tests/test_tools.py -k subagent
+uv run pytest tests/test_slash_commands.py -k "skills or context"
 ```
 
-Expected result: all tests pass. These tests cover DAG validation, post-execution checks, repair decisions, structured tools, and `/multi-agent` visibility.
+Expected result: all tests pass. These tests cover the shared turn runner, sub-agent tool registration, skill-backed sub-agents, structured tool behavior, and `/context` visibility.
 
 ## 2. Fake Provider Smoke Test
 
 Use fake provider mode to verify wiring without spending tokens:
 
 ```bash
-uv run nexus --provider fake --no-session "Implement this plan: update docs and review the diff"
+uv run nexus --provider fake --no-session "Inspect the repo and summarize the approval flow"
 ```
 
-To force the supervisor/planner path, set local config:
+To expose built-in cognitive tools, set local config:
 
 ```toml
-multi_agent_mode = "always"
-multi_agent_show_plan = true
-delegation_enabled = true
+agent_mode = "advanced"
+approval_policy = "on-request"
 ```
 
 Then run:
 
 ```bash
-uv run nexus --provider fake --no-session "Implement this plan: inspect the repo, update docs, verify, and review"
+uv run nexus --provider fake --no-session "Use a read-only sub-agent to inspect the repo, then summarize the result"
 ```
 
 Expected behavior:
 
-- Nexus prints a multi-agent plan.
 - Execution still uses the normal approval-safe turn runner.
-- Session metadata records `multi_agent.shared_state`.
-- No mutating repair loop runs invisibly.
+- Built-in `subagent_planning_analysis`, `subagent_execution`, `subagent_review`, and `subagent_verification` tools are registered when allowed by filters.
+- Sub-agent results return as structured tool output to the supervisor.
+- Mutating tools still ask for approval through the normal approval flow.
 
 ## 3. Interactive Visibility
 
@@ -61,49 +60,20 @@ uv run nexus --provider fake
 Useful commands:
 
 ```text
-/multi-agent status
-/multi-agent plan
-/multi-agent state
+/tools
+/skills
+/skills reload
 /context agents
 /context agent supervisor
 /context usage supervisor
-/delegate status
-/delegate workers
-/tools
 ```
 
 Expected behavior:
 
-- `/multi-agent status` shows mode, threshold, delegation state, latest complexity, and repair decision.
-- `/multi-agent plan` shows the latest task DAG if one was recorded.
-- `/multi-agent state` prints the raw shared-state JSON.
-- `/context agents` lists isolated and shared context snapshots for supervisor/planner/execution/test-review/workers.
-- `/context agent <id>` shows one agent's context snapshot, including scope and handoff inputs.
-- `/context usage <id>` shows estimated token usage for one agent.
-- `/delegate` remains the low-level worker/mailbox inspection surface.
-
-## 3.1 Context Isolation And Handoff Check
-
-Use an explicit delegated worker with shared handoff context:
-
-```text
-/delegate spawn "Verification slice" "Inspect the changed files and summarize risk." --tool git_status --context "Execution changed nexus/runtime/orchestration.py"
-```
-
-Then inspect:
-
-```text
-/delegate tasks
-/context agents
-/context agent worker-worker-1-<task_id>
-```
-
-Expected behavior:
-
-- The worker context snapshot has `scope = "isolated"`.
-- `shared_inputs` contains only the handoff text, not the full supervisor or execution history.
-- `allowed_tools` contains only the worker allowlist.
-- Tool calls execute with the worker's restricted registry.
+- `/tools` shows the active tool surface.
+- Advanced mode shows `subagent_*` tools when allowed by `allowed_tools` and `denied_tools`.
+- `/skills reload` registers local or global skills named `subagent-*` as additional cognitive tools.
+- `/context agents`, `/context agent <id>`, and `/context usage <id>` show compact context snapshots when sub-agent state exists.
 
 ## 4. Structured Tool Checks
 
@@ -133,49 +103,41 @@ After fake-provider smoke tests pass, configure a live provider and keep approva
 
 ```toml
 provider = "openai-compatible"
-multi_agent_mode = "auto"
-multi_agent_show_plan = true
-delegation_enabled = true
+agent_mode = "advanced"
 approval_policy = "on-request"
 ```
 
 Use a read-heavy prompt first:
 
 ```text
-Analyze the runtime approval flow, produce a plan, and review whether multi-agent mode changes the approval invariant. Do not edit files.
+Analyze the runtime approval flow and review whether advanced mode changes the approval invariant. Do not edit files.
 ```
 
 Then try a small edit:
 
 ```text
-Update one docs paragraph about multi-agent testing, then run verification and review the diff.
+Update one docs paragraph about advanced-mode sub-agent testing, then run verification and review the diff.
 ```
 
 Expected behavior:
 
 - Mutating tools still ask for approval.
-- Post-execution checks run after the normal turn.
-- Review findings and repair decisions are stored in `/multi-agent state`.
-- Latest repair/review carry-over appears in later turns through the normal context builder.
+- Sub-agent tool calls do not bypass `run_agent_turn()`.
+- Context summaries from sub-agent work remain compact and inspectable.
 
 ## 6. Failure Cases To Check
 
-Planner JSON failure:
+Advanced mode disabled:
 
-- Use a fake/scripted planner test or `tests/test_orchestration.py::test_parse_task_dag_rejects_invalid_json`.
-- Expected: validation fails before execution.
+- Set `agent_mode = "basic"`.
+- Expected: the supervisor still works, and specialist sub-agent tools are not registered.
 
 Verification failure:
 
 - Introduce a temporary syntax error in a throwaway branch.
-- Run multi-agent mode.
-- Expected: `run_typecheck` reports failure and `/multi-agent status` shows repair needed.
-
-Delegation disabled:
-
-- Set `delegation_enabled = false`.
-- Expected: supervisor still works, specialist subagent tools are simply unavailable, and `/delegate status` explains how to enable delegation.
+- Ask the agent to run `run_typecheck`.
+- Expected: `run_typecheck` reports the failure, and the supervisor explains the blocker rather than running hidden mutation loops.
 
 ## Current Boundary
 
-The current implementation records repair decisions but does not automatically run hidden mutating repair turns. That is intentional. Repairs should remain user-visible and approval-safe until the retry loop has more production history.
+Advanced mode is a tool-registration profile, not a separate orchestration runtime. Repairs should remain user-visible and approval-safe.

@@ -593,8 +593,8 @@ async def handle_context(state: ReplState, args: list[str]) -> None:
                 ("(no args) / show", "Print the current assembled system prompt.",                              "/context"),
                 ("usage",            "Show token usage table: model, context window, history tokens,",          "/context usage"),
                 ("",                 "compaction thresholds, and % of context consumed.",                       ""),
-                ("usage <agent>",     "Show context usage for a supervisor or worker agent.",                    "/context usage supervisor"),
-                ("agents",           "List known supervisor, planner, execution, and worker contexts.",          "/context agents"),
+                ("usage <agent>",     "Show context usage for a supervisor or sub-agent.",                       "/context usage supervisor"),
+                ("agents",           "List known supervisor and sub-agent context snapshots.",                   "/context agents"),
                 ("agent <id>",        "Show one recorded agent context snapshot.",                              "/context agent supervisor"),
                 ("task <id>",         "Show one typed multi-agent task context.",                               "/context task execute"),
                 ("summary",           "Show typed multi-agent session summary.",                                "/context summary"),
@@ -743,183 +743,6 @@ def _print_agent_context_usage(state: ReplState, agent_id: str) -> None:
     state.console.print(table)
 
 
-def _multi_agent_payload(state: ReplState) -> dict:
-    payload = state.session.metadata.get("multi_agent")
-    return payload if isinstance(payload, dict) else {}
-
-
-def _print_multi_agent_status(state: ReplState, payload: dict) -> None:
-    typed = load_multi_agent_state(state.session.metadata)
-    shared_state = payload.get("shared_state") if isinstance(payload.get("shared_state"), dict) else {}
-    repair = shared_state.get("repair_decision") if isinstance(shared_state.get("repair_decision"), dict) else {}
-    repair_packets = [packet for packet in typed.packets if packet.packet_type == "repair_request"]
-    if repair_packets:
-        latest_repair = repair_packets[-1]
-        repair = {
-            "retry": True,
-            "reason": latest_repair.failure_summary or latest_repair.summary,
-        }
-    table = Table(title="Multi-Agent Supervisor")
-    table.add_column("Field")
-    table.add_column("Value")
-    table.add_row("Mode", str(getattr(state.config, "agent_mode", "basic")))
-    table.add_row("Cognitive tools", "enabled" if str(getattr(state.config, "agent_mode", "basic")) == "advanced" else "disabled")
-    table.add_row("Last complexity", str(payload.get("complexity", "-")))
-    table.add_row("Objective", typed.objective or "-")
-    table.add_row("Tasks", str(len(typed.tasks)))
-    table.add_row("Packets", str(len(typed.packets)))
-    table.add_row("Repair needed", str(repair.get("retry", "-")))
-    table.add_row("Repair reason", str(repair.get("reason", "-")))
-    state.console.print(table)
-
-
-def _print_multi_agent_plan(state: ReplState, payload: dict) -> None:
-    typed = load_multi_agent_state(state.session.metadata)
-    shared_state = payload.get("shared_state") if isinstance(payload.get("shared_state"), dict) else {}
-    dag = typed.dag or (shared_state.get("dag") if isinstance(shared_state.get("dag"), dict) else {})
-    if not dag:
-        state.console.print("No legacy coordination plan has been recorded in this session.")
-        return
-    table = Table(title="Latest Legacy Coordination Plan")
-    table.add_column("Task")
-    table.add_column("Role")
-    table.add_column("Depends On")
-    table.add_column("Objective")
-    nodes = dag.get("nodes", [])
-    if not isinstance(nodes, list):
-        nodes = []
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-        deps = node.get("dependencies", [])
-        table.add_row(
-            str(node.get("id", "-")),
-            str(node.get("role", "-")),
-            ", ".join(str(dep) for dep in deps) if isinstance(deps, list) and deps else "-",
-            str(node.get("objective", "-")),
-        )
-    state.console.print(table)
-
-
-def _print_multi_agent_tasks(state: ReplState) -> None:
-    typed = load_multi_agent_state(state.session.metadata)
-    if not typed.tasks:
-        state.console.print("No typed multi-agent tasks recorded yet.")
-        return
-    table = Table(title="Multi-Agent Tasks")
-    table.add_column("Task")
-    table.add_column("Role")
-    table.add_column("Status")
-    table.add_column("Depends On")
-    table.add_column("Packets")
-    table.add_column("Artifacts")
-    table.add_column("Repair")
-    for task in sorted(typed.tasks.values(), key=lambda item: item.task_id):
-        table.add_row(
-            task.task_id,
-            task.role,
-            task.status,
-            ", ".join(task.dependencies) or "-",
-            ", ".join((*task.input_packet_ids, *task.output_packet_ids)) or "-",
-            ", ".join(task.artifact_ids) or "-",
-            str(task.repair_iteration),
-        )
-    state.console.print(table)
-
-
-def _print_multi_agent_packets(state: ReplState) -> None:
-    typed = load_multi_agent_state(state.session.metadata)
-    if not typed.packets:
-        state.console.print("No structured handoff packets recorded yet.")
-        return
-    table = Table(title="Multi-Agent Packets")
-    table.add_column("Packet")
-    table.add_column("Type")
-    table.add_column("Source")
-    table.add_column("Target")
-    table.add_column("Task")
-    table.add_column("Artifacts")
-    table.add_column("Summary")
-    for packet in typed.packets:
-        table.add_row(
-            packet.packet_id,
-            packet.packet_type,
-            packet.source_agent,
-            packet.target_agent,
-            packet.task_id or "-",
-            ", ".join(packet.artifact_ids) or "-",
-            packet.summary,
-        )
-    state.console.print(table)
-
-
-def _print_multi_agent_packet(state: ReplState, packet_id: str) -> None:
-    typed = load_multi_agent_state(state.session.metadata)
-    packet = next((item for item in typed.packets if item.packet_id == packet_id), None)
-    if packet is None:
-        state.console.print(f"Packet not found: {packet_id}")
-        return
-    state.console.print(json.dumps(_public_packet_dict(packet.to_dict()), indent=2))
-
-
-def _print_multi_agent_artifacts(state: ReplState) -> None:
-    typed = load_multi_agent_state(state.session.metadata)
-    if not typed.artifacts:
-        state.console.print("No multi-agent artifacts recorded yet.")
-        return
-    table = Table(title="Multi-Agent Artifacts")
-    table.add_column("Artifact")
-    table.add_column("Type")
-    table.add_column("Task")
-    table.add_column("Producer")
-    table.add_column("Tokens")
-    table.add_column("Summary")
-    for artifact in typed.artifacts.values():
-        table.add_row(
-            artifact.artifact_id,
-            artifact.artifact_type,
-            artifact.task_id or "-",
-            artifact.producer_agent,
-            str(artifact.token_estimate),
-            artifact.summary,
-        )
-    state.console.print(table)
-
-
-def _print_multi_agent_artifact(state: ReplState, artifact_id: str) -> None:
-    typed = load_multi_agent_state(state.session.metadata)
-    artifact = typed.artifacts.get(artifact_id)
-    if artifact is None:
-        state.console.print(f"Artifact not found: {artifact_id}")
-        return
-    state.console.print(json.dumps(_public_artifact_dict(artifact.to_dict()), indent=2))
-
-
-def _print_multi_agent_repair(state: ReplState, payload: dict) -> None:
-    typed = load_multi_agent_state(state.session.metadata)
-    repair_packets = [packet for packet in typed.packets if packet.packet_type == "repair_request"]
-    repair_tasks = [task for task in typed.tasks.values() if task.repair_iteration > 0]
-    if not repair_packets and not repair_tasks:
-        _print_multi_agent_status(state, payload)
-        return
-    table = Table(title="Multi-Agent Repair")
-    table.add_column("Task")
-    table.add_column("Iteration")
-    table.add_column("Status")
-    table.add_column("Latest Packet")
-    table.add_column("Reason")
-    latest_packet = repair_packets[-1] if repair_packets else None
-    for task in repair_tasks or []:
-        table.add_row(
-            task.task_id,
-            str(task.repair_iteration),
-            task.status,
-            latest_packet.packet_id if latest_packet else "-",
-            (latest_packet.failure_summary or latest_packet.summary) if latest_packet else "-",
-        )
-    state.console.print(table)
-
-
 def _print_context_task(state: ReplState, task_id: str) -> None:
     typed = load_multi_agent_state(state.session.metadata)
     task = typed.tasks.get(task_id)
@@ -927,26 +750,6 @@ def _print_context_task(state: ReplState, task_id: str) -> None:
         state.console.print(f"Task context not found: {task_id}")
         return
     state.console.print(json.dumps(task.to_dict(), indent=2))
-
-
-def _public_packet_dict(packet: dict) -> dict:
-    public = dict(packet)
-    if public.get("artifacts"):
-        public["artifact_summaries"] = [str(item)[:300] for item in public.get("artifacts", [])]
-    public.pop("artifacts", None)
-    return public
-
-
-def _public_artifact_dict(artifact: dict) -> dict:
-    public = dict(artifact)
-    content = str(public.pop("content", "") or "")
-    public["has_content"] = bool(content)
-    public["content_chars"] = len(content)
-    if content:
-        public["content_preview"] = content[:2000]
-        if len(content) > 2000:
-            public["content_truncated"] = True
-    return public
 
 
 def _print_context_summary(state: ReplState) -> None:
@@ -963,32 +766,6 @@ def _print_context_summary(state: ReplState) -> None:
     if typed.latest_summary is not None:
         summary["rolling_summary"] = typed.latest_summary.to_dict()
     state.console.print(json.dumps(summary, indent=2))
-
-
-def _public_multi_agent_state(state: ReplState) -> dict:
-    typed = load_multi_agent_state(state.session.metadata)
-    payload = state.session.metadata.get("multi_agent")
-    public = dict(payload) if isinstance(payload, dict) else {}
-    typed_payload = typed.to_dict()
-    typed_payload["packets"] = [_public_packet_dict(packet) for packet in typed_payload.get("packets", [])]
-    typed_payload["artifacts"] = {
-        artifact_id: _public_artifact_dict(artifact)
-        for artifact_id, artifact in typed_payload.get("artifacts", {}).items()
-        if isinstance(artifact, dict)
-    }
-    public["state"] = typed_payload
-    if isinstance(public.get("shared_state"), dict):
-        shared = dict(public["shared_state"])
-        shared["context_packets"] = [
-            _public_packet_dict(packet)
-            for packet in shared.get("context_packets", [])
-            if isinstance(packet, dict)
-        ]
-        for key in ("verification_results", "review_findings"):
-            if isinstance(shared.get(key), list):
-                shared[key] = [str(item)[:500] for item in shared[key]]
-        public["shared_state"] = shared
-    return public
 
 
 

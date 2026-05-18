@@ -11,7 +11,6 @@ from nexus.runtime.context_state import (
     load_multi_agent_state,
     make_artifact_record,
     make_context_packet,
-    make_test_failure_packet,
     upsert_agent_state,
     upsert_task_context,
 )
@@ -85,12 +84,15 @@ def test_multi_agent_state_helpers_create_stable_packet_ids_and_records():
         metadata=metadata,
         source_agent="planner",
         target_agent="execution",
-        packet_type="planner_dag",
+        packet_type="planning_summary",
         summary="Plan ready.",
     )
     append_context_packet(metadata, first)
-    second = make_test_failure_packet(
+    second = make_context_packet(
         metadata=metadata,
+        source_agent="test",
+        target_agent="execution",
+        packet_type="test_failure",
         task_id="verify",
         summary="Typecheck failed.",
         failure_summary="Syntax error.",
@@ -130,23 +132,8 @@ def test_multi_agent_state_helpers_create_stable_packet_ids_and_records():
     assert metadata["multi_agent_context"]["agents"]["test"]["summary"] == "Checked output."
 
 
-def test_agent_state_upsert_refreshes_context_projection_and_filters_plain_shared_text():
-    metadata = {
-        "multi_agent_context": {
-            "agents": {
-                "execution": {
-                    "agent_id": "execution",
-                    "role": "execution",
-                    "summary": "old summary",
-                    "shared_inputs": ["plain text context"],
-                }
-            },
-            "packets": [],
-        }
-    }
-
-    legacy = load_multi_agent_state(metadata)
-    assert legacy.agents["execution"].input_packet_ids == ()
+def test_agent_state_upsert_refreshes_context_projection():
+    metadata = {}
 
     upsert_agent_state(
         metadata,
@@ -165,51 +152,3 @@ def test_agent_state_upsert_refreshes_context_projection_and_filters_plain_share
     assert record["summary"] == "new summary"
     assert record["shared_inputs"] == ["packet-0001"]
     assert record["tool_call_count"] == 2
-
-
-def test_multi_agent_state_loads_legacy_metadata_without_migration_error():
-    metadata = {
-        "multi_agent": {
-            "shared_state": {
-                "dag": {
-                    "goal": "Legacy goal",
-                    "nodes": [
-                        {
-                            "id": "execute",
-                            "role": "execution",
-                            "objective": "Do it",
-                            "dependencies": [],
-                        }
-                    ],
-                    "execution_order": ["execute"],
-                },
-                "context_packets": [
-                    {
-                        "packet_id": "legacy-packet",
-                        "source_agent": "planner",
-                        "target_agent": "execution",
-                        "summary": "Legacy packet.",
-                    }
-                ],
-            }
-        },
-        "multi_agent_context": {
-            "agents": {
-                "supervisor": {
-                    "agent_id": "supervisor",
-                    "role": "supervisor",
-                    "summary": "Legacy supervisor.",
-                    "token_estimate": 10,
-                    "message_count": 1,
-                }
-            },
-            "packets": [],
-        },
-    }
-
-    state = load_multi_agent_state(metadata)
-
-    assert state.objective == "Legacy goal"
-    assert state.tasks["execute"].role == "execution"
-    assert state.packets[0].packet_id == "legacy-packet"
-    assert state.agents["supervisor"].working_summary == "Legacy supervisor."

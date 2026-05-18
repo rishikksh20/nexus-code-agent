@@ -229,7 +229,7 @@ The roadmap below focuses on what should come next, section by section.
 ### Changes Required
 
 - add task checkpointing or recovery markers for interrupted delegated work
-- record worker-level telemetry and correlation more explicitly
+- record sub-agent telemetry and correlation more explicitly
 - define how much mailbox history is retained, summarized, or compacted
 - extend resource claim behavior beyond optimistic version checks if stricter coordination is needed
 - add more coverage for worker clarification, cancellation, timeout, and partial-completion flows

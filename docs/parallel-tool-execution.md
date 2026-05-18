@@ -27,7 +27,7 @@ architecture.
 What you are designing is closer to:
 
 * distributed execution planning
-* DAG-based agent orchestration
+* dependency-aware tool planning
 * speculative context gathering
 * concurrent tool execution runtime
 
@@ -372,11 +372,11 @@ This is where advanced agents gain massive efficiency.
 
 ---
 
-# DAG-Based Execution
+# Dependency-Aware Execution
 
 The BEST approach is not simple parallelization.
 
-It is DAG execution.
+It is dependency-aware execution.
 
 Example:
 
@@ -390,17 +390,9 @@ Example:
 
 Some tools depend on earlier outputs.
 
-So planner creates:
+So planner creates a dependency graph instead of a flat list.
 
-```text
-Directed Acyclic Graph
-```
-
-instead of flat list.
-
----
-
-# Example DAG
+# Example Dependency Graph
 
 ```text
 Node A: read package.json
@@ -497,7 +489,7 @@ await asyncio.gather(*[
 ])
 ```
 
-Classic DAG scheduler.
+Classic dependency scheduler.
 
 ---
 
@@ -712,7 +704,7 @@ Too many parallel results.
 
 ## 2. Dependency Tracking
 
-Need DAG scheduling.
+Need dependency-aware scheduling.
 
 ---
 
@@ -770,7 +762,7 @@ The ideal implementation is:
 
 ```text
 Planner
-→ DAG Builder
+→ Dependency Builder
 → Parallel Read Runtime
 → Context Synthesizer
 → Reasoning Agent

@@ -141,10 +141,6 @@ class SubAgentTool:
         if raw_tools is None and self._definition and self._definition.allowed_tools:
             raw_tools = self._definition.allowed_tools
 
-        # Prepend definition goal_prompt if available
-        if self._definition and self._definition.goal_prompt:
-            instructions = f"{self._definition.goal_prompt}\n\n{instructions}"
-
         return await self._execute_direct(
             call_id,
             title=title,
@@ -362,7 +358,7 @@ class SubAgentTool:
                 "shared_outputs": "final_summary_and_context_snapshot_only",
             },
         }
-        is_failed = status in {"failed", "needs_approval"}
+        is_failed = status in {"failed", "needs_approval", "needs_clarification"}
         raw_output = _raw_output_with_failed_tools(final_response or error or "(no output)", failed_tool_outputs)
         output = _subagent_result_envelope(
             tool_name=self.name,
@@ -422,11 +418,6 @@ async def _collect_inner_events(agent_events, outer_context: ToolExecutionContex
     return await asyncio.wait_for(collect(), timeout=remaining)
 
 
-def _render_inner_events(outer_context: ToolExecutionContext, events) -> None:
-    for event in events:
-        _render_inner_event(outer_context, event)
-
-
 def _render_inner_event(outer_context: ToolExecutionContext, event) -> None:
     ui = outer_context.metadata.get("ui")
     if ui is None:
@@ -477,6 +468,8 @@ def _direct_subagent_system_prompt(
         f"Input packet ids: {packet_text}\n"
         f"Shared handoff context:\n{shared_text}\n\n"
         f"Allowed normal tools: {tools_text}\n\n"
+        "If the task requires reading, editing, testing, or shell inspection, use the allowed normal tools before your final answer. "
+        "Do not claim files were changed, tests were run, or code was inspected unless you actually used the relevant tools.\n\n"
         "Return only a JSON object with keys: status, summary, findings, changed_files, "
         "related_files, tests_run, risks, clarifications_needed, recommended_next_action."
     )
@@ -552,7 +545,7 @@ def _subagent_result_envelope(
     input_packet_ids: tuple[str, ...],
     context_snapshot: dict[str, Any],
 ) -> str:
-    normalized_status = _infer_result_status(raw_result, is_error=is_error)
+    normalized_status = status if status == "needs_clarification" else _infer_result_status(raw_result, is_error=is_error)
     context = {
         "scope": "isolated",
         "input_packet_ids": list(input_packet_ids),

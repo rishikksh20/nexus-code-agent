@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from rich.console import Console
@@ -335,27 +336,6 @@ async def test_mcp_reload_loads_configured_servers(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_delegate_slash_command_is_not_registered(tmp_path):
-    config = load_config(tmp_path, global_root=tmp_path / "global")
-    registry = ToolRegistry()
-    registry.register(GetTimeTool(), source="core", origin="builtin")
-    console = Console(record=True, no_color=True, width=200)
-    state = ReplState(
-        config=config,
-        mode=ExecutionMode.DEFAULT,
-        session=new_snapshot("delegate-slash"),
-        session_store=SessionStore(config.session_dir),
-        tool_registry=registry,
-        memory_store=MemoryStore(config.memory_dir),
-        console=console,
-    )
-
-    handled = await build_router().dispatch(state, "/delegate status")
-
-    assert handled is False
-
-
-@pytest.mark.asyncio
 async def test_skills_slash_command_activates_skill(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     skill_root = config.skills_dir / "review"
@@ -566,6 +546,7 @@ async def test_config_upgrade_reloads_config_and_workspace_dotenv(tmp_path, monk
     assert handled is True
     assert state.config.model_name == "env-after-upgrade"
     assert "reloaded" in console.export_text()
+    os.environ.pop("MODEL", None)
 
 
 @pytest.mark.asyncio
@@ -731,7 +712,6 @@ def _make_state(tmp_path, *, extra_history=None):
 async def test_skills_reload_registers_skill_backed_subagent_tools(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     config.agent_mode = "advanced"
-    config.delegation_enabled = True
     skill_dir = config.local_root / "skills" / "subagent-review"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
@@ -805,7 +785,7 @@ async def test_context_agents_and_agent_usage_show_multi_agent_records(tmp_path)
                 "agent_id": "supervisor",
                 "role": "supervisor",
                 "scope": "shared",
-                "summary": "Supervising the DAG.",
+                "summary": "Supervising cognitive sub-agent context.",
                 "token_estimate": 42,
                 "message_count": 3,
                 "tool_call_count": 0,
@@ -822,7 +802,7 @@ async def test_context_agents_and_agent_usage_show_multi_agent_records(tmp_path)
 
     output = console.export_text()
     assert "Agent Contexts" in output
-    assert "Supervising the DAG" in output
+    assert "Supervising cognitive sub-agent context" in output
     assert "Context Usage: supervisor" in output
     assert "42" in output
 
@@ -837,16 +817,15 @@ async def test_multi_agent_typed_state_is_not_exposed_by_slash_command(tmp_path)
             role="test",
             objective="Run focused checks.",
             status="failed",
-            repair_iteration=1,
         ),
     )
     packet = make_context_packet(
         metadata=state.session.metadata,
         source_agent="test",
         target_agent="execution",
-        packet_type="repair_request",
+        packet_type="test_failure",
         task_id="verify",
-        summary="Repair needed.",
+        summary="Verification follow-up needed.",
         failure_summary="Typecheck failed.",
     )
     append_context_packet(state.session.metadata, packet)
@@ -868,7 +847,7 @@ async def test_multi_agent_typed_state_is_not_exposed_by_slash_command(tmp_path)
     assert handled is False
     output = console.export_text()
     assert "Multi-Agent Tasks" not in output
-    assert "Repair needed" in output
+    assert "Verification follow-up needed" in output
 
 
 # ── /help subcommand ──────────────────────────────────────────────────────────

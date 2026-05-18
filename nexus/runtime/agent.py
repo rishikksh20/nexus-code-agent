@@ -156,6 +156,18 @@ class Agent:
                 yield AgentEvent.tool_call_complete(result)
                 yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
                 continue
+            if not _tool_available_in_context(record, context):
+                result = _tool_not_available_result(tool_call, self.tool_registry, context)
+                yield AgentEvent.tool_call_start(
+                    tool_call.call_id,
+                    str(tool_call.tool_name),
+                    tool_call.arguments,
+                    actor=_tool_actor(context),
+                )
+                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                yield AgentEvent.tool_call_complete(result)
+                yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
+                continue
             tool = record.tool
             confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
             confirmation_preview = _confirmation_preview(confirmation)
@@ -202,6 +214,8 @@ class Agent:
             try:
                 record = self.tool_registry.record(call.tool_name)
             except Exception:
+                continue
+            if not _tool_available_in_context(record, context):
                 continue
             affected_paths = _affected_file_paths(record.tool, call.arguments, None, context)
             if record.tool.is_mutating and affected_paths & mutating_paths_this_batch:
@@ -453,6 +467,44 @@ class Agent:
                         for msg in tool_result_messages:
                             history.append(msg)
                         stop_message = _invalid_tool_call_stop_message(tool_name, "unknown tool name")
+                        yield AgentEvent.text_complete(stop_message)
+                        yield AgentEvent(
+                            kind=AgentEventType.MODEL_RESPONSE,
+                            payload=RuntimeResponse(
+                                message=Message(role="assistant", content=stop_message),
+                                finish_reason="invalid_tool_call",
+                            ),
+                        )
+                        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="invalid_tool_call")
+                        return
+                    continue
+                if not _tool_available_in_context(record, context):
+                    tool_name = _tool_name_text(tool_call.tool_name)
+                    retry_count = unknown_tool_retries.get(tool_name, 0) + 1
+                    unknown_tool_retries[tool_name] = retry_count
+                    unavailable_result = _tool_not_available_result(
+                        tool_call,
+                        self.tool_registry,
+                        context,
+                        retry_count=retry_count,
+                        retry_limit=INVALID_TOOL_CALL_RETRY_LIMIT,
+                    )
+                    tool_calls_executed += 1
+                    tool_result_messages.append(_tool_result_message(unavailable_result))
+                    yield AgentEvent.tool_call_start(
+                        tool_call.call_id,
+                        tool_name,
+                        tool_call.arguments,
+                        actor=_tool_actor(context),
+                    )
+                    yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                    yield AgentEvent.tool_call_complete(unavailable_result)
+                    yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=unavailable_result)
+                    loop_detector.record_action("tool_call", tool_name=tool_name, result="unavailable_tool")
+                    if retry_count > INVALID_TOOL_CALL_RETRY_LIMIT:
+                        for msg in tool_result_messages:
+                            history.append(msg)
+                        stop_message = _invalid_tool_call_stop_message(tool_name, "tool unavailable in this context")
                         yield AgentEvent.text_complete(stop_message)
                         yield AgentEvent(
                             kind=AgentEventType.MODEL_RESPONSE,
@@ -752,6 +804,39 @@ def _unknown_tool_result(
     )
 
 
+def _tool_not_available_result(
+    tool_call: ToolCall,
+    registry: ToolRegistry,
+    context: ToolExecutionContext,
+    *,
+    retry_count: int = 1,
+    retry_limit: int = INVALID_TOOL_CALL_RETRY_LIMIT,
+) -> ToolResult:
+    del context
+    tool_name = _tool_name_text(tool_call.tool_name)
+    available = ", ".join(
+        record.name
+        for record in registry.records()
+        if record.name.startswith("subagent_")
+    ) or "(none)"
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=tool_name,
+        output=(
+            f"Tool '{tool_name}' is not available to the supervisor in advanced mode. "
+            f"Call the appropriate cognitive sub-agent instead. Available supervisor tools: {available}."
+        ),
+        is_error=True,
+        metadata={
+            "tool_unavailable": True,
+            "tool_name": tool_name,
+            "retry_count": retry_count,
+            "retry_limit": retry_limit,
+            "available_tools": [record.name for record in registry.records() if record.name.startswith("subagent_")],
+        },
+    )
+
+
 def _missing_fields_should_be_repaired_by_model(missing_fields: list[str]) -> bool:
     model_owned_fields = {
         "content",
@@ -864,6 +949,12 @@ def _tool_schemas_for_context(registry: ToolRegistry, context: ToolExecutionCont
         for record in registry.records()
         if record.name.startswith("subagent_")
     )
+
+
+def _tool_available_in_context(record: Any, context: ToolExecutionContext) -> bool:
+    if not context.metadata.get("supervisor_cognitive_tools_only"):
+        return True
+    return str(record.name).startswith("subagent_")
 
 
 async def _get_tool_confirmation(
