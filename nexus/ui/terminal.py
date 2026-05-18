@@ -199,10 +199,10 @@ class TerminalUI:
             self._console.print()
         self._assistant_stream_open = False
 
-    def start_thinking(self) -> None:
+    def start_thinking(self, label: str = "Thinking") -> None:
         if self._thinking_status is not None:
             return
-        self._thinking_status = self._console.status("[muted]Thinking…[/muted]", spinner="dots")
+        self._thinking_status = self._console.status(f"[muted]{label}…[/muted]", spinner="dots")
         self._thinking_status.start()
 
     def stop_thinking(self) -> None:
@@ -566,7 +566,7 @@ class TerminalUI:
 
         if event.kind == AgentEventType.THINKING_STARTED and show_thinking_indicator:
             self.end_assistant()
-            self.start_thinking()
+            self.start_thinking(_thinking_label(event))
             return
 
         if event.kind == AgentEventType.TEXT_DELTA:
@@ -801,3 +801,10 @@ class TerminalUI:
             self._console.print(table)
         if report.registered_tools:
             self._console.print("Registered tools: " + ", ".join(report.registered_tools))
+
+
+def _thinking_label(event: Any) -> str:
+    payload = getattr(event, "payload", None)
+    actor = payload.get("actor") if isinstance(payload, dict) else ""
+    actor = str(actor).strip() if actor else ""
+    return f"{actor} - Thinking" if actor else "Thinking"

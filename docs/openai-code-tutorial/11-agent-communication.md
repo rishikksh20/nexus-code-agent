@@ -1,4 +1,4 @@
-# 11 — Agent Communication: Mailboxes and Typed Messages
+# 11 — Agent Communication: Typed Message Queues
 
 ## Prerequisites
 
@@ -25,9 +25,9 @@ agent/
 
 ---
 
-## 1. Why mailboxes beat implicit communication
+## 1. Why typed queues beat implicit communication
 
-Without mailboxes, agent-to-agent communication tends to become:
+Without typed queues, agent-to-agent communication tends to become:
 
 ```python
 # Anti-patterns that feel simple but cause problems:
@@ -257,7 +257,7 @@ def make_local_worker_fn(model_client, tool_registry_factory, base_prompt, cwd, 
                 f"Complete the task and stop."
             ),
             cwd=cwd,
-            model_name=f"worker-{task.worker_id}",
+            model_name=f"task-agent-{task.task_id}",
             mode=ExecutionMode(task.mode),
         )
 
@@ -589,4 +589,3 @@ mailbox = FileMailbox(root=Path("mailbox"))   # durable
 ---
 
 Next: [12-dangerous-actions-and-user-confirmation.md](12-dangerous-actions-and-user-confirmation.md)
-

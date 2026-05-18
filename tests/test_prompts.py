@@ -9,6 +9,11 @@ from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.skills import load_skill_registry
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import GetTimeTool, WriteFileTool
+from nexus.tools.mcp import MCPToolAdapter, MCPServerConfig, MCPToolSpec
+
+
+class _PromptMCPClient:
+    server = MCPServerConfig(name="filesystem", command=("fake",), prefix="fs_")
 
 
 def test_build_context_uses_live_execution_mode(tmp_path):
@@ -31,7 +36,6 @@ def test_build_context_describes_cognitive_subagent_contract(tmp_path):
     registry = ToolRegistry()
     registry.register(
         SubAgentTool(
-            delegation=None,  # type: ignore[arg-type]
             definition=SubagentDefinition(
                 name="planning_analysis",
                 description="Analyze the repo and plan.",
@@ -159,3 +163,28 @@ def test_context_does_not_duplicate_tool_descriptions(tmp_path):
 
     assert sections.tools == []
     assert "Tool schemas describe the available tools" in sections.base_instruction
+
+
+def test_base_instruction_includes_mcp_tool_contract(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())
+    registry.register(
+        MCPToolAdapter(
+            _PromptMCPClient(),
+            MCPToolSpec(
+                name="read_file",
+                description="Read a file through MCP.",
+                input_schema={"type": "object", "properties": {}},
+            ),
+            display_name="fs_read_file",
+        ),
+        source="mcp",
+        origin="filesystem",
+    )
+
+    sections = build_context_sections(config, registry, task_input="inspect MCP")
+
+    assert "MCP Tool Contract" in sections.base_instruction
+    assert "`fs_read_file` from `filesystem` remote `read_file`" in sections.base_instruction
+    assert "MCP tools are mutating by default" in sections.base_instruction

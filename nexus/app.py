@@ -35,15 +35,13 @@ from nexus.hooks import HookExecutor, setup_hooks
 from nexus.integrations.anthropic import AnthropicModelClient, resolve_anthropic_api_key
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.integrations.gemini import GeminiModelClient, resolve_gemini_api_key
-from nexus.integrations.mcp import MCPServerConfig, MCPServerRuntime, MCPToolAdapter
+from nexus.tools.mcp import MCPServerConfig, MCPServerRuntime, register_discovered_mcp_tools
 from nexus.integrations.ollama import OllamaModelClient, resolve_ollama_base_url
 from nexus.integrations.openai_compatible import (
     OpenAICompatibleModelClient,
     resolve_provider_api_key,
 )
-from nexus.memory.store import MemoryStore
 from nexus.runtime.agent import Agent
-from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.post_session import run_post_session_updates
 from nexus.runtime.repl import run_repl
 from nexus.runtime.runtime_session import RuntimeSession, resolve_runtime_session
@@ -247,7 +245,7 @@ class NexusApp:
         server = MCPServerConfig.from_dict(payload)
         runtime = MCPServerRuntime(server=server)
         try:
-            specs = await runtime.refresh()
+            await runtime.refresh()
         except Exception as exc:
             logger.warning("Skipping MCP server %s: %s", server.name, exc)
             runtime.last_error = str(exc)
@@ -255,43 +253,11 @@ class NexusApp:
             return
 
         resources.mcp_servers.append(runtime)
-        client = runtime.client
-        if client is None:
+        if runtime.client is None:
             logger.warning("Skipping MCP server %s: no client after refresh", server.name)
             return
 
-        for display_name in specs:
-            if not self._tool_enabled(display_name):
-                continue
-            try:
-                remote_name = (
-                    display_name.removeprefix(server.prefix)
-                    if server.prefix
-                    else display_name
-                )
-                registry.register(
-                    MCPToolAdapter(
-                        client,
-                        next(
-                            spec
-                            for spec in await runtime._list_tools()
-                            if spec.name == remote_name
-                        ),
-                        display_name=display_name,
-                    ),
-                    source="mcp",
-                    origin=server.name,
-                )
-            except ValueError as exc:
-                logger.warning(
-                    "Skipping MCP tool %s from %s: %s", display_name, server.name, exc
-                )
-
-        runtime.registered_tools = tuple(
-            r.name
-            for r in registry.records()
-            if r.source == "mcp" and r.origin == server.name
-        )
+        register_discovered_mcp_tools(runtime, registry, self.config)
 
     # ------------------------------------------------------------------
     # Private — config / model helpers

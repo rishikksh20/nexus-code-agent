@@ -9,7 +9,7 @@ Chapter 07 added a permission layer that can block or require confirmation for m
 - clear action descriptions
 - scope display
 - approval vs clarification distinction
-- worker-routed approval via mailbox
+- routed approval for sub-tasks
 
 ---
 
@@ -580,4 +580,3 @@ In `auto` mode, `PermissionDecision.CONFIRM` tools are executed without promptin
 ---
 
 Next: [13-guardrails-and-safety.md](13-guardrails-and-safety.md)
-

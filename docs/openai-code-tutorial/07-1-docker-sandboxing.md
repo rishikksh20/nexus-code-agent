@@ -276,7 +276,7 @@ Workers (Chapter 10) should each get their own isolated workspace directory:
 import tempfile
 
 async def worker_fn(task: TaskRecord) -> None:
-    with tempfile.TemporaryDirectory(prefix=f"worker-{task.worker_id}-") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix=f"task-{task.task_id}-") as tmpdir:
         # Worker writes go to tmpdir only
         worker_policy = PermissionPolicy(
             write_allowed_root=tmpdir,     # restrict writes to temp dir
@@ -339,4 +339,3 @@ Workspace accessible: True
 ---
 
 Next: [08-skills.md](08-skills.md) — add on-demand instruction packs for specialized workflows.
-

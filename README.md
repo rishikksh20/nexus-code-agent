@@ -86,7 +86,6 @@ nexus/                         # Main package
 │   ├── anthropic.py           # Native Anthropic client
 │   ├── fake_model.py          # Deterministic local fake client for CI
 │   ├── gemini.py              # Native Gemini client
-│   ├── mcp.py                 # MCP tool discovery over subprocess stdio
 │   ├── ollama.py              # Native Ollama client
 │   ├── openai_compatible.py   # Live OpenAI-compatible HTTP client
 │   └── retry.py               # Bounded retry helper
@@ -136,6 +135,7 @@ nexus/                         # Main package
 │
 ├── tools/                     # Tool abstractions and built-ins
 │   ├── base.py                # BaseTool protocol + ToolRegistry
+│   ├── mcp.py                 # MCP tool discovery and registry adapters
 │   ├── registry.py            # register_core_tools() factory
 │   ├── filesystem.py          # Extended filesystem tools with PermissionChecker
 │   ├── subagents.py           # Skill sub-agent tool registration
@@ -365,7 +365,7 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 | `/memory [list\|search\|save\|show]` | Workspace memory entries |
 | `/tools [reload]` | List registered tools or reload core, plugin, MCP, and sub-agent tools |
 | `/history [n]` | Show recent conversation messages |
-| `/mcp [status\|tools\|refresh [server]]` | Inspect MCP server status and discovered tools |
+| `/mcp [status\|tools\|refresh [server]\|reload]` | Inspect MCP server status, tools, and hot-refresh/reload registrations |
 | `/quit` or `/exit` | Save session and exit |
 
 ---
@@ -714,8 +714,15 @@ project_description = ""
 
 # MCP servers
 mcp_servers = [
-  { name = "filesystem", command = ["uvx", "mcp-server-filesystem", "."], prefix = "fs_" }
+  { name = "filesystem", transport = "stdio", command = ["mcp-server-filesystem", "."], prefix = "mcp_fs_" }
 ]
+
+# Optional MCP fields: env, cwd, startup_timeout_seconds, tool_timeout_seconds,
+# disabled, and disabled_tools.
+# Filesystem MCP server install: npm install -g @modelcontextprotocol/server-filesystem
+# Inspect with /mcp status, list tools with /mcp tools, and rediscover tools with
+# /mcp refresh or /mcp refresh <server>. Use /mcp reload after editing config.
+# See docs/mcp-integration.md.
 
 # Agent profile
 config_version = 2

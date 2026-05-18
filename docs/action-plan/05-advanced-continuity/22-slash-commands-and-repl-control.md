@@ -21,7 +21,7 @@ Slash commands are the surface for all of that. They are distinguishable from ag
 
 The current Nexus runtime now implements a comprehensive slash-command surface:
 
-**Fully implemented handlers:** `/config`, `/mode`, `/skills`, `/session`, `/tools`, `/memory`, `/context`, `/history`, `/mcp`, `/delegate`, `/provider`, `/help`, `/quit`, `/exit`
+**Fully implemented handlers:** `/config`, `/mode`, `/skills`, `/session`, `/tools`, `/memory`, `/context`, `/history`, `/mcp`, `/provider`, `/help`, `/quit`, `/exit`
 
 **Key additions since the original continuity pass:**
 

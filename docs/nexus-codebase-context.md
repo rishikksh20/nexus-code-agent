@@ -12,14 +12,14 @@ Nexus is a CLI-first coding agent implemented as a Python package under `nexus/`
 - `nexus/runtime/agent.py` owns model streaming, tool-call interpretation, permission checks, tool execution, hook emission, and agent events.
 - `nexus/runtime/repl.py` owns the interactive REPL loop: terminal setup, prompt reading, slash-command dispatch, and interactive approval input.
 - `nexus/runtime/turn_runner.py` owns the shared turn runner used by both interactive and headless mode. `run_agent_turn()` is the bridge between user-facing approval UX and the lower-level event-driven agent.
-- `nexus/runtime/orchestration.py` owns the conservative multi-agent supervisor wrapper. `multi_agent_mode = "off"` delegates directly to `run_agent_turn()`; complex modes validate a planner DAG before executing through the same turn runner.
+- `nexus/runtime/orchestration.py` owns the conservative supervisor wrapper. It delegates directly to `run_agent_turn()`; advanced mode is expressed by registering cognitive `subagent_*` tools, not by a separate scheduler.
 - `nexus/runtime/context_state.py` owns compact per-agent context records and handoff packets for multi-agent context isolation, sharing, and `/context` visibility.
 - `nexus/runtime/repl_state.py` prepares each turn: system prompt construction, history preparation, tool-output pruning, context compaction, metadata, and durable history updates.
 - `nexus/runtime/runtime_session.py` builds `ReplState` from config, sessions, skills, memory, hooks, delegation resources, and approval policy.
 - `nexus/config/` contains defaults, TOML/env/CLI merge logic, validation, and model-context limit helpers.
-- `nexus/tools/` contains the first-party tool system, registry helpers, compatibility filesystem tools, and sub-agent tool registration.
+- `nexus/tools/` contains the first-party tool system, MCP adapters, registry helpers, compatibility filesystem tools, and sub-agent tool registration.
 - `nexus/security/` contains approval policies, approval state, permission checks, and shell-risk classification.
-- `nexus/integrations/` contains provider adapters: fake, OpenAI-compatible HTTP providers, native Ollama, native Anthropic, native Gemini, MCP, and retry support.
+- `nexus/integrations/` contains provider adapters: fake, OpenAI-compatible HTTP providers, native Ollama, native Anthropic, native Gemini, and retry support.
 - `nexus/extensions/`, `nexus/hooks/`, `nexus/skills/`, `nexus/memory/`, `nexus/context/`, `nexus/sandbox/`, and `nexus/observability/` provide optional runtime capabilities around the core loop.
 
 ## Runtime Flow
@@ -29,7 +29,7 @@ One runtime session is created through `RuntimeSession.create()`.
 1. `NexusApp.initialize()` applies model context limits, builds hooks, creates the tool registry, loads plugins, connects MCP servers, registers sandbox and sub-agent tools, and creates `Agent`.
 2. Interactive mode calls `run_repl()`. Headless mode calls `run_headless()`.
 3. Both paths append the user message, begin a new approval turn when needed, and call `run_orchestrated_turn()`.
-4. In default config, `run_orchestrated_turn()` delegates directly to `turn_runner.run_agent_turn()`. In multi-agent modes it validates a compact task DAG, stores it in session metadata, then still executes through `run_agent_turn()`.
+4. `run_orchestrated_turn()` delegates directly to `turn_runner.run_agent_turn()`. When `agent_mode = "advanced"`, the supervisor can call registered cognitive sub-agent tools through the same tool/approval path.
 5. `run_agent_turn()` asks `ReplState.prepare_turn()` for model-ready messages, context metadata, and the system prompt.
 6. `Agent.run()` streams model output, emits assistant events, evaluates tool calls, and either executes allowed tools or emits a `CONFIRMATION_REQUESTED` event.
 7. `turn_runner.run_agent_turn()` is the single user-facing approval callback owner. It records approval/refusal/clarification and, on approval, resumes exact pending calls through `Agent.run(..., resume_tool_calls=...)`.
@@ -152,8 +152,8 @@ Optional runtime features include:
 - Plugins loaded from the configured plugins directory.
 - MCP tools registered through connected MCP servers.
 - Skills from global, local, and builtin roots.
-- Delegation runtime and sub-agent tools.
-- Built-in specialist sub-agent definitions for research, review, and test roles when delegation tools are enabled.
+- Cognitive sub-agent tools registered in advanced mode.
+- Built-in specialist sub-agent definitions for planning, execution, review, and verification roles.
 - Multi-agent context records are visible through `/context agents`, `/context agent <id>`, and `/context usage <id>`.
 - Sandbox command execution when enabled.
 - Hooks for lifecycle, prompt submit, pre/post tool use, notifications, and stop events.
@@ -171,7 +171,7 @@ uv run pytest
 
 Current expected result after the multi-agent context-isolation implementation: `290 passed`.
 
-The tests cover config loading, CLI/headless flows, REPL approval behavior, session sanitation, security decisions, tools, hooks, plugins, MCP, sandbox, delegation, prompts, retry, and provider adapters.
+The tests cover config loading, CLI/headless flows, REPL approval behavior, session sanitation, security decisions, tools, hooks, plugins, MCP, sandbox, cognitive sub-agents, prompts, retry, and provider adapters.
 
 ## Review Notes
 

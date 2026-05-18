@@ -56,16 +56,12 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
 
     config = load_config(workspace, global_root=global_root)
 
-    assert config.multi_agent_show_plan is True
-    assert config.multi_agent_max_parallel_tasks == 3
-    assert config.multi_agent_max_repair_iterations == 2
-    assert config.multi_agent_complexity_threshold == "medium"
     assert config.agent_mode == "basic"
-    assert config.delegation_enabled is False
+    assert config.delegation_subagents == []
     assert config.config_version == 2
 
 
-def test_config_accepts_legacy_multi_agent_mode_without_breaking_repo(tmp_path):
+def test_config_accepts_legacy_multi_agent_mode_without_reintroducing_old_fields(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     global_root = tmp_path / "global"
@@ -75,7 +71,7 @@ def test_config_accepts_legacy_multi_agent_mode_without_breaking_repo(tmp_path):
     config = load_config(workspace, global_root=global_root)
 
     assert config.agent_mode == "advanced"
-    assert config.delegation_enabled is True
+    assert not hasattr(config, "multi_agent_mode")
 
 
 def test_config_normalizes_legacy_subagent_tool_names(tmp_path):
@@ -85,13 +81,12 @@ def test_config_normalizes_legacy_subagent_tool_names(tmp_path):
     init_workspace(workspace, global_root=global_root, project_name="workspace")
     (workspace / ".nexus" / "config.toml").write_text(
         'agent_mode = "advanced"\n'
-        'allowed_tools = ["delegate_task", "subagent_research", "subagent_review", "subagent_test"]\n',
+        'allowed_tools = ["subagent_research", "subagent_review", "subagent_test"]\n',
         encoding="utf-8",
     )
 
     config = load_config(workspace, global_root=global_root)
 
-    assert "delegate_task" not in config.allowed_tools
     assert "subagent_research" not in config.allowed_tools
     assert "subagent_test" not in config.allowed_tools
     assert "subagent_planning_analysis" in config.allowed_tools
@@ -115,7 +110,7 @@ def test_config_agent_mode_advanced_activates_multi_agent_profile(tmp_path):
     config = load_config(workspace, global_root=global_root)
 
     assert config.agent_mode == "advanced"
-    assert config.delegation_enabled is True
+    assert config.delegation_subagents == []
 
 
 def test_config_agent_mode_advanced_adds_cognitive_tools_to_legacy_allowlist(tmp_path):
@@ -138,20 +133,17 @@ def test_config_agent_mode_advanced_adds_cognitive_tools_to_legacy_allowlist(tmp
     assert "subagent_verification" in config.allowed_tools
 
 
-def test_config_agent_mode_basic_forces_single_agent_profile(tmp_path):
+def test_config_agent_mode_basic_keeps_single_agent_profile(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     global_root = tmp_path / "global"
     init_workspace(workspace, global_root=global_root, project_name="workspace")
-    (workspace / ".nexus" / "config.toml").write_text(
-        'agent_mode = "basic"\ndelegation_enabled = true\n',
-        encoding="utf-8",
-    )
+    (workspace / ".nexus" / "config.toml").write_text('agent_mode = "basic"\n', encoding="utf-8")
 
     config = load_config(workspace, global_root=global_root)
 
     assert config.agent_mode == "basic"
-    assert config.delegation_enabled is False
+    assert config.delegation_subagents == []
 
 
 def test_config_rejects_invalid_agent_mode(tmp_path):
@@ -291,6 +283,61 @@ def test_config_accepts_structured_mcp_servers(tmp_path):
     ]
 
 
+def test_config_accepts_extended_mcp_server_fields(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        "mcp_servers = [{ "
+        'name = "filesystem", transport = "stdio", command = ["uvx", "mcp-server-filesystem", "."], '
+        'prefix = "fs_", env = { TOKEN = "abc" }, cwd = ".", startup_timeout_seconds = 2.5, '
+        'tool_timeout_seconds = 10, disabled = false, disabled_tools = ["write_file"]'
+        " }]\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.mcp_servers[0]["env"] == {"TOKEN": "abc"}
+    assert config.mcp_servers[0]["disabled_tools"] == ["write_file"]
+    assert config.mcp_servers[0]["startup_timeout_seconds"] == 2.5
+
+
+def test_config_accepts_disabled_mcp_http_server(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'mcp_servers = [{ name = "remote", transport = "streamable_http", url = "http://localhost:3333/mcp", disabled = true }]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.mcp_servers[0]["disabled"] is True
+    assert config.mcp_servers[0]["url"] == "http://localhost:3333/mcp"
+
+
+def test_config_rejects_duplicate_mcp_servers(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'mcp_servers = [{ name = "dup", command = ["cmd"] }, { name = "dup", command = ["cmd"] }]\n',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(workspace, global_root=global_root)
+    except ConfigError as exc:
+        assert "Duplicate mcp_servers entry" in str(exc)
+    else:
+        raise AssertionError("Expected ConfigError for duplicate MCP server")
+
+
 def test_config_accepts_structured_delegation_subagents(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -333,22 +380,16 @@ def test_config_rejects_duplicate_delegation_subagents(tmp_path):
         raise AssertionError("Expected ConfigError for duplicate delegation_subagents")
 
 
-def test_config_rejects_empty_delegation_workers(tmp_path):
+def test_config_ignores_removed_worker_runtime_keys_after_normalization(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     global_root = tmp_path / "global"
     init_workspace(workspace, global_root=global_root, project_name="workspace")
-    (workspace / ".nexus" / "config.toml").write_text(
-        'delegation_workers = []\n',
-        encoding="utf-8",
-    )
+    (workspace / ".nexus" / "config.toml").write_text('multi_agent_mode = "off"\n', encoding="utf-8")
 
-    try:
-        load_config(workspace, global_root=global_root)
-    except ConfigError as exc:
-        assert "delegation_workers" in str(exc)
-    else:
-        raise AssertionError("Expected ConfigError for empty delegation_workers")
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.agent_mode == "basic"
 
 
 def test_config_rejects_overlapping_tool_filters(tmp_path):
