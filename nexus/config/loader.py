@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from nexus.config.defaults import AgentConfig, build_default_config, config_to_plain_dict
+from nexus.config.upgrade import normalize_legacy_config_values
 
 
 PATH_FIELDS = {
@@ -49,11 +50,19 @@ def load_config(
     global_path = (global_config_path or defaults.global_config_file).expanduser()
     local_path = local_config_path or defaults.local_config_file
 
+    global_values = _read_toml(global_path)
+    local_values = _read_toml(local_path)
+    cli_values = cli_overrides or {}
+    global_values = normalize_legacy_config_values(global_values)
+    local_values = normalize_legacy_config_values(local_values)
+    cli_values = normalize_legacy_config_values(cli_values)
+
     merged = dict(base)
-    merged.update(_read_toml(global_path))
-    merged.update(_read_toml(local_path))
+    merged.update(global_values)
+    merged.update(local_values)
     merged.update(_read_environment(defaults))
-    merged.update(cli_overrides or {})
+    merged.update(cli_values)
+    merged = _apply_agent_mode_profile(merged)
     merged = _apply_provider_defaults(merged)
 
     merged["workspace_root"] = str(defaults.workspace_root)
@@ -194,6 +203,7 @@ def _parse_scalar(raw_value: str, template: Any) -> Any:
 
 def _validate_config_values(values: dict[str, Any]) -> None:
     valid_modes = {"plan", "default", "auto"}
+    valid_agent_modes = {"basic", "advanced"}
     valid_log_formats = {"text", "json"}
     valid_providers = {"anthropic", "fake", "gemini", "mistral", "openai", "openai-compatible", "ollama"}
     valid_approval_policies = {
@@ -213,6 +223,12 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     if default_mode not in valid_modes:
         raise ConfigError(
             f"Invalid default_mode '{default_mode}'. Expected one of: {', '.join(sorted(valid_modes))}."
+        )
+
+    agent_mode = values["agent_mode"]
+    if agent_mode not in valid_agent_modes:
+        raise ConfigError(
+            f"Invalid agent_mode '{agent_mode}'. Expected one of: {', '.join(sorted(valid_agent_modes))}."
         )
 
     approval_policy = values.get("approval_policy", "on-request")
@@ -236,7 +252,6 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         "max_loop_iterations",
         "max_tool_calls_per_turn",
         "max_sessions_retained",
-        "delegation_message_history_limit",
         "sandbox_timeout_seconds",
         "context_prune_protect_tokens",
         "context_prune_minimum_tokens",
@@ -244,9 +259,6 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     for field_name in integer_fields:
         if values[field_name] < 1:
             raise ConfigError(f"{field_name} must be greater than 0.")
-
-    if values["delegation_poll_interval_seconds"] <= 0:
-        raise ConfigError("delegation_poll_interval_seconds must be greater than 0.")
 
     if values["compaction_hard_limit"] < values["compaction_soft_limit"]:
         raise ConfigError("compaction_hard_limit must be greater than or equal to compaction_soft_limit.")
@@ -262,19 +274,29 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         if not isinstance(entry, dict):
             raise ConfigError("Each mcp_servers entry must be a table with name and command fields.")
         name = str(entry.get("name", "")).strip()
-        command = entry.get("command")
         if not name:
             raise ConfigError("Each mcp_servers entry must define a non-empty name.")
-        if not isinstance(command, list) or not command:
-            raise ConfigError(f"mcp_servers entry '{name}' must define a non-empty command list.")
-
-    delegation_workers = values["delegation_workers"]
-    if not isinstance(delegation_workers, list) or not delegation_workers:
-        raise ConfigError("delegation_workers must define at least one worker id.")
-    if any(not str(worker_id).strip() for worker_id in delegation_workers):
-        raise ConfigError("delegation_workers entries must be non-empty strings.")
-    if len({str(worker_id).strip() for worker_id in delegation_workers}) != len(delegation_workers):
-        raise ConfigError("delegation_workers must not contain duplicate worker ids.")
+        transport = str(entry.get("transport", "stdio")).strip().lower() or "stdio"
+        if transport == "streamable-http":
+            transport = "streamable_http"
+        if transport not in {"stdio", "http", "streamable_http"}:
+            raise ConfigError(f"mcp_servers entry '{name}' has unsupported transport '{transport}'.")
+        command = entry.get("command")
+        url = str(entry.get("url", "")).strip()
+        if transport == "stdio":
+            if not isinstance(command, list) or not command:
+                raise ConfigError(f"mcp_servers entry '{name}' must define a non-empty command list.")
+        elif not url:
+            raise ConfigError(f"mcp_servers entry '{name}' must define a non-empty url.")
+        env = entry.get("env")
+        if env is not None and not isinstance(env, dict):
+            raise ConfigError(f"mcp_servers entry '{name}' env must be a table.")
+        disabled_tools = entry.get("disabled_tools", [])
+        if disabled_tools is not None and not isinstance(disabled_tools, list):
+            raise ConfigError(f"mcp_servers entry '{name}' disabled_tools must be a list.")
+        for field_name in ("startup_timeout_seconds", "tool_timeout_seconds"):
+            if field_name in entry and float(entry[field_name]) <= 0:
+                raise ConfigError(f"mcp_servers entry '{name}' {field_name} must be greater than 0.")
 
     delegation_subagents = values["delegation_subagents"]
     if not isinstance(delegation_subagents, list):
@@ -353,3 +375,47 @@ def _apply_provider_defaults(values: dict[str, Any]) -> dict[str, Any]:
         if base_url_env:
             resolved["api_base_url"] = base_url_env
     return resolved
+
+
+def _apply_agent_mode_profile(values: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(values)
+    agent_mode = str(resolved.get("agent_mode", "basic")).strip().lower()
+    resolved["agent_mode"] = agent_mode
+    if agent_mode == "advanced":
+        allowed_tools = resolved.get("allowed_tools")
+        if isinstance(allowed_tools, list) and allowed_tools:
+            for tool_name in _advanced_mode_required_tool_names():
+                if tool_name not in allowed_tools:
+                    allowed_tools.append(tool_name)
+            resolved["allowed_tools"] = allowed_tools
+    return resolved
+
+
+def _advanced_mode_required_tool_names() -> tuple[str, ...]:
+    return (
+        *_builtin_cognitive_tool_names(),
+        "read_file",
+        "glob",
+        "grep",
+        "list_dir",
+        "lsp",
+        "write_file",
+        "edit",
+        "insert_edit_into_file",
+        "apply_patch",
+        "git_status",
+        "git_diff",
+        "run_tests",
+        "run_linter",
+        "run_typecheck",
+        "bash",
+    )
+
+
+def _builtin_cognitive_tool_names() -> tuple[str, ...]:
+    return (
+        "subagent_planning_analysis",
+        "subagent_execution",
+        "subagent_review",
+        "subagent_verification",
+    )

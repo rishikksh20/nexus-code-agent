@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from nexus.memory.workspace import AgentDirs, bootstrap_workspace_knowledge
-from nexus.integrations.mcp import mcp_server_example_for_workspace
+from nexus.tools.mcp import mcp_server_example_for_workspace
+from nexus.config.upgrade import CURRENT_CONFIG_VERSION
 
 
 def init_workspace(
@@ -56,12 +57,11 @@ def _global_config_toml() -> str:
             '#   MISTRAL_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, NEXUS_API_KEY',
             '# Or override any value directly in this file.',
             '# Switch to provider = "fake" for local offline use (no API key required).',
+            f'config_version = {CURRENT_CONFIG_VERSION}',
             'default_mode = "default"',
             'stream_output = true',
             'show_tool_calls = true',
             'color_output = true',
-            'delegation_poll_interval_seconds = 0.05',
-            'delegation_message_history_limit = 200',
             'sandbox_image = "nexus-sandbox:latest"',
             'sandbox_timeout_seconds = 30',
             'sandbox_memory_limit = "256m"',
@@ -78,13 +78,18 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
         [
             f'project_name = "{project_name}"',
             f'project_description = "{project_description}"',
+            f'config_version = {CURRENT_CONFIG_VERSION}',
             '# Allowlist of tools available in this workspace.',
             '# Remove this key entirely (or set to []) to allow ALL registered tools.',
             '# Builtin tool names: get_time, read_file, write_file, edit,',
             '#   insert_edit_into_file, apply_patch, glob, grep,',
-            '#   list_dir, lsp, bash, memory, todos, web_fetch, web_search',
+            '#   list_dir, lsp, find_references, code_index, semantic_search,',
+            '#   git_status, git_diff, run_tests, run_linter, run_typecheck,',
+            '#   run_formatter, bash, memory, todos, web_fetch, web_search',
+            '# Advanced cognitive tool names: subagent_planning_analysis,',
+            '#   subagent_execution, subagent_review, subagent_verification',
             '# Add external tool names here when enabling plugins, MCP, or the sandboxed command tool.',
-            'allowed_tools = ["get_time", "read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "bash", "memory", "todos", "web_fetch", "web_search"]',
+            'allowed_tools = ["get_time", "read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "find_references", "code_index", "semantic_search", "git_status", "git_diff", "run_tests", "run_linter", "run_typecheck", "run_formatter", "bash", "memory", "todos", "web_fetch", "web_search", "subagent_planning_analysis", "subagent_execution", "subagent_review", "subagent_verification"]',
             'denied_tools = []',
             '# Hidden/private dot-path reads are blocked by default. Set this to true to allow',
             '# reading hidden/private paths other than .nexus for this workspace. .nexus stays blocked.',
@@ -92,9 +97,16 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             '# Run `nexus doctor --output-format json` before wider rollout to verify production gates.',
             'mcp_servers = []',
             f'# Example: mcp_servers = [{mcp_server_example_for_workspace(workspace_root)}]',
-            'delegation_enabled = false',
-            'delegation_workers = ["worker-1", "worker-2"]',
-            'delegation_subagents = []',
+            '# Agent mode profile:',
+            '#   basic = single LLM execution, no cognitive sub-agent tools',
+            '#   advanced = supervisor LLM with cognitive sub-agent tools',
+            'agent_mode = "basic"',
+            'delegation_subagents = [] # Custom cognitive sub-agent definitions.',
+            '# Optional specialists for advanced mode:',
+            '# delegation_subagents = [',
+            '#   { name = "planning_analysis", description = "Analyze repo structure and produce an implementation plan.", goal_prompt = "Read-only planning and analysis agent. Do not modify files.", allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp"] },',
+            '#   { name = "review", description = "Review code changes for bugs and maintainability.", goal_prompt = "Senior code reviewer. Inspect diffs and report issues only.", allowed_tools = ["git_diff", "read_file", "grep", "lsp"] },',
+            '# ]',
             '# Example: delegation_subagents = [{ name = "explore", description = "Investigate a focused codebase question.", goal_prompt = "Read the relevant code and summarize the answer.", allowed_tools = ["read_file", "glob", "grep"], max_turns = 12, timeout_seconds = 300 }]',
             'sandbox_commands = false',
             '',

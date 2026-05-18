@@ -129,7 +129,7 @@ class OpenAICompatibleModelClient:
         api_base_url: str,
         api_key: str | None = None,
         provider_name: str = "openai-compatible",
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = 120.0,
         retries: int = 3,
         base_delay: float = 0.5,
         jitter: float = 0.2,
@@ -185,10 +185,7 @@ class OpenAICompatibleModelClient:
                 async for event in self._stream_sse(wire_payload):
                     if event.type == StreamEventType.ERROR:
                         error_msg = event.error or ""
-                        if any(
-                            marker in error_msg
-                            for marker in ("503", "502", "504", "429", "500", "408", "409", "connection failed")
-                        ):
+                        if any(marker in error_msg.lower() for marker in _RETRYABLE_ERROR_MARKERS):
                             last_error = error_msg
                             got_retryable_error = True
                             break
@@ -264,6 +261,11 @@ class OpenAICompatibleModelClient:
                 loop.call_soon_threadsafe(
                     queue.put_nowait,
                     RetryableProviderError(f"Provider connection failed: {exc.reason}"),
+                )
+            except TimeoutError as exc:
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    RetryableProviderError(f"Provider request timed out: {exc}"),
                 )
             except Exception as exc:  # noqa: BLE001
                 loop.call_soon_threadsafe(queue.put_nowait, exc)
@@ -368,6 +370,22 @@ class OpenAICompatibleModelClient:
             raise RuntimeError(details) from exc
         except error.URLError as exc:
             raise RetryableProviderError(f"Provider connection failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise RetryableProviderError(f"Provider request timed out: {exc}") from exc
+
+
+_RETRYABLE_ERROR_MARKERS = (
+    "503",
+    "502",
+    "504",
+    "429",
+    "500",
+    "408",
+    "409",
+    "connection failed",
+    "timed out",
+    "timeout",
+)
 
 
 def _request_headers(api_key: str | None) -> dict[str, str]:
@@ -422,4 +440,3 @@ def resolve_provider_api_base_url(provider_name: str, explicit_api_base_url: str
     if base_url_env:
         return base_url_env
     return ""
-

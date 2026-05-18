@@ -58,7 +58,6 @@ class RuntimeSession:
 
         register_skill_subagent_tools(
             tool_registry,
-            resources.delegation,
             config,
             skill_registry,
         )
@@ -83,7 +82,6 @@ class RuntimeSession:
             skill_registry=skill_registry,
             active_skills=active_skills,
             mcp_servers=resources.mcp_servers,
-            delegation=resources.delegation,
         )
         return cls(state=state, session_resumed=session_resumed)
 

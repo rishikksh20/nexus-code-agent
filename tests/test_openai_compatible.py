@@ -229,6 +229,54 @@ async def test_openai_compatible_stream_accumulates_partial_tool_calls_without_u
     assert events[2].usage is None
 
 
+@pytest.mark.asyncio
+async def test_openai_compatible_stream_retries_socket_timeouts(monkeypatch):
+    attempts = {"count": 0}
+    lines = [
+        'data: {"model":"demo-model","choices":[{"delta":{"content":"recovered"}}]}\n',
+        "data: [DONE]\n",
+    ]
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise TimeoutError("The read operation timed out")
+        return _FakeStreamingHTTPResponse(lines)
+
+    async def _no_sleep(delay):
+        return None
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+
+    client = OpenAICompatibleModelClient(
+        api_base_url="https://example.test/v1",
+        api_key="secret",
+        provider_name="openai-compatible",
+        retries=2,
+        base_delay=0.0,
+        jitter=0.0,
+    )
+
+    events = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="demo-model",
+                system_prompt="system",
+                messages=(Message(role="user", content="hello"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert attempts["count"] == 2
+    assert events[0].type == StreamEventType.TEXT_DELTA
+    assert events[0].text_delta is not None
+    assert events[0].text_delta.content == "recovered"
+
+
 def test_build_model_client_uses_provider_config(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global", cli_overrides={"provider": "fake"})
 

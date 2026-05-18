@@ -77,7 +77,7 @@ The material is split into four stages so the difficulty rises slowly.
 ### 03 Extensions And Scale
 
 - `07-mcp-plugins-and-sandboxing.md`
-- `08-delegation-mailboxes-and-coordination.md`
+- `08-cognitive-subagents-and-coordination.md`
 
 ### 04 Production Blueprint
 

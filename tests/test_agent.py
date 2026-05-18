@@ -3,12 +3,23 @@ from __future__ import annotations
 import pytest
 
 from nexus.integrations.fake_model import FakeModelClient
-from nexus.models import ConfirmationKind, Message, RuntimeResponse, ToolCall
+from nexus.models import ConfirmationKind, Message, RuntimeResponse, StreamEvent, StreamEventType, ToolCall
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
+from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.security import ApprovalManager, PermissionDecision
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import BashTool, GetTimeTool, WriteFileTool, WriteNoteTool
+
+
+class RecordingModelClient(FakeModelClient):
+    def __init__(self, scripted=None) -> None:
+        super().__init__(scripted=scripted)
+        self.requests = []
+
+    async def chat_completion(self, request, *, stream: bool = True):
+        self.requests.append(request)
+        yield StreamEvent(type=StreamEventType.MESSAGE_COMPLETE)
 
 
 @pytest.mark.asyncio
@@ -37,9 +48,35 @@ async def test_agent_executes_read_only_tool(tool_context):
     ]
 
     assert any(event.kind == "tool_result" for event in events)
+    assert sum(1 for event in events if event.kind == "thinking_started") >= 2
     # AGENT_STOP is the final event; turn_completed precedes it
     assert events[-1].kind == "AGENT_STOP"
     assert any(event.kind == "turn_completed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_advanced_supervisor_only_exposes_cognitive_tool_schemas(tool_context):
+    model = RecordingModelClient()
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())
+    registry.register(WriteFileTool())
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Implement focused work.",
+                goal_prompt="Use normal tools.",
+            ),
+            base_tool_registry=registry,
+        )
+    )
+    tool_context.metadata["supervisor_cognitive_tools_only"] = True
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    _ = [event async for event in agent.run([Message(role="user", content="build this")], tool_context)]
+
+    schema_names = {schema["function"]["name"] for schema in model.requests[0].tool_schemas}
+    assert schema_names == {"subagent_execution"}
 
 
 @pytest.mark.asyncio
@@ -229,6 +266,81 @@ def test_agent_plans_same_batch_preapproved_tool_calls(tool_context):
     )
 
     assert planned == (note_one, note_two)
+
+
+def test_agent_filters_same_file_preapproved_mutations(tool_context):
+    registry = ToolRegistry()
+    registry.register(WriteNoteTool())
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    approval_manager = ApprovalManager()
+    approval_manager.record_turn_wide_mutating_approval()
+    first = ToolCall(
+        call_id="note-1",
+        tool_name="write_note",
+        arguments={"path": "notes/same.txt", "content": "one"},
+    )
+    second = ToolCall(
+        call_id="note-2",
+        tool_name="write_note",
+        arguments={"path": "notes/same.txt", "content": "two"},
+    )
+
+    planned = agent.preapproved_tool_calls_from_batch(
+        (first, second),
+        first_tool_call=first,
+        mode=ExecutionMode.DEFAULT,
+        context=tool_context,
+        approval_manager=approval_manager,
+        auto_confirm_read_only=True,
+    )
+
+    assert planned == (first,)
+
+
+@pytest.mark.asyncio
+async def test_agent_blocks_same_file_mutations_in_one_model_response_and_refreshes_after_write(tool_context):
+    first = ToolCall(
+        call_id="note-1",
+        tool_name="write_note",
+        arguments={"path": "notes/same.txt", "content": "one"},
+    )
+    second = ToolCall(
+        call_id="note-2",
+        tool_name="write_note",
+        arguments={"path": "notes/same.txt", "content": "two"},
+    )
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Writing twice."),
+                tool_calls=(first, second),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Done.")),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(WriteNoteTool())
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="write twice")],
+            tool_context,
+            auto_confirm=True,
+        )
+    ]
+
+    results = [event.payload for event in events if event.kind == "tool_result"]
+
+    assert [result.call_id for result in results] == ["note-1", "note-2"]
+    assert results[0].is_error is False
+    assert "Post-mutation refresh" in results[0].output
+    assert results[0].metadata["post_mutation_reads"][0]["content"] == "one"
+    assert results[1].is_error is True
+    assert results[1].metadata["same_file_mutation_blocked"] is True
+    assert (tool_context.working_directory / "notes" / "same.txt").read_text(encoding="utf-8") == "one"
 
 
 @pytest.mark.asyncio

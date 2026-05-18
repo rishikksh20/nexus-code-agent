@@ -6,7 +6,7 @@ Structure mirrors the reference code's CLI class pattern:
     await app.initialize(params)      # build registry, agent, resources
     await app.run_single(prompt)      # reference: cli.run_single(message)
     await app.run_interactive()       # reference: cli.run_interactive()
-    await app.close()                 # teardown delegation + MCP
+    await app.close()                 # teardown MCP
 
 Dispatch helpers (_dispatch_runtime, _dispatch_doctor, …) are thin shims
 called by the click commands defined in nexus/cli/args.py.
@@ -35,16 +35,13 @@ from nexus.hooks import HookExecutor, setup_hooks
 from nexus.integrations.anthropic import AnthropicModelClient, resolve_anthropic_api_key
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.integrations.gemini import GeminiModelClient, resolve_gemini_api_key
-from nexus.integrations.mcp import MCPServerConfig, MCPServerRuntime, MCPToolAdapter
+from nexus.tools.mcp import MCPServerConfig, MCPServerRuntime, register_discovered_mcp_tools
 from nexus.integrations.ollama import OllamaModelClient, resolve_ollama_base_url
 from nexus.integrations.openai_compatible import (
     OpenAICompatibleModelClient,
     resolve_provider_api_key,
 )
-from nexus.memory.store import MemoryStore
 from nexus.runtime.agent import Agent
-from nexus.runtime.delegation import DelegationRuntime
-from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.post_session import run_post_session_updates
 from nexus.runtime.repl import run_repl
 from nexus.runtime.runtime_session import RuntimeSession, resolve_runtime_session
@@ -65,11 +62,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class RuntimeResources:
-    """Holds async resources (delegation runtime, MCP server connections) that
-    must be shut down cleanly when the session ends."""
+    """Holds async resources that must be shut down cleanly."""
 
     mcp_servers: list[MCPServerRuntime] = field(default_factory=list)
-    delegation: DelegationRuntime | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +107,7 @@ class NexusApp:
     # ------------------------------------------------------------------
 
     async def initialize(self, *, load_plugins: bool = True) -> None:
-        """Build the tool registry, start delegation, connect MCP servers.
+        """Build the tool registry and connect MCP servers.
 
         Must be awaited before calling :meth:`run_single` or
         :meth:`run_interactive`.
@@ -174,11 +169,9 @@ class NexusApp:
         return 0
 
     async def close(self) -> None:
-        """Shut down delegation runtime and MCP server connections."""
+        """Shut down MCP server connections."""
         if self._resources is None:
             return
-        if self._resources.delegation is not None:
-            await self._resources.delegation.shutdown()
         for server in self._resources.mcp_servers:
             await server.close()
 
@@ -207,36 +200,18 @@ class NexusApp:
         """Build the tool registry and start async runtime resources.
 
         Order:
-        1. Start delegation runtime (if enabled)
-        2. Register all builtin tools
-        3. Load plugins (if enabled)
-        4. Connect MCP servers and register their tools
-        5. Register sandbox / sub-agent tools
+        1. Register all builtin tools
+        2. Load plugins (if enabled)
+        3. Connect MCP servers and register their tools
+        4. Register sandbox / cognitive sub-agent tools
         """
         registry = ToolRegistry()
         resources = RuntimeResources()
 
-        # 1. Delegation runtime
-        if self.config.delegation_enabled:
-            delegation = DelegationRuntime(
-                worker_ids=[str(w) for w in self.config.delegation_workers],
-                hooks=self._hooks,
-                poll_interval=float(self.config.delegation_poll_interval_seconds),
-                history_limit=int(self.config.delegation_message_history_limit),
-                base_tool_registry=registry,
-                model_client_factory=self._build_model_client,
-                workspace_root=self.config.workspace_root,
-                temperature=float(self.config.temperature),
-                max_output_tokens=int(self.config.max_output_tokens),
-                auto_confirm_read_only=bool(self.config.auto_confirm_read_only),
-            )
-            await delegation.start()
-            resources.delegation = delegation
-
-        # 2. Builtin tools
+        # 1. Builtin tools
         register_core_tools(registry, self.config)
 
-        # 3. Plugins
+        # 2. Plugins
         if load_plugins:
             PluginLoader(self.config.plugins_dir).load_all(
                 registry,
@@ -244,17 +219,17 @@ class NexusApp:
                 can_register=lambda tool: self._tool_enabled(tool.name),
             )
 
-        # 4. MCP servers
+        # 3. MCP servers
         for payload in self.config.mcp_servers:
             await self._connect_mcp_server(payload, registry, resources)
 
-        # 5. Sandbox + sub-agent tools
+        # 4. Sandbox + cognitive sub-agent tools
         if self.config.sandbox_commands and self._tool_enabled(SandboxedCommandTool.name):
             register_sandbox_tool(registry, self.config)
         register_subagent_tools(
             registry,
-            resources.delegation,
             self.config,
+            model_client_factory=self._build_model_client,
             definitions=load_subagent_definitions(self.config),
         )
 
@@ -270,7 +245,7 @@ class NexusApp:
         server = MCPServerConfig.from_dict(payload)
         runtime = MCPServerRuntime(server=server)
         try:
-            specs = await runtime.refresh()
+            await runtime.refresh()
         except Exception as exc:
             logger.warning("Skipping MCP server %s: %s", server.name, exc)
             runtime.last_error = str(exc)
@@ -278,43 +253,11 @@ class NexusApp:
             return
 
         resources.mcp_servers.append(runtime)
-        client = runtime.client
-        if client is None:
+        if runtime.client is None:
             logger.warning("Skipping MCP server %s: no client after refresh", server.name)
             return
 
-        for display_name in specs:
-            if not self._tool_enabled(display_name):
-                continue
-            try:
-                remote_name = (
-                    display_name.removeprefix(server.prefix)
-                    if server.prefix
-                    else display_name
-                )
-                registry.register(
-                    MCPToolAdapter(
-                        client,
-                        next(
-                            spec
-                            for spec in await runtime._list_tools()
-                            if spec.name == remote_name
-                        ),
-                        display_name=display_name,
-                    ),
-                    source="mcp",
-                    origin=server.name,
-                )
-            except ValueError as exc:
-                logger.warning(
-                    "Skipping MCP tool %s from %s: %s", display_name, server.name, exc
-                )
-
-        runtime.registered_tools = tuple(
-            r.name
-            for r in registry.records()
-            if r.source == "mcp" and r.origin == server.name
-        )
+        register_discovered_mcp_tools(runtime, registry, self.config)
 
     # ------------------------------------------------------------------
     # Private — config / model helpers

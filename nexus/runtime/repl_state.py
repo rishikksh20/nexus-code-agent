@@ -3,12 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from nexus.config.defaults import AgentConfig
-from nexus.integrations.mcp import MCPServerRuntime
+from nexus.tools.mcp import MCPServerRuntime
 from nexus.memory.store import MemoryStore
 from nexus.models import AgentEvent, Message, ToolExecutionContext
 from nexus.prompts import build_context_sections
 from nexus.context import CarryOverState, ContextBuilder, ContextCompactor, TokenEstimator, prune_tool_outputs
-from nexus.runtime.delegation import DelegationRuntime
+from nexus.runtime.context_state import load_multi_agent_state, multi_agent_carry_over_lines, render_context_packet
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookExecutor
 from nexus.runtime.sessions import SessionSnapshot, SessionStore, prepare_messages_for_model, sanitize_session_messages
@@ -42,9 +42,7 @@ class ReplState:
     history: list[Message] = field(default_factory=list)
     skill_registry: SkillRegistry = field(default_factory=SkillRegistry)
     active_skills: list[str] = field(default_factory=list)
-    disabled_tools: set[str] = field(default_factory=set)
     mcp_servers: list[MCPServerRuntime] = field(default_factory=list)
-    delegation: DelegationRuntime | None = None
     carry_over: CarryOverState = field(default_factory=CarryOverState)
     current_turn_id: str = ""
     current_trace_id: str = ""
@@ -89,6 +87,7 @@ class ReplState:
             carry_over=self.carry_over,
             memory_entries=_load_all_memory(self.memory_store),
         )
+        sections.carry_over.extend(multi_agent_carry_over_lines(self.session.metadata))
         self.current_system_prompt = ContextBuilder().build(sections)
         return self.current_system_prompt
 
@@ -132,6 +131,10 @@ class ReplState:
                 "active_skills": list(self.active_skills),
                 "approval_policy": self.approval_manager.policy.value,
                 "allow_hidden_paths": self.config.allow_hidden_paths,
+                "multi_agent_packet_summaries": {
+                    packet.packet_id: render_context_packet(packet)
+                    for packet in load_multi_agent_state(self.session.metadata).packets
+                },
             },
         )
         return PreparedTurn(
@@ -224,5 +227,3 @@ def _load_all_memory(store: MemoryStore) -> list[str]:
         if content:
             entries.append(f"{key}: {content}")
     return entries
-
-

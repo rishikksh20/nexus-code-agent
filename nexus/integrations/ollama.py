@@ -392,14 +392,6 @@ class OllamaModelClient:
             raise _RetryableOllamaError(f"Ollama connection failed: {exc.reason}") from exc
 
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-def _chat_url(base_url: str) -> str:
-    return f"{base_url}/api/chat"
-
-
 def _http_error_details(exc: error.HTTPError) -> str:
     raw = exc.read().decode("utf-8", errors="replace") if exc.fp is not None else ""
     if raw:
@@ -426,4 +418,3 @@ def resolve_ollama_base_url(explicit: str | None = None) -> str:
     if url.endswith("/v1"):
         url = url[:-3]
     return url
-

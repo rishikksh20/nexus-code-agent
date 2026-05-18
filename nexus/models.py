@@ -145,15 +145,6 @@ class CorrelationContext:
 
 
 @dataclass(slots=True, frozen=True)
-class TurnTelemetry:
-    correlation: CorrelationContext
-    usage: UsageSnapshot | None
-    tool_calls: int
-    duration_ms: float
-    status: str
-
-
-@dataclass(slots=True, frozen=True)
 class RuntimeRequest:
     model_name: str
     system_prompt: str
@@ -249,6 +240,11 @@ class AgentEvent:
         return cls(kind=AgentEventType.TEXT_COMPLETE, payload=content)
 
     @classmethod
+    def thinking_started(cls, *, actor: str | None = None) -> AgentEvent:
+        payload = {"actor": actor} if actor else None
+        return cls(kind=AgentEventType.THINKING_STARTED, payload=payload)
+
+    @classmethod
     def tool_call_start(
         cls,
         call_id: str,
@@ -256,15 +252,19 @@ class AgentEvent:
         arguments: dict[str, Any],
         *,
         preview: dict[str, Any] | None = None,
+        actor: str | None = None,
     ) -> AgentEvent:
+        payload = {
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+            "preview": preview or {},
+        }
+        if actor:
+            payload["actor"] = actor
         return cls(
             kind=AgentEventType.TOOL_CALL_START,
-            payload={
-                "call_id": call_id,
-                "name": name,
-                "arguments": arguments,
-                "preview": preview or {},
-            },
+            payload=payload,
         )
 
     @classmethod

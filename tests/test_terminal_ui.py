@@ -116,3 +116,61 @@ def test_terminal_ui_tool_result_reuses_stored_preview_diff():
     assert output.count("diff") >= 2
     assert "+print('new')" in output
     assert "done" in output
+
+
+def test_terminal_ui_prefixes_nested_subagent_tool_calls():
+    ui = _build_ui()
+    start_event = AgentEvent.tool_call_start(
+        "call-1",
+        "read_file",
+        {"path": "calculator/main.py"},
+        actor="subagent_planning_analysis",
+    )
+    complete_event = AgentEvent.tool_call_complete(
+        ToolResult(
+            call_id="call-1",
+            tool_name="read_file",
+            output="def add(a, b): return a + b",
+            metadata={"actor": "subagent_planning_analysis"},
+        )
+    )
+
+    ui.render_event(start_event, stream_output=False, show_tool_calls=True)
+    ui.render_event(complete_event, stream_output=False, show_tool_calls=True)
+    output = ui.console.export_text()
+
+    assert "subagent_planning_analysis - read_file  #call-1" in output
+
+
+def test_terminal_ui_uses_subagent_name_for_thinking_status():
+    ui = _build_ui()
+
+    ui.render_event(
+        AgentEvent.thinking_started(actor="subagent_execution"),
+        stream_output=False,
+        show_tool_calls=True,
+        show_thinking_indicator=True,
+    )
+
+    assert ui._thinking_status is not None  # type: ignore[attr-defined]
+    assert "subagent_execution - Thinking" in str(ui._thinking_status.status)  # type: ignore[attr-defined]
+    ui.stop_thinking()
+
+
+def test_terminal_ui_stops_tool_wait_on_completion():
+    ui = _build_ui()
+
+    ui.render_event(
+        AgentEvent.tool_call_start("call-1", "subagent_execution", {"title": "Implement", "instructions": "Do it"}),
+        stream_output=False,
+        show_tool_calls=True,
+    )
+    assert ui._tool_status is not None  # type: ignore[attr-defined]
+
+    ui.render_event(
+        AgentEvent.tool_call_complete(ToolResult(call_id="call-1", tool_name="subagent_execution", output="done")),
+        stream_output=False,
+        show_tool_calls=True,
+    )
+
+    assert ui._tool_status is None  # type: ignore[attr-defined]

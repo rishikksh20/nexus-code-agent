@@ -5,14 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from nexus.security import PermissionChecker, PermissionDecision
+from nexus.integrations.fake_model import FakeModelClient
+from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message, RuntimeResponse, ToolCall, ToolResult
+from nexus.security import ApprovalManager, ApprovalPolicy, ApprovalScope, PermissionChecker, PermissionDecision
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.delegation import DelegationRuntime
-from nexus.sandbox.agent_tool import SubagentDefinition
-from nexus.tools.filesystem import WriteFileTool
+from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition, _record_inner_approval
 from nexus.skills import Skill, SkillRegistry
-from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool, MemoryTool, PythonLspTool, WriteNoteTool
+from nexus.tools.base import Tool, ToolKind, ToolRegistry
+from nexus.tools.builtin import GetTimeTool, MemoryTool, PythonLspTool, WriteFileTool
 from nexus.tools.registry import get_core_tools
 from nexus.tools.subagents import (
     load_subagent_definitions,
@@ -20,6 +20,34 @@ from nexus.tools.subagents import (
     register_skill_subagent_tools,
     register_subagent_tools,
 )
+
+
+class FailingRunTestsTool(Tool):
+    name = "run_tests"
+    description = "Failing test runner for regression coverage."
+    kind = ToolKind.READ
+    is_mutating = False
+    input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+    async def execute(self, call_id, arguments, context):
+        return ToolResult(
+            call_id=call_id,
+            tool_name=self.name,
+            output="tests/test_app.py::test_read_main FAILED\nE TypeError: unhashable type: 'dict'\nExit code: 1",
+            is_error=True,
+            metadata={"exit_code": 1},
+        )
+
+
+class RecordingFakeModelClient(FakeModelClient):
+    def __init__(self, scripted=None) -> None:
+        super().__init__(scripted=scripted)
+        self.requests = []
+
+    async def chat_completion(self, request, *, stream: bool = True):
+        self.requests.append(request)
+        async for event in super().chat_completion(request, stream=stream):
+            yield event
 
 
 def test_core_tools_do_not_register_legacy_write_note_alias(tmp_path):
@@ -44,42 +72,6 @@ async def test_get_time_tool_returns_utc_timestamp(tool_context):
     assert result.tool_name == "get_time"
     assert "T" in result.output
     assert result.metadata["timezone"] == "UTC"
-
-
-@pytest.mark.asyncio
-async def test_write_note_tool_writes_in_workspace(tool_context):
-    result = await WriteNoteTool().execute(
-        "call-2",
-        {"path": "notes/todo.txt", "content": "ship it"},
-        tool_context,
-    )
-
-    assert result.is_error is False
-    assert (tool_context.working_directory / "notes/todo.txt").read_text(encoding="utf-8") == "ship it"
-
-
-@pytest.mark.asyncio
-async def test_write_note_tool_rejects_outside_workspace(tool_context):
-    result = await WriteNoteTool().execute(
-        "call-3",
-        {"path": "../escape.txt", "content": "nope"},
-        tool_context,
-    )
-
-    assert result.is_error is True
-    assert "outside the current workspace" in result.output.lower()
-
-
-@pytest.mark.asyncio
-async def test_write_note_tool_rejects_large_content(tool_context):
-    result = await WriteNoteTool(max_bytes=8).execute(
-        "call-4",
-        {"path": "notes/large.txt", "content": "this is too large"},
-        tool_context,
-    )
-
-    assert result.is_error is True
-    assert "larger than 8 bytes" in result.output.lower()
 
 
 @pytest.mark.asyncio
@@ -114,35 +106,260 @@ def test_permission_checker_denies_direct_nexus_memory_file_writes_with_memory_h
 @pytest.mark.asyncio
 async def test_register_subagent_tools_registers_default_and_specialist_tools():
     registry = ToolRegistry()
-    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01, base_tool_registry=registry)
-    await delegation.start()
-    try:
-        config = SimpleNamespace(delegation_enabled=True)
-        definitions = [
-            SubagentDefinition(
-                name="explore",
-                description="Investigate a focused codebase question.",
-                goal_prompt="Explore the requested slice and summarize the result.",
-            )
-        ]
+    config = SimpleNamespace(agent_mode="advanced")
+    definitions = [
+        SubagentDefinition(
+            name="explore",
+            description="Investigate a focused codebase question.",
+            goal_prompt="Explore the requested slice and summarize the result.",
+        )
+    ]
 
-        count = register_subagent_tools(registry, delegation, config, definitions=definitions)
+    count = register_subagent_tools(registry, config, definitions=definitions)
 
-        assert count == 2
-        assert registry.record("delegate_task").source == "agent"
-        specialist = registry.record("subagent_explore")
-        assert specialist.source == "agent"
-        assert specialist.origin == "explore"
-    finally:
-        await delegation.shutdown()
+    assert count == 5
+    specialist = registry.record("subagent_explore")
+    assert specialist.source == "agent"
+    assert specialist.origin == "explore"
+    assert specialist.tool.is_mutating is False
+    assert registry.record("subagent_planning_analysis").origin == "planning_analysis"
+    assert registry.record("subagent_execution").origin == "execution"
+    assert registry.record("subagent_review").origin == "review"
+    assert registry.record("subagent_verification").origin == "verification"
+    verification_tools = registry.record("subagent_verification").tool._definition.allowed_tools
+    assert "bash" in verification_tools
 
 
 @pytest.mark.asyncio
-async def test_register_subagent_tools_skips_when_delegation_disabled():
+async def test_subagent_tool_returns_structured_supervisor_envelope(tool_context):
     registry = ToolRegistry()
-    config = SimpleNamespace(delegation_enabled=False)
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="planning_analysis",
+            description="Analyze and plan.",
+            goal_prompt="Return a plan.",
+            allowed_tools=["get_time"],
+        ),
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
 
-    count = register_subagent_tools(registry, None, config)
+    result = await tool.execute(
+        "call-1",
+        {
+            "title": "Plan focused change",
+            "instructions": "Inspect the task and summarize next steps.",
+            "input_packet_ids": ["packet-0001"],
+        },
+        tool_context,
+    )
+
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == 1
+    assert payload["status"] == "completed"
+    assert payload["agent"] == "subagent_planning_analysis"
+    assert payload["role"] == "planning_analysis"
+    assert payload["context"]["scope"] == "isolated"
+    assert payload["context"]["input_packet_ids"] == ["packet-0001"]
+    assert payload["raw_result"]
+    assert result.metadata["context_snapshot"]["scope"] == "isolated"
+
+
+@pytest.mark.asyncio
+async def test_subagent_goal_prompt_stays_in_system_prompt_only(tool_context):
+    registry = ToolRegistry()
+    goal_prompt = "Return a careful implementation plan."
+    task_instructions = "Inspect the task and summarize next steps."
+    model = RecordingFakeModelClient(
+        scripted=[
+            RuntimeResponse(message=Message(role="assistant", content="Plan ready.")),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="planning_analysis",
+            description="Analyze and plan.",
+            goal_prompt=goal_prompt,
+            allowed_tools=[],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+
+    result = await tool.execute(
+        "call-plan",
+        {"title": "Plan focused change", "instructions": task_instructions},
+        tool_context,
+    )
+
+    assert result.is_error is False
+    request = model.requests[0]
+    assert goal_prompt in request.system_prompt
+    assert request.system_prompt.count(goal_prompt) == 1
+    assert request.messages[-1].content == task_instructions
+    assert goal_prompt not in request.messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_preserves_failed_test_output_after_vague_final_response(tool_context):
+    registry = ToolRegistry()
+    registry.register(FailingRunTestsTool(), source="core", origin="test")
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Running the focused tests."),
+                tool_calls=(
+                    ToolCall(call_id="call-tests", tool_name="run_tests", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(
+                message=Message(
+                    role="assistant",
+                    content="It seems I'm having difficulty accessing the necessary tools to proceed.",
+                ),
+            ),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Implement and validate.",
+            goal_prompt="Run tests and report the result.",
+            allowed_tools=["run_tests"],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+
+    result = await tool.execute(
+        "call-1",
+        {"title": "Validate app", "instructions": "Run focused tests and report failures."},
+        tool_context,
+    )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "failed"
+    assert payload["runtime_status"] == "failed"
+    assert payload["recommended_next_action"] == "continue"
+    assert "tests/test_app.py::test_read_main FAILED" in payload["raw_result"]
+    assert "difficulty accessing the necessary tools" in payload["raw_result"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_marks_unresolved_clarification_as_error(tool_context):
+    registry = ToolRegistry()
+    registry.register(WriteFileTool(), source="core", origin="builtin")
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="I need to write a file."),
+                tool_calls=(
+                    ToolCall(call_id="missing-path", tool_name="write_file", arguments={"content": "hello"}),
+                ),
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Implement a focused change.",
+            goal_prompt="Write the requested file.",
+            allowed_tools=["write_file"],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+
+    result = await tool.execute(
+        "call-clarify",
+        {"title": "Write file", "instructions": "Write a file, asking for missing details if needed."},
+        tool_context,
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is True
+    assert result.metadata["status"] == "needs_clarification"
+    assert payload["status"] == "needs_clarification"
+    assert payload["runtime_status"] == "needs_clarification"
+    assert payload["recommended_next_action"] == "ask_user"
+    assert "Provide a value for 'path'" in payload["raw_result"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_requires_registry_for_direct_execution(tool_context):
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="planning_analysis",
+            description="Analyze and plan.",
+            goal_prompt="Return a plan.",
+            allowed_tools=["get_time"],
+        )
+    )
+
+    result = await tool.execute(
+        "call-1",
+        {"title": "Plan focused change", "instructions": "Inspect the task."},
+        tool_context,
+    )
+
+    assert result.is_error is True
+    assert "not attached to a tool registry" in result.output
+
+
+def test_subagent_inner_approval_turn_scope_matches_supervisor_behavior():
+    manager = ApprovalManager(policy=ApprovalPolicy.ON_REQUEST)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow tool 'write_file'?",
+        reason="write_file replaces the entire file.",
+        call_id="call-1",
+        payload={"approval_policy": "on-request", "risk_level": "medium"},
+        arguments={"path": "one.txt", "content": "one"},
+    )
+
+    _record_inner_approval(
+        manager,
+        request,
+        ConfirmationResponse(approved=True, scope=ApprovalScope.TURN.value),
+    )
+
+    assert manager.is_turn_wide_mutating_preapproved(
+        "write_file",
+        is_mutating=True,
+        risk_level="medium",
+    )
+    assert manager.is_pre_approved("write_file", {"path": "two.txt", "content": "two"}) is False
+
+
+@pytest.mark.asyncio
+async def test_register_subagent_tools_advanced_mode_does_not_require_delegation_flag():
+    registry = ToolRegistry()
+    config = SimpleNamespace(agent_mode="advanced")
+
+    count = register_subagent_tools(registry, config)
+
+    assert count == 4
+    assert {record.name for record in registry.records()} == {
+        "subagent_planning_analysis",
+        "subagent_execution",
+        "subagent_review",
+        "subagent_verification",
+    }
+
+
+@pytest.mark.asyncio
+async def test_register_subagent_tools_skips_unless_advanced_mode():
+    registry = ToolRegistry()
+    config = SimpleNamespace(agent_mode="basic")
+
+    count = register_subagent_tools(registry, config)
 
     assert count == 0
     assert registry.records() == []
@@ -197,54 +414,44 @@ def test_load_subagent_definitions_from_skills_uses_subagent_prefix():
 @pytest.mark.asyncio
 async def test_register_subagent_tools_respects_tool_filters():
     registry = ToolRegistry()
-    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01, base_tool_registry=registry)
-    await delegation.start()
-    try:
-        config = SimpleNamespace(
-            delegation_enabled=True,
-            allowed_tools=["subagent_explore"],
-            denied_tools=[],
+    config = SimpleNamespace(
+        agent_mode="advanced",
+        allowed_tools=["subagent_explore"],
+        denied_tools=[],
+    )
+    definitions = [
+        SubagentDefinition(
+            name="explore",
+            description="Investigate a focused codebase question.",
+            goal_prompt="Explore the requested slice and summarize the result.",
         )
-        definitions = [
-            SubagentDefinition(
-                name="explore",
-                description="Investigate a focused codebase question.",
-                goal_prompt="Explore the requested slice and summarize the result.",
-            )
-        ]
+    ]
 
-        count = register_subagent_tools(registry, delegation, config, definitions=definitions)
+    count = register_subagent_tools(registry, config, definitions=definitions)
 
-        assert count == 1
-        assert registry.records()[0].name == "subagent_explore"
-    finally:
-        await delegation.shutdown()
+    assert count == 1
+    assert registry.records()[0].name == "subagent_explore"
 
 
 @pytest.mark.asyncio
-async def test_register_skill_subagent_tools_registers_skill_backed_workers():
+async def test_register_skill_subagent_tools_registers_skill_backed_cognitive_tools():
     registry = ToolRegistry()
-    delegation = DelegationRuntime(worker_ids=["worker-1"], poll_interval=0.01, base_tool_registry=registry)
-    await delegation.start()
-    try:
-        config = SimpleNamespace(delegation_enabled=True, allowed_tools=[], denied_tools=[])
-        skill_registry = SkillRegistry()
-        skill_registry.register(
-            Skill(
-                name="subagent-review",
-                description="Review a focused code slice.",
-                content="Inspect the selected code and report issues.",
-            )
+    config = SimpleNamespace(agent_mode="advanced", allowed_tools=[], denied_tools=[])
+    skill_registry = SkillRegistry()
+    skill_registry.register(
+        Skill(
+            name="subagent-review",
+            description="Review a focused code slice.",
+            content="Inspect the selected code and report issues.",
         )
+    )
 
-        count = register_skill_subagent_tools(registry, delegation, config, skill_registry)
+    count = register_skill_subagent_tools(registry, config, skill_registry)
 
-        assert count == 1
-        record = registry.record("subagent_review")
-        assert record.source == "agent-skill"
-        assert record.origin == "review"
-    finally:
-        await delegation.shutdown()
+    assert count == 1
+    record = registry.record("subagent_review")
+    assert record.source == "agent-skill"
+    assert record.origin == "review"
 
 
 @pytest.mark.asyncio

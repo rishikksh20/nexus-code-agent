@@ -17,7 +17,18 @@ from nexus.tools.builtin import (
     WebFetchTool,
     WebSearchTool,
     WriteFileTool,
-    get_all_builtin_tools,
+)
+from nexus.tools.mcp import (
+    MCPCallResult,
+    MCPClient,
+    MCPRefreshReport,
+    MCPServerConfig,
+    MCPServerRuntime,
+    MCPToolAdapter,
+    MCPToolSpec,
+    mcp_server_example_for_workspace,
+    refresh_mcp_server_tools,
+    register_discovered_mcp_tools,
 )
 from nexus.tools.registry import create_tool_registry, get_core_tools, register_core_tools, tool_enabled
 
@@ -44,9 +55,19 @@ __all__ = [
     "WebFetchTool",
     "WebSearchTool",
     "WriteFileTool",
+    # MCP tools
+    "MCPCallResult",
+    "MCPClient",
+    "MCPRefreshReport",
+    "MCPServerConfig",
+    "MCPServerRuntime",
+    "MCPToolAdapter",
+    "MCPToolSpec",
+    "mcp_server_example_for_workspace",
+    "refresh_mcp_server_tools",
+    "register_discovered_mcp_tools",
     # Factory
     "create_tool_registry",
-    "get_all_builtin_tools",
     "get_core_tools",
     "register_core_tools",
     "tool_enabled",

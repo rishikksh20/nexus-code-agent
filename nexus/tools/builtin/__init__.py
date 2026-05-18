@@ -5,15 +5,12 @@ This ``__init__.py`` re-exports every tool class so that callers can do either:
 
     from nexus.tools.builtin import ReadFileTool, EditTool, MemoryTool
     from nexus.tools.builtin.edit_file import EditTool
-
-The :func:`get_all_builtin_tools` factory returns a list of pre-constructed
-tool instances ready for registration.
 """
 from __future__ import annotations
 
-from typing import Any
-
 from nexus.tools.builtin.edit_file import EditTool
+from nexus.tools.builtin.code_search import CodeIndexTool, FindReferencesTool, SemanticSearchTool
+from nexus.tools.builtin.git import GitDiffTool, GitStatusTool
 from nexus.tools.builtin.glob import GlobTool
 from nexus.tools.builtin.grep import GrepTool
 from nexus.tools.builtin.list_dir import ListDirTool, LsTool
@@ -27,7 +24,8 @@ from nexus.tools.builtin.time import GetTimeTool
 from nexus.tools.builtin.todo import TodoTool
 from nexus.tools.builtin.web_fetch import WebFetchTool
 from nexus.tools.builtin.web_search import WebSearchTool
-from nexus.tools.builtin.write_file import WriteFileTool, WriteNoteTool
+from nexus.tools.builtin.write_file import WriteFileTool
+from nexus.tools.builtin.verification import RunFormatterTool, RunLinterTool, RunTestsTool, RunTypecheckTool
 
 __all__ = [
     "GetTimeTool",
@@ -44,6 +42,15 @@ __all__ = [
     "ListDirTool",
     "LsTool",
     "PythonLspTool",
+    "FindReferencesTool",
+    "CodeIndexTool",
+    "SemanticSearchTool",
+    "GitStatusTool",
+    "GitDiffTool",
+    "RunTestsTool",
+    "RunLinterTool",
+    "RunTypecheckTool",
+    "RunFormatterTool",
     # Execution
     "ShellTool",
     "BashTool",
@@ -54,24 +61,3 @@ __all__ = [
     "WebFetchTool",
     "WebSearchTool",
 ]
-
-
-def get_all_builtin_tools(*, memory_dir=None) -> list[Any]:
-    """Return pre-constructed builtin tool instances."""
-    return [
-        GetTimeTool(),
-        ReadFileTool(),
-        WriteFileTool(),
-        EditTool(),
-        InsertEditIntoFileTool(),
-        ApplyPatchTool(),
-        GlobTool(),
-        GrepTool(),
-        ListDirTool(),
-        PythonLspTool(),
-        ShellTool(),
-        MemoryTool(memory_dir=memory_dir),
-        TodoTool(),
-        WebFetchTool(),
-        WebSearchTool(),
-    ]

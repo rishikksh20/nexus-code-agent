@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
 from nexus.models import (
@@ -25,10 +26,11 @@ from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
 from nexus.security.manager import ApprovalManager
-from nexus.tools.base import FileDiff, ToolConfirmation, ToolRegistry
+from nexus.tools.base import FileDiff, ToolConfirmation, ToolRegistry, tool_to_schema
 
 
 TOOL_CALL_LIMIT_FINISH_REASON = "tool_call_limit"
+INVALID_TOOL_CALL_RETRY_LIMIT = 2
 
 
 @runtime_checkable
@@ -102,7 +104,7 @@ class Agent:
                 yield event
             return
 
-        yield AgentEvent(kind=AgentEventType.THINKING_STARTED)
+        yield AgentEvent.thinking_started(actor=_tool_actor(context))
         yield AgentEvent.agent_start(messages[-1].content if messages else "")
 
         async for event in self._agentic_loop(
@@ -133,11 +135,51 @@ class Agent:
         *,
         approval_manager: ApprovalManager | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
+        mutating_paths_this_batch: set[str] = set()
         for tool_call in tool_calls:
-            record = self.tool_registry.record(tool_call.tool_name)
+            try:
+                record = self.tool_registry.record(tool_call.tool_name)
+            except LookupError:
+                result = _unknown_tool_result(
+                    tool_call,
+                    self.tool_registry,
+                    retry_count=1,
+                    retry_limit=INVALID_TOOL_CALL_RETRY_LIMIT,
+                )
+                yield AgentEvent.tool_call_start(
+                    tool_call.call_id,
+                    str(tool_call.tool_name),
+                    tool_call.arguments,
+                    actor=_tool_actor(context),
+                )
+                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                yield AgentEvent.tool_call_complete(result)
+                yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
+                continue
+            if not _tool_available_in_context(record, context):
+                result = _tool_not_available_result(tool_call, self.tool_registry, context)
+                yield AgentEvent.tool_call_start(
+                    tool_call.call_id,
+                    str(tool_call.tool_name),
+                    tool_call.arguments,
+                    actor=_tool_actor(context),
+                )
+                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                yield AgentEvent.tool_call_complete(result)
+                yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
+                continue
             tool = record.tool
             confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
             confirmation_preview = _confirmation_preview(confirmation)
+            affected_paths = _affected_file_paths(tool, tool_call.arguments, confirmation, context)
+            duplicate_paths = affected_paths & mutating_paths_this_batch if tool.is_mutating else set()
+            if duplicate_paths:
+                blocked_result = _same_file_mutation_result(tool_call, duplicate_paths)
+                yield AgentEvent.tool_call_complete(blocked_result)
+                yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=blocked_result)
+                continue
+            if tool.is_mutating:
+                mutating_paths_this_batch.update(affected_paths)
             async for event in self._execute_tool_call(
                 record,
                 tool,
@@ -145,6 +187,7 @@ class Agent:
                 context,
                 approval_manager=approval_manager,
                 confirmation_preview=confirmation_preview,
+                affected_paths=affected_paths,
             ):
                 yield event
 
@@ -166,10 +209,16 @@ class Agent:
             0,
         )
         approved_calls: list[ToolCall] = []
+        mutating_paths_this_batch: set[str] = set()
         for call in tool_calls[start_index:]:
             try:
                 record = self.tool_registry.record(call.tool_name)
             except Exception:
+                continue
+            if not _tool_available_in_context(record, context):
+                continue
+            affected_paths = _affected_file_paths(record.tool, call.arguments, None, context)
+            if record.tool.is_mutating and affected_paths & mutating_paths_this_batch:
                 continue
             decision = self.permission_checker.evaluate(
                 record.tool,
@@ -190,6 +239,8 @@ class Agent:
                 risk_level=risk_level,
             ):
                 approved_calls.append(call)
+                if record.tool.is_mutating:
+                    mutating_paths_this_batch.update(affected_paths)
         return tuple(approved_calls or (first_tool_call,))
 
     async def _execute_tool_call(
@@ -201,12 +252,15 @@ class Agent:
         *,
         approval_manager: ApprovalManager | None,
         confirmation_preview: dict[str, Any],
+        affected_paths: set[str] | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
+        actor = _tool_actor(context)
         yield AgentEvent.tool_call_start(
             tool_call.call_id,
             tool_call.tool_name,
             tool_call.arguments,
             preview=confirmation_preview,
+            actor=actor,
         )
         yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
 
@@ -226,6 +280,14 @@ class Agent:
 
         started_at = time.perf_counter()
         result = await tool.execute(tool_call.call_id, tool_call.arguments, context)
+        if actor:
+            result.metadata = {**result.metadata, "actor": actor}
+        if tool.is_mutating:
+            result = _with_post_mutation_refresh(
+                result,
+                affected_paths or set(),
+                context,
+            )
         if approval_manager is not None:
             approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
 
@@ -270,13 +332,17 @@ class Agent:
 
         tool_calls_executed = 0
         loop_detector = LoopDetector()
+        unknown_tool_retries: dict[str, int] = {}
+        invalid_argument_retries: dict[tuple[str, tuple[str, ...]], int] = {}
 
-        for _ in range(max_turns):
+        for turn_index in range(max_turns):
+            if turn_index > 0:
+                yield AgentEvent.thinking_started(actor=_tool_actor(context))
             request = RuntimeRequest(
                 model_name=model_name,
                 system_prompt=system_prompt,
                 messages=tuple(history),
-                tool_schemas=self.tool_registry.schemas(),
+                tool_schemas=_tool_schemas_for_context(self.tool_registry, context),
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
             )
@@ -358,12 +424,8 @@ class Agent:
             # Tool execution
             # ----------------------------------------------------------------
             tool_result_messages: list[Message] = []
+            mutating_paths_this_batch: set[str] = set()
             for tool_call in tool_calls:
-                record = self.tool_registry.record(tool_call.tool_name)
-                tool = record.tool
-                confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
-                confirmation_preview = _confirmation_preview(confirmation)
-
                 if tool_calls_executed >= max_tool_calls_per_turn:
                     pause_message = _tool_call_limit_pause_message(max_tool_calls_per_turn)
                     yield AgentEvent.text_complete(pause_message)
@@ -377,9 +439,128 @@ class Agent:
                     yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload=TOOL_CALL_LIMIT_FINISH_REASON)
                     return
 
+                try:
+                    record = self.tool_registry.record(tool_call.tool_name)
+                except LookupError:
+                    tool_name = _tool_name_text(tool_call.tool_name)
+                    retry_count = unknown_tool_retries.get(tool_name, 0) + 1
+                    unknown_tool_retries[tool_name] = retry_count
+                    unknown_result = _unknown_tool_result(
+                        tool_call,
+                        self.tool_registry,
+                        retry_count=retry_count,
+                        retry_limit=INVALID_TOOL_CALL_RETRY_LIMIT,
+                    )
+                    tool_calls_executed += 1
+                    tool_result_messages.append(_tool_result_message(unknown_result))
+                    yield AgentEvent.tool_call_start(
+                        tool_call.call_id,
+                        tool_name,
+                        tool_call.arguments,
+                        actor=_tool_actor(context),
+                    )
+                    yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                    yield AgentEvent.tool_call_complete(unknown_result)
+                    yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=unknown_result)
+                    loop_detector.record_action("tool_call", tool_name=tool_name, result="unknown_tool")
+                    if retry_count > INVALID_TOOL_CALL_RETRY_LIMIT:
+                        for msg in tool_result_messages:
+                            history.append(msg)
+                        stop_message = _invalid_tool_call_stop_message(tool_name, "unknown tool name")
+                        yield AgentEvent.text_complete(stop_message)
+                        yield AgentEvent(
+                            kind=AgentEventType.MODEL_RESPONSE,
+                            payload=RuntimeResponse(
+                                message=Message(role="assistant", content=stop_message),
+                                finish_reason="invalid_tool_call",
+                            ),
+                        )
+                        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="invalid_tool_call")
+                        return
+                    continue
+                if not _tool_available_in_context(record, context):
+                    tool_name = _tool_name_text(tool_call.tool_name)
+                    retry_count = unknown_tool_retries.get(tool_name, 0) + 1
+                    unknown_tool_retries[tool_name] = retry_count
+                    unavailable_result = _tool_not_available_result(
+                        tool_call,
+                        self.tool_registry,
+                        context,
+                        retry_count=retry_count,
+                        retry_limit=INVALID_TOOL_CALL_RETRY_LIMIT,
+                    )
+                    tool_calls_executed += 1
+                    tool_result_messages.append(_tool_result_message(unavailable_result))
+                    yield AgentEvent.tool_call_start(
+                        tool_call.call_id,
+                        tool_name,
+                        tool_call.arguments,
+                        actor=_tool_actor(context),
+                    )
+                    yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                    yield AgentEvent.tool_call_complete(unavailable_result)
+                    yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=unavailable_result)
+                    loop_detector.record_action("tool_call", tool_name=tool_name, result="unavailable_tool")
+                    if retry_count > INVALID_TOOL_CALL_RETRY_LIMIT:
+                        for msg in tool_result_messages:
+                            history.append(msg)
+                        stop_message = _invalid_tool_call_stop_message(tool_name, "tool unavailable in this context")
+                        yield AgentEvent.text_complete(stop_message)
+                        yield AgentEvent(
+                            kind=AgentEventType.MODEL_RESPONSE,
+                            payload=RuntimeResponse(
+                                message=Message(role="assistant", content=stop_message),
+                                finish_reason="invalid_tool_call",
+                            ),
+                        )
+                        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="invalid_tool_call")
+                        return
+                    continue
+
+                tool = record.tool
                 missing_fields = _missing_required_fields(tool.input_schema, tool_call.arguments)
                 if missing_fields:
+                    if _missing_fields_should_be_repaired_by_model(missing_fields):
+                        retry_key = (tool.name, tuple(missing_fields))
+                        retry_count = invalid_argument_retries.get(retry_key, 0) + 1
+                        invalid_argument_retries[retry_key] = retry_count
+                        invalid_result = _missing_required_argument_result(
+                            tool_call,
+                            tool.name,
+                            missing_fields,
+                            retry_count=retry_count,
+                            retry_limit=INVALID_TOOL_CALL_RETRY_LIMIT,
+                        )
+                        tool_calls_executed += 1
+                        tool_result_messages.append(_tool_result_message(invalid_result))
+                        yield AgentEvent.tool_call_start(
+                            tool_call.call_id,
+                            tool.name,
+                            tool_call.arguments,
+                            actor=_tool_actor(context),
+                        )
+                        yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                        yield AgentEvent.tool_call_complete(invalid_result)
+                        yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=invalid_result)
+                        loop_detector.record_action("tool_call", tool_name=tool.name, result="missing_argument")
+                        if retry_count > INVALID_TOOL_CALL_RETRY_LIMIT:
+                            for msg in tool_result_messages:
+                                history.append(msg)
+                            stop_message = _invalid_tool_call_stop_message(tool.name, "missing required arguments")
+                            yield AgentEvent.text_complete(stop_message)
+                            yield AgentEvent(
+                                kind=AgentEventType.MODEL_RESPONSE,
+                                payload=RuntimeResponse(
+                                    message=Message(role="assistant", content=stop_message),
+                                    finish_reason="invalid_tool_call",
+                                ),
+                            )
+                            yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="invalid_tool_call")
+                            return
+                        continue
+
                     missing_field = missing_fields[0]
+                    confirmation_preview: dict[str, Any] = {}
                     await self.hooks.emit(
                         HookEvent.NOTIFICATION,
                         {
@@ -399,7 +580,7 @@ class Agent:
                         prompt=f"Provide a value for '{missing_field}' before running '{tool.name}'.",
                         reason="Required tool argument is missing.",
                         call_id=tool_call.call_id,
-                        payload={"tool_name": tool.name, "field": missing_field},
+                        payload={"tool_name": tool.name, "field": missing_field, "actor": _tool_actor(context)},
                         arguments=tool_call.arguments,
                         preview=confirmation_preview,
                     )
@@ -408,6 +589,10 @@ class Agent:
                         payload=clarification_request,
                     )
                     return
+
+                confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
+                confirmation_preview = _confirmation_preview(confirmation)
+                affected_paths = _affected_file_paths(tool, tool_call.arguments, confirmation, context)
 
                 decision = self.permission_checker.evaluate(
                     tool,
@@ -439,12 +624,7 @@ class Agent:
                         },
                     )
                     tool_calls_executed += 1
-                    tool_result_messages.append(Message(
-                        role="tool",
-                        content=denied_result.output,
-                        name=denied_result.tool_name,
-                        tool_call_id=denied_result.call_id,
-                    ))
+                    tool_result_messages.append(_tool_result_message(denied_result))
                     yield AgentEvent(kind=AgentEventType.TOOL_DENIED, payload=decision)
                     yield AgentEvent.tool_call_complete(denied_result)
                     yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=denied_result)
@@ -460,15 +640,20 @@ class Agent:
                         risk_level=_risk_level_name(decision.risk_level),
                     )
                     tool_calls_executed += 1
-                    tool_result_messages.append(Message(
-                        role="tool",
-                        content=refused_result.output,
-                        name=refused_result.tool_name,
-                        tool_call_id=refused_result.call_id,
-                    ))
+                    tool_result_messages.append(_tool_result_message(refused_result))
                     yield AgentEvent.tool_call_complete(refused_result)
                     yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=refused_result)
                     loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="refused")
+                    continue
+
+                duplicate_paths = affected_paths & mutating_paths_this_batch if tool.is_mutating else set()
+                if duplicate_paths:
+                    blocked_result = _same_file_mutation_result(tool_call, duplicate_paths)
+                    tool_calls_executed += 1
+                    tool_result_messages.append(_tool_result_message(blocked_result))
+                    yield AgentEvent.tool_call_complete(blocked_result)
+                    yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=blocked_result)
+                    loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="same_file_blocked")
                     continue
 
                 if (
@@ -494,6 +679,7 @@ class Agent:
                             "reason": decision.reason,
                             "approval_policy": str(context.metadata.get("approval_policy", "on-request")),
                             "risk_level": _risk_level_name(decision.risk_level),
+                            "actor": _tool_actor(context),
                         },
                         arguments=tool_call.arguments,
                         preview=confirmation_preview,
@@ -515,6 +701,8 @@ class Agent:
                     yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=conf_request)
                     return
 
+                if tool.is_mutating:
+                    mutating_paths_this_batch.update(affected_paths)
                 result: ToolResult | None = None
                 async for event in self._execute_tool_call(
                     record,
@@ -523,6 +711,7 @@ class Agent:
                     context,
                     approval_manager=approval_manager,
                     confirmation_preview=confirmation_preview,
+                    affected_paths=affected_paths,
                 ):
                     if event.kind == AgentEventType.TOOL_RESULT:
                         result = event.payload
@@ -530,12 +719,7 @@ class Agent:
                 if result is None:
                     continue
                 tool_calls_executed += 1
-                tool_result_messages.append(Message(
-                    role="tool",
-                    content=result.output,
-                    name=result.tool_name,
-                    tool_call_id=result.call_id,
-                ))
+                tool_result_messages.append(_tool_result_message(result))
                 loop_detector.record_action("tool_call", tool_name=tool_call.tool_name)
 
             # Add all tool results to history after the complete batch, then prune
@@ -567,6 +751,148 @@ def _missing_required_fields(schema: dict[str, Any], arguments: dict[str, Any]) 
             if min_length > 0 and not value.strip():
                 missing.append(field_name)
     return missing
+
+
+def _tool_result_message(result: ToolResult) -> Message:
+    return Message(
+        role="tool",
+        content=result.output,
+        name=result.tool_name,
+        tool_call_id=result.call_id,
+    )
+
+
+def _tool_name_text(tool_name: Any) -> str:
+    if isinstance(tool_name, str):
+        return tool_name or "(empty)"
+    return repr(tool_name)
+
+
+def _unknown_tool_result(
+    tool_call: ToolCall,
+    registry: ToolRegistry,
+    *,
+    retry_count: int,
+    retry_limit: int,
+) -> ToolResult:
+    tool_name = _tool_name_text(tool_call.tool_name)
+    available = ", ".join(record.name for record in registry.records()) or "(no tools registered)"
+    if retry_count > retry_limit:
+        guidance = (
+            f"Retry limit exceeded after {retry_limit} repair attempts. Stop using this hallucinated tool name."
+        )
+    else:
+        guidance = (
+            "Retry with one of the available tool names from the current tool schema. "
+            f"Repair attempt {retry_count} of {retry_limit}."
+        )
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=tool_name,
+        output=(
+            f"Unknown tool name: {tool_name}. This tool is not registered in the current context. "
+            f"Available tools: {available}. {guidance}"
+        ),
+        is_error=True,
+        metadata={
+            "unknown_tool": True,
+            "tool_name": tool_name,
+            "retry_count": retry_count,
+            "retry_limit": retry_limit,
+            "available_tools": [record.name for record in registry.records()],
+        },
+    )
+
+
+def _tool_not_available_result(
+    tool_call: ToolCall,
+    registry: ToolRegistry,
+    context: ToolExecutionContext,
+    *,
+    retry_count: int = 1,
+    retry_limit: int = INVALID_TOOL_CALL_RETRY_LIMIT,
+) -> ToolResult:
+    del context
+    tool_name = _tool_name_text(tool_call.tool_name)
+    available = ", ".join(
+        record.name
+        for record in registry.records()
+        if record.name.startswith("subagent_")
+    ) or "(none)"
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=tool_name,
+        output=(
+            f"Tool '{tool_name}' is not available to the supervisor in advanced mode. "
+            f"Call the appropriate cognitive sub-agent instead. Available supervisor tools: {available}."
+        ),
+        is_error=True,
+        metadata={
+            "tool_unavailable": True,
+            "tool_name": tool_name,
+            "retry_count": retry_count,
+            "retry_limit": retry_limit,
+            "available_tools": [record.name for record in registry.records() if record.name.startswith("subagent_")],
+        },
+    )
+
+
+def _missing_fields_should_be_repaired_by_model(missing_fields: list[str]) -> bool:
+    model_owned_fields = {
+        "content",
+        "new_content",
+        "old_content",
+        "new_string",
+        "old_string",
+        "code",
+        "patch",
+    }
+    return any(field in model_owned_fields for field in missing_fields)
+
+
+def _missing_required_argument_result(
+    tool_call: ToolCall,
+    tool_name: str,
+    missing_fields: list[str],
+    *,
+    retry_count: int,
+    retry_limit: int,
+) -> ToolResult:
+    fields_text = ", ".join(f"'{field}'" for field in missing_fields)
+    supplied_keys = ", ".join(sorted(str(key) for key in tool_call.arguments)) or "(none)"
+    alias_hint = ""
+    if "content" in missing_fields and "text" in tool_call.arguments:
+        alias_hint = " You supplied 'text'; use 'content' for the file body instead."
+    if retry_count > retry_limit:
+        guidance = (
+            f"Retry limit exceeded after {retry_limit} repair attempts. Stop and explain the blocker."
+        )
+    else:
+        guidance = (
+            "Retry the tool call with valid arguments generated from the task context. "
+            f"Repair attempt {retry_count} of {retry_limit}."
+        )
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=tool_name,
+        output=(
+            f"Missing required argument(s) for tool '{tool_name}': {fields_text}. "
+            f"Supplied argument keys: {supplied_keys}.{alias_hint} {guidance}"
+        ),
+        is_error=True,
+        metadata={
+            "missing_required_arguments": missing_fields,
+            "retry_count": retry_count,
+            "retry_limit": retry_limit,
+        },
+    )
+
+
+def _invalid_tool_call_stop_message(tool_name: str, reason: str) -> str:
+    return (
+        f"Stopping because the model repeatedly produced an invalid tool call for '{tool_name}' "
+        f"({reason}) after {INVALID_TOOL_CALL_RETRY_LIMIT} repair attempts."
+    )
 
 
 def _is_tool_preapproved(
@@ -610,6 +936,27 @@ def _correlation_payload(context: ToolExecutionContext, *, tool_call_id: str | N
     return {key: value for key, value in payload.items() if value}
 
 
+def _tool_actor(context: ToolExecutionContext) -> str:
+    actor = context.metadata.get("tool_display_prefix") or context.metadata.get("subagent")
+    return str(actor).strip() if actor else ""
+
+
+def _tool_schemas_for_context(registry: ToolRegistry, context: ToolExecutionContext) -> tuple[dict[str, Any], ...]:
+    if not context.metadata.get("supervisor_cognitive_tools_only"):
+        return registry.schemas()
+    return tuple(
+        tool_to_schema(record.tool)
+        for record in registry.records()
+        if record.name.startswith("subagent_")
+    )
+
+
+def _tool_available_in_context(record: Any, context: ToolExecutionContext) -> bool:
+    if not context.metadata.get("supervisor_cognitive_tools_only"):
+        return True
+    return str(record.name).startswith("subagent_")
+
+
 async def _get_tool_confirmation(
     tool: Any,
     call_id: str,
@@ -636,6 +983,155 @@ def _confirmation_preview(confirmation: ToolConfirmation | None) -> dict[str, An
     if confirmation.diff is not None:
         preview["diff"] = _serialize_file_diff(confirmation.diff)
     return preview
+
+
+def _affected_file_paths(
+    tool: Any,
+    arguments: dict[str, Any],
+    confirmation: ToolConfirmation | None,
+    context: ToolExecutionContext,
+) -> set[str]:
+    if not getattr(tool, "is_mutating", False):
+        return set()
+
+    workspace = context.working_directory.resolve()
+    candidates: list[Path] = []
+    if confirmation is not None:
+        candidates.extend(confirmation.affected_paths)
+
+    raw_path = arguments.get("path")
+    if raw_path:
+        candidates.append(_resolve_workspace_path(workspace, str(raw_path)))
+
+    if getattr(tool, "name", "") == "apply_patch":
+        candidates.extend(_paths_from_patch_argument(workspace, str(arguments.get("patch", "")), int(arguments.get("strip", 1))))
+
+    paths: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate.absolute()
+        try:
+            rel = resolved.relative_to(workspace)
+            paths.add(str(rel))
+        except ValueError:
+            paths.add(str(resolved))
+    return paths
+
+
+def _resolve_workspace_path(workspace: Path, raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    return path.resolve() if path.is_absolute() else (workspace / path).resolve()
+
+
+def _paths_from_patch_argument(workspace: Path, patch_text: str, strip: int) -> list[Path]:
+    paths: list[Path] = []
+    pending_old_path: str | None = None
+    for line in patch_text.splitlines():
+        if line.startswith("--- "):
+            pending_old_path = _clean_patch_path(line[4:])
+            continue
+        if line.startswith("+++ ") and pending_old_path is not None:
+            new_path = _clean_patch_path(line[4:])
+            raw_path = pending_old_path if new_path == "/dev/null" else new_path
+            pending_old_path = None
+            if raw_path == "/dev/null":
+                continue
+            parts = Path(raw_path).parts
+            if strip > 0 and len(parts) > strip:
+                raw_path = str(Path(*parts[strip:]))
+            paths.append(_resolve_workspace_path(workspace, raw_path))
+    return paths
+
+
+def _clean_patch_path(raw_path: str) -> str:
+    path = raw_path.split("\t")[0].strip()
+    for prefix in ("a/", "b/"):
+        if path.startswith(prefix):
+            return path[len(prefix):]
+    return path
+
+
+def _same_file_mutation_result(tool_call: ToolCall, duplicate_paths: set[str]) -> ToolResult:
+    paths = ", ".join(sorted(duplicate_paths))
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=tool_call.tool_name,
+        output=(
+            "Skipped mutating tool call: another mutating tool call in the same model response "
+            f"already targeted {paths}. Read the file again after the prior mutation and issue a fresh edit."
+        ),
+        is_error=True,
+        metadata={
+            "same_file_mutation_blocked": True,
+            "paths": sorted(duplicate_paths),
+        },
+    )
+
+
+def _with_post_mutation_refresh(
+    result: ToolResult,
+    affected_paths: set[str],
+    context: ToolExecutionContext,
+) -> ToolResult:
+    if not affected_paths or (result.is_error and int(result.metadata.get("files_patched", 0) or 0) <= 0):
+        return result
+
+    workspace = context.working_directory.resolve()
+    refreshes: list[dict[str, Any]] = []
+    output_parts = [result.output]
+    for path_text in sorted(affected_paths):
+        path = _resolve_workspace_path(workspace, path_text)
+        try:
+            rel = str(path.relative_to(workspace))
+        except ValueError:
+            rel = str(path)
+
+        if not path.exists():
+            refreshes.append({"path": rel, "exists": False, "content": "", "truncated": False})
+            output_parts.append(f"\n[Post-mutation refresh]\nRead {rel} after mutation: file no longer exists.")
+            continue
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            refreshes.append({"path": rel, "exists": True, "error": str(exc)})
+            output_parts.append(f"\n[Post-mutation refresh]\nCould not read {rel} after mutation: {exc}")
+            continue
+
+        max_chars = int(context.metadata.get("post_mutation_read_max_chars", 12_000) or 12_000)
+        clipped = content[:max_chars]
+        truncated = len(content) > max_chars
+        refreshes.append(
+            {
+                "path": rel,
+                "exists": True,
+                "content": clipped,
+                "truncated": truncated,
+                "line_count": len(content.splitlines()),
+            }
+        )
+        suffix = "\n...[truncated]" if truncated else ""
+        output_parts.append(
+            f"\n[Post-mutation refresh]\nRead {rel} after mutation ({len(content.splitlines())} lines):\n"
+            f"```text\n{clipped}{suffix}\n```"
+        )
+
+    if not refreshes:
+        return result
+
+    metadata = dict(result.metadata)
+    metadata["post_mutation_reads"] = refreshes
+    metadata["affected_paths"] = sorted(affected_paths)
+    return ToolResult(
+        call_id=result.call_id,
+        tool_name=result.tool_name,
+        output="\n".join(output_parts),
+        is_error=result.is_error,
+        metadata=metadata,
+    )
 
 
 def _serialize_file_diff(diff: FileDiff) -> dict[str, Any]:
