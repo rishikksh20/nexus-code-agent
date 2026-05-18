@@ -14,7 +14,7 @@ import signal
 import shlex
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import Tool, ToolConfirmation, ToolKind
@@ -218,8 +218,31 @@ class ShellTool(Tool):
             start_new_session=True,
         )
 
+        stdout_parts: list[bytes] = []
+        stderr_parts: list[bytes] = []
+        stream_output = _stream_output_callback(context, call_id, self.name)
+        stdout_task = asyncio.create_task(
+            _read_process_stream(
+                process.stdout,
+                "stdout",
+                stdout_parts,
+                stream_output,
+            )
+        )
+        stderr_task = asyncio.create_task(
+            _read_process_stream(
+                process.stderr,
+                "stderr",
+                stderr_parts,
+                stream_output,
+            )
+        )
+
         try:
-            stdout_data, stderr_data = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            await asyncio.wait_for(
+                asyncio.gather(process.wait(), stdout_task, stderr_task),
+                timeout=timeout,
+            )
         except asyncio.TimeoutError:
             try:
                 if sys.platform != "win32":
@@ -228,9 +251,14 @@ class ShellTool(Tool):
                     process.kill()
             except ProcessLookupError:
                 pass
+            for task in (stdout_task, stderr_task):
+                task.cancel()
             await process.wait()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             return ToolResult(call_id=call_id, tool_name=self.name, output=f"Command timed out after {timeout}s", is_error=True, metadata={"timeout": True})
 
+        stdout_data = b"".join(stdout_parts)
+        stderr_data = b"".join(stderr_parts)
         stdout = stdout_data.decode("utf-8", errors="replace")
         stderr = stderr_data.decode("utf-8", errors="replace")
         exit_code = process.returncode
@@ -255,6 +283,46 @@ class ShellTool(Tool):
 
     def _build_env(self) -> dict[str, str]:
         return os.environ.copy()
+
+
+StreamOutputCallback = Callable[[str, str], Awaitable[None] | None]
+
+
+def _stream_output_callback(
+    context: ToolExecutionContext,
+    call_id: str,
+    tool_name: str,
+) -> StreamOutputCallback | None:
+    ui = context.metadata.get("ui")
+    callback = getattr(ui, "stream_tool_output", None)
+    if not callable(callback):
+        return None
+
+    def stream(stream_name: str, chunk: str) -> Awaitable[None] | None:
+        return callback(call_id, tool_name, stream_name, chunk)
+
+    return stream
+
+
+async def _read_process_stream(
+    stream: asyncio.StreamReader | None,
+    stream_name: str,
+    sink: list[bytes],
+    callback: StreamOutputCallback | None,
+) -> None:
+    if stream is None:
+        return
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            return
+        sink.append(chunk)
+        if callback is None:
+            continue
+        text = chunk.decode("utf-8", errors="replace")
+        maybe_awaitable = callback(stream_name, text)
+        if maybe_awaitable is not None:
+            await maybe_awaitable
 
 
 # Alias — "BashTool" is the name used in tests and the filesystem shim

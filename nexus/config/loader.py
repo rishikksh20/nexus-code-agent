@@ -274,11 +274,29 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         if not isinstance(entry, dict):
             raise ConfigError("Each mcp_servers entry must be a table with name and command fields.")
         name = str(entry.get("name", "")).strip()
-        command = entry.get("command")
         if not name:
             raise ConfigError("Each mcp_servers entry must define a non-empty name.")
-        if not isinstance(command, list) or not command:
-            raise ConfigError(f"mcp_servers entry '{name}' must define a non-empty command list.")
+        transport = str(entry.get("transport", "stdio")).strip().lower() or "stdio"
+        if transport == "streamable-http":
+            transport = "streamable_http"
+        if transport not in {"stdio", "http", "streamable_http"}:
+            raise ConfigError(f"mcp_servers entry '{name}' has unsupported transport '{transport}'.")
+        command = entry.get("command")
+        url = str(entry.get("url", "")).strip()
+        if transport == "stdio":
+            if not isinstance(command, list) or not command:
+                raise ConfigError(f"mcp_servers entry '{name}' must define a non-empty command list.")
+        elif not url:
+            raise ConfigError(f"mcp_servers entry '{name}' must define a non-empty url.")
+        env = entry.get("env")
+        if env is not None and not isinstance(env, dict):
+            raise ConfigError(f"mcp_servers entry '{name}' env must be a table.")
+        disabled_tools = entry.get("disabled_tools", [])
+        if disabled_tools is not None and not isinstance(disabled_tools, list):
+            raise ConfigError(f"mcp_servers entry '{name}' disabled_tools must be a list.")
+        for field_name in ("startup_timeout_seconds", "tool_timeout_seconds"):
+            if field_name in entry and float(entry[field_name]) <= 0:
+                raise ConfigError(f"mcp_servers entry '{name}' {field_name} must be greater than 0.")
 
     delegation_subagents = values["delegation_subagents"]
     if not isinstance(delegation_subagents, list):

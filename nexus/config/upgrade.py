@@ -31,12 +31,20 @@ class ConfigUpgradeReport:
     path: Path
     missing_keys: tuple[str, ...] = ()
     deprecated_keys: tuple[str, ...] = ()
+    allowed_tool_additions: tuple[str, ...] = ()
+    allowed_tools_updated: bool = False
     current_version: int | None = None
     target_version: int = CURRENT_CONFIG_VERSION
 
     @property
     def needs_upgrade(self) -> bool:
-        return bool(self.missing_keys or self.deprecated_keys or self.current_version != self.target_version)
+        return bool(
+            self.missing_keys
+            or self.deprecated_keys
+            or self.allowed_tool_additions
+            or self.allowed_tools_updated
+            or self.current_version != self.target_version
+        )
 
 
 def inspect_config_upgrade(path: Path, template_str: str) -> ConfigUpgradeReport:
@@ -44,11 +52,15 @@ def inspect_config_upgrade(path: Path, template_str: str) -> ConfigUpgradeReport
     template = tomllib.loads(template_str)
     missing = tuple(key for key in template if key not in existing)
     deprecated = tuple(key for key in DEPRECATED_CONFIG_KEYS if key in existing)
+    upgraded_allowed_tools = _upgraded_allowed_tools(existing, template)
+    allowed_tool_additions = _allowed_tool_additions(existing, template)
     version = _optional_int(existing.get("config_version"))
     return ConfigUpgradeReport(
         path=path,
         missing_keys=missing,
         deprecated_keys=deprecated,
+        allowed_tool_additions=allowed_tool_additions,
+        allowed_tools_updated=upgraded_allowed_tools is not None,
         current_version=version,
     )
 
@@ -59,6 +71,13 @@ def upgrade_config_file(path: Path, template_str: str) -> ConfigUpgradeReport:
     existing = _read_top_level_toml(path)
     content = path.read_text(encoding="utf-8") if path.exists() else ""
     lines = _remove_deprecated_and_version_lines(content.splitlines())
+    upgraded_allowed_tools = _upgraded_allowed_tools(existing, template)
+    if upgraded_allowed_tools is not None:
+        lines = _replace_top_level_assignment(
+            lines,
+            "allowed_tools",
+            _render_toml_value(upgraded_allowed_tools),
+        )
 
     additions: list[str] = []
     if lines and lines[-1].strip():
@@ -109,6 +128,40 @@ def _normalize_legacy_tool_names(tool_names: list[Any]) -> list[str]:
     return normalized
 
 
+def _allowed_tool_additions(existing: dict[str, Any], template: dict[str, Any]) -> tuple[str, ...]:
+    current = existing.get("allowed_tools")
+    if not isinstance(current, list) or not current:
+        return ()
+    upgraded = _upgraded_allowed_tools(existing, template)
+    if upgraded is None:
+        return ()
+    current_names = _normalize_legacy_tool_names(current)
+    return tuple(tool_name for tool_name in upgraded if tool_name not in current_names)
+
+
+def _upgraded_allowed_tools(existing: dict[str, Any], template: dict[str, Any]) -> list[str] | None:
+    current = existing.get("allowed_tools")
+    defaults = template.get("allowed_tools")
+    if not isinstance(current, list) or not current or not isinstance(defaults, list):
+        return None
+
+    denied = {
+        str(tool_name).strip()
+        for tool_name in existing.get("denied_tools", [])
+        if str(tool_name).strip()
+    }
+    upgraded = _normalize_legacy_tool_names(current)
+    for item in defaults:
+        tool_name = str(item).strip()
+        if tool_name and tool_name not in denied and tool_name not in upgraded:
+            upgraded.append(tool_name)
+
+    current_normalized = _normalize_legacy_tool_names(current)
+    if upgraded == current_normalized:
+        return None
+    return upgraded
+
+
 def _read_top_level_toml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -130,6 +183,39 @@ def _remove_deprecated_and_version_lines(lines: list[str]) -> list[str]:
         kept.append(line)
     while kept and not kept[-1].strip():
         kept.pop()
+    return kept
+
+
+def _replace_top_level_assignment(lines: list[str], key: str, rendered_value: str) -> list[str]:
+    kept: list[str] = []
+    replaced = False
+    skipping_multiline = False
+    bracket_depth = 0
+
+    for line in lines:
+        if skipping_multiline:
+            bracket_depth += line.count("[") - line.count("]")
+            if bracket_depth <= 0:
+                skipping_multiline = False
+            continue
+
+        stripped = line.strip()
+        is_assignment = (
+            stripped
+            and not stripped.startswith("#")
+            and (stripped.startswith(f"{key} ") or stripped.startswith(f"{key}="))
+        )
+        if is_assignment:
+            if not replaced:
+                kept.append(f"{key} = {rendered_value}")
+                replaced = True
+            bracket_depth = line.count("[") - line.count("]")
+            if bracket_depth > 0:
+                skipping_multiline = True
+            continue
+
+        kept.append(line)
+
     return kept
 
 

@@ -101,7 +101,7 @@ Mark this scenario as **not applicable** and note whether the empty-state UX is 
 
 ---
 
-## Scenario 3 — Delegation disabled path
+## Scenario 3 — Basic agent mode path
 
 Start the REPL:
 
@@ -112,25 +112,22 @@ uv --directory /home/rishikesh/dev/exp/build-an-ai-agent/build-an-ai-agent run n
 Inside:
 
 ```text
-/delegate status
-/delegate workers
-/delegate tasks
-/delegate tasks active
+/tools
+/context agents
 /quit
 ```
 
 ### Expected result
 
-If delegation is not enabled:
-
-- each command should fail gracefully with a clear message
-- the message should tell you how to enable delegation
+- only normal single-agent tools should be visible
+- no `subagent_*` tools should be registered in basic mode
+- context commands should still render a clear empty state
 
 ---
 
-## Scenario 4 — Delegation enabled path
+## Scenario 4 — Advanced cognitive sub-agent path
 
-Only run this if you want to validate worker coordination.
+Only run this if you want to validate advanced-mode sub-agent tooling.
 
 Create a local config override:
 
@@ -152,44 +149,22 @@ uv --directory /home/rishikesh/dev/exp/build-an-ai-agent/build-an-ai-agent run n
 Inside:
 
 ```text
-/delegate status
-/delegate workers
-/delegate tasks
-/delegate tasks active
-/delegate spawn "Review docs" "Summarize the workspace purpose." --worker worker-1
-/delegate spawn "Review docs with controls" "Summarize the workspace purpose and note required follow-ups." --worker worker-1 --tool write_note --resource docs-readme --permission-action write_note --permission-reason "Need approval before writing a summary note"
-/delegate tasks
-/delegate messages
-/delegate messages worker-1 10
-/delegate approvals
+/tools
+/skills
+/context agents
+Ask the agent to inspect the workspace using a read-only cognitive sub-agent.
 ```
 
 ### Expected result
 
-- status should indicate delegation is enabled
-- workers should be listed
-- spawned work should produce visible task state
-- approvals/messages should be inspectable
-
-### Optional approval branch
-
-If a worker requests permission:
-
-```text
-/delegate approvals
-/delegate approve <decision-id>
-```
-
-or
-
-```text
-/delegate reject <decision-id>
-```
+- `subagent_planning_analysis`, `subagent_execution`, `subagent_review`, and `subagent_verification` should be available when allowed by tool filters
+- sub-agent output should return to the supervisor as a structured tool result
+- mutating tools used by any sub-agent should still go through the normal approval path
 
 ### Gap checklist
 
-- is worker activity understandable from the terminal alone?
-- can a user reason about who asked for permission and why?
+- is sub-agent activity understandable from the terminal alone?
+- can a user reason about which tool asked for permission and why?
 
 ---
 
@@ -369,5 +344,4 @@ When you finish all five chapters, summarize findings under these headings:
 6. **feature gaps or missing commands**
 
 That report will be much more useful than a raw terminal transcript because it distinguishes implementation bugs from documentation or onboarding gaps.
-
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from nexus.config.defaults import AgentConfig
-from nexus.integrations.mcp import MCPServerRuntime
+from nexus.tools.mcp import MCPServerRuntime
 from nexus.memory.store import MemoryStore
 from nexus.models import AgentEvent, Message, ToolExecutionContext
 from nexus.prompts import build_context_sections
@@ -42,7 +42,6 @@ class ReplState:
     history: list[Message] = field(default_factory=list)
     skill_registry: SkillRegistry = field(default_factory=SkillRegistry)
     active_skills: list[str] = field(default_factory=list)
-    disabled_tools: set[str] = field(default_factory=set)
     mcp_servers: list[MCPServerRuntime] = field(default_factory=list)
     carry_over: CarryOverState = field(default_factory=CarryOverState)
     current_turn_id: str = ""

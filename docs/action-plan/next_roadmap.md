@@ -187,19 +187,19 @@ The roadmap below focuses on what should come next, section by section.
 - MCP tools can be discovered over stdio
 - plugin loading exists from the global plugin directory
 - Docker sandbox execution is available when configured
-- MCP refresh does not hot-register newly discovered tools into an active session
+- MCP refresh hot-registers newly discovered tools into an active session; see `docs/mcp-integration.md`
 
 ### Next Steps
 
 1. Improve lifecycle control for MCP servers.
 2. Tighten plugin trust and validation rules.
 3. Expand sandbox guardrails and operator visibility.
-4. Clarify how dynamic tool changes should behave during a live session.
+4. Keep dynamic tool refresh behavior covered by regression tests.
 
 ### Changes Required
 
 - add stronger MCP reconnect and status reporting semantics
-- decide whether runtime tool hot-registration is supported or intentionally deferred
+- keep runtime tool hot-registration observable and approval-safe
 - introduce plugin manifest validation and safer load diagnostics
 - add sandbox execution metadata to hooks, audit, and doctor reporting
 - define per-tool or per-source safety policies so plugin and MCP tools can be constrained more explicitly
@@ -229,7 +229,7 @@ The roadmap below focuses on what should come next, section by section.
 ### Changes Required
 
 - add task checkpointing or recovery markers for interrupted delegated work
-- record worker-level telemetry and correlation more explicitly
+- record sub-agent telemetry and correlation more explicitly
 - define how much mailbox history is retained, summarized, or compacted
 - extend resource claim behavior beyond optimistic version checks if stricter coordination is needed
 - add more coverage for worker clarification, cancellation, timeout, and partial-completion flows

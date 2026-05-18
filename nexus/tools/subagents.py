@@ -26,6 +26,7 @@ def register_subagent_tools(
 
     count = 0
     for definition in _merge_builtin_definitions(definitions):
+        definition = _with_builtin_mcp_tools(definition, registry)
         tool = SubAgentTool(
             definition=definition,
             model_client_factory=model_client_factory,
@@ -73,6 +74,7 @@ def register_skill_subagent_tools(
     count = 0
     existing_names = {record.name for record in registry.records()}
     for definition in load_subagent_definitions_from_skills(skill_registry):
+        definition = _with_builtin_mcp_tools(definition, registry)
         tool = SubAgentTool(
             definition=definition,
             model_client_factory=model_client_factory,
@@ -125,10 +127,14 @@ def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
             description="Implement a focused coding task using the normal workspace tools.",
             goal_prompt=(
                 "You are a Nexus execution agent. Implement only the assigned task, follow existing project "
-                "patterns, use tools for edits and validation, and return changed files, tests run, and blockers."
+                "patterns, use tools for edits and validation, and return changed files, tests run, and blockers. "
+                "When using bash, never run servers, watchers, REPLs, or infinite loops in the foreground. "
+                "Use bounded commands with explicit timeouts; for dev servers, start them in the background, "
+                "probe readiness, collect logs, and stop the process in the same command. If a bash command "
+                "times out, do not retry the same command unchanged."
             ),
             allowed_tools=["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_tests", "run_linter", "run_typecheck", "bash"],
-            max_turns=20,
+            max_turns=14,
             timeout_seconds=600,
         ),
         SubagentDefinition(
@@ -149,10 +155,14 @@ def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
             goal_prompt=(
                 "You are a Nexus verification agent. Run focused tests, lint, type/syntax checks, "
                 "and git status inspection. Return a concise validation summary and failures. "
-                "Do not modify files."
+                "Do not modify files. When using bash, never run servers, watchers, REPLs, or infinite "
+                "loops in the foreground. Use bounded commands with explicit timeouts; for server-based "
+                "checks, start the server in the background, probe it, capture relevant output, and stop "
+                "it in the same command. If a bash command times out, do not retry the same command "
+                "unchanged; report the timeout and relevant output."
             ),
             allowed_tools=["run_tests", "run_linter", "run_typecheck", "git_status", "bash"],
-            max_turns=8,
+            max_turns=6,
             timeout_seconds=600,
         ),
     ]
@@ -166,6 +176,43 @@ def _merge_builtin_definitions(definitions: "Iterable[SubagentDefinition]") -> l
             merged.append(definition)
             existing.add(definition.name)
     return merged
+
+
+def _with_builtin_mcp_tools(definition: SubagentDefinition, registry: "ToolRegistry") -> SubagentDefinition:
+    if not _is_builtin_subagent_definition(definition):
+        return definition
+    mcp_tools = [
+        record.name
+        for record in registry.records()
+        if record.source == "mcp"
+    ]
+    if not mcp_tools:
+        return definition
+    allowed = list(definition.allowed_tools or [])
+    changed = False
+    for tool_name in mcp_tools:
+        if tool_name not in allowed:
+            allowed.append(tool_name)
+            changed = True
+    if not changed:
+        return definition
+    return SubagentDefinition(
+        name=definition.name,
+        description=definition.description,
+        goal_prompt=definition.goal_prompt,
+        allowed_tools=allowed,
+        max_turns=definition.max_turns,
+        timeout_seconds=definition.timeout_seconds,
+    )
+
+
+def _is_builtin_subagent_definition(definition: SubagentDefinition) -> bool:
+    return definition.name in {
+        "planning_analysis",
+        "execution",
+        "review",
+        "verification",
+    }
 
 
 def _skill_subagent_name(skill_name: str) -> str | None:

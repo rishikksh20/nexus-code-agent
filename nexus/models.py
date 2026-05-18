@@ -240,6 +240,11 @@ class AgentEvent:
         return cls(kind=AgentEventType.TEXT_COMPLETE, payload=content)
 
     @classmethod
+    def thinking_started(cls, *, actor: str | None = None) -> AgentEvent:
+        payload = {"actor": actor} if actor else None
+        return cls(kind=AgentEventType.THINKING_STARTED, payload=payload)
+
+    @classmethod
     def tool_call_start(
         cls,
         call_id: str,

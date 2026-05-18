@@ -25,6 +25,7 @@ class AgentConfig:
     show_tool_calls: bool = True
     show_thinking_indicator: bool = True
     color_output: bool = True
+    textual_ui: bool = True
     max_sessions_retained: int = 50
     save_on_every_turn: bool = True
     skills_dir: Path = field(default_factory=Path)

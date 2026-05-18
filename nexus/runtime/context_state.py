@@ -131,7 +131,6 @@ class TaskContext:
     artifact_ids: tuple[str, ...] = ()
     related_files: tuple[str, ...] = ()
     modified_files: tuple[str, ...] = ()
-    repair_iteration: int = 0
     updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     def to_dict(self) -> dict[str, Any]:
@@ -147,7 +146,6 @@ class TaskContext:
             "artifact_ids": list(self.artifact_ids),
             "related_files": list(self.related_files),
             "modified_files": list(self.modified_files),
-            "repair_iteration": self.repair_iteration,
             "updated_at": self.updated_at,
         }
 
@@ -165,7 +163,6 @@ class TaskContext:
             artifact_ids=_tuple_of_str(payload.get("artifact_ids")),
             related_files=_tuple_of_str(payload.get("related_files")),
             modified_files=_tuple_of_str(payload.get("modified_files")),
-            repair_iteration=int(payload.get("repair_iteration") or 0),
             updated_at=str(payload.get("updated_at") or datetime.now(UTC).isoformat()),
         )
 
@@ -359,7 +356,6 @@ class MultiAgentSessionState:
     schema_version: int = _SCHEMA_VERSION
     session_id: str = ""
     objective: str = ""
-    dag: dict[str, Any] | None = None
     tasks: dict[str, TaskContext] = field(default_factory=dict)
     agents: dict[str, AgentSessionState] = field(default_factory=dict)
     packets: list[ContextPacket] = field(default_factory=list)
@@ -373,7 +369,6 @@ class MultiAgentSessionState:
             "schema_version": self.schema_version,
             "session_id": self.session_id,
             "objective": self.objective,
-            "dag": self.dag,
             "tasks": {task_id: task.to_dict() for task_id, task in self.tasks.items()},
             "agents": {agent_id: agent.to_dict() for agent_id, agent in self.agents.items()},
             "packets": [packet.to_dict() for packet in self.packets],
@@ -421,7 +416,6 @@ class MultiAgentSessionState:
             schema_version=int(payload.get("schema_version") or _SCHEMA_VERSION),
             session_id=str(payload.get("session_id") or ""),
             objective=str(payload.get("objective") or ""),
-            dag=payload.get("dag") if isinstance(payload.get("dag"), dict) else None,
             tasks=tasks,
             agents=agents,
             packets=packets[-_PACKET_LIMIT:],
@@ -512,29 +506,6 @@ def make_context_packet(
     )
 
 
-def make_research_complete_packet(**kwargs: Any) -> ContextPacket:
-    return make_context_packet(packet_type="research_complete", source_agent="research", target_agent="execution", **kwargs)
-
-
-def make_implementation_complete_packet(**kwargs: Any) -> ContextPacket:
-    return make_context_packet(packet_type="implementation_complete", source_agent="execution", target_agent="test", **kwargs)
-
-
-def make_test_success_packet(**kwargs: Any) -> ContextPacket:
-    return make_context_packet(packet_type="test_success", source_agent="test", target_agent="review", **kwargs)
-
-
-def make_test_failure_packet(**kwargs: Any) -> ContextPacket:
-    return make_context_packet(packet_type="test_failure", source_agent="test", target_agent="execution", **kwargs)
-
-
-def make_review_findings_packet(**kwargs: Any) -> ContextPacket:
-    return make_context_packet(packet_type="review_findings", source_agent="review", target_agent="execution", **kwargs)
-
-
-def make_repair_request_packet(**kwargs: Any) -> ContextPacket:
-    return make_context_packet(packet_type="repair_request", source_agent="supervisor", target_agent="execution", **kwargs)
-
 def make_artifact_record(
     *,
     metadata: dict[str, Any] | None = None,
@@ -562,12 +533,9 @@ def make_artifact_record(
 
 def load_multi_agent_state(metadata: dict[str, Any]) -> MultiAgentSessionState:
     payload = metadata.get(_MULTI_AGENT_KEY)
-    if isinstance(payload, dict):
-        raw_state = payload.get("state")
-        if isinstance(raw_state, dict):
-            return MultiAgentSessionState.from_dict(raw_state)
-        return _synthesize_state_from_legacy(payload, metadata)
-    return _synthesize_state_from_legacy({}, metadata)
+    if isinstance(payload, dict) and isinstance(payload.get("state"), dict):
+        return MultiAgentSessionState.from_dict(payload["state"])
+    return MultiAgentSessionState()
 
 
 def save_multi_agent_state(
@@ -576,7 +544,6 @@ def save_multi_agent_state(
     *,
     mode: str | None = None,
     complexity: str | None = None,
-    shared_state: dict[str, Any] | None = None,
 ) -> None:
     payload = metadata.setdefault(_MULTI_AGENT_KEY, {})
     if not isinstance(payload, dict):
@@ -591,10 +558,6 @@ def save_multi_agent_state(
     elif "complexity" not in payload:
         payload["complexity"] = "-"
     payload["state"] = state.to_dict()
-    if shared_state is not None:
-        payload["shared_state"] = shared_state
-    elif "shared_state" not in payload:
-        payload["shared_state"] = _shared_state_projection(state)
     _project_context_payload(metadata, state)
 
 
@@ -683,41 +646,11 @@ def multi_agent_carry_over_lines(metadata: dict[str, Any]) -> list[str]:
         if modified_files:
             lines.append("Multi-agent changed files: " + ", ".join(dict.fromkeys(modified_files[:12])))
         for packet in state.packets[-3:]:
-            if packet.packet_type in {"test_failure", "review_findings", "repair_request"}:
+            if packet.packet_type in {"test_failure", "review_findings"}:
                 lines.append("Latest multi-agent handoff: " + render_context_packet(packet)[:500])
-        repair_tasks = [task for task in state.tasks.values() if task.repair_iteration > 0]
-        if repair_tasks:
-            latest = repair_tasks[-1]
-            lines.append(
-                "Latest repair state: "
-                f"task={latest.task_id}; iteration={latest.repair_iteration}; status={latest.status}"
-            )
         if lines:
             return lines
-
-    payload = metadata.get("multi_agent")
-    if not isinstance(payload, dict):
-        return []
-    shared_state = payload.get("shared_state")
-    if not isinstance(shared_state, dict):
-        return []
-    lines: list[str] = []
-    changed_files = shared_state.get("changed_files")
-    if isinstance(changed_files, list) and changed_files:
-        lines.append("Multi-agent changed files: " + ", ".join(str(path) for path in changed_files[:12]))
-    verification = shared_state.get("verification_results")
-    if isinstance(verification, list) and verification:
-        lines.append("Latest verification summary: " + str(verification[-1])[:500])
-    review = shared_state.get("review_findings")
-    if isinstance(review, list) and review:
-        lines.append("Latest review feedback: " + str(review[-1])[:500])
-    repair = shared_state.get("repair_decision")
-    if isinstance(repair, dict):
-        lines.append(
-            "Latest repair decision: "
-            f"retry={repair.get('retry')}; reason={repair.get('reason', '-')}"
-        )
-    return lines
+    return []
 
 
 def _ensure_payload(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -748,101 +681,11 @@ def _project_context_payload(metadata: dict[str, Any], state: MultiAgentSessionS
     payload["packets"] = [packet.to_dict() for packet in state.packets[-20:]]
 
 
-def _synthesize_state_from_legacy(
-    payload: dict[str, Any],
-    metadata: dict[str, Any],
-) -> MultiAgentSessionState:
-    shared_state = payload.get("shared_state") if isinstance(payload.get("shared_state"), dict) else {}
-    dag = shared_state.get("dag") if isinstance(shared_state, dict) and isinstance(shared_state.get("dag"), dict) else None
-    objective = str(dag.get("goal") or "") if isinstance(dag, dict) else ""
-    tasks: dict[str, TaskContext] = {}
-    if isinstance(dag, dict):
-        nodes = dag.get("nodes", [])
-        if isinstance(nodes, list):
-            for node in nodes:
-                if not isinstance(node, dict):
-                    continue
-                task = TaskContext.from_dict(
-                    {
-                        "task_id": node.get("id"),
-                        "role": node.get("role"),
-                        "objective": node.get("objective"),
-                        "status": node.get("status"),
-                        "dependencies": node.get("dependencies"),
-                        "related_files": node.get("claimed_resources"),
-                    }
-                )
-                if task.task_id:
-                    tasks[task.task_id] = task
-
-    packets_by_id: dict[str, ContextPacket] = {}
-    for source in (
-        shared_state.get("context_packets", []) if isinstance(shared_state, dict) else [],
-        get_context_payload(metadata).get("packets", []),
-    ):
-        if not isinstance(source, list):
-            continue
-        for item in source:
-            if isinstance(item, dict):
-                packet = ContextPacket.from_dict(item)
-                packets_by_id[packet.packet_id] = packet
-
-    agents: dict[str, AgentSessionState] = {}
-    context_agents = get_context_payload(metadata).get("agents", {})
-    if isinstance(context_agents, dict):
-        for agent_id, item in context_agents.items():
-            if isinstance(item, dict):
-                agent_state = AgentSessionState.from_dict({"agent_id": agent_id, **item})
-                agents[agent_state.agent_id] = agent_state
-
-    return MultiAgentSessionState(
-        schema_version=_SCHEMA_VERSION,
-        objective=objective,
-        dag=dag,
-        tasks=tasks,
-        agents=agents,
-        packets=list(packets_by_id.values())[-_PACKET_LIMIT:],
-        counters={
-            "packet": len(packets_by_id),
-            "artifact": 0,
-            "event": 0,
-        },
-    )
-
-
-def _shared_state_projection(state: MultiAgentSessionState) -> dict[str, Any]:
-    changed_files: list[str] = []
-    verification_results: list[str] = []
-    review_findings: list[str] = []
-    repair_decision: dict[str, Any] | None = None
-    for task in state.tasks.values():
-        changed_files.extend(task.modified_files)
-    for packet in state.packets:
-        changed_files.extend(packet.modified_files)
-        if packet.packet_type in {"test_success", "test_failure"}:
-            verification_results.append(packet.summary)
-        if packet.packet_type == "review_findings":
-            review_findings.append(packet.summary)
-        if packet.packet_type == "repair_request":
-            repair_decision = {"retry": True, "reason": packet.failure_summary or packet.summary, "target_agent": packet.target_agent}
-    return {
-        "dag": state.dag,
-        "repo_map": [],
-        "findings": {},
-        "changed_files": list(dict.fromkeys(changed_files)),
-        "verification_results": verification_results,
-        "review_findings": review_findings,
-        "repair_decision": repair_decision,
-        "context_packets": [packet.to_dict() for packet in state.packets],
-    }
-
-
 def _replace_state(state: MultiAgentSessionState, **changes: Any) -> MultiAgentSessionState:
     values = {
         "schema_version": state.schema_version,
         "session_id": state.session_id,
         "objective": state.objective,
-        "dag": state.dag,
         "tasks": state.tasks,
         "agents": state.agents,
         "packets": state.packets,

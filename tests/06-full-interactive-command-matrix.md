@@ -389,65 +389,39 @@ Mark as `not applicable` if MCP is intentionally not configured.
 
 ---
 
-## G. Delegation commands
+## G. Advanced Sub-Agent Visibility
 
-### Disabled-path audit
+### Basic-mode audit
 
 Inside REPL:
 
 ```text
-/delegate status
-/delegate workers
-/delegate tasks
-/delegate tasks active
-/delegate messages
-/delegate approvals
+/tools
+/context agents
 ```
 
-Expected when delegation is disabled:
+Expected in basic mode:
 
-- clear guidance that delegation is off
-- no crash
+- normal single-agent tools are visible
+- `subagent_*` tools are absent unless advanced mode is enabled
+- context commands show a readable empty or current-state view
 
-### Enabled-path audit
+### Advanced-mode audit
 
-Only run this if delegation is enabled in local config.
+Only run this if `agent_mode = "advanced"` is enabled in local config.
 
 ```text
-/delegate status
-/delegate workers
-/delegate tasks
-/delegate tasks active
-/delegate spawn "Matrix check" "Summarize the current workspace state." --worker worker-1
-/delegate spawn "Matrix check with approval" "Summarize the workspace and write a note if approved." --worker worker-1 --tool write_note --resource workspace-summary --permission-action write_note --permission-reason "Need explicit approval for a write"
-/delegate tasks
-/delegate messages
-/delegate messages worker-1 10
-/delegate approvals
+/tools
+/skills
+/context agents
+/context usage
 ```
 
 Expected:
 
-- workers/tasks/messages render in a readable way
-- `tasks active` filters meaningfully
-- approvals are visible if requested by workers
-
-Approval branch if a decision id is shown:
-
-```text
-/delegate approve <decision-id>
-```
-
-or
-
-```text
-/delegate reject <decision-id>
-```
-
-Expected:
-
-- readable acknowledgement
-- state updates are observable through `/delegate tasks` or `/delegate approvals`
+- built-in `subagent_*` tools are visible when allowed by tool filters
+- skill-backed `subagent-*` skills appear after `/skills reload`
+- approvals requested by sub-agent tool calls use the normal approval UI
 
 ---
 
@@ -539,17 +513,12 @@ Mark each item when manually verified:
 - [ ] `/mcp refresh`
 - [ ] `/mcp refresh <server>`
 
-### Delegation
-- [ ] `/delegate status`
-- [ ] `/delegate workers`
-- [ ] `/delegate tasks`
-- [ ] `/delegate tasks active`
-- [ ] `/delegate messages`
-- [ ] `/delegate messages <agent> <limit>`
-- [ ] `/delegate approvals`
-- [ ] `/delegate approve <decision-id>`
-- [ ] `/delegate reject <decision-id>`
-- [ ] `/delegate spawn <title> <instructions> ...`
+### Advanced Sub-Agents
+- [ ] `agent_mode = "advanced"` exposes built-in `subagent_*` tools
+- [ ] `/skills reload` registers skill-backed `subagent-*` tools
+- [ ] `/context agents`
+- [ ] `/context agent <agent-id>`
+- [ ] `/context usage <agent-id>`
 
 ### Robustness
 - [ ] unknown slash command fails cleanly
@@ -582,4 +551,3 @@ When this final matrix is done, summarize the results using:
 ```
 
 That gives you a compact end-state report after running the richer scenario chapters before it.
-

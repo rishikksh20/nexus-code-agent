@@ -87,7 +87,7 @@ what time is it?
 ### Expected result
 
 - a readable table or list of slash commands appears
-- commands such as `/mode`, `/config`, `/session`, `/tools`, `/memory`, `/history`, `/context`, `/quit`, `/mcp`, and `/delegate` should be visible
+- commands such as `/mode`, `/config`, `/session`, `/tools`, `/memory`, `/history`, `/context`, `/quit`, `/mcp`, `/skills`, and `/provider` should be visible
 
 ### UX questions
 
@@ -373,4 +373,3 @@ Document anything unclear around:
 - session IDs and memory IDs
 - command output readability
 - the balance between debug detail and terminal noise
-

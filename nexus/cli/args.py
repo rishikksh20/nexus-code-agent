@@ -38,6 +38,7 @@ _CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], max_content_width=1
 @click.option("--no-stream", "no_stream", is_flag=True, help="Disable streamed output.")
 @click.option("--quiet", "-q", is_flag=True, help="Suppress tool call and progress output.")
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug-level logging.")
+@click.option("--no-tui", "no_tui", is_flag=True, help="Use the classic line-oriented terminal UI.")
 @click.option("--auto-confirm", "auto_confirm", is_flag=True, help="Automatically confirm all mutating tool calls.")
 @click.option("--deny-mutating", "deny_mutating", is_flag=True, help="Deny all mutating tools (implies plan mode).")
 @click.option("--allow-hidden-paths", "allow_hidden_paths", is_flag=True, help="Allow the agent to read hidden/private paths other than .nexus for this run.")
@@ -67,6 +68,7 @@ def cli(
     no_stream: bool,
     quiet: bool,
     verbose: bool,
+    no_tui: bool,
     auto_confirm: bool,
     deny_mutating: bool,
     allow_hidden_paths: bool,
@@ -151,6 +153,7 @@ def args_to_config_overrides(
     no_stream: bool = False,
     quiet: bool = False,
     verbose: bool = False,
+    no_tui: bool = False,
     allow_hidden_paths: bool = False,
     allowed_tools: str | None = None,
     denied_tools: str | None = None,
@@ -176,6 +179,8 @@ def args_to_config_overrides(
         overrides["show_tool_calls"] = False
     if verbose:
         overrides["log_level"] = "DEBUG"
+    if no_tui:
+        overrides["textual_ui"] = False
     if allow_hidden_paths:
         overrides["allow_hidden_paths"] = True
     if allowed_tools:

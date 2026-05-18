@@ -142,6 +142,21 @@ def test_terminal_ui_prefixes_nested_subagent_tool_calls():
     assert "subagent_planning_analysis - read_file  #call-1" in output
 
 
+def test_terminal_ui_uses_subagent_name_for_thinking_status():
+    ui = _build_ui()
+
+    ui.render_event(
+        AgentEvent.thinking_started(actor="subagent_execution"),
+        stream_output=False,
+        show_tool_calls=True,
+        show_thinking_indicator=True,
+    )
+
+    assert ui._thinking_status is not None  # type: ignore[attr-defined]
+    assert "subagent_execution - Thinking" in str(ui._thinking_status.status)  # type: ignore[attr-defined]
+    ui.stop_thinking()
+
+
 def test_terminal_ui_stops_tool_wait_on_completion():
     ui = _build_ui()
 
