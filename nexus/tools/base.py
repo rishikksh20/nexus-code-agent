@@ -208,6 +208,20 @@ class ToolRegistry:
     def records(self) -> list[ToolRecord]:
         return list(self._tools.values())
 
+    def unregister(self, name: str) -> bool:
+        return self._tools.pop(name, None) is not None
+
+    def unregister_source(self, *, source: str, origin: str | None = None) -> tuple[str, ...]:
+        removed: list[str] = []
+        for name, record in list(self._tools.items()):
+            if record.source != source:
+                continue
+            if origin is not None and record.origin != origin:
+                continue
+            removed.append(name)
+            del self._tools[name]
+        return tuple(removed)
+
     def schemas(self) -> tuple[dict[str, Any], ...]:
         return tuple(tool_to_schema(tool) for tool in self.all())
 

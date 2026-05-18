@@ -23,6 +23,13 @@ from nexus.runtime.context_state import (
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import message_to_dict, new_snapshot
+from nexus.tools.mcp import (
+    MCPRefreshReport,
+    MCPServerConfig,
+    MCPServerRuntime,
+    refresh_mcp_server_tools,
+    register_discovered_mcp_tools,
+)
 from nexus.security.manager import ApprovalManager
 from nexus.security.policy import ApprovalPolicy
 from nexus.skills import get_skill_roots, load_skill_registry
@@ -145,23 +152,25 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
 
 
 async def handle_mcp(state: ReplState, args: list[str]) -> None:
-    if not state.mcp_servers:
-        state.console.print("No MCP servers configured.")
-        return
-
     subcommand = args[0].lower() if args else "status"
     if subcommand == "help":
-        _print_subcommand_help(
-            state, "mcp", "Inspect MCP server status and tools.",
-            (
-                ("status",           "Show all configured MCP servers and their connection state.", "/mcp status"),
-                ("tools",            "List tools discovered from each MCP server.",                  "/mcp tools"),
-                ("refresh",         "Refresh all MCP servers.",                                    "/mcp refresh"),
-                ("refresh <server>", "Refresh a specific server by name.",                          "/mcp refresh filesystem"),
-                ("help",            "Show this help.",                                             "/mcp help"),
-            ),
-        )
+        _print_mcp_help(state)
         return
+
+    if subcommand == "reload":
+        reports = await _reload_mcp_servers(state)
+        if not reports:
+            state.console.print("No MCP servers configured. Add mcp_servers to .nexus/config.toml, then run /mcp reload.")
+            return
+        _print_mcp_refresh_reports(state, reports, title="MCP Reload")
+        _print_mcp_status(state)
+        return
+
+    if not state.mcp_servers:
+        state.console.print("No MCP servers loaded. Add mcp_servers to .nexus/config.toml, then run /mcp reload.")
+        state.console.print("Usage: /mcp [status|tools|refresh|reload|help]")
+        return
+
     if subcommand == "status":
         _print_mcp_status(state)
         return
@@ -170,14 +179,14 @@ async def handle_mcp(state: ReplState, args: list[str]) -> None:
         return
     if subcommand == "refresh":
         target_name = args[1] if len(args) > 1 else None
-        refreshed = await _refresh_mcp_servers(state, target_name)
-        if not refreshed:
+        reports = await _refresh_mcp_servers(state, target_name)
+        if not reports:
             state.console.print(f"MCP server not found: {target_name}")
             return
-        state.console.print("MCP status refreshed. Tool registry is unchanged for this session.")
+        _print_mcp_refresh_reports(state, reports)
         _print_mcp_status(state)
         return
-    state.console.print("Usage: /mcp [status|tools|refresh [server]]")
+    state.console.print("Usage: /mcp [status|tools|refresh [server]|reload|help]")
 
 
 async def handle_mode(state: ReplState, args: list[str]) -> None:
@@ -987,45 +996,117 @@ def _public_multi_agent_state(state: ReplState) -> dict:
 def _print_mcp_status(state: ReplState) -> None:
     table = Table(title="MCP Servers")
     table.add_column("Name")
+    table.add_column("Transport")
     table.add_column("Status")
     table.add_column("Prefix")
     table.add_column("Registered")
     table.add_column("Discovered")
+    table.add_column("Last Checked")
     table.add_column("Last Error")
     for server in state.mcp_servers:
         table.add_row(
             server.server.name,
+            server.server.transport,
             "connected" if server.connected else "disconnected",
             server.server.prefix or "-",
             str(len(server.registered_tools)),
             str(len(server.discovered_tools)),
+            server.last_checked_at or "-",
             server.last_error or "-",
         )
     state.console.print(table)
 
 
+def _print_mcp_help(state: ReplState) -> None:
+    _print_subcommand_help(
+        state, "mcp", "Inspect MCP server status and tools.",
+        (
+            ("status",           "Show MCP server status, transport, counts, and last error.", "/mcp status"),
+            ("tools",            "List registered and discovered MCP tools.",                  "/mcp tools"),
+            ("refresh",          "Rediscover and hot-register loaded MCP tools.",              "/mcp refresh"),
+            ("refresh <server>", "Rediscover and hot-register one loaded server.",             "/mcp refresh filesystem"),
+            ("reload",           "Reload config, restart MCP servers, and register tools.",    "/mcp reload"),
+            ("help",             "Show this help.",                                           "/mcp help"),
+        ),
+    )
+
+
 def _print_mcp_tools(state: ReplState) -> None:
     table = Table(title="MCP Tools")
     table.add_column("Server")
-    table.add_column("Registered Tools")
-    table.add_column("Discovered Tools")
+    table.add_column("Nexus Name")
+    table.add_column("Remote Name")
+    table.add_column("State")
+    table.add_column("Description")
     for server in state.mcp_servers:
-        table.add_row(
-            server.server.name,
-            ", ".join(server.registered_tools) or "-",
-            ", ".join(server.discovered_tools) or "-",
-        )
+        registered = set(server.registered_tools)
+        disabled = set(server.server.disabled_tools)
+        if not server.discovered_specs:
+            table.add_row(server.server.name, "-", "-", "none", "-")
+            continue
+        for spec in server.discovered_specs:
+            display_name = server.display_name(spec.name)
+            if server.server.disabled or spec.name in disabled:
+                state_text = "disabled"
+            elif display_name in registered:
+                state_text = "enabled"
+            else:
+                state_text = "filtered"
+            description = spec.description.replace("\n", " ")[:80] or "-"
+            table.add_row(server.server.name, display_name, spec.name, state_text, description)
     state.console.print(table)
 
 
-async def _refresh_mcp_servers(state: ReplState, target_name: str | None) -> bool:
-    matched = False
+async def _refresh_mcp_servers(state: ReplState, target_name: str | None) -> list[MCPRefreshReport]:
+    reports: list[MCPRefreshReport] = []
     for server in state.mcp_servers:
         if target_name is not None and server.server.name != target_name:
             continue
-        matched = True
-        await server.refresh()
-    return matched
+        reports.append(await refresh_mcp_server_tools(server, state.tool_registry, state.config))
+    return reports
+
+
+async def _reload_mcp_servers(state: ReplState) -> list[MCPRefreshReport]:
+    for server in state.mcp_servers:
+        await server.close()
+
+    state.tool_registry.unregister_source(source="mcp")
+    state.mcp_servers.clear()
+    _reload_config(state)
+
+    reports: list[MCPRefreshReport] = []
+    for payload in state.config.mcp_servers:
+        try:
+            runtime = MCPServerRuntime(server=MCPServerConfig.from_dict(payload))
+            await runtime.refresh()
+            state.mcp_servers.append(runtime)
+            if runtime.last_error:
+                reports.append(MCPRefreshReport(server=runtime.server.name, failed=runtime.last_error))
+                continue
+            registered = register_discovered_mcp_tools(runtime, state.tool_registry, state.config)
+            reports.append(MCPRefreshReport(server=runtime.server.name, added=tuple(sorted(registered))))
+        except Exception as exc:
+            name = str(payload.get("name", "unknown")) if isinstance(payload, dict) else "unknown"
+            reports.append(MCPRefreshReport(server=name, failed=str(exc)))
+    return reports
+
+
+def _print_mcp_refresh_reports(state: ReplState, reports: list[MCPRefreshReport], *, title: str = "MCP Refresh") -> None:
+    table = Table(title=title)
+    table.add_column("Server")
+    table.add_column("Added")
+    table.add_column("Removed")
+    table.add_column("Unchanged")
+    table.add_column("Error")
+    for report in reports:
+        table.add_row(
+            report.server,
+            ", ".join(report.added) or "-",
+            ", ".join(report.removed) or "-",
+            str(len(report.unchanged)),
+            report.failed or "-",
+        )
+    state.console.print(table)
 
 
 async def _handle_config_upgrade(state: ReplState, scope: str) -> None:

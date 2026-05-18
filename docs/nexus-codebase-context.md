@@ -17,9 +17,9 @@ Nexus is a CLI-first coding agent implemented as a Python package under `nexus/`
 - `nexus/runtime/repl_state.py` prepares each turn: system prompt construction, history preparation, tool-output pruning, context compaction, metadata, and durable history updates.
 - `nexus/runtime/runtime_session.py` builds `ReplState` from config, sessions, skills, memory, hooks, delegation resources, and approval policy.
 - `nexus/config/` contains defaults, TOML/env/CLI merge logic, validation, and model-context limit helpers.
-- `nexus/tools/` contains the first-party tool system, registry helpers, compatibility filesystem tools, and sub-agent tool registration.
+- `nexus/tools/` contains the first-party tool system, MCP adapters, registry helpers, compatibility filesystem tools, and sub-agent tool registration.
 - `nexus/security/` contains approval policies, approval state, permission checks, and shell-risk classification.
-- `nexus/integrations/` contains provider adapters: fake, OpenAI-compatible HTTP providers, native Ollama, native Anthropic, native Gemini, MCP, and retry support.
+- `nexus/integrations/` contains provider adapters: fake, OpenAI-compatible HTTP providers, native Ollama, native Anthropic, native Gemini, and retry support.
 - `nexus/extensions/`, `nexus/hooks/`, `nexus/skills/`, `nexus/memory/`, `nexus/context/`, `nexus/sandbox/`, and `nexus/observability/` provide optional runtime capabilities around the core loop.
 
 ## Runtime Flow

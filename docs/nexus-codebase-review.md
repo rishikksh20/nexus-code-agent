@@ -28,8 +28,8 @@ The runtime is organized around these layers:
 - `nexus/runtime/turn_runner.py`: shared turn runner used by both REPL and headless mode, including `run_agent_turn()`, confirmation helpers, approval resume, and history-safe commit helpers.
 - `nexus/runtime/repl_state.py`: system prompt, model history preparation, pruning, compaction, context metadata, event persistence.
 - `nexus/security/`: approval policy, approval memory, command classification, hard-deny path rules.
-- `nexus/tools/`: first-party tool registry, tool base protocol, builtin tools, legacy compatibility tool classes, sub-agent tools.
-- `nexus/integrations/`: fake, OpenAI-compatible, Ollama, Anthropic, Gemini, MCP, retry.
+- `nexus/tools/`: first-party tool registry, tool base protocol, MCP adapters, builtin tools, legacy compatibility tool classes, sub-agent tools.
+- `nexus/integrations/`: fake, OpenAI-compatible, Ollama, Anthropic, Gemini, retry.
 - `nexus/extensions/`, `nexus/hooks/`, `nexus/skills/`, `nexus/memory/`, `nexus/sandbox/`, `nexus/observability/`: optional runtime capabilities.
 
 ## Approval Flow Review

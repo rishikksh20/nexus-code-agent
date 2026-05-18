@@ -291,6 +291,61 @@ def test_config_accepts_structured_mcp_servers(tmp_path):
     ]
 
 
+def test_config_accepts_extended_mcp_server_fields(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        "mcp_servers = [{ "
+        'name = "filesystem", transport = "stdio", command = ["uvx", "mcp-server-filesystem", "."], '
+        'prefix = "fs_", env = { TOKEN = "abc" }, cwd = ".", startup_timeout_seconds = 2.5, '
+        'tool_timeout_seconds = 10, disabled = false, disabled_tools = ["write_file"]'
+        " }]\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.mcp_servers[0]["env"] == {"TOKEN": "abc"}
+    assert config.mcp_servers[0]["disabled_tools"] == ["write_file"]
+    assert config.mcp_servers[0]["startup_timeout_seconds"] == 2.5
+
+
+def test_config_accepts_disabled_mcp_http_server(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'mcp_servers = [{ name = "remote", transport = "streamable_http", url = "http://localhost:3333/mcp", disabled = true }]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.mcp_servers[0]["disabled"] is True
+    assert config.mcp_servers[0]["url"] == "http://localhost:3333/mcp"
+
+
+def test_config_rejects_duplicate_mcp_servers(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'mcp_servers = [{ name = "dup", command = ["cmd"] }, { name = "dup", command = ["cmd"] }]\n',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(workspace, global_root=global_root)
+    except ConfigError as exc:
+        assert "Duplicate mcp_servers entry" in str(exc)
+    else:
+        raise AssertionError("Expected ConfigError for duplicate MCP server")
+
+
 def test_config_accepts_structured_delegation_subagents(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

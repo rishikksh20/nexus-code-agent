@@ -26,6 +26,7 @@ def register_subagent_tools(
 
     count = 0
     for definition in _merge_builtin_definitions(definitions):
+        definition = _with_builtin_mcp_tools(definition, registry)
         tool = SubAgentTool(
             definition=definition,
             model_client_factory=model_client_factory,
@@ -73,6 +74,7 @@ def register_skill_subagent_tools(
     count = 0
     existing_names = {record.name for record in registry.records()}
     for definition in load_subagent_definitions_from_skills(skill_registry):
+        definition = _with_builtin_mcp_tools(definition, registry)
         tool = SubAgentTool(
             definition=definition,
             model_client_factory=model_client_factory,
@@ -174,6 +176,43 @@ def _merge_builtin_definitions(definitions: "Iterable[SubagentDefinition]") -> l
             merged.append(definition)
             existing.add(definition.name)
     return merged
+
+
+def _with_builtin_mcp_tools(definition: SubagentDefinition, registry: "ToolRegistry") -> SubagentDefinition:
+    if not _is_builtin_subagent_definition(definition):
+        return definition
+    mcp_tools = [
+        record.name
+        for record in registry.records()
+        if record.source == "mcp"
+    ]
+    if not mcp_tools:
+        return definition
+    allowed = list(definition.allowed_tools or [])
+    changed = False
+    for tool_name in mcp_tools:
+        if tool_name not in allowed:
+            allowed.append(tool_name)
+            changed = True
+    if not changed:
+        return definition
+    return SubagentDefinition(
+        name=definition.name,
+        description=definition.description,
+        goal_prompt=definition.goal_prompt,
+        allowed_tools=allowed,
+        max_turns=definition.max_turns,
+        timeout_seconds=definition.timeout_seconds,
+    )
+
+
+def _is_builtin_subagent_definition(definition: SubagentDefinition) -> bool:
+    return definition.name in {
+        "planning_analysis",
+        "execution",
+        "review",
+        "verification",
+    }
 
 
 def _skill_subagent_name(skill_name: str) -> str | None:

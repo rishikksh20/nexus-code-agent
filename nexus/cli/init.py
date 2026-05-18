@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from nexus.memory.workspace import AgentDirs, bootstrap_workspace_knowledge
-from nexus.integrations.mcp import mcp_server_example_for_workspace
+from nexus.tools.mcp import mcp_server_example_for_workspace
 from nexus.config.upgrade import CURRENT_CONFIG_VERSION
 
 

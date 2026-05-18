@@ -7,7 +7,7 @@ from rich.console import Console
 
 from nexus.cli.init import init_workspace
 from nexus.config import load_config
-from nexus.integrations.mcp import MCPServerConfig, MCPServerRuntime, MCPToolSpec
+from nexus.tools.mcp import MCPServerConfig, MCPServerRuntime, MCPToolSpec
 from nexus.memory.store import MemoryStore
 from nexus.models import Message, ToolCall
 from nexus.runtime.context_state import (
@@ -73,7 +73,12 @@ async def test_slash_command_invalid_quoting_does_not_crash(tmp_path):
 
 
 class _FakeMCPClient:
-    def __init__(self) -> None:
+    def __init__(self, server: MCPServerConfig | None = None) -> None:
+        self.server = server or MCPServerConfig(
+            name="filesystem",
+            command=("uvx", "mcp-server-filesystem", "."),
+            prefix="fs_",
+        )
         self._tools = [
             MCPToolSpec(
                 name="read_file",
@@ -90,6 +95,50 @@ class _FakeMCPClient:
 
 
 @pytest.mark.asyncio
+async def test_mcp_help_shows_without_configured_servers(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-help"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/mcp help")
+
+    assert handled is True
+    output = console.export_text()
+    assert "/mcp" in output
+    assert "reload" in output
+
+
+@pytest.mark.asyncio
+async def test_mcp_default_shows_usage_without_loaded_servers(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-empty"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/mcp")
+
+    assert handled is True
+    output = console.export_text()
+    assert "No MCP servers loaded" in output
+    assert "/mcp reload" in output
+
+
+@pytest.mark.asyncio
 async def test_mcp_status_slash_command_shows_server_state(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
@@ -101,6 +150,13 @@ async def test_mcp_status_slash_command_shows_server_state(tmp_path):
         connected=True,
         registered_tools=("fs_read_file",),
         discovered_tools=("fs_read_file",),
+        discovered_specs=(
+            MCPToolSpec(
+                name="read_file",
+                description="Read files.",
+                input_schema={"type": "object", "properties": {}, "required": []},
+            ),
+        ),
     )
     state = ReplState(
         config=config,
@@ -178,7 +234,104 @@ async def test_mcp_refresh_slash_command_updates_discovered_tools(tmp_path):
     assert handled is True
     assert runtime.discovered_tools == ("fs_read_file",)
     output = console.export_text()
-    assert "MCP status refreshed" in output
+    assert "MCP Refresh" in output
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_slash_command_shows_tool_details(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    console = Console(record=True, no_color=True, width=200)
+    runtime = MCPServerRuntime(
+        server=MCPServerConfig(name="filesystem", command=("uvx", "mcp-server-filesystem", "."), prefix="fs_"),
+        client=_FakeMCPClient(),
+        connected=True,
+        registered_tools=("fs_read_file",),
+        discovered_tools=("fs_read_file",),
+        discovered_specs=(
+            MCPToolSpec(
+                name="read_file",
+                description="Read files.",
+                input_schema={"type": "object", "properties": {}, "required": []},
+            ),
+        ),
+    )
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-tools"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        mcp_servers=[runtime],
+    )
+
+    handled = await build_router().dispatch(state, "/mcp tools")
+
+    assert handled is True
+    output = console.export_text()
+    assert "fs_read_file" in output
+    assert "read_file" in output
+    assert "enabled" in output
+
+
+@pytest.mark.asyncio
+async def test_mcp_refresh_unknown_server_reports_not_found(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-refresh-missing"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        mcp_servers=[
+            MCPServerRuntime(
+                server=MCPServerConfig(name="filesystem", command=("uvx", "mcp-server-filesystem", ".")),
+            )
+        ],
+    )
+
+    handled = await build_router().dispatch(state, "/mcp refresh missing")
+
+    assert handled is True
+    assert "MCP server not found: missing" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_mcp_reload_loads_configured_servers(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'mcp_servers = [{ name = "broken", transport = "stdio", command = ["definitely-missing-mcp-server"], prefix = "mcp_broken_" }]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-reload"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/mcp reload")
+
+    assert handled is True
+    assert len(state.mcp_servers) == 1
+    assert state.mcp_servers[0].server.name == "broken"
+    output = console.export_text()
+    assert "MCP Reload" in output
+    assert "broken" in output
 
 
 @pytest.mark.asyncio
