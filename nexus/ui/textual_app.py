@@ -234,11 +234,11 @@ class TextualTerminalUI(TerminalUI):
     def end_assistant(self) -> None:
         self._assistant_stream_open = False
 
-    def start_thinking(self) -> None:
-        self._app.set_status("Thinking")
+    def start_thinking(self, label: str = "Thinking") -> None:
+        self._app.set_status(label)
 
     def stop_thinking(self) -> None:
-        self._app.clear_status("Thinking")
+        self._app.clear_status()
 
     def start_tool_wait(self, label: str) -> None:
         self._app.set_status(label)
@@ -261,7 +261,7 @@ class TextualTerminalUI(TerminalUI):
 
         if event.kind == AgentEventType.THINKING_STARTED and show_thinking_indicator:
             self.end_assistant()
-            self.start_thinking()
+            self.start_thinking(_thinking_label(event))
             return
 
         if event.kind == AgentEventType.TEXT_DELTA:
@@ -782,3 +782,10 @@ class NexusTextualApp(App[None]):
                 "message_count": len(self.state.history),
             },
         )
+
+
+def _thinking_label(event: Any) -> str:
+    payload = getattr(event, "payload", None)
+    actor = payload.get("actor") if isinstance(payload, dict) else ""
+    actor = str(actor).strip() if actor else ""
+    return f"{actor} - Thinking" if actor else "Thinking"

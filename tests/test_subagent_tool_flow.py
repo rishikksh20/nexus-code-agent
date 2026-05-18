@@ -17,11 +17,15 @@ from nexus.tools.builtin import WriteFileTool
 class _RecordingUI:
     def __init__(self) -> None:
         self.events: list[AgentEventType] = []
+        self.thinking_labels: list[str] = []
         self.tool_start_seen = asyncio.Event()
 
     def render_event(self, event, **kwargs) -> None:
         del kwargs
         self.events.append(event.kind)
+        if event.kind == AgentEventType.THINKING_STARTED:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            self.thinking_labels.append(str(payload.get("actor", "")))
         if event.kind == AgentEventType.TOOL_CALL_START:
             self.tool_start_seen.set()
 
@@ -187,6 +191,7 @@ async def test_subagent_renders_inner_tool_start_before_read_executes(tmp_path):
     assert result.is_error is False
     assert AgentEventType.TOOL_CALL_START in ui.events
     assert ui.events.index(AgentEventType.TOOL_CALL_START) < ui.events.index(AgentEventType.TOOL_CALL_COMPLETE)
+    assert "subagent_planning_analysis" in ui.thinking_labels
 
 
 @pytest.mark.asyncio

@@ -104,7 +104,7 @@ class Agent:
                 yield event
             return
 
-        yield AgentEvent(kind=AgentEventType.THINKING_STARTED)
+        yield AgentEvent.thinking_started(actor=_tool_actor(context))
         yield AgentEvent.agent_start(messages[-1].content if messages else "")
 
         async for event in self._agentic_loop(
@@ -337,7 +337,7 @@ class Agent:
 
         for turn_index in range(max_turns):
             if turn_index > 0:
-                yield AgentEvent(kind=AgentEventType.THINKING_STARTED)
+                yield AgentEvent.thinking_started(actor=_tool_actor(context))
             request = RuntimeRequest(
                 model_name=model_name,
                 system_prompt=system_prompt,
