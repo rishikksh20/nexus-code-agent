@@ -125,10 +125,14 @@ def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
             description="Implement a focused coding task using the normal workspace tools.",
             goal_prompt=(
                 "You are a Nexus execution agent. Implement only the assigned task, follow existing project "
-                "patterns, use tools for edits and validation, and return changed files, tests run, and blockers."
+                "patterns, use tools for edits and validation, and return changed files, tests run, and blockers. "
+                "When using bash, never run servers, watchers, REPLs, or infinite loops in the foreground. "
+                "Use bounded commands with explicit timeouts; for dev servers, start them in the background, "
+                "probe readiness, collect logs, and stop the process in the same command. If a bash command "
+                "times out, do not retry the same command unchanged."
             ),
             allowed_tools=["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_tests", "run_linter", "run_typecheck", "bash"],
-            max_turns=20,
+            max_turns=14,
             timeout_seconds=600,
         ),
         SubagentDefinition(
@@ -149,10 +153,14 @@ def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
             goal_prompt=(
                 "You are a Nexus verification agent. Run focused tests, lint, type/syntax checks, "
                 "and git status inspection. Return a concise validation summary and failures. "
-                "Do not modify files."
+                "Do not modify files. When using bash, never run servers, watchers, REPLs, or infinite "
+                "loops in the foreground. Use bounded commands with explicit timeouts; for server-based "
+                "checks, start the server in the background, probe it, capture relevant output, and stop "
+                "it in the same command. If a bash command times out, do not retry the same command "
+                "unchanged; report the timeout and relevant output."
             ),
             allowed_tools=["run_tests", "run_linter", "run_typecheck", "git_status", "bash"],
-            max_turns=8,
+            max_turns=6,
             timeout_seconds=600,
         ),
     ]
