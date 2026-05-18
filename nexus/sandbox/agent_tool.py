@@ -6,6 +6,7 @@ sub-agent calls inside its own agent loop keeps the usual permission behavior.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -218,25 +219,32 @@ class SubAgentTool:
         error = None
         failed_tool_outputs: list[dict[str, str]] = []
         modified_files: list[str] = []
+        deadline = asyncio.get_running_loop().time() + float(getattr(self._definition, "timeout_seconds", 600.0) or 600.0)
 
         for _ in range(int(getattr(self._definition, "max_turns", 20) or 20)):
-            events = [
-                event
-                async for event in agent.run(
-                    history,
-                    sub_context,
-                    system_prompt=system_prompt,
-                    model_name=str(getattr(self._config, "model_name", "fake-model")),
-                    mode=ExecutionMode(str(outer_context.metadata.get("execution_mode", "default"))),
-                    approval_manager=outer_context.metadata.get("approval_manager"),
-                    auto_confirm=bool(outer_context.metadata.get("auto_confirm", False)),
-                    auto_confirm_read_only=bool(outer_context.metadata.get("auto_confirm_read_only", True)),
-                    temperature=float(getattr(self._config, "temperature", 0.0)),
-                    max_output_tokens=getattr(self._config, "max_output_tokens", None),
-                    max_turns=1,
+            try:
+                events = await _collect_inner_events(
+                    agent.run(
+                        history,
+                        sub_context,
+                        system_prompt=system_prompt,
+                        model_name=str(getattr(self._config, "model_name", "fake-model")),
+                        mode=ExecutionMode(str(outer_context.metadata.get("execution_mode", "default"))),
+                        approval_manager=outer_context.metadata.get("approval_manager"),
+                        auto_confirm=bool(outer_context.metadata.get("auto_confirm", False)),
+                        auto_confirm_read_only=bool(outer_context.metadata.get("auto_confirm_read_only", True)),
+                        temperature=float(getattr(self._config, "temperature", 0.0)),
+                        max_output_tokens=getattr(self._config, "max_output_tokens", None),
+                        max_turns=1,
+                    ),
+                    outer_context,
+                    deadline=deadline,
                 )
-            ]
-            _render_inner_events(outer_context, events)
+            except TimeoutError:
+                status = "failed"
+                error = f"Sub-agent timed out after {float(getattr(self._definition, 'timeout_seconds', 600.0) or 600.0):g}s."
+                final_response = error
+                break
 
             confirmation = next((event for event in events if event.kind == AgentEventType.CONFIRMATION_REQUESTED), None)
             if confirmation is not None:
@@ -263,24 +271,30 @@ class SubAgentTool:
                                 tool_call_id=pending_message.tool_call_id,
                             )
                         )
-                    resume_events = [
-                        event
-                        async for event in agent.run(
-                            history,
-                            sub_context,
-                            system_prompt=system_prompt,
-                            model_name=str(getattr(self._config, "model_name", "fake-model")),
-                            mode=ExecutionMode(str(outer_context.metadata.get("execution_mode", "default"))),
-                            approval_manager=outer_context.metadata.get("approval_manager"),
-                            auto_confirm=bool(outer_context.metadata.get("auto_confirm", False)),
-                            auto_confirm_read_only=bool(outer_context.metadata.get("auto_confirm_read_only", True)),
-                            temperature=float(getattr(self._config, "temperature", 0.0)),
-                            max_output_tokens=getattr(self._config, "max_output_tokens", None),
-                            max_turns=1,
-                            resume_tool_calls=(resume_call,),
+                    try:
+                        resume_events = await _collect_inner_events(
+                            agent.run(
+                                history,
+                                sub_context,
+                                system_prompt=system_prompt,
+                                model_name=str(getattr(self._config, "model_name", "fake-model")),
+                                mode=ExecutionMode(str(outer_context.metadata.get("execution_mode", "default"))),
+                                approval_manager=outer_context.metadata.get("approval_manager"),
+                                auto_confirm=bool(outer_context.metadata.get("auto_confirm", False)),
+                                auto_confirm_read_only=bool(outer_context.metadata.get("auto_confirm_read_only", True)),
+                                temperature=float(getattr(self._config, "temperature", 0.0)),
+                                max_output_tokens=getattr(self._config, "max_output_tokens", None),
+                                max_turns=1,
+                                resume_tool_calls=(resume_call,),
+                            ),
+                            outer_context,
+                            deadline=deadline,
                         )
-                    ]
-                    _render_inner_events(outer_context, resume_events)
+                    except TimeoutError:
+                        status = "failed"
+                        error = f"Sub-agent timed out after {float(getattr(self._definition, 'timeout_seconds', 600.0) or 600.0):g}s."
+                        final_response = error
+                        break
                     for event in resume_events:
                         if event.kind == AgentEventType.TOOL_RESULT:
                             tool_call_count += 1
@@ -396,7 +410,24 @@ def _packet_summaries_from_context(
     return tuple(rendered)
 
 
+async def _collect_inner_events(agent_events, outer_context: ToolExecutionContext, *, deadline: float) -> list:
+    events = []
+    async def collect() -> list:
+        async for event in agent_events:
+            events.append(event)
+            _render_inner_event(outer_context, event)
+        return events
+
+    remaining = max(0.001, deadline - asyncio.get_running_loop().time())
+    return await asyncio.wait_for(collect(), timeout=remaining)
+
+
 def _render_inner_events(outer_context: ToolExecutionContext, events) -> None:
+    for event in events:
+        _render_inner_event(outer_context, event)
+
+
+def _render_inner_event(outer_context: ToolExecutionContext, event) -> None:
     ui = outer_context.metadata.get("ui")
     if ui is None:
         return
@@ -411,15 +442,14 @@ def _render_inner_events(outer_context: ToolExecutionContext, events) -> None:
         AgentEventType.CONFIRMATION_REQUESTED,
         AgentEventType.AGENT_ERROR,
     }
-    for event in events:
-        if event.kind not in visible_kinds:
-            continue
-        render_event(
-            event,
-            stream_output=bool(outer_context.metadata.get("stream_output", True)),
-            show_tool_calls=bool(outer_context.metadata.get("show_tool_calls", True)),
-            show_thinking_indicator=True,
-        )
+    if event.kind not in visible_kinds:
+        return
+    render_event(
+        event,
+        stream_output=bool(outer_context.metadata.get("stream_output", True)),
+        show_tool_calls=bool(outer_context.metadata.get("show_tool_calls", True)),
+        show_thinking_indicator=True,
+    )
 
 
 def _direct_subagent_system_prompt(

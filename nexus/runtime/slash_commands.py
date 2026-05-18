@@ -26,7 +26,11 @@ from nexus.runtime.sessions import message_to_dict, new_snapshot
 from nexus.security.manager import ApprovalManager
 from nexus.security.policy import ApprovalPolicy
 from nexus.skills import get_skill_roots, load_skill_registry
-from nexus.tools.subagents import register_skill_subagent_tools
+from nexus.tools.subagents import (
+    load_subagent_definitions,
+    register_skill_subagent_tools,
+    register_subagent_tools,
+)
 
 
 CommandHandler = Callable[[ReplState, list[str]], Awaitable[None]]
@@ -128,7 +132,7 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
         ("/provider [list|set <param> <value>]", "Show active provider and update model/session parameters."),
         ("/skills [list|show|add|remove|reload]", "Inspect and activate session skills."),
         ("/config show [scope]", "Print config for merged, local, or global scope."),
-        ("/config upgrade [local|global]", "Add new config keys from latest Nexus defaults without overwriting existing values."),
+        ("/config upgrade [local|global]", "Add new config keys/tool allowlist entries from latest Nexus defaults, then reload tools."),
         ("/session [new|list|resume|save|export]", "Show current session or manage saved sessions."),
         ("/tools [reload]", "List tools or reload the tool registry from config."),
         ("/memory list|search|save|show", "Inspect or update workspace memory."),
@@ -299,7 +303,7 @@ async def handle_config(state: ReplState, args: list[str]) -> None:
                 ("",                        "Example hidden-path override: /config set allow_hidden_paths true", ""),
                 ("reset <key>",             "Remove a key from local config and reload.",                      "/config reset temperature"),
                 ("reload",                  "Reload config plus workspace .env/environment values.",            "/config reload"),
-                ("upgrade [local|global]",  "Add new config keys introduced in latest Nexus version without changing existing values. Does not touch memory or sessions.", "/config upgrade"),
+                ("upgrade [local|global]",  "Add new config keys and default tool allowlist entries, then reload config and tools. Does not touch memory or sessions.", "/config upgrade"),
                 ("reinit [local|global]",   "Rewrite local (default) or global config to clean Nexus defaults.  Clears provider/model overrides. Does not touch sessions or memory.","/config reinit"),
                 ("help",                    "Show this help.",                                                 "/config help"),
             ),
@@ -513,28 +517,8 @@ async def handle_tools(state: ReplState, args: list[str]) -> None:
         )
         return
     if subcommand == "reload":
-        from nexus.config import load_config
-        from nexus.tools.registry import register_core_tools, tool_enabled
-
-        state.config = load_config(
-            state.config.workspace_root,
-            global_root=state.config.global_root,
-            local_config_path=state.config.local_config_file,
-            global_config_path=state.config.global_config_file,
-        )
-        cfg = state.config
-
-        # Save non-builtin records (MCP, plugins) so they survive the clear
-        non_builtin = [r for r in state.tool_registry.records() if r.source != "core"]
-
-        state.tool_registry.clear()
-        register_core_tools(state.tool_registry, cfg)
-
-        for record in non_builtin:
-            if tool_enabled(cfg, record.name):
-                state.tool_registry.register(record.tool, source=record.source, origin=record.origin)
-
-        count = len(state.tool_registry.records())
+        _reload_config(state)
+        count = _reload_tools(state)
         state.console.print(f"[green]Tools reloaded.[/green] {count} tool(s) registered.")
         return
     table = Table(title="Registered Tools")
@@ -1069,20 +1053,24 @@ async def _handle_config_upgrade(state: ReplState, scope: str) -> None:
     report = inspect_config_upgrade(path, template_str)
     if not report.needs_upgrade:
         _reload_config(state)
+        count = _reload_tools(state)
         state.console.print(
-            f"[green]{label.capitalize()} config is already up to date — no new keys to add. Config and .env reloaded.[/green]"
+            f"[green]{label.capitalize()} config is already up to date — no new keys to add. Config, .env, and {count} tool(s) reloaded.[/green]"
         )
         return
 
     upgrade_config_file(path, template_str)
     _reload_config(state)
+    count = _reload_tools(state)
     state.console.print(
-        f"[green]Upgraded {label} config at {path}, then reloaded config and .env:[/green]"
+        f"[green]Upgraded {label} config at {path}, then reloaded config, .env, and {count} tool(s):[/green]"
     )
     for key in report.deprecated_keys:
         state.console.print(f"  [bold]-[/bold] removed deprecated {key}")
     for key in report.missing_keys:
         state.console.print(f"  [bold]+[/bold] {key}")
+    for tool_name in report.allowed_tool_additions:
+        state.console.print(f"  [bold]+[/bold] allowed_tools: {tool_name}")
 
 
 def _reload_config(state: ReplState) -> None:
@@ -1092,6 +1080,37 @@ def _reload_config(state: ReplState) -> None:
         local_config_path=state.config.local_config_file,
         global_config_path=state.config.global_config_file,
     )
+
+
+def _reload_tools(state: ReplState) -> int:
+    from nexus.tools.registry import register_core_tools, tool_enabled
+
+    cfg = state.config
+    rebuilt_sources = {"core", "agent", "agent-skill"}
+    preserved_records = [
+        record
+        for record in state.tool_registry.records()
+        if record.source not in rebuilt_sources
+    ]
+
+    state.tool_registry.clear()
+    register_core_tools(state.tool_registry, cfg)
+
+    for record in preserved_records:
+        if tool_enabled(cfg, record.name):
+            state.tool_registry.register(record.tool, source=record.source, origin=record.origin)
+
+    register_subagent_tools(
+        state.tool_registry,
+        cfg,
+        definitions=load_subagent_definitions(cfg),
+    )
+    register_skill_subagent_tools(
+        state.tool_registry,
+        cfg,
+        state.skill_registry,
+    )
+    return len(state.tool_registry.records())
 
 
 def _update_toml_value(path: Path, key: str, value: str) -> None:

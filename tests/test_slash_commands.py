@@ -416,6 +416,45 @@ async def test_config_upgrade_reloads_config_and_workspace_dotenv(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_config_upgrade_updates_allowed_tools_and_live_registry(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    local_config.write_text(
+        'project_name = "workspace"\n'
+        'config_version = 2\n'
+        'agent_mode = "advanced"\n'
+        'allowed_tools = ["get_time"]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=global_root)
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("config-upgrade-tools"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/config upgrade local")
+
+    assert handled is True
+    content = local_config.read_text(encoding="utf-8")
+    assert '"write_file"' in content
+    assert "write_file" in state.config.allowed_tools
+    assert state.tool_registry.record("write_file").source == "core"
+    assert state.tool_registry.record("subagent_planning_analysis").source == "agent"
+    assert "allowed_tools: write_file" in console.export_text()
+
+
+@pytest.mark.asyncio
 async def test_config_upgrade_removes_deprecated_multi_agent_mode(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

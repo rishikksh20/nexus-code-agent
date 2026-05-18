@@ -359,11 +359,11 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 | `/context [show\|usage]` | Print system prompt or show token/context-window usage stats |
 | `/context agents\|agent \<id\>\|usage \<id\>` | Inspect per-agent context isolation, handoffs, and usage |
 | `/provider [list\|set \<param\> \<value\>]` | Show or update provider, model, temperature, and session parameters |
-| `/config [show\|set\|reset\|reload\|reinit [local\|global]]` | Inspect or edit configuration; `reinit` rewrites to clean defaults |
-| `/skills [list\|show\|add\|remove\|reload]` | Manage session skills |
+| `/config [show\|set\|reset\|reload\|upgrade\|reinit [local\|global]]` | Inspect or edit configuration; `upgrade` merges new defaults and reloads tools |
+| `/skills [list\|show\|add\|remove\|reload]` | Manage session skills and skill-backed sub-agent tools |
 | `/session [new\|list\|resume\|save\|export]` | Manage sessions |
 | `/memory [list\|search\|save\|show]` | Workspace memory entries |
-| `/tools [reload]` | List registered tools or reload the tool registry |
+| `/tools [reload]` | List registered tools or reload core, plugin, MCP, and sub-agent tools |
 | `/history [n]` | Show recent conversation messages |
 | `/mcp [status\|tools\|refresh [server]]` | Inspect MCP server status and discovered tools |
 | `/quit` or `/exit` | Save session and exit |
@@ -477,6 +477,73 @@ All tools pass through the permission system and lifecycle hooks. **Risk level**
 | `bash` | **dynamic** | Yes | Runs a bash command; risk classified per command (see below) |
 
 Compatibility tool classes such as `write_note`, `modify_file`, and `replace_text` still exist for older tests/docs, but the normal core registry exposes the canonical tools above.
+
+### Cognitive Sub-Agent Tools
+
+Sub-agent tools are normal registry tools that let the supervisor call a focused inner agent. They are disabled by default for conservative single-agent operation. Turn them on per workspace with:
+
+```toml
+# .nexus/config.toml
+agent_mode = "advanced"
+
+# Easiest option: allow every registered tool, including cognitive tools.
+allowed_tools = []
+denied_tools = []
+```
+
+If the workspace uses a non-empty `allowed_tools` allowlist, it must include the cognitive tool names. For built-in specialists, use:
+
+```toml
+agent_mode = "advanced"
+allowed_tools = [
+  "get_time", "read_file", "write_file", "edit", "insert_edit_into_file",
+  "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff",
+  "run_tests", "run_linter", "run_typecheck", "bash",
+  "subagent_planning_analysis", "subagent_execution",
+  "subagent_review", "subagent_verification",
+]
+```
+
+Built-in cognitive tools:
+
+| Tool | Purpose |
+|---|---|
+| `subagent_planning_analysis` | Read-only repo analysis and implementation planning |
+| `subagent_execution` | Focused implementation work using normal workspace tools |
+| `subagent_review` | Code review for bugs, regressions, and maintainability risks |
+| `subagent_verification` | Runs tests, lint/type checks, and summarizes failures |
+
+Custom workspace sub-agents are configured in `.nexus/config.toml` with `delegation_subagents`. Each entry becomes a tool named `subagent_<name>`:
+
+```toml
+agent_mode = "advanced"
+delegation_subagents = [
+  {
+    name = "explore",
+    description = "Investigate a focused codebase question.",
+    goal_prompt = "Read the relevant code and summarize the answer. Do not modify files.",
+    allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp"],
+    max_turns = 12,
+    timeout_seconds = 300
+  }
+]
+
+# Required only when allowed_tools is non-empty:
+# allowed_tools = ["subagent_explore", "read_file", "glob", "grep", "list_dir", "lsp", ...]
+```
+
+Skill-backed sub-agent tools are also supported. Create a skill named `subagent-review` or `subagent_review` under `.nexus/skills/` or `~/.nexus/skills/`, then run `/skills reload`; it registers as `subagent_review` when `agent_mode = "advanced"`.
+
+Useful commands after editing `.nexus/config.toml`:
+
+```text
+/config upgrade local  # merge new default keys/tool allowlist entries and reload tools
+/config reload         # reload config and .env values
+/tools reload          # rebuild the live tool registry from the current config
+/tools                 # confirm which subagent_* tools are registered
+/skills reload         # rescan skills and register skill-backed sub-agent tools
+/context agents        # inspect sub-agent context isolation and handoffs
+```
 
 ### Approval Flow
 
@@ -657,12 +724,12 @@ agent_mode = "basic" # basic | advanced
 # advanced = supervisor LLM with cognitive sub-agent tools.
 # Built-in cognitive tools in advanced mode: subagent_planning_analysis,
 # subagent_execution, subagent_review, subagent_verification
-
-When an interactive session starts, Nexus checks the workspace `.nexus/config.toml`
-against the current template. If keys are missing, deprecated keys are present,
-or the config version is old, Nexus asks before upgrading. Legacy keys are
-accepted for compatibility; `/config upgrade local` removes deprecated keys and
-adds the current schema version.
+delegation_subagents = []
+# Custom sub-agents become tools named subagent_<name>.
+# Example:
+# delegation_subagents = [
+#   { name = "explore", description = "Investigate a focused codebase question.", goal_prompt = "Read the relevant code and summarize the answer.", allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp"], max_turns = 12, timeout_seconds = 300 }
+# ]
 
 # Sandbox
 sandbox_commands = false
@@ -670,6 +737,13 @@ sandbox_image = "nexus-sandbox:latest"
 sandbox_timeout_seconds = 30
 sandbox_network = "none"
 ```
+
+When an interactive session starts, Nexus checks the workspace `.nexus/config.toml`
+against the current template. If keys are missing, deprecated keys are present,
+the config version is old, or the local tool allowlist is missing current
+default tools, Nexus asks before upgrading. Legacy keys are accepted for
+compatibility; `/config upgrade local` removes deprecated keys, adds the current
+schema version, merges default tool allowlist entries, and reloads live tools.
 
 ### User-Level Config (`~/.nexus/config.toml`)
 
