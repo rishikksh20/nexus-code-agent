@@ -713,16 +713,25 @@ project_name = ""
 project_description = ""
 
 # MCP servers
+# See docs/mcp-integration.md for a full setup guide.
+#
+# Filesystem MCP (npm package — do NOT use uvx):
+#   Install: npm install -g @modelcontextprotocol/server-filesystem
+#   Command: ["mcp-server-filesystem", "/absolute/path/to/workspace"]
+#
+# Git MCP (Python package — use uvx or pip install mcp-server-git):
+#   Command: ["uvx", "mcp-server-git", "--repository", "/absolute/git/repo/root"]
+#   The path must be the git repo root (where .git/ lives).
+#   Run: git rev-parse --show-toplevel  to find the correct path.
+#
+# After editing this list in a running REPL, run /mcp reload.
+# Inspect with /mcp status · list tools with /mcp tools · rediscover with /mcp refresh.
 mcp_servers = [
-  { name = "filesystem", transport = "stdio", command = ["mcp-server-filesystem", "."], prefix = "mcp_fs_" }
+  { name = "filesystem", transport = "stdio", command = ["mcp-server-filesystem", "."], prefix = "fs_", startup_timeout_seconds = 10, tool_timeout_seconds = 60 },
+  { name = "git", transport = "stdio", command = ["uvx", "mcp-server-git", "--repository", "."], prefix = "git_", startup_timeout_seconds = 15, tool_timeout_seconds = 60 }
 ]
 
-# Optional MCP fields: env, cwd, startup_timeout_seconds, tool_timeout_seconds,
-# disabled, and disabled_tools.
-# Filesystem MCP server install: npm install -g @modelcontextprotocol/server-filesystem
-# Inspect with /mcp status, list tools with /mcp tools, and rediscover tools with
-# /mcp refresh or /mcp refresh <server>. Use /mcp reload after editing config.
-# See docs/mcp-integration.md.
+# Optional MCP fields: env, cwd, disabled, disabled_tools.
 
 # Agent profile
 config_version = 2
@@ -755,6 +764,93 @@ schema version, merges default tool allowlist entries, and reloads live tools.
 ### User-Level Config (`~/.nexus/config.toml`)
 
 Same format as the workspace config. Applied to all workspaces; overridden by workspace-level settings.
+
+---
+
+### MCP Servers (Git + Filesystem)
+
+Nexus can connect to external MCP servers and expose their tools through the normal tool registry. The two most useful servers are the official **filesystem** server and the **git** server.
+
+#### Install
+
+```bash
+# Filesystem MCP — npm package (do NOT use uvx)
+npm install -g @modelcontextprotocol/server-filesystem
+
+# Git MCP — Python package (uvx fetches on demand, no install needed)
+uvx mcp-server-git --help
+# or install permanently:
+pip install mcp-server-git
+```
+
+#### Configure in `.nexus/config.toml`
+
+```toml
+mcp_servers = [
+  {
+    name      = "filesystem",
+    transport = "stdio",
+    command   = ["mcp-server-filesystem", "/absolute/path/to/workspace"],
+    prefix    = "fs_",
+    startup_timeout_seconds = 10,
+    tool_timeout_seconds    = 60
+  },
+  {
+    name      = "git",
+    transport = "stdio",
+    command   = ["uvx", "mcp-server-git", "--repository", "/absolute/path/to/repo-root"],
+    prefix    = "git_",
+    startup_timeout_seconds = 15,
+    tool_timeout_seconds    = 60
+  }
+]
+```
+
+> **Git path:** Point `--repository` at the directory containing `.git/` — not a subdirectory.
+> Run `git rev-parse --show-toplevel` to confirm the correct path.
+
+> **Filesystem command:** Use `mcp-server-filesystem` directly (npm binary). Do **not** prefix with `uvx` — it is not a Python package.
+
+#### Add tool names to `allowed_tools`
+
+```toml
+allowed_tools = [
+  # ... existing built-in tools ...
+
+  # Filesystem MCP (prefix "fs_")
+  "fs_read_file", "fs_write_file", "fs_list_directory",
+  "fs_create_directory", "fs_delete_file", "fs_move_file",
+  "fs_get_file_info", "fs_search_files", "fs_list_allowed_directories",
+
+  # Git MCP (prefix "git_" — note: server already names tools with git_ internally)
+  "git_git_status", "git_git_log", "git_git_diff_unstaged", "git_git_diff_staged",
+  "git_git_diff", "git_git_add", "git_git_commit", "git_git_reset",
+  "git_git_create_branch", "git_git_checkout", "git_git_show", "git_git_read_file"
+]
+```
+
+#### Verify with REPL slash commands
+
+```bash
+uv run nexus
+```
+
+```
+# Check connection status
+/mcp status
+
+# List all discovered tools
+/mcp tools
+
+# After editing config in a running REPL
+/mcp reload
+
+# Rediscover tools without restarting the server process
+/mcp refresh
+/mcp refresh git
+```
+
+See [`docs/mcp-integration.md`](docs/mcp-integration.md) for the full configuration reference, all supported fields, tool name tables, safety behavior, and troubleshooting guide.
 
 ### Key Directories
 
