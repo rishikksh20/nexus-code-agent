@@ -13,6 +13,7 @@ from typing import Any
 
 from nexus.models import AgentEventType, ConfirmationKind, Message, ToolCall, ToolExecutionContext, ToolResult
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.agent_scope import render_skill_metadata, subagent_skill_names, subagent_tool_names
 from nexus.security.manager import ApprovalScope
 from nexus.security.policy import ApprovalPolicy
 from nexus.tools.base import ToolKind
@@ -137,15 +138,11 @@ class SubAgentTool:
                 is_error=True,
             )
 
-        # Merge definition-level allowed_tools if caller didn't override
-        if raw_tools is None and self._definition and self._definition.allowed_tools:
-            raw_tools = self._definition.allowed_tools
-
         return await self._execute_direct(
             call_id,
             title=title,
             instructions=instructions,
-            allowed_tools=tuple(raw_tools) if raw_tools else (),
+            caller_allowed_tools=tuple(raw_tools) if raw_tools is not None else None,
             input_packet_ids=input_packet_ids,
             outer_context=context,
         )
@@ -156,7 +153,7 @@ class SubAgentTool:
         *,
         title: str,
         instructions: str,
-        allowed_tools: tuple[str, ...],
+        caller_allowed_tools: tuple[str, ...] | None,
         input_packet_ids: tuple[str, ...],
         outer_context: ToolExecutionContext,
     ) -> ToolResult:
@@ -174,17 +171,33 @@ class SubAgentTool:
             )
 
         registry = ToolRegistry()
-        allowed = set(allowed_tools)
+        scoped_config = outer_context.metadata.get("config", self._config)
+        effective_tool_names = subagent_tool_names(
+            scoped_config,
+            self._base_tool_registry,
+            self._definition.name if self._definition else "delegate",
+            base_allowed_tools=self._definition.allowed_tools if self._definition else None,
+            caller_allowed_tools=caller_allowed_tools,
+        )
         for record in self._base_tool_registry.records():
             if record.name == self.name or record.name.startswith("subagent_") or record.name == "delegate_task":
                 continue
-            if allowed and record.name not in allowed:
+            if record.name not in effective_tool_names:
                 continue
             registry.register(record.tool, source=record.source, origin=record.origin)
 
         model_factory = self._model_client_factory or (lambda: FakeModelClient())
         agent = Agent(model_client=model_factory(), tool_registry=registry)
         shared_context = _packet_summaries_from_context(outer_context, input_packet_ids)
+        active_skill_names = subagent_skill_names(
+            scoped_config,
+            self._definition.name if self._definition else "delegate",
+            outer_context.metadata.get("global_active_skills", outer_context.metadata.get("active_skills", [])),
+        )
+        attached_skill_metadata = render_skill_metadata(
+            outer_context.metadata.get("skill_catalog", {}),
+            active_skill_names,
+        )
         sub_context = ToolExecutionContext(
             session_id=f"{outer_context.session_id}-subagent-{call_id}",
             working_directory=outer_context.working_directory,
@@ -198,6 +211,7 @@ class SubAgentTool:
                 "supervisor_cognitive_tools_only": False,
                 "input_packet_ids": list(input_packet_ids),
                 "shared_context": list(shared_context),
+                "active_skills": list(active_skill_names),
             },
         )
         system_prompt = _direct_subagent_system_prompt(
@@ -205,6 +219,7 @@ class SubAgentTool:
             title=title,
             instructions=instructions,
             allowed_tools=tuple(record.name for record in registry.records()),
+            attached_skill_metadata=attached_skill_metadata,
             shared_context=shared_context,
             input_packet_ids=input_packet_ids,
         )
@@ -348,6 +363,7 @@ class SubAgentTool:
             "scope": "isolated",
             "input_packet_ids": list(input_packet_ids),
             "shared_context": list(shared_context),
+            "active_skills": list(active_skill_names),
             "allowed_tools": [record.name for record in registry.records()],
             "tool_call_count": tool_call_count,
             "message_count": len(history),
@@ -449,10 +465,12 @@ def _direct_subagent_system_prompt(
     title: str,
     instructions: str,
     allowed_tools: tuple[str, ...],
+    attached_skill_metadata: tuple[str, ...],
     shared_context: tuple[str, ...],
     input_packet_ids: tuple[str, ...],
 ) -> str:
     tools_text = ", ".join(allowed_tools) if allowed_tools else "no tools"
+    skills_text = "\n".join(attached_skill_metadata) if attached_skill_metadata else "(none)"
     shared_text = "\n".join(shared_context) if shared_context else "(none)"
     packet_text = ", ".join(input_packet_ids) if input_packet_ids else "(none)"
     role_prompt = definition.goal_prompt if definition is not None else "Complete the delegated cognitive task."
@@ -467,6 +485,7 @@ def _direct_subagent_system_prompt(
         f"Task instructions:\n{instructions}\n\n"
         f"Input packet ids: {packet_text}\n"
         f"Shared handoff context:\n{shared_text}\n\n"
+        f"Attached skill metadata:\n{skills_text}\n\n"
         f"Allowed normal tools: {tools_text}\n\n"
         "If the task requires reading, editing, testing, or shell inspection, use the allowed normal tools before your final answer. "
         "Do not claim files were changed, tests were run, or code was inspected unless you actually used the relevant tools.\n\n"

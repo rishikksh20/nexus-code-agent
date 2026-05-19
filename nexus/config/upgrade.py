@@ -24,6 +24,17 @@ LEGACY_TOOL_NAME_ALIASES: dict[str, tuple[str, ...]] = {
     "subagent_research": ("subagent_planning_analysis",),
     "subagent_test": ("subagent_verification",),
 }
+LEGACY_AGENT_SCOPE_KEYS: dict[str, str] = {
+    "agent_allowed_tools": "allowed_tools",
+    "agent_attached_tools": "attached_tools",
+    "agent_detached_tools": "detached_tools",
+    "agent_allowed_skills": "allowed_skills",
+    "agent_attached_skills": "attached_skills",
+    "agent_detached_skills": "detached_skills",
+    "agent_allowed_mcp_servers": "allowed_mcp_servers",
+    "agent_attached_mcp_servers": "attached_mcp_servers",
+    "agent_detached_mcp_servers": "detached_mcp_servers",
+}
 
 
 @dataclass(slots=True, frozen=True)
@@ -33,6 +44,8 @@ class ConfigUpgradeReport:
     deprecated_keys: tuple[str, ...] = ()
     allowed_tool_additions: tuple[str, ...] = ()
     allowed_tools_updated: bool = False
+    agent_scope_migrated: bool = False
+    subagent_scope_migrated: bool = False
     current_version: int | None = None
     target_version: int = CURRENT_CONFIG_VERSION
 
@@ -43,6 +56,8 @@ class ConfigUpgradeReport:
             or self.deprecated_keys
             or self.allowed_tool_additions
             or self.allowed_tools_updated
+            or self.agent_scope_migrated
+            or self.subagent_scope_migrated
             or self.current_version != self.target_version
         )
 
@@ -54,6 +69,8 @@ def inspect_config_upgrade(path: Path, template_str: str) -> ConfigUpgradeReport
     deprecated = tuple(key for key in DEPRECATED_CONFIG_KEYS if key in existing)
     upgraded_allowed_tools = _upgraded_allowed_tools(existing, template)
     allowed_tool_additions = _allowed_tool_additions(existing, template)
+    agent_scope_migrated = _needs_agent_scope_migration(existing)
+    subagent_scope_migrated = _needs_subagent_scope_migration(existing)
     version = _optional_int(existing.get("config_version"))
     return ConfigUpgradeReport(
         path=path,
@@ -61,6 +78,8 @@ def inspect_config_upgrade(path: Path, template_str: str) -> ConfigUpgradeReport
         deprecated_keys=deprecated,
         allowed_tool_additions=allowed_tool_additions,
         allowed_tools_updated=upgraded_allowed_tools is not None,
+        agent_scope_migrated=agent_scope_migrated,
+        subagent_scope_migrated=subagent_scope_migrated,
         current_version=version,
     )
 
@@ -71,6 +90,13 @@ def upgrade_config_file(path: Path, template_str: str) -> ConfigUpgradeReport:
     existing = _read_top_level_toml(path)
     content = path.read_text(encoding="utf-8") if path.exists() else ""
     lines = _remove_deprecated_and_version_lines(content.splitlines())
+    if _needs_agent_scope_migration(existing):
+        lines = _remove_top_level_assignments(lines, LEGACY_AGENT_SCOPE_KEYS)
+        lines = _remove_table(lines, "agents")
+    if _needs_subagent_scope_migration(existing):
+        lines = _remove_top_level_assignments(lines, {"subagent_profiles"})
+        if "sub-agents" not in existing:
+            lines = _remove_array_table(lines, "sub-agents")
     upgraded_allowed_tools = _upgraded_allowed_tools(existing, template)
     if upgraded_allowed_tools is not None:
         lines = _replace_top_level_assignment(
@@ -84,10 +110,20 @@ def upgrade_config_file(path: Path, template_str: str) -> ConfigUpgradeReport:
         additions.append("")
     additions.append("# Added by Nexus config upgrade")
     additions.append(f"config_version = {CURRENT_CONFIG_VERSION}")
+    migrated_subagents = _migrated_subagent_profiles(existing)
     for key in template:
         if key == "config_version" or key in existing:
             continue
-        additions.append(f"{key} = {_render_toml_value(template[key])}")
+        if key == "sub-agents" and migrated_subagents:
+            continue
+        value = _migrated_agent_scope(existing, template[key]) if key == "agents" else template[key]
+        additions.extend(_render_toml_assignment(key, value))
+    if _needs_agent_scope_migration(existing) and "agents" in existing:
+        additions.extend(_render_toml_assignment("agents", _migrated_agent_scope(existing, template.get("agents", {}))))
+    if migrated_subagents:
+        if additions and additions[-1].strip():
+            additions.append("")
+        additions.extend(_render_toml_assignment("sub-agents", migrated_subagents))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join((*lines, *additions)).rstrip() + "\n", encoding="utf-8")
@@ -166,11 +202,97 @@ def _read_top_level_toml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        with path.open("rb") as handle:
-            data = tomllib.load(handle)
+        data = tomllib.loads(_normalize_bare_all_assignments(path.read_text(encoding="utf-8")))
     except tomllib.TOMLDecodeError:
         return {}
-    return {key: value for key, value in data.items() if not isinstance(value, dict)}
+    return dict(data)
+
+
+def _normalize_bare_all_assignments(content: str) -> str:
+    lines: list[str] = []
+    for line in content.splitlines():
+        before_hash, hash_mark, after_hash = line.partition("#")
+        key, equals, value = before_hash.partition("=")
+        if equals and value.strip().lower() == "all":
+            line = f'{key}{equals} "all"'
+            if hash_mark:
+                line = f"{line} {hash_mark}{after_hash}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_toml_assignment(key: str, value: Any) -> list[str]:
+    if isinstance(value, dict):
+        lines = [f"[{key}]"]
+        for child_key, child_value in value.items():
+            if isinstance(child_value, dict):
+                continue
+            lines.append(f"{child_key} = {_render_toml_value(child_value)}")
+        return lines
+    if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+        lines: list[str] = []
+        for entry in value:
+            if lines:
+                lines.append("")
+            lines.append(f"[[{key}]]")
+            for child_key, child_value in entry.items():
+                if isinstance(child_value, dict):
+                    continue
+                lines.append(f"{child_key} = {_render_toml_value(child_value)}")
+        return lines
+    return [f"{key} = {_render_toml_value(value)}"]
+
+
+def _needs_agent_scope_migration(existing: dict[str, Any]) -> bool:
+    return bool(set(LEGACY_AGENT_SCOPE_KEYS) & set(existing))
+
+
+def _needs_subagent_scope_migration(existing: dict[str, Any]) -> bool:
+    return "subagent_profiles" in existing
+
+
+def _migrated_agent_scope(existing: dict[str, Any], template_agents: Any) -> dict[str, Any]:
+    if isinstance(template_agents, dict):
+        migrated = dict(template_agents)
+    else:
+        migrated = {}
+    current = existing.get("agents")
+    if isinstance(current, dict):
+        migrated.update(current)
+    for old_key, new_key in LEGACY_AGENT_SCOPE_KEYS.items():
+        value = existing.get(old_key)
+        if old_key not in existing:
+            continue
+        if _is_non_empty_scope_value(migrated.get(new_key)):
+            continue
+        migrated[new_key] = value
+    return migrated
+
+
+def _migrated_subagent_profiles(existing: dict[str, Any]) -> list[dict[str, Any]]:
+    if "sub-agents" in existing:
+        return []
+    profiles = existing.get("subagent_profiles")
+    if not isinstance(profiles, list):
+        return []
+    return [_subagent_profile_for_new_layout(dict(entry)) for entry in profiles if isinstance(entry, dict)]
+
+
+def _subagent_profile_for_new_layout(entry: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(entry)
+    if "allowed_mcp_servers" in migrated and "allowed_mcps" not in migrated:
+        migrated["allowed_mcps"] = migrated.pop("allowed_mcp_servers")
+    if "attached_mcp_servers" in migrated and "attached_mcps" not in migrated:
+        migrated["attached_mcps"] = migrated.pop("attached_mcp_servers")
+    if "detached_mcp_servers" in migrated and "detached_mcps" not in migrated:
+        migrated["detached_mcps"] = migrated.pop("detached_mcp_servers")
+    return migrated
+
+
+def _is_non_empty_scope_value(value: Any) -> bool:
+    if isinstance(value, list):
+        return bool(value)
+    return value not in (None, "")
 
 
 def _remove_deprecated_and_version_lines(lines: list[str]) -> list[str]:
@@ -183,6 +305,70 @@ def _remove_deprecated_and_version_lines(lines: list[str]) -> list[str]:
         kept.append(line)
     while kept and not kept[-1].strip():
         kept.pop()
+    return kept
+
+
+def _remove_top_level_assignments(lines: list[str], keys: set[str] | dict[str, Any]) -> list[str]:
+    updated = lines
+    for key in keys:
+        updated = _remove_top_level_assignment(updated, key)
+    return updated
+
+
+def _remove_top_level_assignment(lines: list[str], key: str) -> list[str]:
+    kept: list[str] = []
+    skipping_multiline = False
+    bracket_depth = 0
+
+    for line in lines:
+        if skipping_multiline:
+            bracket_depth += line.count("[") - line.count("]")
+            if bracket_depth <= 0:
+                skipping_multiline = False
+            continue
+        stripped = line.strip()
+        is_assignment = (
+            stripped
+            and not stripped.startswith("#")
+            and (stripped.startswith(f"{key} ") or stripped.startswith(f"{key}="))
+        )
+        if is_assignment:
+            bracket_depth = line.count("[") - line.count("]")
+            if bracket_depth > 0:
+                skipping_multiline = True
+            continue
+        kept.append(line)
+    return kept
+
+
+def _remove_table(lines: list[str], table_name: str) -> list[str]:
+    return _remove_toml_block(lines, header=f"[{table_name}]", array_header_prefix="[[")
+
+
+def _remove_array_table(lines: list[str], table_name: str) -> list[str]:
+    return _remove_toml_block(lines, header=f"[[{table_name}]]", array_header_prefix=None)
+
+
+def _remove_toml_block(lines: list[str], *, header: str, array_header_prefix: str | None) -> list[str]:
+    kept: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        if skipping:
+            is_table_header = stripped.startswith("[") and stripped.endswith("]")
+            if is_table_header:
+                skipping = stripped == header
+                if skipping:
+                    continue
+                kept.append(line)
+            continue
+        if stripped == header:
+            skipping = True
+            continue
+        if array_header_prefix is not None and stripped.startswith(array_header_prefix):
+            kept.append(line)
+            continue
+        kept.append(line)
     return kept
 
 

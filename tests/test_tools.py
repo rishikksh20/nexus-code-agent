@@ -365,6 +365,24 @@ async def test_register_subagent_tools_skips_unless_advanced_mode():
     assert registry.records() == []
 
 
+def test_register_subagent_tools_loads_configured_subagents_in_basic_mode():
+    registry = ToolRegistry()
+    config = SimpleNamespace(
+        agent_mode="basic",
+        allowed_tools=[],
+        denied_tools=[],
+        subagent_profiles=[
+            {"name": "execution", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
+            {"name": "review", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
+        ],
+    )
+
+    count = register_subagent_tools(registry, config)
+
+    assert count == 2
+    assert {record.name for record in registry.records()} == {"subagent_execution", "subagent_review"}
+
+
 def test_load_subagent_definitions_builds_definition_objects():
     config = SimpleNamespace(
         delegation_subagents=[

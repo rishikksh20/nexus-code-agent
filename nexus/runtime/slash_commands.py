@@ -22,6 +22,19 @@ from nexus.runtime.context_state import (
     render_context_packet,
 )
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.agent_scope import (
+    SUBAGENT_PROFILE_FIELDS,
+    clean_string_list,
+    is_all_scope,
+    mcp_tool_names_for_servers,
+    normalize_subagent_name,
+    subagent_profile,
+    subagent_skill_names,
+    subagent_tool_name,
+    subagent_tool_names,
+    supervisor_skill_names,
+    supervisor_tool_names,
+)
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import message_to_dict, new_snapshot
 from nexus.tools.mcp import (
@@ -115,6 +128,9 @@ def build_router() -> SlashCommandRouter:
     router = SlashCommandRouter()
     router.register(SlashCommand("help", "Show available slash commands.", handle_help))
     router.register(SlashCommand("mcp", "Inspect MCP server status and tools.", handle_mcp))
+    router.register(SlashCommand("agent", "Inspect and scope supervisor tools, skills, and MCP.", handle_agent))
+    router.register(SlashCommand("sub-agent", "Inspect and scope cognitive sub-agent resources.", handle_sub_agent))
+    router.register(SlashCommand("subagent", "Inspect and scope cognitive sub-agent resources.", handle_sub_agent))
     router.register(SlashCommand("mode", "Show or switch execution mode.", handle_mode))
     router.register(SlashCommand("provider", "Show or update model provider and session parameters.", handle_provider))
     router.register(SlashCommand("skills", "Inspect and activate skills.", handle_skills))
@@ -137,6 +153,8 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
     for name, description in (
         ("/help", "Show command help."),
         ("/mcp [status|tools|available|activate|deactivate|refresh]", "Inspect and manage MCP server connections."),
+        ("/agent [status|tools|skills|mcp|attach|detach]", "Inspect and scope supervisor resources."),
+        ("/sub-agent [list|show|tools|skills|mcp|attach|detach]", "Inspect and scope sub-agent resources."),
         ("/mode [plan|default|auto]", "Show or switch execution mode."),
         ("/provider [list|set <param> <value>]", "Show active provider and update model/session parameters."),
         ("/skills [list|show|add|remove|reload]", "Inspect and activate session skills."),
@@ -209,6 +227,99 @@ async def handle_mcp(state: ReplState, args: list[str]) -> None:
         _print_mcp_status(state)
         return
     state.console.print("Usage: /mcp [status|tools|available|activate|deactivate|refresh [server]|reload|help]")
+
+
+async def handle_agent(state: ReplState, args: list[str]) -> None:
+    subcommand = args[0].lower() if args else "status"
+    if subcommand == "help":
+        _print_subcommand_help(
+            state, "agent", "Inspect and scope supervisor tools, skills, and MCP servers.",
+            (
+                ("status", "Show supervisor mode and effective resource counts.", "/agent status"),
+                ("tools", "List registered tools and whether the supervisor can call them.", "/agent tools"),
+                ("skills", "List globally active skills and supervisor scoped state.", "/agent skills"),
+                ("mcp", "List active MCP servers and supervisor scoped state.", "/agent mcp"),
+                ("attach tool <tool>", "Attach a registered tool to the supervisor.", "/agent attach tool read_file"),
+                ("detach tool <tool>", "Detach a registered tool from the supervisor.", "/agent detach tool read_file"),
+                ("attach skill <skill>", "Attach a globally active skill to the supervisor.", "/agent attach skill review"),
+                ("detach skill <skill>", "Detach a skill from the supervisor.", "/agent detach skill review"),
+                ("attach mcp <server>", "Attach an active MCP server's tools to the supervisor.", "/agent attach mcp filesystem"),
+                ("detach mcp <server>", "Detach an MCP server's tools from the supervisor.", "/agent detach mcp filesystem"),
+            ),
+        )
+        return
+    if subcommand == "status":
+        _print_agent_status(state)
+        return
+    if subcommand == "tools":
+        _print_agent_tools(state)
+        return
+    if subcommand == "skills":
+        _print_agent_skills(state)
+        return
+    if subcommand == "mcp":
+        _print_agent_mcp(state)
+        return
+    if subcommand in {"attach", "detach"}:
+        if len(args) < 3:
+            state.console.print("Usage: /agent attach|detach tool|skill|mcp <name>")
+            return
+        if _set_agent_resource_scope(state, args[1].lower(), args[2], attached=(subcommand == "attach")):
+            state.refresh_system_prompt()
+            _print_agent_status(state)
+        return
+    state.console.print("Usage: /agent [status|tools|skills|mcp|attach|detach|help]")
+
+
+async def handle_sub_agent(state: ReplState, args: list[str]) -> None:
+    subcommand = args[0].lower() if args else "list"
+    if subcommand == "help":
+        _print_subcommand_help(
+            state, "sub-agent", "Inspect and scope cognitive sub-agent resources.",
+            (
+                ("list", "List registered cognitive sub-agent tools.", "/sub-agent list"),
+                ("show <name>", "Show one sub-agent description and effective resources.", "/sub-agent show execution"),
+                ("tools <name>", "List effective tools for one sub-agent.", "/sub-agent tools execution"),
+                ("skills <name>", "List attached skill metadata for one sub-agent.", "/sub-agent skills execution"),
+                ("mcp <name>", "List active MCP servers and sub-agent scoped state.", "/sub-agent mcp execution"),
+                ("attach <name> tool|skill|mcp <id>", "Attach a resource to a sub-agent.", "/sub-agent attach execution tool read_file"),
+                ("detach <name> tool|skill|mcp <id>", "Detach a resource from a sub-agent.", "/sub-agent detach execution mcp filesystem"),
+            ),
+        )
+        return
+    if subcommand == "list":
+        _print_subagent_list(state)
+        return
+    if subcommand in {"show", "tools", "skills", "mcp"}:
+        if len(args) < 2:
+            state.console.print(f"Usage: /sub-agent {subcommand} <name>")
+            return
+        record = _subagent_record(state, args[1])
+        if record is None:
+            state.console.print(f"Sub-agent not found: {args[1]}")
+            return
+        if subcommand == "show":
+            _print_subagent_show(state, record)
+        elif subcommand == "tools":
+            _print_subagent_tools(state, record)
+        elif subcommand == "skills":
+            _print_subagent_skills(state, record)
+        else:
+            _print_subagent_mcp(state, record)
+        return
+    if subcommand in {"attach", "detach"}:
+        if len(args) < 4:
+            state.console.print("Usage: /sub-agent attach|detach <name> tool|skill|mcp <id>")
+            return
+        record = _subagent_record(state, args[1])
+        if record is None:
+            state.console.print(f"Sub-agent not found: {args[1]}")
+            return
+        if _set_subagent_resource_scope(state, record, args[2].lower(), args[3], attached=(subcommand == "attach")):
+            state.refresh_system_prompt()
+            _print_subagent_show(state, record)
+        return
+    state.console.print("Usage: /sub-agent [list|show|tools|skills|mcp|attach|detach|help]")
 
 
 async def handle_mode(state: ReplState, args: list[str]) -> None:
@@ -884,6 +995,430 @@ def _print_context_summary(state: ReplState) -> None:
     state.console.print(json.dumps(summary, indent=2))
 
 
+def _print_agent_status(state: ReplState) -> None:
+    tools = supervisor_tool_names(state.config, state.tool_registry)
+    skills = supervisor_skill_names(state.config, state.active_skills)
+    allowed_tools = clean_string_list(getattr(state.config, "agent_allowed_tools", []))
+    allowed_skills = clean_string_list(getattr(state.config, "agent_allowed_skills", []))
+    allowed_mcp_servers = clean_string_list(getattr(state.config, "agent_allowed_mcp_servers", []))
+    mcp_servers = clean_string_list(getattr(state.config, "agent_attached_mcp_servers", []))
+    table = Table(title="Supervisor Agent")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("Mode", str(state.config.agent_mode))
+    table.add_row("Effective tools", str(len(tools)))
+    table.add_row("Effective skills", str(len(skills)))
+    table.add_row("Configured allowed tools", ", ".join(allowed_tools) or "default")
+    table.add_row("Configured allowed skills", ", ".join(allowed_skills) or "default")
+    table.add_row("Configured allowed MCP servers", ", ".join(allowed_mcp_servers) or "default")
+    table.add_row("Attached MCP servers", ", ".join(mcp_servers) or "-")
+    state.console.print(table)
+
+
+def _print_agent_tools(state: ReplState) -> None:
+    available = supervisor_tool_names(state.config, state.tool_registry)
+    configured_scope = getattr(state.config, "agent_allowed_tools", [])
+    configured_mcp_scope = getattr(state.config, "agent_allowed_mcp_servers", [])
+    configured = set(clean_string_list(configured_scope))
+    configured_mcp = set(clean_string_list(configured_mcp_scope))
+    attached = set(clean_string_list(getattr(state.config, "agent_attached_tools", [])))
+    detached = set(clean_string_list(getattr(state.config, "agent_detached_tools", [])))
+    attached_mcp = set(clean_string_list(getattr(state.config, "agent_attached_mcp_servers", [])))
+    detached_mcp = set(clean_string_list(getattr(state.config, "agent_detached_mcp_servers", [])))
+    configured_mcp_tools = mcp_tool_names_for_servers(state.tool_registry, configured_mcp)
+    attached_mcp_tools = mcp_tool_names_for_servers(state.tool_registry, attached_mcp)
+    detached_mcp_tools = mcp_tool_names_for_servers(state.tool_registry, detached_mcp)
+    table = Table(title="Supervisor Tools")
+    table.add_column("Tool")
+    table.add_column("Source")
+    table.add_column("State")
+    table.add_column("Description")
+    for record in state.tool_registry.records():
+        if record.name in detached or record.name in detached_mcp_tools:
+            scope = "detached"
+        elif (record.source != "mcp" and is_all_scope(configured_scope)) or (record.source == "mcp" and is_all_scope(configured_mcp_scope)):
+            scope = "allowed"
+        elif record.name in configured or record.name in configured_mcp_tools:
+            scope = "allowed"
+        elif record.name in attached or record.name in attached_mcp_tools:
+            scope = "attached"
+        elif record.name in available:
+            scope = "default"
+        else:
+            scope = "unavailable"
+        table.add_row(record.name, record.source, scope, record.tool.description)
+    state.console.print(table)
+
+
+def _print_agent_skills(state: ReplState) -> None:
+    effective = set(supervisor_skill_names(state.config, state.active_skills))
+    configured_scope = getattr(state.config, "agent_allowed_skills", [])
+    configured = set(clean_string_list(configured_scope))
+    attached = set(clean_string_list(getattr(state.config, "agent_attached_skills", [])))
+    detached = set(clean_string_list(getattr(state.config, "agent_detached_skills", [])))
+    table = Table(title="Supervisor Skills")
+    table.add_column("Skill")
+    table.add_column("Global Active")
+    table.add_column("State")
+    table.add_column("Description")
+    for skill in state.skill_registry.all():
+        globally_active = skill.name in state.active_skills
+        if skill.name in detached:
+            scope = "detached"
+        elif is_all_scope(configured_scope) and globally_active:
+            scope = "allowed"
+        elif skill.name in configured:
+            scope = "allowed"
+        elif skill.name in attached:
+            scope = "attached"
+        elif skill.name in effective:
+            scope = "default"
+        else:
+            scope = "unavailable"
+        table.add_row(skill.name, "yes" if globally_active else "no", scope, skill.description)
+    state.console.print(table)
+
+
+def _print_agent_mcp(state: ReplState) -> None:
+    attached = set(clean_string_list(getattr(state.config, "agent_attached_mcp_servers", [])))
+    configured_scope = getattr(state.config, "agent_allowed_mcp_servers", [])
+    configured = set(clean_string_list(configured_scope))
+    detached = set(clean_string_list(getattr(state.config, "agent_detached_mcp_servers", [])))
+    table = Table(title="Supervisor MCP Servers")
+    table.add_column("Server")
+    table.add_column("Global Active")
+    table.add_column("State")
+    table.add_column("Tools")
+    for server in state.mcp_servers:
+        if server.server.name in detached:
+            scope = "detached"
+        elif is_all_scope(configured_scope):
+            scope = "allowed"
+        elif server.server.name in configured:
+            scope = "allowed"
+        elif server.server.name in attached:
+            scope = "attached"
+        elif str(state.config.agent_mode).strip().lower() == "basic":
+            scope = "default"
+        else:
+            scope = "unavailable"
+        table.add_row(server.server.name, "yes", scope, ", ".join(server.registered_tools) or "-")
+    state.console.print(table)
+
+
+def _set_agent_resource_scope(state: ReplState, kind: str, name: str, *, attached: bool) -> bool:
+    normalized = _normalize_resource_name(state, kind, name, require_active=attached)
+    if normalized is None:
+        return False
+    field_prefix = {
+        "tool": "agent_attached_tools",
+        "skill": "agent_attached_skills",
+        "mcp": "agent_attached_mcp_servers",
+    }.get(kind)
+    detached_prefix = {
+        "tool": "agent_detached_tools",
+        "skill": "agent_detached_skills",
+        "mcp": "agent_detached_mcp_servers",
+    }.get(kind)
+    if field_prefix is None or detached_prefix is None:
+        state.console.print("Resource kind must be one of: tool, skill, mcp")
+        return False
+    payload = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8")) if state.config.local_config_file.exists() else {}
+    agent_scope = _payload_agent_scope(payload)
+    add_field = field_prefix if attached else detached_prefix
+    remove_field = detached_prefix if attached else field_prefix
+    _add_to_payload_list(agent_scope, _agent_section_key(add_field), normalized)
+    _remove_from_payload_list(agent_scope, _agent_section_key(remove_field), normalized)
+    _write_toml(state.config.local_config_file, payload)
+    _reload_config(state)
+    action = "Attached" if attached else "Detached"
+    state.console.print(f"{action} {kind} for supervisor: {normalized}")
+    return True
+
+
+def _print_subagent_list(state: ReplState) -> None:
+    records = _subagent_records(state)
+    if not records:
+        state.console.print("No sub-agent tools registered. Set agent_mode = \"advanced\" or add [[sub-agents]] entries, then reload tools.")
+        return
+    table = Table(title="Sub-Agents")
+    table.add_column("Name")
+    table.add_column("Tool")
+    table.add_column("Source")
+    table.add_column("Description")
+    for record in records:
+        definition = getattr(record.tool, "_definition", None)
+        name = getattr(definition, "name", record.name.removeprefix("subagent_"))
+        table.add_row(name, record.name, record.source, record.tool.description)
+    state.console.print(table)
+
+
+def _print_subagent_show(state: ReplState, record) -> None:
+    definition = getattr(record.tool, "_definition", None)
+    name = getattr(definition, "name", record.name.removeprefix("subagent_"))
+    table = Table(title=f"Sub-Agent: {name}")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("Tool", record.name)
+    table.add_row("Source", record.source)
+    table.add_row("Description", record.tool.description)
+    table.add_row("Effective tools", ", ".join(_effective_subagent_tools(state, record)) or "-")
+    table.add_row("Attached skills", ", ".join(_effective_subagent_skills(state, record)) or "-")
+    table.add_row("Active MCP tools", ", ".join(_effective_subagent_mcp_tools(state, record)) or "-")
+    state.console.print(table)
+
+
+def _print_subagent_tools(state: ReplState, record) -> None:
+    effective = set(_effective_subagent_tools(state, record))
+    definition = getattr(record.tool, "_definition", None)
+    profile = subagent_profile(state.config, getattr(definition, "name", record.name))
+    configured_scope = profile.get("allowed_tools", [])
+    configured_mcp_scope = profile.get("allowed_mcps", []) or profile.get("allowed_mcp_servers", [])
+    configured = set(clean_string_list(configured_scope))
+    configured_mcp = set(clean_string_list(configured_mcp_scope))
+    attached = set(clean_string_list(profile.get("attached_tools", [])))
+    detached = set(clean_string_list(profile.get("detached_tools", [])))
+    configured_mcp_tools = mcp_tool_names_for_servers(state.tool_registry, configured_mcp)
+    table = Table(title=f"Sub-Agent Tools: {record.name}")
+    table.add_column("Tool")
+    table.add_column("Source")
+    table.add_column("State")
+    table.add_column("Description")
+    for tool_record in state.tool_registry.records():
+        if tool_record.name.startswith("subagent_") or tool_record.name == "delegate_task":
+            continue
+        if tool_record.name in detached:
+            scope = "detached"
+        elif (tool_record.source != "mcp" and is_all_scope(configured_scope)) or (tool_record.source == "mcp" and is_all_scope(configured_mcp_scope)):
+            scope = "allowed"
+        elif tool_record.name in configured or tool_record.name in configured_mcp_tools:
+            scope = "allowed"
+        elif tool_record.name in attached:
+            scope = "attached"
+        elif tool_record.name in effective:
+            scope = "available"
+        else:
+            scope = "unavailable"
+        table.add_row(tool_record.name, tool_record.source, scope, tool_record.tool.description)
+    state.console.print(table)
+
+
+def _print_subagent_skills(state: ReplState, record) -> None:
+    effective = set(_effective_subagent_skills(state, record))
+    definition = getattr(record.tool, "_definition", None)
+    profile = subagent_profile(state.config, getattr(definition, "name", record.name))
+    configured_scope = profile.get("allowed_skills", [])
+    configured = set(clean_string_list(configured_scope))
+    attached = set(clean_string_list(profile.get("attached_skills", [])))
+    detached = set(clean_string_list(profile.get("detached_skills", [])))
+    table = Table(title=f"Sub-Agent Skills: {record.name}")
+    table.add_column("Skill")
+    table.add_column("Global Active")
+    table.add_column("State")
+    table.add_column("Description")
+    for skill in state.skill_registry.all():
+        if skill.name in detached:
+            scope = "detached"
+        elif is_all_scope(configured_scope) and skill.name in state.active_skills:
+            scope = "allowed"
+        elif skill.name in configured:
+            scope = "allowed"
+        elif skill.name in attached:
+            scope = "attached"
+        elif skill.name in effective:
+            scope = "available"
+        else:
+            scope = "unavailable"
+        table.add_row(skill.name, "yes" if skill.name in state.active_skills else "no", scope, skill.description)
+    state.console.print(table)
+
+
+def _print_subagent_mcp(state: ReplState, record) -> None:
+    effective_tools = set(_effective_subagent_tools(state, record))
+    definition = getattr(record.tool, "_definition", None)
+    profile = subagent_profile(state.config, getattr(definition, "name", record.name))
+    configured_scope = profile.get("allowed_mcps", []) or profile.get("allowed_mcp_servers", [])
+    configured = set(clean_string_list(configured_scope))
+    attached = set(clean_string_list(profile.get("attached_mcps", [])) or clean_string_list(profile.get("attached_mcp_servers", [])))
+    detached = set(clean_string_list(profile.get("detached_mcps", [])) or clean_string_list(profile.get("detached_mcp_servers", [])))
+    table = Table(title=f"Sub-Agent MCP: {record.name}")
+    table.add_column("Server")
+    table.add_column("State")
+    table.add_column("Effective Tools")
+    for server in state.mcp_servers:
+        server_tools = [tool for tool in server.registered_tools if tool in effective_tools]
+        if server.server.name in detached:
+            scope = "detached"
+        elif is_all_scope(configured_scope):
+            scope = "allowed"
+        elif server.server.name in configured:
+            scope = "allowed"
+        elif server.server.name in attached:
+            scope = "attached"
+        elif server_tools:
+            scope = "available"
+        else:
+            scope = "unavailable"
+        table.add_row(server.server.name, scope, ", ".join(server_tools) or "-")
+    state.console.print(table)
+
+
+def _set_subagent_resource_scope(state: ReplState, record, kind: str, name: str, *, attached: bool) -> bool:
+    normalized_resource = _normalize_resource_name(state, kind, name, require_active=attached)
+    if normalized_resource is None:
+        return False
+    definition = getattr(record.tool, "_definition", None)
+    subagent_name = normalize_subagent_name(getattr(definition, "name", record.name))
+    field_map = {
+        "tool": ("attached_tools", "detached_tools"),
+        "skill": ("attached_skills", "detached_skills"),
+        "mcp": ("attached_mcp_servers", "detached_mcp_servers"),
+    }
+    fields = field_map.get(kind)
+    if fields is None:
+        state.console.print("Resource kind must be one of: tool, skill, mcp")
+        return False
+    add_field, remove_field = fields if attached else (fields[1], fields[0])
+    payload = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8")) if state.config.local_config_file.exists() else {}
+    profile = _payload_subagent_profile(payload, subagent_name)
+    _add_to_profile_list(profile, add_field, normalized_resource)
+    _remove_from_profile_list(profile, remove_field, normalized_resource)
+    _write_toml(state.config.local_config_file, payload)
+    _reload_config(state)
+    action = "Attached" if attached else "Detached"
+    state.console.print(f"{action} {kind} for sub-agent {subagent_name}: {normalized_resource}")
+    return True
+
+
+def _normalize_resource_name(state: ReplState, kind: str, name: str, *, require_active: bool) -> str | None:
+    if kind == "tool":
+        try:
+            return state.tool_registry.record(name).name
+        except LookupError:
+            state.console.print(f"Tool not found: {name}")
+            return None
+    if kind == "skill":
+        skill = state.skill_registry.get(name)
+        if skill is None:
+            state.console.print(f"Skill not found: {name}")
+            return None
+        if require_active and skill.name not in state.active_skills:
+            state.console.print(f"Skill is not globally active. Activate it first with /skills activate {skill.name}.")
+            return None
+        return skill.name
+    if kind == "mcp":
+        active = _active_mcp_server_names(state)
+        if require_active and name not in active:
+            state.console.print(f"MCP server is not globally active. Activate it first with /mcp activate {name}.")
+            return None
+        return name
+    state.console.print("Resource kind must be one of: tool, skill, mcp")
+    return None
+
+
+def _subagent_records(state: ReplState) -> list:
+    return [record for record in state.tool_registry.records() if record.name.startswith("subagent_")]
+
+
+def _subagent_record(state: ReplState, name: str):
+    target_tool = subagent_tool_name(name)
+    target_name = normalize_subagent_name(name)
+    for record in _subagent_records(state):
+        definition = getattr(record.tool, "_definition", None)
+        definition_name = normalize_subagent_name(getattr(definition, "name", record.name))
+        if record.name == target_tool or definition_name == target_name:
+            return record
+    return None
+
+
+def _effective_subagent_tools(state: ReplState, record) -> list[str]:
+    definition = getattr(record.tool, "_definition", None)
+    names = subagent_tool_names(
+        state.config,
+        state.tool_registry,
+        getattr(definition, "name", record.name),
+        base_allowed_tools=getattr(definition, "allowed_tools", None),
+    )
+    return sorted(names)
+
+
+def _effective_subagent_skills(state: ReplState, record) -> list[str]:
+    definition = getattr(record.tool, "_definition", None)
+    return subagent_skill_names(
+        state.config,
+        getattr(definition, "name", record.name),
+        state.active_skills,
+    )
+
+
+def _effective_subagent_mcp_tools(state: ReplState, record) -> list[str]:
+    effective = set(_effective_subagent_tools(state, record))
+    return sorted(record.name for record in state.tool_registry.records() if record.source == "mcp" and record.name in effective)
+
+
+def _active_mcp_server_names(state: ReplState) -> set[str]:
+    names = {str(entry.get("name", "")).strip() for entry in state.config.mcp_servers if isinstance(entry, dict)}
+    names.update(server.server.name for server in state.mcp_servers)
+    return {name for name in names if name}
+
+
+def _add_to_payload_list(payload: dict[str, object], field_name: str, value: str) -> None:
+    values = clean_string_list(payload.get(field_name, []))
+    if value not in values:
+        values.append(value)
+    payload[field_name] = values
+
+
+def _remove_from_payload_list(payload: dict[str, object], field_name: str, value: str) -> None:
+    payload[field_name] = [item for item in clean_string_list(payload.get(field_name, [])) if item != value]
+
+
+def _payload_subagent_profile(payload: dict[str, object], name: str) -> dict[str, object]:
+    profiles = payload.get("sub-agents")
+    if not isinstance(profiles, list):
+        profiles = payload.pop("subagent_profiles", None)
+    if not isinstance(profiles, list):
+        profiles = []
+        payload["sub-agents"] = profiles
+    else:
+        payload["sub-agents"] = profiles
+    for entry in profiles:
+        if not isinstance(entry, dict):
+            continue
+        if normalize_subagent_name(str(entry.get("name", ""))) == name:
+            for field_name in SUBAGENT_PROFILE_FIELDS:
+                entry.setdefault(field_name, [])
+            return entry
+    entry: dict[str, object] = {"name": name}
+    for field_name in SUBAGENT_PROFILE_FIELDS:
+        entry[field_name] = []
+    profiles.append(entry)
+    return entry
+
+
+def _payload_agent_scope(payload: dict[str, object]) -> dict[str, object]:
+    agents = payload.get("agents")
+    if not isinstance(agents, dict):
+        agents = {}
+        payload["agents"] = agents
+    return agents
+
+
+def _agent_section_key(field_name: str) -> str:
+    return field_name.removeprefix("agent_")
+
+
+def _add_to_profile_list(profile: dict[str, object], field_name: str, value: str) -> None:
+    values = clean_string_list(profile.get(field_name, []))
+    if value not in values:
+        values.append(value)
+    profile[field_name] = values
+
+
+def _remove_from_profile_list(profile: dict[str, object], field_name: str, value: str) -> None:
+    profile[field_name] = [item for item in clean_string_list(profile.get(field_name, [])) if item != value]
+
+
 
 
 def _print_mcp_status(state: ReplState) -> None:
@@ -1143,6 +1678,10 @@ async def _handle_config_upgrade(state: ReplState, scope: str) -> None:
         state.console.print(f"  [bold]-[/bold] removed deprecated {key}")
     for key in report.missing_keys:
         state.console.print(f"  [bold]+[/bold] {key}")
+    if report.agent_scope_migrated:
+        state.console.print("  [bold]~[/bold] migrated agent scope to [agents]")
+    if report.subagent_scope_migrated:
+        state.console.print("  [bold]~[/bold] migrated sub-agent scope to [[sub-agents]]")
     for tool_name in report.allowed_tool_additions:
         state.console.print(f"  [bold]+[/bold] allowed_tools: {tool_name}")
 
@@ -1153,7 +1692,14 @@ def _reload_config(state: ReplState) -> None:
         global_root=state.config.global_root,
         local_config_path=state.config.local_config_file,
         global_config_path=state.config.global_config_file,
+        strict=False,
     )
+    for warning in getattr(state.config, "config_warnings", []) or []:
+        print_warning = getattr(state.console, "print_warning", None)
+        if print_warning is not None:
+            print_warning(warning)
+        else:
+            state.console.print(f"Warning: {warning}")
 
 
 def _reload_tools(state: ReplState) -> int:
@@ -1217,8 +1763,33 @@ def _coerce_toml_value(value: str):
 
 def _write_toml(path: Path, payload: dict[str, object]) -> None:
     lines: list[str] = []
+    table_blocks: list[tuple[str, dict[str, object]]] = []
+    array_table_blocks: list[tuple[str, list[dict[str, object]]]] = []
     for key, value in payload.items():
+        if isinstance(value, dict):
+            table_blocks.append((key, value))
+            continue
+        if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+            array_table_blocks.append((key, [dict(item) for item in value if isinstance(item, dict)]))
+            continue
         lines.append(f"{key} = {_render_toml_value(value)}")
+    for key, table in table_blocks:
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.append(f"[{key}]")
+        for child_key, child_value in table.items():
+            if isinstance(child_value, dict):
+                continue
+            lines.append(f"{child_key} = {_render_toml_value(child_value)}")
+    for key, entries in array_table_blocks:
+        for entry in entries:
+            if lines and lines[-1] != "":
+                lines.append("")
+            lines.append(f"[[{key}]]")
+            for child_key, child_value in entry.items():
+                if isinstance(child_value, dict):
+                    continue
+                lines.append(f"{child_key} = {_render_toml_value(child_value)}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

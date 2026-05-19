@@ -20,12 +20,14 @@ from nexus.runtime.context_state import (
     upsert_task_context,
 )
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.agent_scope import subagent_skill_names, subagent_tool_names, supervisor_skill_names, supervisor_tool_names
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
 from nexus.runtime.slash_commands import build_router
+from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.skills import get_skill_roots, load_skill_registry
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool
+from nexus.tools.builtin import GetTimeTool, ReadFileTool
 
 
 @pytest.mark.asyncio
@@ -204,6 +206,227 @@ async def test_multi_agent_slash_command_is_not_registered(tmp_path):
     assert status_handled is False
     output = console.export_text()
     assert "Multi-Agent Supervisor" not in output
+
+
+@pytest.mark.asyncio
+async def test_agent_attach_tool_persists_and_updates_supervisor_scope(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    local_config.write_text(
+        'agent_mode = "advanced"\n'
+        'allowed_tools = ["get_time", "read_file", "subagent_execution"]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Execute focused work.",
+                goal_prompt="Do the task.",
+                allowed_tools=["get_time"],
+            ),
+            base_tool_registry=registry,
+            config=config,
+        ),
+        source="agent",
+        origin="execution",
+    )
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("agent-scope"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/agent attach tool read_file")
+
+    assert handled is True
+    assert state.config.agent_attached_tools == ["read_file"]
+    assert "read_file" in supervisor_tool_names(state.config, state.tool_registry)
+    assert "get_time" not in supervisor_tool_names(state.config, state.tool_registry)
+    content = local_config.read_text(encoding="utf-8")
+    assert "[agents]" in content
+    assert 'attached_tools = ["read_file"]' in content
+    assert "Attached tool for supervisor" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_subagent_commands_show_and_persist_resource_scope(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Execute focused work.",
+                goal_prompt="Do the task.",
+                allowed_tools=["get_time"],
+            ),
+            base_tool_registry=registry,
+            config=config,
+        ),
+        source="agent",
+        origin="execution",
+    )
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("subagent-scope"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    router = build_router()
+    assert await router.dispatch(state, "/sub-agent list") is True
+    assert await router.dispatch(state, "/sub-agent attach execution tool read_file") is True
+    assert await router.dispatch(state, "/sub-agent tools execution") is True
+
+    assert state.config.subagent_profiles[0]["name"] == "execution"
+    assert state.config.subagent_profiles[0]["attached_tools"] == ["read_file"]
+    assert "[[sub-agents]]" in config.local_config_file.read_text(encoding="utf-8")
+    output = console.export_text()
+    assert "Sub-Agents" in output
+    assert "Attached tool for sub-agent execution" in output
+    assert "read_file" in output
+
+
+@pytest.mark.asyncio
+async def test_agent_allowed_config_restricts_tools_and_skills(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    config.agent_allowed_tools = ["read_file"]
+    config.agent_allowed_skills = ["review"]
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("agent-allowed-config"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        active_skills=["review", "notes"],
+    )
+
+    await build_router().dispatch(state, "/agent status")
+
+    assert supervisor_tool_names(config, registry) == {"read_file"}
+    assert supervisor_skill_names(config, state.active_skills) == ["review"]
+    assert "Configured allowed tools" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_agent_all_scope_uses_workspace_resources(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    config.agent_allowed_tools = ["all"]
+    config.agent_allowed_mcp_servers = ["all"]
+    config.agent_allowed_skills = ["all"]
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(GetTimeTool(), source="mcp", origin="filesystem")
+
+    assert supervisor_tool_names(config, registry) == {"read_file", "get_time"}
+    assert supervisor_skill_names(config, ["review", "notes"]) == ["review", "notes"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_profile_allowed_config_overrides_default_tools(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    config.subagent_profiles = [
+        {
+            "name": "execution",
+            "allowed_tools": ["read_file"],
+            "attached_tools": [],
+            "detached_tools": [],
+            "allowed_skills": [],
+            "attached_skills": [],
+            "detached_skills": [],
+            "allowed_mcp_servers": [],
+            "attached_mcp_servers": [],
+            "detached_mcp_servers": [],
+        }
+    ]
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    definition = SubagentDefinition(
+        name="execution",
+        description="Execute focused work.",
+        goal_prompt="Do the task.",
+        allowed_tools=["get_time", "read_file"],
+    )
+    registry.register(
+        SubAgentTool(definition, base_tool_registry=registry, config=config),
+        source="agent",
+        origin="execution",
+    )
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("subagent-allowed-config"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    await build_router().dispatch(state, "/sub-agent tools execution")
+
+    assert subagent_tool_names(
+        config,
+        registry,
+        "execution",
+        base_allowed_tools=definition.allowed_tools,
+    ) == {"read_file"}
+    output = console.export_text()
+    assert "allowed" in output
+
+
+@pytest.mark.asyncio
+async def test_subagent_all_scope_uses_workspace_resources(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    config.subagent_profiles = [
+        {
+            "name": "execution",
+            "allowed_tools": ["all"],
+            "allowed_skills": ["all"],
+            "allowed_mcp_servers": ["all"],
+        }
+    ]
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(GetTimeTool(), source="mcp", origin="filesystem")
+
+    assert subagent_tool_names(
+        config,
+        registry,
+        "execution",
+        base_allowed_tools=["read_file"],
+    ) == {"read_file", "get_time"}
+    assert subagent_skill_names(config, "execution", ["review", "notes"]) == ["review", "notes"]
 
 
 @pytest.mark.asyncio

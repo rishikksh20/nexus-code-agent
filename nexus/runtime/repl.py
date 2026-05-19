@@ -194,7 +194,10 @@ def _maybe_prompt_config_upgrade(state: ReplState) -> None:
         global_root=cfg.global_root,
         local_config_path=cfg.local_config_file,
         global_config_path=cfg.global_config_file,
+        strict=False,
     )
+    for warning in getattr(state.config, "config_warnings", []) or []:
+        state.console.print_warning(warning)
     state.console.print("[green]Workspace config upgraded and reloaded.[/green]")
 
 

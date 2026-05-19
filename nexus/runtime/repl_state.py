@@ -10,6 +10,7 @@ from nexus.prompts import build_context_sections
 from nexus.context import CarryOverState, ContextBuilder, ContextCompactor, TokenEstimator, prune_tool_outputs
 from nexus.runtime.context_state import load_multi_agent_state, multi_agent_carry_over_lines, render_context_packet
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.agent_scope import skill_metadata_catalog, supervisor_skill_names, supervisor_tool_names
 from nexus.hooks import HookExecutor
 from nexus.runtime.sessions import SessionSnapshot, SessionStore, prepare_messages_for_model, sanitize_session_messages
 from nexus.security.manager import ApprovalManager
@@ -80,13 +81,14 @@ class ReplState:
 
     def build_system_prompt(self, prompt_text: str) -> str:
         self.current_system_prompt_task_input = prompt_text
+        scoped_active_skills = supervisor_skill_names(self.config, self.active_skills)
         sections = build_context_sections(
             self.config,
             self.tool_registry,
             task_input=prompt_text,
             execution_mode=self.mode.value,
             skill_registry=self.skill_registry,
-            active_skills=self.active_skills,
+            active_skills=scoped_active_skills,
             carry_over=self.carry_over,
             memory_entries=_load_all_memory(self.memory_store),
         )
@@ -136,9 +138,13 @@ class ReplState:
             metadata={
                 "turn_id": turn_id,
                 "trace_id": trace_id,
-                "active_skills": list(self.active_skills),
+                "active_skills": supervisor_skill_names(self.config, self.active_skills),
+                "global_active_skills": list(self.active_skills),
+                "skill_catalog": skill_metadata_catalog(self.skill_registry),
+                "config": self.config,
                 "approval_policy": self.approval_manager.policy.value,
                 "allow_hidden_paths": self.config.allow_hidden_paths,
+                "supervisor_available_tools": sorted(supervisor_tool_names(self.config, self.tool_registry)),
                 "multi_agent_packet_summaries": {
                     packet.packet_id: render_context_packet(packet)
                     for packet in load_multi_agent_state(self.session.metadata).packets

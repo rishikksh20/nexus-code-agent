@@ -812,19 +812,21 @@ def _tool_not_available_result(
     retry_count: int = 1,
     retry_limit: int = INVALID_TOOL_CALL_RETRY_LIMIT,
 ) -> ToolResult:
-    del context
     tool_name = _tool_name_text(tool_call.tool_name)
+    scoped_available = context.metadata.get("supervisor_available_tools")
+    if isinstance(scoped_available, list):
+        available_names = [str(name) for name in scoped_available if str(name).strip()]
+    else:
+        available_names = [record.name for record in registry.records() if record.name.startswith("subagent_")]
     available = ", ".join(
-        record.name
-        for record in registry.records()
-        if record.name.startswith("subagent_")
+        available_names
     ) or "(none)"
     return ToolResult(
         call_id=tool_call.call_id,
         tool_name=tool_name,
         output=(
-            f"Tool '{tool_name}' is not available to the supervisor in advanced mode. "
-            f"Call the appropriate cognitive sub-agent instead. Available supervisor tools: {available}."
+            f"Tool '{tool_name}' is not available to the supervisor in this context. "
+            f"Use an available supervisor tool or attach the resource first. Available supervisor tools: {available}."
         ),
         is_error=True,
         metadata={
@@ -832,7 +834,7 @@ def _tool_not_available_result(
             "tool_name": tool_name,
             "retry_count": retry_count,
             "retry_limit": retry_limit,
-            "available_tools": [record.name for record in registry.records() if record.name.startswith("subagent_")],
+            "available_tools": available_names,
         },
     )
 
@@ -942,16 +944,81 @@ def _tool_actor(context: ToolExecutionContext) -> str:
 
 
 def _tool_schemas_for_context(registry: ToolRegistry, context: ToolExecutionContext) -> tuple[dict[str, Any], ...]:
+    scoped_available = context.metadata.get("supervisor_available_tools")
+    if isinstance(scoped_available, list):
+        allowed = {str(name) for name in scoped_available}
+        records = [
+            record
+            for record in _supervisor_preferred_tool_records(registry.records())
+            if record.name in allowed
+        ]
+        return tuple(
+            _supervisor_tool_schema(record, records)
+            for record in records
+        )
     if not context.metadata.get("supervisor_cognitive_tools_only"):
         return registry.schemas()
-    return tuple(
-        tool_to_schema(record.tool)
-        for record in registry.records()
+    records = [
+        record
+        for record in _supervisor_preferred_tool_records(registry.records())
         if record.name.startswith("subagent_")
-    )
+    ]
+    return tuple(_supervisor_tool_schema(record, records) for record in records)
+
+
+def _supervisor_preferred_tool_records(records: list[Any]) -> list[Any]:
+    if not any(str(getattr(record, "name", "")).startswith("subagent_") for record in records):
+        return list(records)
+    return sorted(records, key=_supervisor_tool_priority)
+
+
+def _supervisor_tool_priority(record: Any) -> tuple[int, int, str]:
+    name = str(getattr(record, "name", ""))
+    subagent_order = {
+        "subagent_planning_analysis": 0,
+        "subagent_execution": 1,
+        "subagent_verification": 2,
+        "subagent_review": 3,
+    }
+    if name.startswith("subagent_"):
+        return (0, subagent_order.get(name, 50), name)
+    if getattr(record, "source", "") == "mcp":
+        return (2, 0, name)
+    return (1, 0, name)
+
+
+def _supervisor_tool_schema(record: Any, records: list[Any]) -> dict[str, Any]:
+    schema = tool_to_schema(record.tool)
+    function = schema.get("function", {})
+    description = str(function.get("description", ""))
+    has_subagents = any(str(getattr(item, "name", "")).startswith("subagent_") for item in records)
+    name = str(getattr(record, "name", ""))
+    if name.startswith("subagent_"):
+        function["description"] = _subagent_preference_description(name, description)
+    elif has_subagents:
+        function["description"] = (
+            f"{description} Supervisor direct-use escape hatch: for substantial repo inspection, "
+            "edits, tests, shell work, MCP-backed work, or skill-specific work, prefer delegating "
+            "through the appropriate subagent_* tool first."
+        ).strip()
+    return schema
+
+
+def _subagent_preference_description(name: str, description: str) -> str:
+    routing = {
+        "subagent_planning_analysis": "Preferred for codebase exploration, impact analysis, and implementation planning.",
+        "subagent_execution": "Preferred for file edits, implementation, refactors, and normal workspace tool use.",
+        "subagent_verification": "Preferred for tests, lint, typecheck, runtime checks, and validation summaries.",
+        "subagent_review": "Preferred for bug/regression review, diffs, and maintainability risk checks.",
+    }
+    prefix = routing.get(name, "Preferred delegation route for focused cognitive work.")
+    return f"{prefix} {description}".strip()
 
 
 def _tool_available_in_context(record: Any, context: ToolExecutionContext) -> bool:
+    scoped_available = context.metadata.get("supervisor_available_tools")
+    if isinstance(scoped_available, list):
+        return str(record.name) in {str(name) for name in scoped_available}
     if not context.metadata.get("supervisor_cognitive_tools_only"):
         return True
     return str(record.name).startswith("subagent_")

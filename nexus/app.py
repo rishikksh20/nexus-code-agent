@@ -436,6 +436,7 @@ def _dispatch_runtime(params: dict) -> int:
             cli_overrides=args_to_config_overrides(**params),
             local_config_path=params.get("config_file"),
             global_config_path=params.get("global_config"),
+            strict=False,
         )
     except ConfigError as exc:
         console.print_config_error(exc)
@@ -443,6 +444,7 @@ def _dispatch_runtime(params: dict) -> int:
 
     logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
     console = TerminalUI(color=config.color_output)
+    _print_config_warnings(console, config)
     return asyncio.run(_run_app(config, console, params))
 
 
@@ -478,12 +480,13 @@ def _dispatch_doctor(output_format: str) -> int:
     workspace_root = Path.cwd()
     console = TerminalUI()
     try:
-        config = load_config(workspace_root)
+        config = load_config(workspace_root, strict=False)
     except ConfigError as exc:
         console.print_config_error(exc)
         return 1
 
     logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
+    _print_config_warnings(console, config)
     return asyncio.run(_run_doctor(config, console, output_format=output_format))
 
 
@@ -505,13 +508,14 @@ def _dispatch_init(force: bool) -> None:
     workspace_root = Path.cwd()
     console = TerminalUI()
     try:
-        config = load_config(workspace_root)
+        config = load_config(workspace_root, strict=False)
     except ConfigError as exc:
         console.print_config_error(exc)
         return
 
     logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
     console = TerminalUI(color=config.color_output)
+    _print_config_warnings(console, config)
     ensure_config_dirs(config)
     created = init_workspace(
         workspace_root,
@@ -534,12 +538,13 @@ def _dispatch_config(scope: str) -> None:
     workspace_root = Path.cwd()
     console = TerminalUI()
     try:
-        config = load_config(workspace_root)
+        config = load_config(workspace_root, strict=False)
     except ConfigError as exc:
         console.print_config_error(exc)
         return
 
     console = TerminalUI(color=config.color_output)
+    _print_config_warnings(console, config)
     if scope == "global":
         console.print(
             config.global_config_file.read_text(encoding="utf-8")
@@ -554,6 +559,11 @@ def _dispatch_config(scope: str) -> None:
         )
     else:
         console.print(json.dumps(config_to_plain_dict(config), indent=2))
+
+
+def _print_config_warnings(console: TerminalUI, config) -> None:
+    for warning in getattr(config, "config_warnings", []) or []:
+        console.print_warning(warning)
 
 
 # ---------------------------------------------------------------------------

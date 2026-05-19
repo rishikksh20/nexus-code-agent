@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
+from nexus.runtime.agent_scope import configured_subagent_names, normalize_subagent_name
 from nexus.tools.registry import tool_enabled
 
 if TYPE_CHECKING:
@@ -21,11 +22,15 @@ def register_subagent_tools(
     definitions: "Iterable[SubagentDefinition]" = (),
 ) -> int:
     """Register cognitive sub-agent tools."""
-    if str(getattr(config, "agent_mode", "basic")).strip().lower() != "advanced":
+    configured_names = configured_subagent_names(config)
+    advanced_mode = str(getattr(config, "agent_mode", "basic")).strip().lower() == "advanced"
+    if not advanced_mode and not configured_names:
         return 0
 
     count = 0
     for definition in _merge_builtin_definitions(definitions):
+        if not advanced_mode and normalize_subagent_name(definition.name) not in configured_names:
+            continue
         definition = _with_builtin_mcp_tools(definition, registry)
         tool = SubAgentTool(
             definition=definition,
@@ -68,12 +73,16 @@ def register_skill_subagent_tools(
     model_client_factory=None,
 ) -> int:
     """Register cognitive sub-agent tools discovered from loaded skills."""
-    if str(getattr(config, "agent_mode", "basic")).strip().lower() != "advanced":
+    configured_names = configured_subagent_names(config)
+    advanced_mode = str(getattr(config, "agent_mode", "basic")).strip().lower() == "advanced"
+    if not advanced_mode and not configured_names:
         return 0
 
     count = 0
     existing_names = {record.name for record in registry.records()}
     for definition in load_subagent_definitions_from_skills(skill_registry):
+        if not advanced_mode and normalize_subagent_name(definition.name) not in configured_names:
+            continue
         definition = _with_builtin_mcp_tools(definition, registry)
         tool = SubAgentTool(
             definition=definition,

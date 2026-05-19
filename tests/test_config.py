@@ -3,6 +3,7 @@ from __future__ import annotations
 from nexus.cli.init import init_workspace
 from nexus.config import load_config
 from nexus.config.loader import ConfigError
+from nexus.config.upgrade import upgrade_config_file
 
 
 def test_config_merges_local_overrides(tmp_path, monkeypatch):
@@ -59,6 +60,270 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
     assert config.agent_mode == "basic"
     assert config.delegation_subagents == []
     assert config.config_version == 2
+    assert config.agent_allowed_tools == []
+    assert config.agent_attached_tools == []
+    assert config.agent_detached_tools == []
+    assert config.agent_allowed_skills == []
+    assert config.agent_attached_skills == []
+    assert config.agent_detached_skills == []
+    assert config.agent_allowed_mcp_servers == []
+    assert config.agent_attached_mcp_servers == []
+    assert config.agent_detached_mcp_servers == []
+    assert [entry["name"] for entry in config.subagent_profiles] == [
+        "planning_analysis",
+        "execution",
+        "review",
+        "verification",
+    ]
+    execution_profile = next(entry for entry in config.subagent_profiles if entry["name"] == "execution")
+    assert execution_profile["allowed_tools"] == [
+        "read_file",
+        "write_file",
+        "edit",
+        "insert_edit_into_file",
+        "apply_patch",
+        "glob",
+        "grep",
+        "list_dir",
+        "lsp",
+        "git_status",
+        "git_diff",
+        "run_tests",
+        "run_linter",
+        "run_typecheck",
+        "bash",
+    ]
+    assert execution_profile["allowed_mcp_servers"] == []
+    assert execution_profile["allowed_skills"] == []
+
+
+def test_config_accepts_agent_scope_fields(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'agent_allowed_tools = ["subagent_execution"]\n'
+        'agent_attached_tools = ["read_file"]\n'
+        'agent_detached_tools = ["bash"]\n'
+        'agent_allowed_skills = ["nexus-agent"]\n'
+        'agent_attached_skills = ["review"]\n'
+        'agent_detached_skills = ["notes"]\n'
+        'agent_allowed_mcp_servers = ["search"]\n'
+        'agent_attached_mcp_servers = ["filesystem"]\n'
+        'agent_detached_mcp_servers = ["git"]\n'
+        'subagent_profiles = [{ name = "execution", allowed_tools = ["grep"], attached_tools = ["read_file"], allowed_skills = ["review"], allowed_mcp_servers = ["filesystem"], detached_mcp_servers = ["git"] }]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.agent_allowed_tools == ["subagent_execution"]
+    assert config.agent_attached_tools == ["read_file"]
+    assert config.agent_detached_tools == ["bash"]
+    assert config.agent_allowed_skills == ["nexus-agent"]
+    assert config.agent_attached_skills == ["review"]
+    assert config.agent_detached_skills == ["notes"]
+    assert config.agent_allowed_mcp_servers == ["search"]
+    assert config.agent_attached_mcp_servers == ["filesystem"]
+    assert config.agent_detached_mcp_servers == ["git"]
+    assert config.subagent_profiles[0]["name"] == "execution"
+    assert config.subagent_profiles[0]["allowed_tools"] == ["grep"]
+
+
+def test_config_accepts_agents_and_sub_agents_sections(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        "[agents]\n"
+        'allowed_tools = ["subagent_execution"]\n'
+        'attached_tools = ["read_file"]\n'
+        'detached_tools = ["bash"]\n'
+        'allowed_skills = ["nexus-agent"]\n'
+        'attached_skills = ["review"]\n'
+        'detached_skills = ["notes"]\n'
+        'allowed_mcp_servers = ["search"]\n'
+        'attached_mcp_servers = ["filesystem"]\n'
+        'detached_mcp_servers = ["git"]\n'
+        "\n"
+        "[[sub-agents]]\n"
+        'name = "execution"\n'
+        'allowed_tools = ["grep"]\n'
+        'attached_tools = ["read_file"]\n'
+        'allowed_skills = ["review"]\n'
+        'allowed_mcps = ["filesystem"]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.agent_allowed_tools == ["subagent_execution"]
+    assert config.agent_attached_tools == ["read_file"]
+    assert config.agent_detached_tools == ["bash"]
+    assert config.agent_allowed_skills == ["nexus-agent"]
+    assert config.agent_attached_skills == ["review"]
+    assert config.agent_detached_skills == ["notes"]
+    assert config.agent_allowed_mcp_servers == ["search"]
+    assert config.agent_attached_mcp_servers == ["filesystem"]
+    assert config.agent_detached_mcp_servers == ["git"]
+    assert config.subagent_profiles[0]["name"] == "execution"
+    assert config.subagent_profiles[0]["allowed_tools"] == ["grep"]
+    assert config.subagent_profiles[0]["allowed_mcp_servers"] == ["filesystem"]
+
+
+def test_config_accepts_all_scope_sentinel(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        "[agents]\n"
+        'allowed_tools = "all"\n'
+        'allowed_skills = "all"\n'
+        'allowed_mcps = "all"\n'
+        "\n"
+        "[[sub-agents]]\n"
+        'name = "execution"\n'
+        'allowed_tools = "all"\n'
+        'allowed_skills = "all"\n'
+        'allowed_mcps = "all"\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.agent_allowed_tools == ["all"]
+    assert config.agent_allowed_skills == ["all"]
+    assert config.agent_allowed_mcp_servers == ["all"]
+    assert config.subagent_profiles[0]["allowed_tools"] == ["all"]
+    assert config.subagent_profiles[0]["allowed_skills"] == ["all"]
+    assert config.subagent_profiles[0]["allowed_mcp_servers"] == ["all"]
+
+
+def test_config_accepts_sub_agents_named_tables(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        "[sub-agents.execution]\n"
+        'allowed_tools = ["read_file"]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.subagent_profiles == [{"allowed_tools": ["read_file"], "name": "execution"}]
+
+
+def test_config_upgrade_migrates_legacy_agent_scope_to_new_tables(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    local_config.write_text(
+        'project_name = "workspace"\n'
+        'agent_allowed_tools = ["subagent_execution"]\n'
+        'agent_attached_tools = ["read_file"]\n'
+        'agent_detached_mcp_servers = ["git"]\n'
+        'subagent_profiles = [{ name = "execution", allowed_tools = ["grep"], allowed_mcp_servers = ["filesystem"], attached_tools = ["read_file"] }]\n',
+        encoding="utf-8",
+    )
+
+    report = upgrade_config_file(
+        local_config,
+        __import__("nexus.cli.init", fromlist=["_local_config_toml"])._local_config_toml(
+            workspace_root=workspace,
+            project_name="workspace",
+            project_description="",
+        ),
+    )
+    content = local_config.read_text(encoding="utf-8")
+    config = load_config(workspace, global_root=global_root)
+
+    assert report.agent_scope_migrated is True
+    assert report.subagent_scope_migrated is True
+    assert "[agents]" in content
+    assert 'allowed_tools = ["subagent_execution"]' in content
+    assert 'attached_tools = ["read_file"]' in content
+    assert 'detached_mcp_servers = ["git"]' in content
+    assert "[[sub-agents]]" in content
+    assert 'name = "execution"' in content
+    assert 'allowed_mcps = ["filesystem"]' in content
+    assert "agent_allowed_tools" not in content
+    assert "subagent_profiles" not in content
+    assert config.agent_allowed_tools == ["subagent_execution"]
+    assert config.agent_attached_tools == ["read_file"]
+    assert config.agent_detached_mcp_servers == ["git"]
+    assert config.subagent_profiles[0]["allowed_tools"] == ["grep"]
+    assert config.subagent_profiles[0]["allowed_mcp_servers"] == ["filesystem"]
+
+
+def test_config_upgrade_merges_legacy_agent_scope_into_existing_agents_table(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    local_config.write_text(
+        'project_name = "workspace"\n'
+        'agent_attached_tools = ["read_file"]\n'
+        "[agents]\n"
+        'allowed_tools = ["subagent_execution"]\n',
+        encoding="utf-8",
+    )
+
+    report = upgrade_config_file(
+        local_config,
+        __import__("nexus.cli.init", fromlist=["_local_config_toml"])._local_config_toml(
+            workspace_root=workspace,
+            project_name="workspace",
+            project_description="",
+        ),
+    )
+    content = local_config.read_text(encoding="utf-8")
+    config = load_config(workspace, global_root=global_root)
+
+    assert report.agent_scope_migrated is True
+    assert content.count("[agents]") == 1
+    assert "agent_attached_tools" not in content
+    assert config.agent_allowed_tools == ["subagent_execution"]
+    assert config.agent_attached_tools == ["read_file"]
+
+
+def test_config_non_strict_uses_defaults_and_warning_when_toml_is_corrupt(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text("project_name = [\n", encoding="utf-8")
+
+    config = load_config(workspace, global_root=global_root, strict=False)
+
+    assert config.project_name == "workspace"
+    assert config.config_warnings
+    assert "using defaults" in config.config_warnings[0]
+
+
+def test_config_rejects_invalid_subagent_profile_scope_list(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'subagent_profiles = [{ name = "execution", attached_tools = "read_file" }]\n',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(workspace, global_root=global_root)
+    except ConfigError as exc:
+        assert "attached_tools must be a list" in str(exc)
+    else:
+        raise AssertionError("Expected ConfigError for invalid subagent profile")
 
 
 def test_config_accepts_legacy_multi_agent_mode_without_reintroducing_old_fields(tmp_path):
