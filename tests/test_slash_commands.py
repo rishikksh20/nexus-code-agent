@@ -481,7 +481,10 @@ async def test_skills_slash_command_activates_skill(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     skill_root = config.skills_dir / "review"
     skill_root.mkdir(parents=True, exist_ok=True)
-    (skill_root / "SKILL.md").write_text("# Review skill\n\nAlways review carefully.", encoding="utf-8")
+    (skill_root / "SKILL.md").write_text(
+        "---\nname: review\ndescription: Review skill\n---\n\n# Review skill\n\nAlways review carefully.",
+        encoding="utf-8",
+    )
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")
     console = Console(record=True, no_color=True, width=200)
@@ -501,6 +504,118 @@ async def test_skills_slash_command_activates_skill(tmp_path):
 
     assert handled is True
     assert state.active_skills == ["review"]
+    assert state.config.enabled_skills == ["review"]
+
+
+@pytest.mark.asyncio
+async def test_skills_deactivate_refreshes_prompt_and_config(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    skill_root = config.skills_dir / "review"
+    skill_root.mkdir(parents=True, exist_ok=True)
+    (skill_root / "SKILL.md").write_text(
+        "---\nname: review\ndescription: Review skill\n---\n\nAlways review carefully.",
+        encoding="utf-8",
+    )
+    config.enabled_skills = ["review"]
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("skills-deactivate"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        skill_registry=load_skill_registry(config.skills_dir),
+        active_skills=["review"],
+    )
+    state.build_system_prompt("review this")
+    assert "Always review carefully." in state.current_system_prompt
+
+    handled = await build_router().dispatch(state, "/skills deactivate review")
+
+    assert handled is True
+    assert state.active_skills == []
+    assert state.config.disabled_skills == ["review"]
+    assert "Always review carefully." not in state.current_system_prompt
+
+
+@pytest.mark.asyncio
+async def test_skills_deactivate_removes_run_only_skill(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    skill_root = config.skills_dir / "review"
+    skill_root.mkdir(parents=True, exist_ok=True)
+    (skill_root / "SKILL.md").write_text(
+        "---\nname: review\ndescription: Review skill\n---\n\nAlways review carefully.",
+        encoding="utf-8",
+    )
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("skills-run-only-deactivate"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True, width=200),
+        skill_registry=load_skill_registry(config.skills_dir),
+        active_skills=["review"],
+        run_skills=["review"],
+    )
+
+    handled = await build_router().dispatch(state, "/skills deactivate review")
+
+    assert handled is True
+    assert state.active_skills == []
+    assert state.run_skills == []
+
+
+@pytest.mark.asyncio
+async def test_skills_create_and_remove_local_skill(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("skills-local"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        skill_registry=load_skill_registry(*get_skill_roots(config)),
+    )
+    router = build_router()
+
+    assert await router.dispatch(state, "/skills create-local code-review") is True
+    skill_file = config.local_root / "skills" / "code-review" / "SKILL.md"
+    assert skill_file.exists()
+    assert state.skill_registry.get("code-review") is not None
+
+    assert await router.dispatch(state, "/skills remove-local code-review") is True
+    assert not skill_file.exists()
+    assert state.skill_registry.get("code-review") is None
+
+
+@pytest.mark.asyncio
+async def test_skills_remove_local_refuses_builtin(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("skills-refuse-builtin"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        skill_registry=load_skill_registry(*get_skill_roots(config)),
+    )
+
+    handled = await build_router().dispatch(state, "/skills remove-local nexus-agent")
+
+    assert handled is True
+    assert "Refusing to remove non-local skill" in console.export_text()
 
 
 @pytest.mark.asyncio
@@ -520,7 +635,10 @@ async def test_skills_list_shows_subagent_type(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     skill_root = config.local_root / "skills" / "subagent-review"
     skill_root.mkdir(parents=True, exist_ok=True)
-    (skill_root / "SKILL.md").write_text("# Review skill\n\nAlways review carefully.", encoding="utf-8")
+    (skill_root / "SKILL.md").write_text(
+        "---\nname: subagent-review\ndescription: Review skill\n---\n\n# Review skill\n\nAlways review carefully.",
+        encoding="utf-8",
+    )
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")
     console = Console(record=True, no_color=True, width=200)
@@ -856,6 +974,10 @@ async def test_skills_reload_registers_skill_backed_subagent_tools(tmp_path):
     skill_dir = config.local_root / "skills" / "subagent-review"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: subagent-review\n"
+        "description: Review code changes.\n"
+        "---\n\n"
         "# Review Skill\n\nInspect the selected code and report issues.\n",
         encoding="utf-8",
     )

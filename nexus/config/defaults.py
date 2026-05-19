@@ -29,6 +29,7 @@ class AgentConfig:
     max_sessions_retained: int = 50
     save_on_every_turn: bool = True
     skills_dir: Path = field(default_factory=Path)
+    skill_paths: list[Path] = field(default_factory=list)
     plugins_dir: Path = field(default_factory=Path)
     memory_dir: Path = field(default_factory=Path)
     session_dir: Path = field(default_factory=Path)
@@ -43,6 +44,8 @@ class AgentConfig:
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
     enabled_mcp_servers: list[str] = field(default_factory=list)
     disabled_mcp_servers: list[str] = field(default_factory=list)
+    enabled_skills: list[str] = field(default_factory=list)
+    disabled_skills: list[str] = field(default_factory=list)
     approval_policy: str = "on-request"
     allow_hidden_paths: bool = False
     developer_instructions: str = ""
@@ -92,6 +95,8 @@ def config_to_plain_dict(config: AgentConfig) -> dict[str, Any]:
         value = getattr(config, item.name)
         if isinstance(value, Path):
             plain[item.name] = str(value)
+        elif isinstance(value, list) and any(isinstance(part, Path) for part in value):
+            plain[item.name] = [str(part) if isinstance(part, Path) else part for part in value]
         else:
             plain[item.name] = value
     return plain

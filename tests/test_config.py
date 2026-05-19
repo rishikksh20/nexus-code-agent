@@ -447,6 +447,25 @@ def test_config_rejects_overlapping_tool_filters(tmp_path):
         raise AssertionError("Expected ConfigError for overlapping tool filters")
 
 
+def test_config_accepts_skill_activation_and_paths(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'skill_paths = ["extra-skills"]\n'
+        'enabled_skills = ["code-*", "re:docs"]\n'
+        'disabled_skills = ["code-old"]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.skill_paths == [(workspace / "extra-skills").resolve()]
+    assert config.enabled_skills == ["code-*", "re:docs"]
+    assert config.disabled_skills == ["code-old"]
+
+
 def test_config_dotenv_injects_api_key(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

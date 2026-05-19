@@ -42,6 +42,7 @@ class ReplState:
     history: list[Message] = field(default_factory=list)
     skill_registry: SkillRegistry = field(default_factory=SkillRegistry)
     active_skills: list[str] = field(default_factory=list)
+    run_skills: list[str] = field(default_factory=list)
     mcp_servers: list[MCPServerRuntime] = field(default_factory=list)
     carry_over: CarryOverState = field(default_factory=CarryOverState)
     current_turn_id: str = ""

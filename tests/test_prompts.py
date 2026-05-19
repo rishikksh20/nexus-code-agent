@@ -104,7 +104,14 @@ def test_build_context_includes_active_skill_and_carry_over(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     skill_root = tmp_path / "global" / "skills" / "review"
     skill_root.mkdir(parents=True)
-    (skill_root / "SKILL.md").write_text("# Review skill\n\nAlways review carefully.", encoding="utf-8")
+    (skill_root / "SKILL.md").write_text(
+        "---\n"
+        "name: review\n"
+        "description: Review skill\n"
+        "---\n\n"
+        "# Review skill\n\nAlways review carefully.",
+        encoding="utf-8",
+    )
     registry = ToolRegistry()
     registry.register(GetTimeTool())
     skill_registry = load_skill_registry(config.skills_dir)
@@ -119,7 +126,7 @@ def test_build_context_includes_active_skill_and_carry_over(tmp_path):
     )
 
     assert any("review: Review skill (active)" in item for item in sections.skills)
-    assert not any("Always review carefully." in item for item in sections.skills)
+    assert any("Always review carefully." in item for item in sections.skills)
     assert "Earlier context compacted." in sections.carry_over
 
 

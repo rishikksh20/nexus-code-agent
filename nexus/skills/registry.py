@@ -20,8 +20,15 @@ class SkillRegistry:
         if not self._skills:
             return ""
         active = active or set()
-        items = [
-            f"- {skill.name}: {skill.description}" + (" (active)" if skill.name in active else "")
-            for skill in self.all()
-        ]
-        return "Available skills:\n" + "\n".join(items)
+        lines = ["Available skills:"]
+        for skill in self.all():
+            lines.append(
+                f"- {skill.name}: {skill.description}"
+                + (" (active)" if skill.name in active else "")
+            )
+        active_skills = [skill for skill in self.all() if skill.name in active]
+        if active_skills:
+            lines.extend(["", "Active skill instructions:"])
+            for skill in active_skills:
+                lines.extend([f"## {skill.name}", skill.content.strip()])
+        return "\n".join(lines)

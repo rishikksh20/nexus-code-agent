@@ -573,31 +573,47 @@ High-risk bash commands always require confirmation regardless of execution mode
 
 ## Skills
 
-Skills are Markdown files that inject structured instructions or context into the agent's system prompt for the current session.
+Nexus supports Agent Skills: directory-based instruction packs with a required
+`SKILL.md` file containing YAML frontmatter and Markdown instructions. Skills
+are discovered as a catalogue, then activated by name for a workspace or one
+CLI run.
 
 ### Discovery Order
 
-Skills are loaded from three sources in priority order (later source overrides earlier on name collision):
+Later roots override earlier roots when skill names collide:
 
-1. **Built-in** — `nexus/builtin_skills/` (shipped with the package)
-2. **Global** — `~/.nexus/skills/`
-3. **Workspace** — `.nexus/skills/`
+1. Packaged built-ins — `nexus/builtin_skills/`
+2. Extra `skill_paths` from config
+3. Global catalogue — `~/.nexus/skills/`
+4. Workspace skills — `.nexus/skills/`
+5. Standard Agent Skills path — `.agents/skills/`
 
-### Built-in Skills
+### Activation
 
-| Skill | Auto-activated | Description |
-|---|---|---|
-| `nexus-agent` | Yes | Answers natural-language questions about Nexus commands, config, and providers |
+Workspace activation is stored in `.nexus/config.toml`:
+
+```toml
+skill_paths = []
+enabled_skills = ["nexus-agent"]
+disabled_skills = []
+```
+
+`enabled_skills` and `disabled_skills` accept exact names, glob patterns such
+as `review-*`, and regex patterns prefixed with `re:`.
 
 ### Managing Skills in the REPL
 
 ```
-/skills list              — list all loaded skills (name, type, active status)
-/skills show nexus-agent  — print the full content of a skill file
-/skills add my-skill      — activate a skill for this session
-/skills remove my-skill   — deactivate a skill
-/skills reload            — rescan all skill directories
+/skills list                 — list discovered skills, source, path, and active state
+/skills show nexus-agent     — print the skill's SKILL.md
+/skills activate my-skill    — activate a skill in local config
+/skills deactivate my-skill  — deactivate a skill in local config
+/skills create-local review  — create .nexus/skills/review/SKILL.md
+/skills remove-local review  — remove a workspace-local skill
+/skills reload               — rescan skills and refresh the prompt
 ```
+
+`/skills add` and `/skills remove` remain aliases for activate/deactivate.
 
 ### Activating from the CLI
 
@@ -606,19 +622,22 @@ uv run nexus --skill my-skill --prompt "use the skill"
 uv run nexus --no-skills   # disable all skill loading
 ```
 
-### Creating a Custom Skill
+`--skill` is run-only and does not write config.
 
-Create a Markdown file in `.nexus/skills/` or `~/.nexus/skills/`:
+### Skill Format
 
 ```markdown
-# my-skill
+---
+name: code-review
+description: Review code changes for bugs, regressions, and missing tests. Use when the user asks for review.
+---
 
-<!-- description: Project-specific coding conventions -->
+# Code Review
 
-Always use double quotes for strings.
-Prefer `pathlib.Path` over `os.path`.
-Run `ruff check .` before marking any task complete.
+Inspect diffs first, report findings with file references, and keep summaries brief.
 ```
+
+See [`docs/skills.md`](docs/skills.md) for the full Nexus skill guide.
 
 ---
 

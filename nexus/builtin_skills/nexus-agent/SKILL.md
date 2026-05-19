@@ -1,3 +1,11 @@
+---
+name: nexus-agent
+description: Answer questions about Nexus commands, configuration, providers, tools, skills, sessions, memory, MCP, cognitive sub-agents, sandboxing, observability, and runtime behavior.
+license: MIT
+metadata:
+  bundled: "true"
+---
+
 # Nexus AI Coding Agent Reference
 
 Use this skill only for questions about Nexus itself: commands, config, providers, tools, skills, sessions, memory, MCP, cognitive sub-agents, sandboxing, observability, and runtime behavior.

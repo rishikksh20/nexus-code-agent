@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
 from pathlib import Path
 import tomllib
 from collections.abc import Awaitable, Callable
@@ -32,7 +33,8 @@ from nexus.tools.mcp import (
 )
 from nexus.security.manager import ApprovalManager
 from nexus.security.policy import ApprovalPolicy
-from nexus.skills import get_skill_roots, load_skill_registry
+from nexus.skills import get_skill_roots, load_skill_registry, resolve_active_skill_names, skill_template
+from nexus.skills.parser import SkillParseError, validate_skill_metadata
 from nexus.tools.subagents import (
     load_subagent_definitions,
     register_skill_subagent_tools,
@@ -465,18 +467,21 @@ async def handle_skills(state: ReplState, args: list[str]) -> None:
     subcommand = args[0].lower() if args else "list"
     if subcommand == "help":
         _print_subcommand_help(
-            state, "skills", "Inspect and activate session skills. Skills named subagent-* register specialist cognitive tools in advanced mode.",
+            state, "skills", "Inspect and manage Agent Skills. Skills named subagent-* register specialist cognitive tools in advanced mode.",
             (
-                ("(no args) / list",  "List all loaded skills with name, type, description, and active status.", "/skills"),
-                ("show <name>",      "Print the full content of a skill file.",                          "/skills show nexus-agent"),
-                ("add <name>",       "Activate a skill for this session.",                               "/skills add nexus-agent"),
-                ("remove <name>",    "Deactivate a skill.",                                             "/skills remove nexus-agent"),
-                ("reload",           "Rescan builtin, user, and workspace skill directories.",          "/skills reload"),
-                ("help",             "Show this help.",                                                 "/skills help"),
+                ("(no args) / list", "List discovered skills with source, active state, description, and path.", "/skills"),
+                ("available", "Alias for list.", "/skills available"),
+                ("show <name>", "Print the skill's SKILL.md content.", "/skills show nexus-agent"),
+                ("activate <name> / add", "Persist skill activation to workspace config.", "/skills activate nexus-agent"),
+                ("deactivate <name> / remove", "Persist skill deactivation to workspace config.", "/skills deactivate nexus-agent"),
+                ("create-local <name>", "Create .nexus/skills/<name>/SKILL.md from a valid template.", "/skills create-local code-review"),
+                ("remove-local <name>", "Remove only a workspace-local skill directory.", "/skills remove-local code-review"),
+                ("reload", "Rescan skills, refresh sub-agent tools and prompt.", "/skills reload"),
+                ("help", "Show this help.", "/skills help"),
             ),
         )
         return
-    if subcommand in {"list", ""}:
+    if subcommand in {"list", "available", ""}:
         skills = state.skill_registry.all()
         if not skills:
             state.console.print("No skills loaded.")
@@ -484,49 +489,138 @@ async def handle_skills(state: ReplState, args: list[str]) -> None:
         table = Table(title="Skills")
         table.add_column("Name")
         table.add_column("Type")
-        table.add_column("Description")
+        table.add_column("Source")
         table.add_column("Active")
+        table.add_column("Description")
+        table.add_column("Path")
         for skill in skills:
             table.add_row(
                 skill.name,
                 "subagent" if _is_subagent_skill_name(skill.name) else "skill",
-                skill.description,
+                skill.source,
                 "yes" if skill.name in state.active_skills else "no",
+                skill.description,
+                str(skill.skill_path or "-"),
             )
         state.console.print(table)
         return
     if subcommand == "show" and len(args) > 1:
         skill = state.skill_registry.get(args[1])
-        state.console.print(skill.content if skill is not None else f"Skill not found: {args[1]}")
-        return
-    if subcommand == "add" and len(args) > 1:
-        skill = state.skill_registry.get(args[1])
         if skill is None:
             state.console.print(f"Skill not found: {args[1]}")
             return
-        if skill.name not in state.active_skills:
-            state.active_skills.append(skill.name)
-        state.console.print(f"Activated skill: {skill.name}")
+        if skill.skill_path and skill.skill_path.exists():
+            state.console.print(skill.skill_path.read_text(encoding="utf-8"))
+        else:
+            state.console.print(skill.content)
         return
-    if subcommand == "remove" and len(args) > 1:
-        state.active_skills = [name for name in state.active_skills if name != args[1]]
-        state.console.print(f"Removed skill: {args[1]}")
+    if subcommand in {"activate", "add"} and len(args) > 1:
+        _set_skill_active(state, args[1], active=True)
+        return
+    if subcommand in {"deactivate", "remove"} and len(args) > 1:
+        _set_skill_active(state, args[1], active=False)
+        return
+    if subcommand == "create-local" and len(args) > 1:
+        _create_local_skill(state, args[1])
+        return
+    if subcommand == "remove-local" and len(args) > 1:
+        _remove_local_skill(state, args[1])
         return
     if subcommand == "reload":
-        state.skill_registry = load_skill_registry(*get_skill_roots(state.config))
-        state.active_skills = [name for name in state.active_skills if state.skill_registry.get(name) is not None]
-        preserved_records = [record for record in state.tool_registry.records() if record.source != "agent-skill"]
-        state.tool_registry.clear()
-        for record in preserved_records:
-            state.tool_registry.register(record.tool, source=record.source, origin=record.origin)
-        register_skill_subagent_tools(
-            state.tool_registry,
-            state.config,
-            state.skill_registry,
-        )
+        _reload_skill_state(state)
         state.console.print("Reloaded skills.")
         return
-    state.console.print("Usage: /skills [list|show <name>|add <name>|remove <name>|reload]")
+    state.console.print("Usage: /skills [list|available|show <name>|activate <name>|deactivate <name>|create-local <name>|remove-local <name>|reload]")
+
+
+def _set_skill_active(state: ReplState, skill_name: str, *, active: bool) -> None:
+    skill = state.skill_registry.get(skill_name)
+    if skill is None:
+        state.console.print(f"Skill not found: {skill_name}")
+        return
+    payload = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8")) if state.config.local_config_file.exists() else {}
+    enabled = _string_list(payload.get("enabled_skills", []))
+    disabled = _string_list(payload.get("disabled_skills", []))
+    if active:
+        if skill.name not in enabled:
+            enabled.append(skill.name)
+        disabled = [name for name in disabled if name != skill.name]
+        action = "Activated"
+    else:
+        enabled = [name for name in enabled if name != skill.name]
+        if skill.name not in disabled:
+            disabled.append(skill.name)
+        state.run_skills = [name for name in state.run_skills if name != skill.name]
+        action = "Deactivated"
+    payload["enabled_skills"] = enabled
+    payload["disabled_skills"] = disabled
+    _write_toml(state.config.local_config_file, payload)
+    _reload_config(state)
+    _reload_skill_state(state)
+    state.console.print(f"{action} skill: {skill.name}")
+
+
+def _create_local_skill(state: ReplState, skill_name: str) -> None:
+    try:
+        validate_skill_metadata(
+            {
+                "name": skill_name,
+                "description": f"Describe what {skill_name} helps with and when Nexus should use it.",
+            },
+            directory_name=skill_name,
+        )
+    except SkillParseError as exc:
+        state.console.print(f"Invalid skill name: {exc}")
+        return
+    skill_dir = state.config.local_root / "skills" / skill_name
+    skill_file = skill_dir / "SKILL.md"
+    if skill_file.exists():
+        state.console.print(f"Local skill already exists: {skill_name}")
+        return
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "scripts").mkdir()
+    (skill_dir / "references").mkdir()
+    (skill_dir / "assets").mkdir()
+    skill_file.write_text(skill_template(skill_name), encoding="utf-8")
+    _reload_skill_state(state)
+    state.console.print(f"Created local skill: {skill_file}")
+
+
+def _remove_local_skill(state: ReplState, skill_name: str) -> None:
+    skill = state.skill_registry.get(skill_name)
+    if skill is None:
+        state.console.print(f"Skill not found: {skill_name}")
+        return
+    local_skills_root = (state.config.local_root / "skills").resolve()
+    skill_dir = skill.skill_path.parent.resolve() if skill.skill_path else None
+    if skill_dir is None or skill.source != "local" or skill_dir.parent != local_skills_root:
+        state.console.print(f"Refusing to remove non-local skill: {skill_name}")
+        return
+    shutil.rmtree(skill_dir)
+    if skill_name in state.active_skills:
+        _set_skill_active(state, skill_name, active=False)
+    else:
+        _reload_skill_state(state)
+    state.console.print(f"Removed local skill: {skill_name}")
+
+
+def _reload_skill_state(state: ReplState) -> None:
+    state.skill_registry = load_skill_registry(*get_skill_roots(state.config), config=state.config)
+    state.active_skills = resolve_active_skill_names(
+        state.skill_registry,
+        state.config,
+        extra=tuple(state.run_skills),
+    )
+    preserved_records = [record for record in state.tool_registry.records() if record.source != "agent-skill"]
+    state.tool_registry.clear()
+    for record in preserved_records:
+        state.tool_registry.register(record.tool, source=record.source, origin=record.origin)
+    register_skill_subagent_tools(
+        state.tool_registry,
+        state.config,
+        state.skill_registry,
+    )
+    state.refresh_system_prompt()
 
 
 def _is_subagent_skill_name(skill_name: str) -> bool:

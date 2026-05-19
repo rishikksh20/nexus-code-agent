@@ -185,6 +185,7 @@ def _subagent_guidance_lines(records) -> list[str]:
         "",
         "## Cognitive Sub-Agent Contract",
         "",
+        "- Do not do substantial repo research or coding directly as supervisor; delegate that work through the appropriate `subagent_*` tool.",
         "- In advanced mode, the supervisor's executable tools are the cognitive `subagent_*` tools; normal workspace tools are reserved for sub-agents.",
         "- Do not call normal read/write/shell tools directly as supervisor. Call the matching specialist and integrate its structured result.",
         "- For implementation requests, prefer `subagent_planning_analysis` first, then `subagent_execution`; use `subagent_verification` and `subagent_review` after changes when available.",

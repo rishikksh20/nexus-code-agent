@@ -23,6 +23,7 @@ PATH_FIELDS = {
     "global_config_file",
     "local_config_file",
 }
+PATH_LIST_FIELDS = {"skill_paths"}
 
 
 class ConfigError(ValueError):
@@ -90,6 +91,8 @@ def load_config(
     for item in fields(AgentConfig):
         raw_value = resolved[item.name]
         values[item.name] = _coerce_value(raw_value, getattr(defaults, item.name))
+        if item.name in PATH_LIST_FIELDS:
+            values[item.name] = _resolve_path_list(values[item.name], defaults.workspace_root)
     _validate_config_values(values)
     return AgentConfig(**values)
 
@@ -237,6 +240,16 @@ def _resolve_paths(data: dict[str, Any], workspace_root: Path) -> dict[str, Any]
         if not path.is_absolute():
             path = workspace_root / path
         resolved[key] = str(path.resolve())
+    return resolved
+
+
+def _resolve_path_list(values: list, workspace_root: Path) -> list[Path]:
+    resolved: list[Path] = []
+    for value in values:
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute():
+            path = workspace_root / path
+        resolved.append(path.resolve())
     return resolved
 
 
@@ -404,6 +417,12 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     overlap = sorted(set(allowed_tools) & set(denied_tools))
     if overlap:
         raise ConfigError("allowed_tools and denied_tools must not overlap: " + ", ".join(overlap))
+
+    for field_name in ("enabled_skills", "disabled_skills"):
+        if not isinstance(values[field_name], list):
+            raise ConfigError(f"{field_name} must be a list of skill names or patterns.")
+        if any(not str(item).strip() for item in values[field_name]):
+            raise ConfigError(f"{field_name} must only contain non-empty strings.")
 
     server_names: set[str] = set()
     for entry in mcp_servers:

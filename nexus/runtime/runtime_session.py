@@ -8,7 +8,7 @@ from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import EphemeralSessionStore, SessionStore, new_snapshot, sanitize_session_messages
 from nexus.security.manager import ApprovalManager
 from nexus.security.policy import ApprovalPolicy
-from nexus.skills import SkillRegistry, get_skill_roots, load_skill_registry
+from nexus.skills import SkillRegistry, get_skill_roots, load_skill_registry, resolve_active_skill_names
 from nexus.tools.subagents import register_skill_subagent_tools
 
 
@@ -48,13 +48,18 @@ class RuntimeSession:
         skill_registry = (
             SkillRegistry()
             if no_skills
-            else load_skill_registry(*get_skill_roots(config))
+            else load_skill_registry(*get_skill_roots(config), config=config)
         )
-        active_skills = [
+        run_skills = [
             name
             for name in params.get("skills", ())
-            if skill_registry.get(name) is not None
+            if not no_skills and skill_registry.get(name) is not None
         ]
+        active_skills = [] if no_skills else resolve_active_skill_names(
+            skill_registry,
+            config,
+            extra=tuple(run_skills),
+        )
 
         register_skill_subagent_tools(
             tool_registry,
@@ -81,6 +86,7 @@ class RuntimeSession:
             history=list(session.messages),
             skill_registry=skill_registry,
             active_skills=active_skills,
+            run_skills=run_skills,
             mcp_servers=resources.mcp_servers,
         )
         return cls(state=state, session_resumed=session_resumed)
