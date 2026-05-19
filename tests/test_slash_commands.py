@@ -532,13 +532,16 @@ async def test_skills_deactivate_refreshes_prompt_and_config(tmp_path):
         active_skills=["review"],
     )
     state.build_system_prompt("review this")
-    assert "Always review carefully." in state.current_system_prompt
+    assert "name=review" in state.current_system_prompt
+    assert "active=yes" in state.current_system_prompt
+    assert "Always review carefully." not in state.current_system_prompt
 
     handled = await build_router().dispatch(state, "/skills deactivate review")
 
     assert handled is True
     assert state.active_skills == []
     assert state.config.disabled_skills == ["review"]
+    assert "active=no" in state.current_system_prompt
     assert "Always review carefully." not in state.current_system_prompt
 
 

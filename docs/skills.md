@@ -80,6 +80,11 @@ Patterns support exact names, shell-style globs, and regex with a `re:` prefix.
 skills from the active set. CLI `--skill <name>` activates a skill for that run
 only and does not edit config.
 
+Nexus keeps the system prompt lightweight by including skill metadata only:
+name, description, source, active state, optional fields, and `SKILL.md` path.
+It does not inject full skill bodies into the prompt. Use `/skills show <name>`
+or read the listed `SKILL.md` when full instructions are needed.
+
 ## REPL Commands
 
 ```text

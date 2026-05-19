@@ -161,7 +161,7 @@ nexus/                         # Main package
 │
 └── builtin_skills/
     └── nexus-agent/
-        └── SKILL.md           # Built-in nexus-agent skill (auto-activated)
+        └── SKILL.md           # Built-in Nexus self-help skill
 
 tests/                         # Pytest test suite
 docs/                          # Architecture plans and tutorial reference material
@@ -600,6 +600,11 @@ disabled_skills = []
 
 `enabled_skills` and `disabled_skills` accept exact names, glob patterns such
 as `review-*`, and regex patterns prefixed with `re:`.
+
+The system prompt includes skill metadata only: name, description, source,
+active state, and `SKILL.md` path. Full skill instructions stay in the skill
+file and can be inspected with `/skills show <name>` or read from the listed
+path when the task calls for it.
 
 ### Managing Skills in the REPL
 

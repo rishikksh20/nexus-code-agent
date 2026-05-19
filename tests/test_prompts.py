@@ -100,7 +100,7 @@ def test_build_context_ignores_unreadable_knowledge_file(tmp_path, monkeypatch):
     assert sections.project_notes == [f"Project: {config.project_name}"]
 
 
-def test_build_context_includes_active_skill_and_carry_over(tmp_path):
+def test_build_context_includes_skill_metadata_only_and_carry_over(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     skill_root = tmp_path / "global" / "skills" / "review"
     skill_root.mkdir(parents=True)
@@ -125,8 +125,11 @@ def test_build_context_includes_active_skill_and_carry_over(tmp_path):
         carry_over=CarryOverState(summarized_history=["Earlier context compacted."], active_constraints=["Stay concise."]),
     )
 
-    assert any("review: Review skill (active)" in item for item in sections.skills)
-    assert any("Always review carefully." in item for item in sections.skills)
+    assert any("name=review" in item for item in sections.skills)
+    assert any("description=Review skill" in item for item in sections.skills)
+    assert any("active=yes" in item for item in sections.skills)
+    assert any("SKILL.md" in item for item in sections.skills)
+    assert not any("Always review carefully." in item for item in sections.skills)
     assert "Earlier context compacted." in sections.carry_over
 
 

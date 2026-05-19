@@ -40,7 +40,7 @@ The current Nexus runtime uses `.nexus/` and `~/.nexus/` rather than `.agent/`, 
 - `~/.nexus/profile.md`
 - `~/.nexus/workspaces.json`
 
-Skills are loaded from **three** sources in priority order (last wins on name collision): built-in package skills (`nexus/builtin_skills/`), global `~/.nexus/skills/`, and local `.nexus/skills/`. The built-in `nexus-agent` skill is auto-activated in every REPL session by default.
+Skills are loaded from built-ins, configured `skill_paths`, global `~/.nexus/skills/`, local `.nexus/skills/`, and `.agents/skills/` in priority order (last wins on name collision). The system prompt includes skill metadata only; activation is controlled by config or run-only `--skill`.
 
 For live provider calls, Nexus uses `provider`, `model_name`, and `api_base_url` from the merged config. `mistral` is the default provider with `mistral-medium-latest` and `https://api.mistral.ai/v1` as built-in defaults. Provider auth is resolved from environment variables (`MISTRAL_API_KEY` → `NEXUS_API_KEY` → `OPENAI_API_KEY`); the `api_key` config field is also supported for cases where an env var is not preferred.
 
