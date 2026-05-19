@@ -278,6 +278,147 @@ async def test_mcp_tools_slash_command_shows_tool_details(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_mcp_available_slash_command_shows_global_catalog(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
+    (tmp_path / "global" / "config.toml").write_text(
+        'mcp_servers = [{ name = "filesystem", transport = "stdio", command = ["mcp-server-filesystem", "."], prefix = "fs_" }]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-available"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/mcp available")
+
+    assert handled is True
+    output = console.export_text()
+    assert "filesystem" in output
+    assert "global" in output
+    assert "available" in output
+
+
+@pytest.mark.asyncio
+async def test_mcp_activate_slash_command_enables_global_server_locally(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
+    (tmp_path / "global" / "config.toml").write_text(
+        'mcp_servers = [{ name = "broken", transport = "stdio", command = ["definitely-missing-mcp-server"], prefix = "mcp_broken_" }]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-activate"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/mcp activate broken")
+
+    assert handled is True
+    assert "broken" in state.config.enabled_mcp_servers
+    assert state.config.mcp_servers[0]["name"] == "broken"
+    assert len(state.mcp_servers) == 1
+    output = console.export_text()
+    assert "Activated MCP server" in output
+
+
+@pytest.mark.asyncio
+async def test_mcp_activate_refreshes_cached_system_prompt(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
+    (tmp_path / "global" / "config.toml").write_text(
+        'mcp_servers = [{ name = "filesystem", transport = "stdio", command = ["fake-mcp"], prefix = "fs_" }]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-activate-prompt"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+    state.build_system_prompt("inspect files")
+    assert "MCP Tool Contract" not in state.current_system_prompt
+
+    async def fake_refresh(self):
+        self.client = _FakeMCPClient(self.server)
+        self.connected = True
+        self.last_error = None
+        self.discovered_specs = tuple(await self.client.list_tools())
+        self.discovered_tools = tuple(self.display_name(spec.name) for spec in self.discovered_specs)
+        return self.discovered_tools
+
+    monkeypatch.setattr(MCPServerRuntime, "refresh", fake_refresh)
+
+    handled = await build_router().dispatch(state, "/mcp activate filesystem")
+
+    assert handled is True
+    assert "MCP Tool Contract" in state.current_system_prompt
+    assert "`fs_read_file` from `filesystem` remote `read_file`" in state.current_system_prompt
+
+
+@pytest.mark.asyncio
+async def test_mcp_deactivate_refreshes_cached_system_prompt(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'mcp_servers = [{ name = "filesystem", transport = "stdio", command = ["fake-mcp"], prefix = "fs_" }]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-deactivate-prompt"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    async def fake_refresh(self):
+        self.client = _FakeMCPClient(self.server)
+        self.connected = True
+        self.last_error = None
+        self.discovered_specs = tuple(await self.client.list_tools())
+        self.discovered_tools = tuple(self.display_name(spec.name) for spec in self.discovered_specs)
+        return self.discovered_tools
+
+    monkeypatch.setattr(MCPServerRuntime, "refresh", fake_refresh)
+    await build_router().dispatch(state, "/mcp reload")
+    assert "MCP Tool Contract" in state.current_system_prompt
+
+    handled = await build_router().dispatch(state, "/mcp deactivate filesystem")
+
+    assert handled is True
+    assert "MCP Tool Contract" not in state.current_system_prompt
+    assert "fs_read_file" not in state.current_system_prompt
+
+
+@pytest.mark.asyncio
 async def test_mcp_refresh_unknown_server_reports_not_found(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     console = Console(record=True, no_color=True, width=200)

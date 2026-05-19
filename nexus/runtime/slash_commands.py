@@ -134,7 +134,7 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
     table.add_column("Description")
     for name, description in (
         ("/help", "Show command help."),
-        ("/mcp [status|tools|refresh [server]]", "Inspect MCP server connections and registered tools."),
+        ("/mcp [status|tools|available|activate|deactivate|refresh]", "Inspect and manage MCP server connections."),
         ("/mode [plan|default|auto]", "Show or switch execution mode."),
         ("/provider [list|set <param> <value>]", "Show active provider and update model/session parameters."),
         ("/skills [list|show|add|remove|reload]", "Inspect and activate session skills."),
@@ -157,18 +157,37 @@ async def handle_mcp(state: ReplState, args: list[str]) -> None:
         _print_mcp_help(state)
         return
 
+    if subcommand == "available":
+        _print_mcp_available(state)
+        return
+
+    if subcommand in {"activate", "add"}:
+        if len(args) < 2:
+            state.console.print("Usage: /mcp activate <server>")
+            return
+        await _set_mcp_server_active(state, args[1], active=True)
+        return
+
+    if subcommand in {"deactivate", "remove"}:
+        if len(args) < 2:
+            state.console.print("Usage: /mcp deactivate <server>")
+            return
+        await _set_mcp_server_active(state, args[1], active=False)
+        return
+
     if subcommand == "reload":
         reports = await _reload_mcp_servers(state)
         if not reports:
             state.console.print("No MCP servers configured. Add mcp_servers to .nexus/config.toml, then run /mcp reload.")
             return
+        _refresh_system_prompt_after_mcp_change(state)
         _print_mcp_refresh_reports(state, reports, title="MCP Reload")
         _print_mcp_status(state)
         return
 
     if not state.mcp_servers:
         state.console.print("No MCP servers loaded. Add mcp_servers to .nexus/config.toml, then run /mcp reload.")
-        state.console.print("Usage: /mcp [status|tools|refresh|reload|help]")
+        state.console.print("Usage: /mcp [status|tools|available|activate|deactivate|refresh|reload|help]")
         return
 
     if subcommand == "status":
@@ -183,10 +202,11 @@ async def handle_mcp(state: ReplState, args: list[str]) -> None:
         if not reports:
             state.console.print(f"MCP server not found: {target_name}")
             return
+        _refresh_system_prompt_after_mcp_change(state)
         _print_mcp_refresh_reports(state, reports)
         _print_mcp_status(state)
         return
-    state.console.print("Usage: /mcp [status|tools|refresh [server]|reload|help]")
+    state.console.print("Usage: /mcp [status|tools|available|activate|deactivate|refresh [server]|reload|help]")
 
 
 async def handle_mode(state: ReplState, args: list[str]) -> None:
@@ -532,6 +552,7 @@ async def handle_tools(state: ReplState, args: list[str]) -> None:
         return
     table = Table(title="Registered Tools")
     table.add_column("Name")
+    table.add_column("Type")
     table.add_column("Source")
     table.add_column("Origin")
     table.add_column("Mutating")
@@ -540,6 +561,7 @@ async def handle_tools(state: ReplState, args: list[str]) -> None:
         tool = record.tool
         table.add_row(
             record.name,
+            getattr(tool.kind, "value", str(tool.kind)),
             record.source,
             record.origin or "-",
             "yes" if tool.is_mutating else "no",
@@ -796,9 +818,12 @@ def _print_mcp_status(state: ReplState) -> None:
 
 def _print_mcp_help(state: ReplState) -> None:
     _print_subcommand_help(
-        state, "mcp", "Inspect MCP server status and tools.",
+        state, "mcp", "Inspect and manage MCP server status and tools.",
         (
             ("status",           "Show MCP server status, transport, counts, and last error.", "/mcp status"),
+            ("available",        "List MCP servers defined globally or locally and their workspace state.", "/mcp available"),
+            ("activate <server>", "Enable a global or local MCP server for this workspace.",     "/mcp activate filesystem"),
+            ("deactivate <server>", "Disable an MCP server for this workspace.",                 "/mcp deactivate filesystem"),
             ("tools",            "List registered and discovered MCP tools.",                  "/mcp tools"),
             ("refresh",          "Rediscover and hot-register loaded MCP tools.",              "/mcp refresh"),
             ("refresh <server>", "Rediscover and hot-register one loaded server.",             "/mcp refresh filesystem"),
@@ -828,10 +853,107 @@ def _print_mcp_tools(state: ReplState) -> None:
             elif display_name in registered:
                 state_text = "enabled"
             else:
-                state_text = "filtered"
+                state_text = "unregistered"
             description = spec.description.replace("\n", " ")[:80] or "-"
             table.add_row(server.server.name, display_name, spec.name, state_text, description)
     state.console.print(table)
+
+
+def _print_mcp_available(state: ReplState) -> None:
+    catalog = _mcp_server_catalog(state)
+    if not catalog:
+        state.console.print("No MCP servers configured globally or locally.")
+        return
+    active_names = {str(entry.get("name", "")).strip() for entry in state.config.mcp_servers}
+    enabled = set(getattr(state.config, "enabled_mcp_servers", []))
+    disabled = set(getattr(state.config, "disabled_mcp_servers", []))
+    table = Table(title="Available MCP Servers")
+    table.add_column("Name")
+    table.add_column("Scope")
+    table.add_column("State")
+    table.add_column("Transport")
+    table.add_column("Prefix")
+    table.add_column("Command/URL")
+    for name, entry in sorted(catalog.items()):
+        if name in active_names:
+            state_text = "active"
+        elif name in disabled:
+            state_text = "disabled"
+        elif name in enabled:
+            state_text = "missing"
+        else:
+            state_text = "available"
+        command = entry.get("url") or " ".join(str(part) for part in entry.get("command", []))
+        table.add_row(
+            name,
+            str(entry.get("_scope", "-")),
+            state_text,
+            str(entry.get("transport", "stdio")),
+            str(entry.get("prefix", "")) or "-",
+            command or "-",
+        )
+    state.console.print(table)
+
+
+async def _set_mcp_server_active(state: ReplState, server_name: str, *, active: bool) -> None:
+    catalog = _mcp_server_catalog(state)
+    if server_name not in catalog:
+        state.console.print(f"MCP server not found in global or local config: {server_name}")
+        return
+
+    payload = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8")) if state.config.local_config_file.exists() else {}
+    enabled = _string_list(payload.get("enabled_mcp_servers", []))
+    disabled = _string_list(payload.get("disabled_mcp_servers", []))
+    if active:
+        if server_name not in enabled:
+            enabled.append(server_name)
+        disabled = [name for name in disabled if name != server_name]
+        action = "Activated"
+    else:
+        enabled = [name for name in enabled if name != server_name]
+        if server_name not in disabled:
+            disabled.append(server_name)
+        action = "Deactivated"
+    payload["enabled_mcp_servers"] = enabled
+    payload["disabled_mcp_servers"] = disabled
+    _write_toml(state.config.local_config_file, payload)
+
+    reports = await _reload_mcp_servers(state)
+    _refresh_system_prompt_after_mcp_change(state)
+    state.console.print(f"{action} MCP server for this workspace: {server_name}")
+    if reports:
+        _print_mcp_refresh_reports(state, reports, title="MCP Reload")
+
+
+def _mcp_server_catalog(state: ReplState) -> dict[str, dict[str, object]]:
+    catalog: dict[str, dict[str, object]] = {}
+    for scope, path in (("global", state.config.global_config_file), ("local", state.config.local_config_file)):
+        if not path.exists():
+            continue
+        payload = tomllib.loads(path.read_text(encoding="utf-8"))
+        servers = payload.get("mcp_servers", [])
+        if not isinstance(servers, list):
+            continue
+        for entry in servers:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "")).strip()
+            if not name:
+                continue
+            record = dict(entry)
+            record["_scope"] = scope
+            catalog[name] = record
+    return catalog
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _refresh_system_prompt_after_mcp_change(state: ReplState) -> None:
+    state.refresh_system_prompt()
 
 
 async def _refresh_mcp_servers(state: ReplState, target_name: str | None) -> list[MCPRefreshReport]:
@@ -955,7 +1077,7 @@ def _reload_tools(state: ReplState) -> int:
     register_core_tools(state.tool_registry, cfg)
 
     for record in preserved_records:
-        if tool_enabled(cfg, record.name):
+        if record.source == "mcp" or tool_enabled(cfg, record.name):
             state.tool_registry.register(record.tool, source=record.source, origin=record.origin)
 
     register_subagent_tools(
@@ -1002,14 +1124,19 @@ def _coerce_toml_value(value: str):
 def _write_toml(path: Path, payload: dict[str, object]) -> None:
     lines: list[str] = []
     for key, value in payload.items():
-        if isinstance(value, bool):
-            rendered = "true" if value else "false"
-        elif isinstance(value, (int, float)):
-            rendered = str(value)
-        elif isinstance(value, list):
-            rendered = "[" + ", ".join(json.dumps(item) for item in value) + "]"
-        else:
-            rendered = json.dumps(value)
-        lines.append(f"{key} = {rendered}")
+        lines.append(f"{key} = {_render_toml_value(value)}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _render_toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_render_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        parts = [f"{key} = {_render_toml_value(item)}" for key, item in value.items()]
+        return "{ " + ", ".join(parts) + " }"
+    return json.dumps(value)

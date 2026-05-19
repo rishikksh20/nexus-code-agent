@@ -41,6 +41,8 @@ class AgentConfig:
     allowed_tools: list[str] = field(default_factory=list)
     denied_tools: list[str] = field(default_factory=list)
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
+    enabled_mcp_servers: list[str] = field(default_factory=list)
+    disabled_mcp_servers: list[str] = field(default_factory=list)
     approval_policy: str = "on-request"
     allow_hidden_paths: bool = False
     developer_instructions: str = ""

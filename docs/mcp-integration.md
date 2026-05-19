@@ -39,7 +39,10 @@ pip install mcp-server-git
 > **Note:** `mcp-server-filesystem` is an npm package — do **not** use `uvx` to invoke it.
 > `mcp-server-git` is a Python package — use `uvx` or `pip install`.
 
-### Step 2 — Configure `.nexus/config.toml`
+### Step 2 — Configure MCP Servers
+
+Define reusable MCP servers globally in `~/.nexus/config.toml`, or define
+workspace-only servers in `.nexus/config.toml`.
 
 ```toml
 mcp_servers = [
@@ -67,26 +70,27 @@ Replace `/path/to/your/workspace` and `/path/to/your/git-repo-root` with absolut
 > **Important:** The git server requires the **git repository root** (the directory that contains `.git/`), not a subdirectory inside the repo.
 > Run `git rev-parse --show-toplevel` to find the correct path.
 
-### Step 3 — Add MCP tool names to `allowed_tools`
+### Step 3 — Activate Servers for a Workspace
 
-By default only tools listed in `allowed_tools` can be called. Add the prefixed MCP names alongside your existing built-in tools:
+Workspace-local `mcp_servers` are active by default. Global MCP servers are a
+catalog; activate them per workspace by name:
 
 ```toml
-allowed_tools = [
-  # ... existing built-in tools ...
-
-  # Filesystem MCP tools (prefix = "fs_")
-  "fs_read_file", "fs_write_file", "fs_list_directory",
-  "fs_create_directory", "fs_delete_file", "fs_move_file",
-  "fs_get_file_info", "fs_search_files", "fs_list_allowed_directories",
-
-  # Git MCP tools (prefix = "git_")
-  "git_git_status", "git_git_diff_unstaged", "git_git_diff_staged",
-  "git_git_diff", "git_git_commit", "git_git_add", "git_git_reset",
-  "git_git_log", "git_git_create_branch", "git_git_checkout",
-  "git_git_show", "git_git_read_file"
-]
+enabled_mcp_servers = ["filesystem", "git"]
+disabled_mcp_servers = []
 ```
+
+You can also manage this from the REPL:
+
+```
+/mcp available
+/mcp activate filesystem
+/mcp deactivate filesystem
+```
+
+Do not add MCP tool names to `allowed_tools`. When an MCP server is active,
+Nexus discovers its tools during initialization and registers all discovered
+tools except any remote names listed in that server's `disabled_tools`.
 
 > **Prefix doubling explained:** `mcp-server-git` names its tools internally with a `git_` prefix (e.g. `git_status`). Adding `prefix = "git_"` in config makes the Nexus name `git_git_status`. To avoid doubling, use `prefix = "mcp_git_"` instead (giving names like `mcp_git_git_status`), or omit the prefix entirely — but then the MCP tool `git_status` collides with the Nexus built-in `git_status`.
 
@@ -133,7 +137,7 @@ Then ask the agent naturally:
 
 ## Configuration Reference
 
-Add MCP servers to `mcp_servers` in `.nexus/config.toml` (workspace-level) or `~/.nexus/config.toml` (global):
+Add MCP servers to `mcp_servers` in `.nexus/config.toml` (workspace-level) or `~/.nexus/config.toml` (global catalog):
 
 ```toml
 mcp_servers = [
@@ -159,7 +163,12 @@ mcp_servers = [
 | `disabled` | bool | `false` | Skip discovery and registration for this server |
 | `disabled_tools` | list | `[]` | Remote MCP tool names to hide from Nexus |
 
-Global `allowed_tools` and `denied_tools` still apply to the final Nexus tool name after prefixing.
+`allowed_tools` and `denied_tools` apply to built-in, plugin, sandbox, and
+sub-agent tools. MCP tools are controlled at the server level:
+
+- `enabled_mcp_servers` activates global catalog servers for the workspace.
+- `disabled_mcp_servers` disables local or global servers by name.
+- `disabled_tools` on one server hides specific remote MCP tool names.
 
 ### Full Multi-Server Example
 
@@ -228,7 +237,26 @@ List all discovered tools across all connected servers. Shows server name, Nexus
 /mcp tools
 ```
 
-Use this to confirm your `allowed_tools` entries match the actual published names and to see which tools are enabled vs filtered.
+Use this to confirm the actual published names and to see which tools are enabled or disabled.
+
+### `/mcp available`
+
+List MCP servers defined globally or locally, plus whether each one is active,
+available, disabled, or referenced but missing.
+
+```
+/mcp available
+```
+
+### `/mcp activate <server>` and `/mcp deactivate <server>`
+
+Enable or disable an MCP server for the current workspace by name. These update
+the workspace config and reload MCP servers immediately.
+
+```
+/mcp activate filesystem
+/mcp deactivate filesystem
+```
 
 ### `/mcp refresh [server]`
 
@@ -367,15 +395,11 @@ Install it once:
 npm install -g @modelcontextprotocol/server-filesystem
 ```
 
-### Tools appear as `filtered` in `/mcp tools`
+### Tools appear as `unregistered` in `/mcp tools`
 
-The prefixed tool name is blocked by `allowed_tools` or `denied_tools`. Add the exact Nexus name to `allowed_tools`:
-
-```toml
-allowed_tools = ["fs_read_file", "git_git_status", ...]
-```
-
-Then run `/mcp reload` in the REPL to apply.
+The MCP server is active and discovery saw the remote tool, but Nexus could not
+publish that tool name. The usual cause is a name collision with an existing
+tool. Set a unique server `prefix`, then run `/mcp reload`.
 
 ### `mcp-server-git` error: "not a valid Git repository"
 

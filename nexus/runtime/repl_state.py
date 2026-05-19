@@ -47,6 +47,7 @@ class ReplState:
     current_turn_id: str = ""
     current_trace_id: str = ""
     current_system_prompt: str = ""
+    current_system_prompt_task_input: str = ""
     should_exit: bool = False
 
     @property
@@ -77,6 +78,7 @@ class ReplState:
         return stripped, False
 
     def build_system_prompt(self, prompt_text: str) -> str:
+        self.current_system_prompt_task_input = prompt_text
         sections = build_context_sections(
             self.config,
             self.tool_registry,
@@ -90,6 +92,11 @@ class ReplState:
         sections.carry_over.extend(multi_agent_carry_over_lines(self.session.metadata))
         self.current_system_prompt = ContextBuilder().build(sections)
         return self.current_system_prompt
+
+    def refresh_system_prompt(self) -> str:
+        """Rebuild the cached prompt after live tool/config changes."""
+        prompt_text = self.current_system_prompt_task_input or self.paused_turn_prompt
+        return self.build_system_prompt(prompt_text)
 
     def prepare_turn(
         self,

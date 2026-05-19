@@ -320,6 +320,43 @@ def test_config_accepts_disabled_mcp_http_server(tmp_path):
     assert config.mcp_servers[0]["url"] == "http://localhost:3333/mcp"
 
 
+def test_config_activates_global_mcp_servers_by_workspace_name(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (global_root / "config.toml").write_text(
+        'mcp_servers = [{ name = "filesystem", command = ["mcp-server-filesystem", "."], prefix = "fs_" }]\n',
+        encoding="utf-8",
+    )
+    (workspace / ".nexus" / "config.toml").write_text(
+        'enabled_mcp_servers = ["filesystem"]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.mcp_servers == [
+        {"name": "filesystem", "command": ["mcp-server-filesystem", "."], "prefix": "fs_"}
+    ]
+
+
+def test_config_deactivates_local_mcp_server_by_name(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'mcp_servers = [{ name = "filesystem", command = ["mcp-server-filesystem", "."], prefix = "fs_" }]\n'
+        'disabled_mcp_servers = ["filesystem"]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.mcp_servers == []
+
+
 def test_config_rejects_duplicate_mcp_servers(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

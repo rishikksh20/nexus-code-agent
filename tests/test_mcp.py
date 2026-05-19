@@ -255,6 +255,21 @@ async def test_mcp_registration_uses_refresh_snapshot_without_relisting(tmp_path
     assert registry.record("fs_echo").source == "mcp"
 
 
+@pytest.mark.asyncio
+async def test_mcp_registration_ignores_global_tool_allowlist(tmp_path):
+    config = SimpleNamespace(allowed_tools=["get_time"], denied_tools=[])
+    server = MCPServerConfig(name="fake", command=("fake",), prefix="fs_")
+    client = _CountingClient(server)
+    runtime = MCPServerRuntime(server=server, client=client)
+    registry = ToolRegistry()
+
+    await runtime.refresh()
+    register_discovered_mcp_tools(runtime, registry, config)
+
+    assert runtime.registered_tools == ("fs_echo",)
+    assert registry.record("fs_echo").source == "mcp"
+
+
 def test_tools_package_exports_mcp_surface():
     assert ExportedMCPServerConfig is MCPServerConfig
 

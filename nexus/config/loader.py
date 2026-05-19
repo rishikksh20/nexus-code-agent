@@ -56,12 +56,26 @@ def load_config(
     global_values = normalize_legacy_config_values(global_values)
     local_values = normalize_legacy_config_values(local_values)
     cli_values = normalize_legacy_config_values(cli_values)
+    global_mcp_servers = _as_mcp_server_list(global_values.pop("mcp_servers", []))
+    local_mcp_servers = _as_mcp_server_list(local_values.pop("mcp_servers", []))
+    for duplicate_name in (
+        _duplicate_mcp_server_name(global_mcp_servers),
+        _duplicate_mcp_server_name(local_mcp_servers),
+    ):
+        if duplicate_name is not None:
+            raise ConfigError(f"Duplicate mcp_servers entry '{duplicate_name}'.")
 
     merged = dict(base)
     merged.update(global_values)
     merged.update(local_values)
     merged.update(_read_environment(defaults))
     merged.update(cli_values)
+    merged["mcp_servers"] = _active_mcp_servers(
+        global_mcp_servers=global_mcp_servers,
+        local_mcp_servers=local_mcp_servers,
+        enabled_names=merged.get("enabled_mcp_servers", []),
+        disabled_names=merged.get("disabled_mcp_servers", []),
+    )
     merged = _apply_agent_mode_profile(merged)
     merged = _apply_provider_defaults(merged)
 
@@ -78,6 +92,61 @@ def load_config(
         values[item.name] = _coerce_value(raw_value, getattr(defaults, item.name))
     _validate_config_values(values)
     return AgentConfig(**values)
+
+
+def _as_mcp_server_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(entry) for entry in value if isinstance(entry, dict)]
+
+
+def _mcp_server_name(entry: dict[str, Any]) -> str:
+    return str(entry.get("name", "")).strip()
+
+
+def _duplicate_mcp_server_name(entries: list[dict[str, Any]]) -> str | None:
+    seen: set[str] = set()
+    for entry in entries:
+        name = _mcp_server_name(entry)
+        if not name:
+            continue
+        if name in seen:
+            return name
+        seen.add(name)
+    return None
+
+
+def _active_mcp_servers(
+    *,
+    global_mcp_servers: list[dict[str, Any]],
+    local_mcp_servers: list[dict[str, Any]],
+    enabled_names: Any,
+    disabled_names: Any,
+) -> list[dict[str, Any]]:
+    enabled = {str(name).strip() for name in enabled_names if str(name).strip()} if isinstance(enabled_names, list) else set()
+    disabled = {str(name).strip() for name in disabled_names if str(name).strip()} if isinstance(disabled_names, list) else set()
+
+    global_by_name = {
+        name: dict(entry)
+        for entry in global_mcp_servers
+        if (name := _mcp_server_name(entry))
+    }
+    local_by_name = {
+        name: dict(entry)
+        for entry in local_mcp_servers
+        if (name := _mcp_server_name(entry))
+    }
+
+    active: dict[str, dict[str, Any]] = {}
+    for name in enabled:
+        entry = local_by_name.get(name) or global_by_name.get(name)
+        if entry is not None:
+            active[name] = dict(entry)
+    for name, entry in local_by_name.items():
+        active.setdefault(name, dict(entry))
+    for name in disabled:
+        active.pop(name, None)
+    return list(active.values())
 
 
 def _inject_dotenv(path: Path) -> None:

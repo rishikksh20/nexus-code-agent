@@ -365,7 +365,7 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 | `/memory [list\|search\|save\|show]` | Workspace memory entries |
 | `/tools [reload]` | List registered tools or reload core, plugin, MCP, and sub-agent tools |
 | `/history [n]` | Show recent conversation messages |
-| `/mcp [status\|tools\|refresh [server]\|reload]` | Inspect MCP server status, tools, and hot-refresh/reload registrations |
+| `/mcp [status\|available\|activate\|deactivate\|tools\|refresh [server]\|reload]` | Inspect and manage MCP server activation, status, tools, and reloads |
 | `/quit` or `/exit` | Save session and exit |
 
 ---
@@ -730,6 +730,8 @@ mcp_servers = [
   { name = "filesystem", transport = "stdio", command = ["mcp-server-filesystem", "."], prefix = "fs_", startup_timeout_seconds = 10, tool_timeout_seconds = 60 },
   { name = "git", transport = "stdio", command = ["uvx", "mcp-server-git", "--repository", "."], prefix = "git_", startup_timeout_seconds = 15, tool_timeout_seconds = 60 }
 ]
+enabled_mcp_servers = []        # enable global MCP catalog entries by name
+disabled_mcp_servers = []       # disable local or global MCP entries by name
 
 # Optional MCP fields: env, cwd, disabled, disabled_tools.
 
@@ -811,23 +813,18 @@ mcp_servers = [
 
 > **Filesystem command:** Use `mcp-server-filesystem` directly (npm binary). Do **not** prefix with `uvx` — it is not a Python package.
 
-#### Add tool names to `allowed_tools`
+#### Activate MCP servers
 
 ```toml
-allowed_tools = [
-  # ... existing built-in tools ...
-
-  # Filesystem MCP (prefix "fs_")
-  "fs_read_file", "fs_write_file", "fs_list_directory",
-  "fs_create_directory", "fs_delete_file", "fs_move_file",
-  "fs_get_file_info", "fs_search_files", "fs_list_allowed_directories",
-
-  # Git MCP (prefix "git_" — note: server already names tools with git_ internally)
-  "git_git_status", "git_git_log", "git_git_diff_unstaged", "git_git_diff_staged",
-  "git_git_diff", "git_git_add", "git_git_commit", "git_git_reset",
-  "git_git_create_branch", "git_git_checkout", "git_git_show", "git_git_read_file"
-]
+enabled_mcp_servers = ["filesystem", "git"]
+disabled_mcp_servers = []
 ```
+
+Do not add MCP tool names to `allowed_tools`. Workspace-local MCP servers are
+active by default; global MCP servers are a reusable catalog and are activated
+per workspace by name. Once a server is active, Nexus discovers its tools at
+startup and registers all discovered tools except any remote names listed in
+that server's `disabled_tools`.
 
 #### Verify with REPL slash commands
 
@@ -838,6 +835,13 @@ uv run nexus
 ```
 # Check connection status
 /mcp status
+
+# List global/local servers and workspace activation state
+/mcp available
+
+# Activate or deactivate a server by name
+/mcp activate filesystem
+/mcp deactivate filesystem
 
 # List all discovered tools
 /mcp tools

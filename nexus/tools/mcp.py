@@ -10,7 +10,6 @@ from typing import Any
 
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import ToolKind, ToolRegistry
-from nexus.tools.registry import tool_enabled
 
 
 @dataclass(slots=True, frozen=True)
@@ -461,8 +460,6 @@ def _register_runtime_tools(runtime: MCPServerRuntime, registry: ToolRegistry, c
         if spec.name in disabled_remote_tools:
             continue
         display_name = runtime.display_name(spec.name)
-        if not tool_enabled(config, display_name):
-            continue
         try:
             registry.register(
                 MCPToolAdapter(client, spec, display_name=display_name),
