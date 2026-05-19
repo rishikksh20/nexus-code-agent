@@ -106,6 +106,7 @@ nexus/                         # Main package
 │
 ├── runtime/                   # Core agent execution
 │   ├── agent.py               # Agent class — agentic loop, tool dispatch, hooks
+│   ├── agent_scope.py         # Supervisor/sub-agent tool, skill, and MCP visibility logic
 │   ├── repl.py                # Turn runner plus interactive REPL loop
 │   ├── repl_state.py          # ReplState — session, history, config, approval manager
 │   ├── slash_commands.py      # /command router and all slash-command handlers
@@ -130,6 +131,7 @@ nexus/                         # Main package
 │
 ├── skills/                    # Skill loading and registry
 │   ├── loader.py              # Discover and load Markdown skill files
+│   ├── parser.py              # SKILL.md YAML frontmatter + body parser
 │   ├── registry.py            # SkillRegistry
 │   └── models.py              # Skill dataclass
 │
@@ -160,8 +162,12 @@ nexus/                         # Main package
 │   └── terminal.py            # TerminalUI — Rich-backed console rendering
 │
 └── builtin_skills/
-    └── nexus-agent/
-        └── SKILL.md           # Built-in Nexus self-help skill
+    ├── nexus-agent/
+    │   └── SKILL.md           # Built-in Nexus self-help skill
+    ├── python-code-review/
+    │   └── SKILL.md           # PEP 8 + Google Style Guide code review skill
+    └── note-taking/
+        └── SKILL.md           # Append time-stamped notes to notes.toml
 
 tests/                         # Pytest test suite
 docs/                          # Architecture plans and tutorial reference material
