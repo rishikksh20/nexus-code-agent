@@ -362,7 +362,7 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 |---|---|
 | `/help` | Show all available slash commands |
 | `/mode [plan\|default\|auto]` | Show or switch execution mode |
-| `/context [show\|usage]` | Print system prompt or show token/context-window usage stats |
+| `/context [show\|usage]` | Print system prompt or show supervisor token/context-window usage, including tool, MCP, sub-agent, and skill prompt/schema estimates |
 | `/context agents\|agent \<id\>\|usage \<id\>` | Inspect per-agent context isolation, handoffs, and usage |
 | `/provider [list\|set \<param\> \<value\>]` | Show or update provider, model, temperature, and session parameters |
 | `/config [show\|set\|reset\|reload\|upgrade\|reinit [local\|global]]` | Inspect or edit configuration; `upgrade` merges new defaults and reloads tools |
@@ -403,15 +403,17 @@ Mode set to: auto
 Done. Added a module-level docstring describing the BaseTool protocol and ToolRegistry.
 
 > /context usage
-┌─ Context Usage ──────────────────────────────────────┐
-│ Provider          openai-compatible                   │
-│ Model             mistral-medium-latest               │
-│ Context window    131,072 tokens                      │
-│ System prompt     ~420 tokens                         │
-│ History           ~1,840 tokens                       │
-│ Total used        ~2,260 tokens  (1.7%)               │
-│ Compaction soft   85,197 tokens  (65%)                │
-│ Compaction hard   111,411 tokens (85%)                │
+┌─ Context Usage: supervisor ──────────────────────────┐
+│ Provider                       openai-compatible     │
+│ Model                          mistral-medium-latest │
+│ Context window                 131,072 tokens        │
+│ System prompt (est.)           ~420 tokens           │
+│ History (est.)                 ~1,840 tokens         │
+│ Tool schemas (est.)            ~900 tokens           │
+│ Sub-agent schemas (est.)       ~320 tokens           │
+│ MCP schemas (est.)             ~180 tokens           │
+│ Active skills prompt (est.)    ~240 tokens           │
+│ Total used incl. schemas       ~3,660 tokens (2.8%)  │
 └──────────────────────────────────────────────────────┘
 
 > /session save
@@ -579,6 +581,49 @@ Useful commands after editing `.nexus/config.toml`:
 /sub-agent show execution # inspect one sub-agent's effective resources
 /context agents        # inspect sub-agent context isolation and handoffs
 ```
+
+### YAML Sub-Agents
+
+In addition to `delegation_subagents` in `config.toml`, you can define sub-agents as standalone `.yml` files — one file per agent. Nexus discovers them automatically from two directories:
+
+| Scope | Path | Priority |
+|---|---|---|
+| Global | `~/.nexus/agents/<name>.yml` | Base |
+| Local (workspace) | `.nexus/agents/<name>.yml` | Overrides global |
+
+**Minimal example** (`.nexus/agents/explore.yml`):
+
+```yaml
+name: explore
+description: Investigate a focused codebase question and summarize the answer.
+goal_prompt: |
+  Read the relevant code and summarize the answer. Do not modify files.
+allowed_tools:
+  - read_file
+  - glob
+  - grep
+  - list_dir
+  - lsp
+allowed_skills: []   # omit or leave empty to allow all active skills
+allowed_mcps: []     # omit or leave empty to allow all active MCP servers
+max_turns: 12
+timeout_seconds: 300
+```
+
+The file name (without `.yml`) must match the `name` field. The sub-agent is registered as `subagent_<name>` when `agent_mode = "advanced"` or the name appears in `delegation_subagents`.
+
+**REPL commands:**
+
+```text
+/sub-agent agents list               — list all discovered YAML agent files
+/sub-agent agents new <name>         — scaffold a local .nexus/agents/<name>.yml
+/sub-agent agents new <name> global  — scaffold a global ~/.nexus/agents/<name>.yml
+/sub-agent agents reload             — re-scan and register new YAML agents live
+/sub-agent agents promote <name>     — move local → global
+/sub-agent agents demote <name>      — move global → local
+```
+
+YAML agents participate in the same definition priority chain as built-in and config agents: built-ins → `delegation_subagents` → YAML files (YAML wins on name collision). `/tools reload` also rebuilds YAML agents. See [`docs/sub-agents-integration.md`](docs/sub-agents-integration.md) for the full field reference and examples.
 
 ### Approval Flow
 

@@ -208,10 +208,18 @@ def _subagent_guidance_lines(records) -> list[str]:
     ]
     for record in subagents:
         tool = record.tool
-        allowed_tools = getattr(getattr(tool, "_definition", None), "allowed_tools", None)
+        definition = getattr(tool, "_definition", None)
+        allowed_tools = getattr(definition, "allowed_tools", None)
+        allowed_skills = getattr(definition, "allowed_skills", ())
+        allowed_mcps = getattr(definition, "allowed_mcps", ())
         allowed_text = ", ".join(allowed_tools) if allowed_tools else "task-scoped registry"
+        skills_text = ", ".join(allowed_skills) if allowed_skills else "active skill scope"
+        mcps_text = ", ".join(allowed_mcps) if allowed_mcps else "active MCP scope"
         origin = f" ({record.origin})" if record.origin else ""
-        lines.append(f"- `{record.name}`{origin}: {tool.description} Allowed tools: {allowed_text}.")
+        lines.append(
+            f"- `{record.name}`{origin}: {tool.description} "
+            f"Allowed tools: {allowed_text}. Skills: {skills_text}. MCPs: {mcps_text}."
+        )
     return lines
 
 

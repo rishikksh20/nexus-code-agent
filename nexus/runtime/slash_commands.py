@@ -48,10 +48,18 @@ from nexus.security.manager import ApprovalManager
 from nexus.security.policy import ApprovalPolicy
 from nexus.skills import get_skill_roots, load_skill_registry, resolve_active_skill_names, skill_template
 from nexus.skills.parser import SkillParseError, validate_skill_metadata
+from nexus.agents.loader import (
+    demote_to_local,
+    get_agent_roots,
+    list_yaml_subagent_files,
+    promote_to_global,
+    scaffold_yaml,
+)
 from nexus.tools.subagents import (
     load_subagent_definitions,
     register_skill_subagent_tools,
     register_subagent_tools,
+    register_yaml_subagent_tools,
 )
 
 
@@ -284,11 +292,19 @@ async def handle_sub_agent(state: ReplState, args: list[str]) -> None:
                 ("mcp <name>", "List active MCP servers and sub-agent scoped state.", "/sub-agent mcp execution"),
                 ("attach <name> tool|skill|mcp <id>", "Attach a resource to a sub-agent.", "/sub-agent attach execution tool read_file"),
                 ("detach <name> tool|skill|mcp <id>", "Detach a resource from a sub-agent.", "/sub-agent detach execution mcp filesystem"),
+                ("agents list", "List YAML sub-agents in local and global agent directories.", "/sub-agent agents list"),
+                ("agents new <name> [local|global]", "Scaffold a new YAML sub-agent file.", "/sub-agent agents new explore"),
+                ("agents promote <name>", "Move a local YAML sub-agent to the global directory.", "/sub-agent agents promote explore"),
+                ("agents demote <name>", "Move a global YAML sub-agent to the local directory.", "/sub-agent agents demote explore"),
+                ("agents reload", "Re-scan agent directories and register new YAML sub-agents.", "/sub-agent agents reload"),
             ),
         )
         return
     if subcommand == "list":
         _print_subagent_list(state)
+        return
+    if subcommand == "agents":
+        await _handle_sub_agent_agents(state, args[1:])
         return
     if subcommand in {"show", "tools", "skills", "mcp"}:
         if len(args) < 2:
@@ -319,7 +335,152 @@ async def handle_sub_agent(state: ReplState, args: list[str]) -> None:
             state.refresh_system_prompt()
             _print_subagent_show(state, record)
         return
-    state.console.print("Usage: /sub-agent [list|show|tools|skills|mcp|attach|detach|help]")
+    state.console.print("Usage: /sub-agent [list|show|tools|skills|mcp|attach|detach|agents|help]")
+
+
+async def _handle_sub_agent_agents(state: ReplState, args: list[str]) -> None:
+    """Handle the ``/sub-agent agents <subcommand>`` family."""
+    subcommand = args[0].lower() if args else "list"
+
+    if subcommand == "list":
+        _print_yaml_agent_list(state)
+        return
+
+    if subcommand == "new":
+        if len(args) < 2:
+            state.console.print("Usage: /sub-agent agents new <name> [local|global]")
+            return
+        name = args[1].lower()
+        scope = args[2].lower() if len(args) > 2 else "local"
+        if scope not in {"local", "global"}:
+            state.console.print("Scope must be 'local' or 'global'.")
+            return
+        _scaffold_yaml_agent(state, name, scope)
+        return
+
+    if subcommand == "promote":
+        if len(args) < 2:
+            state.console.print("Usage: /sub-agent agents promote <name>")
+            return
+        _move_yaml_agent(state, args[1].lower(), direction="promote")
+        return
+
+    if subcommand == "demote":
+        if len(args) < 2:
+            state.console.print("Usage: /sub-agent agents demote <name>")
+            return
+        _move_yaml_agent(state, args[1].lower(), direction="demote")
+        return
+
+    if subcommand == "reload":
+        _reload_yaml_agents(state)
+        return
+
+    state.console.print(
+        "Usage: /sub-agent agents [list|new <name>|promote <name>|demote <name>|reload]"
+    )
+
+
+def _print_yaml_agent_list(state: ReplState) -> None:
+    records = list_yaml_subagent_files(state.config)
+    if not records:
+        local, global_ = get_agent_roots(state.config)
+        state.console.print(
+            f"No YAML sub-agent files found.\n"
+            f"  Local:  {local}\n"
+            f"  Global: {global_}\n"
+            "Create one with: /sub-agent agents new <name>"
+        )
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Name", no_wrap=True)
+    table.add_column("Scope")
+    table.add_column("Description")
+    table.add_column("Tools")
+    table.add_column("Skills")
+    table.add_column("MCPs")
+    table.add_column("Turns")
+    for rec in records:
+        if not rec.get("valid"):
+            table.add_row(
+                rec["name"],
+                rec["scope"],
+                f"[red]INVALID: {rec.get('error', '?')}[/red]",
+                "",
+                "",
+                "",
+                "",
+            )
+        else:
+            tools = ", ".join(rec.get("allowed_tools") or []) or "(all active)"
+            skills = ", ".join(rec.get("allowed_skills") or []) or "(all active)"
+            mcps = ", ".join(rec.get("allowed_mcps") or []) or "(all active)"
+            table.add_row(
+                rec["name"],
+                rec["scope"],
+                rec["description"],
+                tools,
+                skills,
+                mcps,
+                str(rec["max_turns"]),
+            )
+    state.console.print(table)
+
+
+def _scaffold_yaml_agent(state: ReplState, name: str, scope: str) -> None:
+    import re
+    _NAME_RE = re.compile(r"^[a-z0-9]+(?:[_-][a-z0-9]+)*$")
+    if not _NAME_RE.fullmatch(name):
+        state.console.print(
+            f"Invalid name '{name}'. Use lowercase letters, digits, hyphens, or underscores."
+        )
+        return
+
+    local, global_ = get_agent_roots(state.config)
+    target_dir = local if scope == "local" else global_
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dest = target_dir / f"{name}.yml"
+    if dest.exists():
+        state.console.print(f"File already exists: {dest}")
+        return
+    dest.write_text(scaffold_yaml(name), encoding="utf-8")
+    state.console.print(f"Created {scope} sub-agent file: {dest}")
+    state.console.print("Edit the file, then run: /sub-agent agents reload")
+
+
+def _move_yaml_agent(state: ReplState, name: str, *, direction: str) -> None:
+    try:
+        if direction == "promote":
+            dest = promote_to_global(name, state.config)
+            state.console.print(f"Promoted '{name}' to global: {dest}")
+        else:
+            dest = demote_to_local(name, state.config)
+            state.console.print(f"Demoted '{name}' to local: {dest}")
+    except FileNotFoundError as exc:
+        state.console.print(f"[red]{exc}[/red]")
+        return
+    except FileExistsError as exc:
+        state.console.print(f"[red]{exc}[/red]")
+        return
+    # Reload so the moved definition is re-registered under its new scope.
+    _reload_yaml_agents(state)
+
+
+def _reload_yaml_agents(state: ReplState) -> None:
+    """Re-scan agent directories and register newly discovered YAML sub-agents."""
+    removed = state.tool_registry.unregister_source(source="agent-yaml")
+    count = register_yaml_subagent_tools(
+        state.tool_registry,
+        state.config,
+        replace_existing=True,
+    )
+    state.refresh_system_prompt()
+    if count:
+        action = "Reloaded" if removed else "Registered"
+        state.console.print(f"{action} {count} YAML sub-agent tool(s). Run /tools to verify.")
+    else:
+        state.console.print("No YAML sub-agents found.")
+    _print_yaml_agent_list(state)
 
 
 async def handle_mode(state: ReplState, args: list[str]) -> None:
@@ -834,27 +995,7 @@ async def handle_context(state: ReplState, args: list[str]) -> None:
         if len(args) > 1:
             _print_agent_context_usage(state, args[1])
             return
-        estimator = TokenEstimator()
-        history_tokens = sum(estimator.estimate(m.content) for m in state.history)
-        system_tokens = estimator.estimate(state.current_system_prompt or "")
-        total_estimated = history_tokens + system_tokens
-        ctx_limit = get_model_context_limit(state.config.model_name)
-        soft = state.config.compaction_soft_limit
-        hard = state.config.compaction_hard_limit
-        pct = round(total_estimated / ctx_limit * 100, 1) if ctx_limit else 0.0
-
-        table = Table(title="Context Usage")
-        table.add_column("Field")
-        table.add_column("Value", justify="right")
-        table.add_row("Provider", state.config.provider)
-        table.add_row("Model", state.config.model_name)
-        table.add_row("Context window", f"{ctx_limit:,} tokens")
-        table.add_row("System prompt (est.)", f"{system_tokens:,} tokens")
-        table.add_row("History (est.)", f"{history_tokens:,} tokens")
-        table.add_row("Total used (est.)", f"{total_estimated:,} tokens  ({pct}%)")
-        table.add_row("Compaction soft limit", f"{soft:,} tokens  ({round(soft/ctx_limit*100,1)}%)")
-        table.add_row("Compaction hard limit", f"{hard:,} tokens  ({round(hard/ctx_limit*100,1)}%)")
-        state.console.print(table)
+        _print_supervisor_context_usage(state)
         return
 
     if subcommand == "agents":
@@ -875,6 +1016,75 @@ async def handle_context(state: ReplState, args: list[str]) -> None:
 
     # Default: show system prompt
     state.console.print(state.current_system_prompt or "Context not built yet.")
+
+
+def _print_supervisor_context_usage(state: ReplState) -> None:
+    estimator = TokenEstimator()
+    history_tokens = sum(estimator.estimate(m.content) for m in state.history)
+    system_tokens = estimator.estimate(state.current_system_prompt or "")
+    definition_tokens = _supervisor_definition_token_breakdown(state, estimator)
+    schema_tokens = (
+        definition_tokens["tool_schemas"]
+        + definition_tokens["subagent_schemas"]
+        + definition_tokens["mcp_schemas"]
+    )
+    total_estimated = history_tokens + system_tokens + schema_tokens
+    ctx_limit = get_model_context_limit(state.config.model_name)
+    soft = state.config.compaction_soft_limit
+    hard = state.config.compaction_hard_limit
+    pct = round(total_estimated / ctx_limit * 100, 1) if ctx_limit else 0.0
+
+    table = Table(title="Context Usage: supervisor")
+    table.add_column("Field")
+    table.add_column("Value", justify="right")
+    table.add_row("Provider", state.config.provider)
+    table.add_row("Model", state.config.model_name)
+    table.add_row("Context window", f"{ctx_limit:,} tokens")
+    table.add_row("System prompt (est.)", f"{system_tokens:,} tokens")
+    table.add_row("History (est.)", f"{history_tokens:,} tokens")
+    table.add_row("Tool schemas (est.)", f"{definition_tokens['tool_schemas']:,} tokens")
+    table.add_row("Sub-agent schemas (est.)", f"{definition_tokens['subagent_schemas']:,} tokens")
+    table.add_row("MCP schemas (est.)", f"{definition_tokens['mcp_schemas']:,} tokens")
+    table.add_row("Active skills prompt (est.)", f"{definition_tokens['skills_prompt']:,} tokens")
+    table.add_row("MCP prompt guidance (est.)", f"{definition_tokens['mcp_prompt']:,} tokens")
+    table.add_row("Total used incl. schemas (est.)", f"{total_estimated:,} tokens  ({pct}%)")
+    table.add_row("Compaction soft limit", f"{soft:,} tokens  ({round(soft/ctx_limit*100,1)}%)")
+    table.add_row("Compaction hard limit", f"{hard:,} tokens  ({round(hard/ctx_limit*100,1)}%)")
+    state.console.print(table)
+
+
+def _supervisor_definition_token_breakdown(state: ReplState, estimator: TokenEstimator) -> dict[str, int]:
+    from nexus.tools.base import tool_to_schema
+
+    available = supervisor_tool_names(state.config, state.tool_registry)
+    buckets = {
+        "tool_schemas": 0,
+        "subagent_schemas": 0,
+        "mcp_schemas": 0,
+        "skills_prompt": 0,
+        "mcp_prompt": 0,
+    }
+    for record in state.tool_registry.records():
+        if record.name not in available:
+            continue
+        schema_text = json.dumps(tool_to_schema(record.tool), sort_keys=True)
+        if record.source == "mcp":
+            buckets["mcp_schemas"] += estimator.estimate(schema_text)
+        elif record.name.startswith("subagent_"):
+            buckets["subagent_schemas"] += estimator.estimate(schema_text)
+        else:
+            buckets["tool_schemas"] += estimator.estimate(schema_text)
+
+    if state.skill_registry.all():
+        active = set(supervisor_skill_names(state.config, state.active_skills))
+        buckets["skills_prompt"] = estimator.estimate(state.skill_registry.summary(active=active))
+
+    prompt = state.current_system_prompt or ""
+    marker = "## MCP Tool Contract"
+    if marker in prompt:
+        mcp_section = prompt.split(marker, 1)[1].split("\n\n## ", 1)[0]
+        buckets["mcp_prompt"] = estimator.estimate(marker + mcp_section)
+    return buckets
 
 
 async def handle_history(state: ReplState, args: list[str]) -> None:
@@ -1338,6 +1548,7 @@ def _effective_subagent_tools(state: ReplState, record) -> list[str]:
         state.tool_registry,
         getattr(definition, "name", record.name),
         base_allowed_tools=getattr(definition, "allowed_tools", None),
+        base_allowed_mcps=getattr(definition, "allowed_mcps", ()),
     )
     return sorted(names)
 
@@ -1348,6 +1559,7 @@ def _effective_subagent_skills(state: ReplState, record) -> list[str]:
         state.config,
         getattr(definition, "name", record.name),
         state.active_skills,
+        base_allowed_skills=getattr(definition, "allowed_skills", ()),
     )
 
 
@@ -1706,7 +1918,7 @@ def _reload_tools(state: ReplState) -> int:
     from nexus.tools.registry import register_core_tools, tool_enabled
 
     cfg = state.config
-    rebuilt_sources = {"core", "agent", "agent-skill"}
+    rebuilt_sources = {"core", "agent", "agent-skill", "agent-yaml"}
     preserved_records = [
         record
         for record in state.tool_registry.records()
@@ -1729,6 +1941,10 @@ def _reload_tools(state: ReplState) -> int:
         state.tool_registry,
         cfg,
         state.skill_registry,
+    )
+    register_yaml_subagent_tools(
+        state.tool_registry,
+        cfg,
     )
     return len(state.tool_registry.records())
 

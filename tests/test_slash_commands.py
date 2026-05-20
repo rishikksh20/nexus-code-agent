@@ -1229,6 +1229,60 @@ async def test_skills_reload_registers_skill_backed_subagent_tools(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_sub_agent_agents_reload_registers_and_updates_yaml_tools(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = load_config(
+        workspace,
+        global_root=tmp_path / "global",
+        cli_overrides={"agent_mode": "advanced"},
+    )
+    agents_dir = workspace / ".nexus" / "agents"
+    agents_dir.mkdir(parents=True)
+    yaml_path = agents_dir / "summarizer.yml"
+    yaml_path.write_text(
+        "name: summarizer\n"
+        "description: First summary agent.\n"
+        "goal_prompt: Summarize briefly.\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("yaml-agent-reload"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    router = build_router()
+    handled = await router.dispatch(state, "/sub-agent agents reload")
+
+    assert handled is True
+    assert state.tool_registry.record("subagent_summarizer").source == "agent-yaml"
+    assert state.tool_registry.record("subagent_summarizer").tool.description == "First summary agent."
+
+    yaml_path.write_text(
+        "name: summarizer\n"
+        "description: Updated summary agent.\n"
+        "goal_prompt: Summarize carefully.\n"
+        "max_turns: 9\n",
+        encoding="utf-8",
+    )
+    handled = await router.dispatch(state, "/sub-agent agents reload")
+
+    assert handled is True
+    record = state.tool_registry.record("subagent_summarizer")
+    assert record.source == "agent-yaml"
+    assert record.tool.description == "Updated summary agent."
+    assert record.tool._definition.max_turns == 9
+
+
+@pytest.mark.asyncio
 async def test_context_usage_command_shows_table(tmp_path):
     state, console = _make_state(tmp_path)
     router = build_router()
@@ -1238,6 +1292,10 @@ async def test_context_usage_command_shows_table(tmp_path):
     output = console.export_text()
     assert "Context Usage" in output
     assert "Context window" in output
+    assert "Tool schemas" in output
+    assert "Sub-agent schemas" in output
+    assert "MCP schemas" in output
+    assert "Active skills prompt" in output
     assert "tokens" in output
 
 

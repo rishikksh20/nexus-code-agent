@@ -9,6 +9,7 @@ from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message, RuntimeResponse, ToolCall, ToolResult
 from nexus.security import ApprovalManager, ApprovalPolicy, ApprovalScope, PermissionChecker, PermissionDecision
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.agent_scope import subagent_skill_names, subagent_tool_names
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition, _record_inner_approval
 from nexus.skills import Skill, SkillRegistry
 from nexus.tools.base import Tool, ToolKind, ToolRegistry
@@ -19,6 +20,7 @@ from nexus.tools.subagents import (
     load_subagent_definitions_from_skills,
     register_skill_subagent_tools,
     register_subagent_tools,
+    register_yaml_subagent_tools,
 )
 
 
@@ -128,6 +130,180 @@ async def test_register_subagent_tools_registers_default_and_specialist_tools():
     assert registry.record("subagent_verification").origin == "verification"
     verification_tools = registry.record("subagent_verification").tool._definition.allowed_tools
     assert "bash" in verification_tools
+
+
+def test_yaml_subagents_are_discovered_with_local_precedence(tmp_path):
+    from nexus.config import load_config
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    config = load_config(
+        workspace,
+        global_root=global_root,
+        cli_overrides={"agent_mode": "advanced"},
+    )
+    global_agents = global_root / "agents"
+    local_agents = workspace / ".nexus" / "agents"
+    global_agents.mkdir(parents=True)
+    local_agents.mkdir(parents=True)
+    (global_agents / "reviewer.yml").write_text(
+        "name: reviewer\n"
+        "description: Global reviewer.\n"
+        "goal_prompt: Check globally.\n"
+        "allowed_tools: [get_time]\n"
+        "max_turns: 3\n"
+        "timeout_seconds: 30\n",
+        encoding="utf-8",
+    )
+    (local_agents / "reviewer.yml").write_text(
+        "name: reviewer\n"
+        "description: Local reviewer.\n"
+        "goal_prompt: Check locally.\n"
+        "allowed_tools: [get_time]\n"
+        "max_turns: 4\n"
+        "timeout_seconds: 40\n",
+        encoding="utf-8",
+    )
+
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    count = register_subagent_tools(registry, config)
+
+    assert count == 5
+    record = registry.record("subagent_reviewer")
+    assert record.source == "agent-yaml"
+    assert record.origin == "reviewer"
+    assert record.tool.description == "Local reviewer."
+    assert record.tool._definition.max_turns == 4
+
+
+def test_yaml_subagent_reload_replaces_existing_definition(tmp_path):
+    from nexus.config import load_config
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = load_config(
+        workspace,
+        global_root=tmp_path / "global",
+        cli_overrides={"agent_mode": "advanced"},
+    )
+    agents = workspace / ".nexus" / "agents"
+    agents.mkdir(parents=True)
+    path = agents / "summarizer.yml"
+    path.write_text(
+        "name: summarizer\n"
+        "description: First description.\n"
+        "goal_prompt: Summarize briefly.\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    assert register_yaml_subagent_tools(registry, config) == 1
+
+    path.write_text(
+        "name: summarizer\n"
+        "description: Updated description.\n"
+        "goal_prompt: Summarize carefully.\n"
+        "max_turns: 7\n",
+        encoding="utf-8",
+    )
+    assert register_yaml_subagent_tools(registry, config, replace_existing=True) == 1
+
+    record = registry.record("subagent_summarizer")
+    assert record.source == "agent-yaml"
+    assert record.tool.description == "Updated description."
+    assert record.tool._definition.max_turns == 7
+
+
+def test_yaml_subagent_allowed_skills_and_mcps_default_to_active_scope(tmp_path):
+    from nexus.config import load_config
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = load_config(
+        workspace,
+        global_root=tmp_path / "global",
+        cli_overrides={"agent_mode": "advanced"},
+    )
+    agents = workspace / ".nexus" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "research.yml").write_text(
+        "name: research\n"
+        "description: Research with tools, skills, and MCPs.\n"
+        "goal_prompt: Research the task.\n"
+        "allowed_tools: [get_time]\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    mcp_tool = GetTimeTool()
+    mcp_tool.name = "fs_time"
+    registry.register(mcp_tool, source="mcp", origin="filesystem")
+    register_yaml_subagent_tools(registry, config)
+
+    definition = registry.record("subagent_research").tool._definition
+    assert definition.allowed_skills is None
+    assert definition.allowed_mcps is None
+    assert subagent_tool_names(
+        config,
+        registry,
+        definition.name,
+        base_allowed_tools=definition.allowed_tools,
+        base_allowed_mcps=definition.allowed_mcps,
+    ) == {"get_time", "fs_time"}
+    assert subagent_skill_names(
+        config,
+        definition.name,
+        ["python-code-review", "nexus-agent"],
+        base_allowed_skills=definition.allowed_skills,
+    ) == ["python-code-review", "nexus-agent"]
+
+
+def test_yaml_subagent_can_restrict_allowed_skills_and_mcps(tmp_path):
+    from nexus.config import load_config
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = load_config(
+        workspace,
+        global_root=tmp_path / "global",
+        cli_overrides={"agent_mode": "advanced"},
+    )
+    agents = workspace / ".nexus" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "research.yml").write_text(
+        "name: research\n"
+        "description: Research with restricted resources.\n"
+        "goal_prompt: Research the task.\n"
+        "allowed_tools: [get_time]\n"
+        "allowed_skills: [python-code-review]\n"
+        "allowed_mcps: [filesystem]\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    mcp_tool = GetTimeTool()
+    mcp_tool.name = "fs_time"
+    registry.register(mcp_tool, source="mcp", origin="filesystem")
+    register_yaml_subagent_tools(registry, config)
+
+    definition = registry.record("subagent_research").tool._definition
+    assert definition.allowed_skills == ["python-code-review"]
+    assert definition.allowed_mcps == ["filesystem"]
+    assert subagent_tool_names(
+        config,
+        registry,
+        definition.name,
+        base_allowed_tools=definition.allowed_tools,
+        base_allowed_mcps=definition.allowed_mcps,
+    ) == {"get_time", "fs_time"}
+    assert subagent_skill_names(
+        config,
+        definition.name,
+        ["python-code-review", "nexus-agent"],
+        base_allowed_skills=definition.allowed_skills,
+    ) == ["python-code-review"]
 
 
 @pytest.mark.asyncio

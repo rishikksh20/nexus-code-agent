@@ -41,6 +41,10 @@ class SubagentDefinition:
         System prompt / goal injected into the cognitive sub-agent.
     allowed_tools:
         Restrict which normal tools the sub-agent may use. ``None`` = all.
+    allowed_skills:
+        Restrict which active skills are exposed as metadata. ``None`` = all.
+    allowed_mcps:
+        Restrict which active MCP servers' tools are exposed. ``None`` = all.
     max_turns:
         Maximum number of agent turns for the sub-agent.
     timeout_seconds:
@@ -51,6 +55,8 @@ class SubagentDefinition:
     description: str
     goal_prompt: str
     allowed_tools: list[str] | None = None
+    allowed_skills: list[str] | None = field(default_factory=list)
+    allowed_mcps: list[str] | None = field(default_factory=list)
     max_turns: int = 20
     timeout_seconds: float = 600.0
 
@@ -177,6 +183,7 @@ class SubAgentTool:
             self._base_tool_registry,
             self._definition.name if self._definition else "delegate",
             base_allowed_tools=self._definition.allowed_tools if self._definition else None,
+            base_allowed_mcps=self._definition.allowed_mcps if self._definition else None,
             caller_allowed_tools=caller_allowed_tools,
         )
         for record in self._base_tool_registry.records():
@@ -193,6 +200,7 @@ class SubAgentTool:
             scoped_config,
             self._definition.name if self._definition else "delegate",
             outer_context.metadata.get("global_active_skills", outer_context.metadata.get("active_skills", [])),
+            base_allowed_skills=self._definition.allowed_skills if self._definition else None,
         )
         attached_skill_metadata = render_skill_metadata(
             outer_context.metadata.get("skill_catalog", {}),

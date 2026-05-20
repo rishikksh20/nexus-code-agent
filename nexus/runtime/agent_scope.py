@@ -159,7 +159,13 @@ def supervisor_skill_names(config: Any, active_skills: Iterable[str]) -> list[st
     return [name for name in _ordered_unique([*base, *attached]) if name not in detached]
 
 
-def subagent_skill_names(config: Any, name: str, active_skills: Iterable[str]) -> list[str]:
+def subagent_skill_names(
+    config: Any,
+    name: str,
+    active_skills: Iterable[str],
+    *,
+    base_allowed_skills: Iterable[str] | None | object = (),
+) -> list[str]:
     profile = subagent_profile(config, name)
     active = _ordered_unique(active_skills)
     active_set = set(active)
@@ -169,6 +175,11 @@ def subagent_skill_names(config: Any, name: str, active_skills: Iterable[str]) -
     detached = set(clean_string_list(profile.get("detached_skills", [])))
     if is_all_scope(configured_scope):
         configured = active
+    elif not configured and not attached:
+        if base_allowed_skills is None:
+            configured = active
+        elif base_allowed_skills != ():
+            configured = [name for name in clean_string_list(list(base_allowed_skills)) if name in active_set]
     return [name for name in _ordered_unique([*configured, *attached]) if name not in detached]
 
 
@@ -178,14 +189,10 @@ def subagent_tool_names(
     name: str,
     *,
     base_allowed_tools: Iterable[str] | None,
+    base_allowed_mcps: Iterable[str] | None | object = (),
     caller_allowed_tools: Iterable[str] | None = None,
 ) -> set[str]:
     profile = subagent_profile(config, name)
-    candidate_names = {
-        record.name
-        for record in registry.records()
-        if not record.name.startswith("subagent_") and record.name != "delegate_task"
-    }
     normal_candidate_names = {
         record.name
         for record in registry.records()
@@ -202,17 +209,19 @@ def subagent_tool_names(
     elif configured_tools:
         allowed = set(configured_tools) & normal_candidate_names
     elif base_allowed_tools is None:
-        allowed = set(candidate_names)
+        allowed = set(normal_candidate_names)
     else:
-        allowed = set(clean_string_list(list(base_allowed_tools))) & candidate_names
+        allowed = set(clean_string_list(list(base_allowed_tools))) & normal_candidate_names
 
     normalized_name = normalize_subagent_name(name)
     if is_all_scope(configured_mcp_scope):
         allowed |= all_mcp_tool_names(registry)
     elif configured_mcp:
         allowed |= mcp_tool_names_for_servers(registry, configured_mcp)
-    elif normalized_name in BUILTIN_SUBAGENT_NAMES:
+    elif base_allowed_mcps is None or normalized_name in BUILTIN_SUBAGENT_NAMES:
         allowed |= all_mcp_tool_names(registry)
+    elif base_allowed_mcps != ():
+        allowed |= mcp_tool_names_for_servers(registry, clean_string_list(list(base_allowed_mcps)))
 
     allowed |= set(clean_string_list(profile.get("attached_tools", []))) & normal_candidate_names
     attached_mcp = clean_string_list(profile.get("attached_mcps", [])) or clean_string_list(profile.get("attached_mcp_servers", []))
