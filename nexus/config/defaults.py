@@ -46,6 +46,9 @@ class AgentConfig:
     disabled_mcp_servers: list[str] = field(default_factory=list)
     enabled_skills: list[str] = field(default_factory=list)
     disabled_skills: list[str] = field(default_factory=list)
+    agent_allowed_tools: list[str] = field(default_factory=list)
+    agent_allowed_skills: list[str] = field(default_factory=list)
+    agent_allowed_mcp_servers: list[str] = field(default_factory=list)
     approval_policy: str = "on-request"
     allow_hidden_paths: bool = False
     developer_instructions: str = ""
@@ -55,6 +58,7 @@ class AgentConfig:
     context_prune_minimum_tokens: int = 20_000
     agent_mode: str = "basic"
     delegation_subagents: list[dict[str, Any]] = field(default_factory=list)
+    subagent_profiles: list[dict[str, Any]] = field(default_factory=list)
     sandbox_commands: bool = False
     sandbox_image: str = "nexus-sandbox:latest"
     sandbox_timeout_seconds: int = 30
@@ -67,6 +71,7 @@ class AgentConfig:
     local_root: Path = field(default_factory=Path)
     global_config_file: Path = field(default_factory=Path)
     local_config_file: Path = field(default_factory=Path)
+    config_warnings: list[str] = field(default_factory=list)
 
 
 def build_default_config(workspace_root: Path, global_root: Path | None = None) -> AgentConfig:

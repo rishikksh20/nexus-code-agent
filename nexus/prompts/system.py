@@ -185,30 +185,41 @@ def _subagent_guidance_lines(records) -> list[str]:
         "",
         "## Cognitive Sub-Agent Contract",
         "",
-        "- Do not do substantial repo research or coding directly as supervisor; delegate that work through the appropriate `subagent_*` tool.",
-        "- In advanced mode, the supervisor's executable tools are the cognitive `subagent_*` tools; normal workspace tools are reserved for sub-agents.",
-        "- Do not call normal read/write/shell tools directly as supervisor. Call the matching specialist and integrate its structured result.",
-        "- For implementation requests, prefer `subagent_planning_analysis` first, then `subagent_execution`; use `subagent_verification` and `subagent_review` after changes when available.",
+        "- Default to delegation: when a task needs repo inspection, code edits, tests, shell commands, MCP calls, or skill-specific work, call the appropriate `subagent_*` tool instead of doing the work directly as supervisor.",
+        "- Direct normal tool use is only for tiny supervisor-local checks, slash/config/status work, one-off lookups, or recovery after a sub-agent cannot proceed.",
+        "- If both a normal tool and a sub-agent could handle the same substantive work, choose the sub-agent first and integrate its structured result.",
+        "- Routing: use `subagent_planning_analysis` for exploration/planning; `subagent_execution` for edits or implementation; `subagent_verification` for tests/lint/typecheck/runtime validation; `subagent_review` for bug/regression review.",
+        "- For implementation requests, prefer `subagent_planning_analysis` first when context is unclear, then `subagent_execution`; use `subagent_verification` and `subagent_review` after changes when available.",
+        "- If active skill metadata is relevant, mention the skill name and expected workflow in the sub-agent instructions; do not expand hidden skill bodies yourself.",
         "- You are the only agent that talks to the user; sub-agents return findings, blockers, and clarification requests to you.",
         "- Treat sub-agent local conversation and tool history as isolated private context.",
         "- Share context with sub-agents only through focused `instructions` and relevant `input_packet_ids`; do not copy the full conversation.",
+        "- Keep each delegation bounded: include the role, exact files/symbols if known, constraints, expected output, and stop condition.",
         "- Prefer packet ids over pasted summaries when packet ids are available in context.",
         "- A sub-agent result is a JSON envelope with `status`, `agent`, `task_id`, `summary`, `raw_result`, `context`, and `recommended_next_action`.",
         "- If a sub-agent reports `status: needs_clarification`, ask the user yourself and then resume the appropriate workflow.",
         "",
         "Sub-agent input shape:",
         '```json',
-        '{"title": "Short task title", "instructions": "Role-specific objective, constraints, expected output, and stop condition", "input_packet_ids": ["packet-..."], "allowed_tools": ["optional", "override"]}',
+        '{"title": "Short task title", "instructions": "Role-specific objective, constraints, expected output, and stop condition", "input_packet_ids": ["packet-..."]}',
         '```',
         "",
         "Available cognitive tools:",
     ]
     for record in subagents:
         tool = record.tool
-        allowed_tools = getattr(getattr(tool, "_definition", None), "allowed_tools", None)
+        definition = getattr(tool, "_definition", None)
+        allowed_tools = getattr(definition, "allowed_tools", None)
+        allowed_skills = getattr(definition, "allowed_skills", ())
+        allowed_mcps = getattr(definition, "allowed_mcps", ())
         allowed_text = ", ".join(allowed_tools) if allowed_tools else "task-scoped registry"
+        skills_text = ", ".join(allowed_skills) if allowed_skills else "active skill scope"
+        mcps_text = ", ".join(allowed_mcps) if allowed_mcps else "active MCP scope"
         origin = f" ({record.origin})" if record.origin else ""
-        lines.append(f"- `{record.name}`{origin}: {tool.description} Allowed tools: {allowed_text}.")
+        lines.append(
+            f"- `{record.name}`{origin}: {tool.description} "
+            f"Allowed tools: {allowed_text}. Skills: {skills_text}. MCPs: {mcps_text}."
+        )
     return lines
 
 

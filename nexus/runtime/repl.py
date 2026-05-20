@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import readline  # noqa: F401 - activates arrow-key / history line editing for input()
 from os import environ
 from uuid import uuid4
@@ -83,6 +84,7 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
         if not resumed_paused_turn:
             state.approval_manager.begin_turn()
         try:
+            state.begin_running_turn()
             events = await run_orchestrated_turn(
                 state,
                 agent,
@@ -90,12 +92,18 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
                 ui=ui,
                 approval_callback=approval_callback,
             )
+        except asyncio.CancelledError:
+            ui.print_warning("Turn aborted.")
+            state.history.pop()
+            continue
         except Exception as exc:  # noqa: BLE001
             from nexus.app import provider_error_message
 
             ui.print_error(provider_error_message(exc, state.config))
             state.history.pop()
             continue
+        finally:
+            state.clear_running_turn()
         state.apply_events(events)
         state.current_turn_id = ""
         state.current_trace_id = ""
@@ -194,7 +202,10 @@ def _maybe_prompt_config_upgrade(state: ReplState) -> None:
         global_root=cfg.global_root,
         local_config_path=cfg.local_config_file,
         global_config_path=cfg.global_config_file,
+        strict=False,
     )
+    for warning in getattr(state.config, "config_warnings", []) or []:
+        state.console.print_warning(warning)
     state.console.print("[green]Workspace config upgraded and reloaded.[/green]")
 
 

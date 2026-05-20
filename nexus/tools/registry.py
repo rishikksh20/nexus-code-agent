@@ -38,7 +38,10 @@ def tool_enabled(config, tool_name: str) -> bool:
     """Return True when *tool_name* is permitted by the active config."""
     allowed_tools = getattr(config, "allowed_tools", [])
     denied_tools = getattr(config, "denied_tools", [])
-    if allowed_tools and tool_name not in allowed_tools:
+    allowed = [allowed_tools] if isinstance(allowed_tools, str) else list(allowed_tools or [])
+    if any(str(item).strip().lower() == "all" for item in allowed):
+        return tool_name not in denied_tools
+    if allowed and tool_name not in allowed:
         return False
     return tool_name not in denied_tools
 

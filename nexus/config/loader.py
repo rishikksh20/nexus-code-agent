@@ -8,6 +8,7 @@ from typing import Any
 
 from nexus.config.defaults import AgentConfig, build_default_config, config_to_plain_dict
 from nexus.config.upgrade import normalize_legacy_config_values
+from nexus.runtime.agent_scope import SUBAGENT_PROFILE_FIELDS, SUPERVISOR_SCOPE_FIELDS
 
 
 PATH_FIELDS = {
@@ -37,6 +38,35 @@ def load_config(
     cli_overrides: dict[str, Any] | None = None,
     local_config_path: Path | None = None,
     global_config_path: Path | None = None,
+    strict: bool = True,
+) -> AgentConfig:
+    try:
+        return _load_config_strict(
+            workspace_root,
+            global_root=global_root,
+            cli_overrides=cli_overrides,
+            local_config_path=local_config_path,
+            global_config_path=global_config_path,
+        )
+    except Exception as exc:
+        if strict:
+            raise
+        defaults = build_default_config(workspace_root, global_root=global_root)
+        defaults.global_config_file = (global_config_path or defaults.global_config_file).expanduser()
+        defaults.local_config_file = local_config_path or defaults.local_config_file
+        defaults.config_warnings.append(
+            f"Config could not be loaded; using defaults for this run: {exc}"
+        )
+        return defaults
+
+
+def _load_config_strict(
+    workspace_root: Path,
+    *,
+    global_root: Path | None = None,
+    cli_overrides: dict[str, Any] | None = None,
+    local_config_path: Path | None = None,
+    global_config_path: Path | None = None,
 ) -> AgentConfig:
     # Load .env from the workspace root first so its values are visible to
     # all subsequent os.environ reads (including resolve_provider_api_key).
@@ -54,6 +84,9 @@ def load_config(
     global_values = _read_toml(global_path)
     local_values = _read_toml(local_path)
     cli_values = cli_overrides or {}
+    global_values = _normalize_config_layout(global_values)
+    local_values = _normalize_config_layout(local_values)
+    cli_values = _normalize_config_layout(cli_values)
     global_values = normalize_legacy_config_values(global_values)
     local_values = normalize_legacy_config_values(local_values)
     cli_values = normalize_legacy_config_values(cli_values)
@@ -126,7 +159,7 @@ def _active_mcp_servers(
     enabled_names: Any,
     disabled_names: Any,
 ) -> list[dict[str, Any]]:
-    enabled = {str(name).strip() for name in enabled_names if str(name).strip()} if isinstance(enabled_names, list) else set()
+    enabled = _normalized_name_list(enabled_names)
     disabled = {str(name).strip() for name in disabled_names if str(name).strip()} if isinstance(disabled_names, list) else set()
 
     global_by_name = {
@@ -140,16 +173,30 @@ def _active_mcp_servers(
         if (name := _mcp_server_name(entry))
     }
 
-    active: dict[str, dict[str, Any]] = {}
+    active: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for name in enabled:
+        if name in disabled or name in seen:
+            continue
         entry = local_by_name.get(name) or global_by_name.get(name)
         if entry is not None:
-            active[name] = dict(entry)
-    for name, entry in local_by_name.items():
-        active.setdefault(name, dict(entry))
-    for name in disabled:
-        active.pop(name, None)
-    return list(active.values())
+            active.append(dict(entry))
+            seen.add(name)
+    return active
+
+
+def _normalized_name_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        name = str(item).strip()
+        if not name or name in seen:
+            continue
+        names.append(name)
+        seen.add(name)
+    return names
 
 
 def _inject_dotenv(path: Path) -> None:
@@ -196,9 +243,102 @@ def ensure_config_dirs(config: AgentConfig) -> None:
 def _read_toml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    with path.open("rb") as handle:
-        data = tomllib.load(handle)
-    return {key: value for key, value in data.items() if not isinstance(value, dict)}
+    content = path.read_text(encoding="utf-8")
+    data = tomllib.loads(_normalize_bare_all_assignments(content))
+    return dict(data)
+
+
+def _normalize_bare_all_assignments(content: str) -> str:
+    """Accept the user-friendly ``key = all`` shorthand for scope lists."""
+    lines: list[str] = []
+    for line in content.splitlines():
+        before_hash, hash_mark, after_hash = line.partition("#")
+        key, equals, value = before_hash.partition("=")
+        if equals and value.strip().lower() == "all":
+            line = f'{key}{equals} "all"'
+            if hash_mark:
+                line = f"{line} {hash_mark}{after_hash}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _normalize_config_layout(values: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(values)
+    agents = normalized.pop("agents", None)
+    if isinstance(agents, dict):
+        _merge_agent_section(normalized, agents)
+
+    subagent_entries: list[dict[str, Any]] = []
+    legacy_profiles = normalized.get("subagent_profiles")
+    if isinstance(legacy_profiles, list):
+        subagent_entries.extend(_normalize_subagent_profile_aliases(dict(entry)) for entry in legacy_profiles if isinstance(entry, dict))
+
+    for key in ("sub-agents", "sub_agents", "subagents"):
+        raw = normalized.pop(key, None)
+        subagent_entries.extend(_subagent_entries_from_section(raw))
+    if subagent_entries:
+        normalized["subagent_profiles"] = subagent_entries
+    return normalized
+
+
+def _merge_agent_section(target: dict[str, Any], agents: dict[str, Any]) -> None:
+    key_map = {
+        "allowed_tools": "agent_allowed_tools",
+        "allowed_skills": "agent_allowed_skills",
+        "allowed_mcp_servers": "agent_allowed_mcp_servers",
+        "allowed_mcps": "agent_allowed_mcp_servers",
+    }
+    for source, destination in key_map.items():
+        if source in agents:
+            target[destination] = agents[source]
+
+
+def _subagent_entries_from_section(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, list):
+        return [_normalize_subagent_profile_aliases(dict(entry)) for entry in raw if isinstance(entry, dict)]
+    if not isinstance(raw, dict):
+        return []
+    entries: list[dict[str, Any]] = []
+    if "name" in raw:
+        entries.append(dict(raw))
+    for name, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        entry = dict(value)
+        entry.setdefault("name", str(name))
+        entries.append(entry)
+    return [_normalize_subagent_profile_aliases(entry) for entry in entries]
+
+
+def _normalize_subagent_profile_aliases(entry: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(entry)
+    alias_map = {
+        "allowed_mcps": "allowed_mcp_servers",
+    }
+    for alias, canonical in alias_map.items():
+        if alias in normalized and canonical not in normalized:
+            normalized[canonical] = normalized[alias]
+    for obsolete in (
+        "attached_tools",
+        "detached_tools",
+        "attached_skills",
+        "detached_skills",
+        "attached_mcps",
+        "attached_mcp_servers",
+        "detached_mcps",
+        "detached_mcp_servers",
+    ):
+        normalized.pop(obsolete, None)
+    for field_name in SUBAGENT_PROFILE_FIELDS:
+        if field_name in normalized:
+            normalized[field_name] = _coerce_scope_list_value(normalized[field_name])
+    return normalized
+
+
+def _coerce_scope_list_value(value: Any) -> Any:
+    if isinstance(value, str) and value.strip().lower() == "all":
+        return ["all"]
+    return value
 
 
 def _read_environment(defaults: AgentConfig) -> dict[str, Any]:
@@ -266,6 +406,8 @@ def _coerce_value(value: Any, template: Any) -> Any:
         if isinstance(value, list):
             return list(value)
         if isinstance(value, str):
+            if value.strip().lower() == "all":
+                return ["all"]
             return [part.strip() for part in value.split(",") if part.strip()]
         return []
     return value
@@ -418,11 +560,31 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     if overlap:
         raise ConfigError("allowed_tools and denied_tools must not overlap: " + ", ".join(overlap))
 
-    for field_name in ("enabled_skills", "disabled_skills"):
+    for field_name in ("enabled_skills", "disabled_skills", *SUPERVISOR_SCOPE_FIELDS):
         if not isinstance(values[field_name], list):
-            raise ConfigError(f"{field_name} must be a list of skill names or patterns.")
+            raise ConfigError(f"{field_name} must be a list of names or patterns.")
         if any(not str(item).strip() for item in values[field_name]):
             raise ConfigError(f"{field_name} must only contain non-empty strings.")
+
+    subagent_profiles = values["subagent_profiles"]
+    if not isinstance(subagent_profiles, list):
+        raise ConfigError("subagent_profiles must be a list of sub-agent scope definitions.")
+    profile_names: set[str] = set()
+    for entry in subagent_profiles:
+        if not isinstance(entry, dict):
+            raise ConfigError("Each subagent_profiles entry must be a table.")
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            raise ConfigError("Each subagent_profiles entry must define a non-empty name.")
+        if name in profile_names:
+            raise ConfigError(f"Duplicate subagent_profiles entry '{name}'.")
+        profile_names.add(name)
+        for field_name in SUBAGENT_PROFILE_FIELDS:
+            value = entry.get(field_name, [])
+            if value is not None and not isinstance(value, list):
+                raise ConfigError(f"subagent_profiles entry '{name}' {field_name} must be a list.")
+            if isinstance(value, list) and any(not str(item).strip() for item in value):
+                raise ConfigError(f"subagent_profiles entry '{name}' {field_name} must only contain non-empty strings.")
 
     server_names: set[str] = set()
     for entry in mcp_servers:

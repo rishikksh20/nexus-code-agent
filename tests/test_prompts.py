@@ -54,7 +54,9 @@ def test_build_context_describes_cognitive_subagent_contract(tmp_path):
     assert '"input_packet_ids"' in sections.base_instruction
     assert "status: needs_clarification" in sections.base_instruction
     assert "local conversation and tool history as isolated private context" in sections.base_instruction
-    assert "Do not do substantial repo research or coding directly" in sections.base_instruction
+    assert "Default to delegation" in sections.base_instruction
+    assert "If both a normal tool and a sub-agent could handle the same substantive work" in sections.base_instruction
+    assert "Routing: use `subagent_planning_analysis`" in sections.base_instruction
 
 
 def test_build_context_includes_current_time_and_working_directory(tmp_path, monkeypatch):
