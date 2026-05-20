@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -117,6 +118,43 @@ for raw_line in sys.stdin:
 """
 
 
+HEADER_REJECTION_SERVER_SCRIPT = """
+import json
+import sys
+import time
+
+while True:
+    raw_line = sys.stdin.buffer.readline()
+    if not raw_line:
+        break
+    if raw_line.startswith(b"Content-Length:"):
+        sys.stderr.write("Invalid JSON: expected value at line 1 column 1 [type=json_invalid, input_value='Content-Length: 180\\n', input_type=str]\\n")
+        sys.stderr.flush()
+        time.sleep(5)
+        continue
+    stripped = raw_line.strip()
+    if not stripped:
+        continue
+    message = json.loads(stripped)
+    method = message.get("method")
+    if "id" not in message:
+        continue
+    request_id = message["id"]
+    if method == "initialize":
+        response = {"jsonrpc": "2.0", "id": request_id, "result": {"capabilities": {"tools": {}}}}
+    elif method == "tools/list":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"tools": [{"name": "echo", "description": "Echo.", "inputSchema": {"type": "object", "properties": {}}}]},
+        }
+    else:
+        response = {"jsonrpc": "2.0", "id": request_id, "result": {"content": []}}
+    sys.stdout.write(json.dumps(response) + "\\n")
+    sys.stdout.flush()
+"""
+
+
 @pytest.mark.asyncio
 async def test_mcp_client_lists_and_calls_tools(tmp_path):
     server_path = tmp_path / "fake_mcp_server.py"
@@ -150,6 +188,30 @@ async def test_mcp_client_falls_back_to_json_lines_stdio(tmp_path):
     try:
         tools = await client.list_tools()
         assert [tool.name for tool in tools] == ["echo"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_short_circuits_header_rejection_from_stderr(tmp_path):
+    server_path = tmp_path / "header_rejection_server.py"
+    server_path.write_text(HEADER_REJECTION_SERVER_SCRIPT, encoding="utf-8")
+
+    client = MCPClient(
+        MCPServerConfig(
+            name="line-hint",
+            command=(sys.executable, str(server_path)),
+            startup_timeout_seconds=1.0,
+        ),
+    )
+
+    started_at = time.monotonic()
+    await client.connect()
+    elapsed = time.monotonic() - started_at
+    try:
+        tools = await client.list_tools()
+        assert [tool.name for tool in tools] == ["echo"]
+        assert elapsed < 0.5
     finally:
         await client.close()
 

@@ -737,7 +737,8 @@ async def test_mcp_deactivate_refreshes_cached_system_prompt(tmp_path, monkeypat
     workspace.mkdir()
     init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
     (workspace / ".nexus" / "config.toml").write_text(
-        'mcp_servers = [{ name = "filesystem", transport = "stdio", command = ["fake-mcp"], prefix = "fs_" }]\n',
+        'mcp_servers = [{ name = "filesystem", transport = "stdio", command = ["fake-mcp"], prefix = "fs_" }]\n'
+        'enabled_mcp_servers = ["filesystem"]\n',
         encoding="utf-8",
     )
     config = load_config(workspace, global_root=tmp_path / "global")
@@ -797,12 +798,13 @@ async def test_mcp_refresh_unknown_server_reports_not_found(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_reload_loads_configured_servers(tmp_path):
+async def test_mcp_reload_loads_enabled_servers(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
     (workspace / ".nexus" / "config.toml").write_text(
-        'mcp_servers = [{ name = "broken", transport = "stdio", command = ["definitely-missing-mcp-server"], prefix = "mcp_broken_" }]\n',
+        'mcp_servers = [{ name = "broken", transport = "stdio", command = ["definitely-missing-mcp-server"], prefix = "mcp_broken_" }]\n'
+        'enabled_mcp_servers = ["broken"]\n',
         encoding="utf-8",
     )
     config = load_config(workspace, global_root=tmp_path / "global")
@@ -827,6 +829,36 @@ async def test_mcp_reload_loads_configured_servers(tmp_path):
     output = console.export_text()
     assert "MCP Reload" in output
     assert "broken" in output
+
+
+@pytest.mark.asyncio
+async def test_mcp_reload_skips_local_servers_that_are_not_enabled(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'mcp_servers = [{ name = "broken", transport = "stdio", command = ["definitely-missing-mcp-server"], prefix = "mcp_broken_" }]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-reload-inactive"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/mcp reload")
+
+    assert handled is True
+    assert state.mcp_servers == []
+    assert all(record.source != "mcp" for record in state.tool_registry.records())
 
 
 @pytest.mark.asyncio

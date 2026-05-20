@@ -159,7 +159,7 @@ def _active_mcp_servers(
     enabled_names: Any,
     disabled_names: Any,
 ) -> list[dict[str, Any]]:
-    enabled = {str(name).strip() for name in enabled_names if str(name).strip()} if isinstance(enabled_names, list) else set()
+    enabled = _normalized_name_list(enabled_names)
     disabled = {str(name).strip() for name in disabled_names if str(name).strip()} if isinstance(disabled_names, list) else set()
 
     global_by_name = {
@@ -173,16 +173,30 @@ def _active_mcp_servers(
         if (name := _mcp_server_name(entry))
     }
 
-    active: dict[str, dict[str, Any]] = {}
+    active: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for name in enabled:
+        if name in disabled or name in seen:
+            continue
         entry = local_by_name.get(name) or global_by_name.get(name)
         if entry is not None:
-            active[name] = dict(entry)
-    for name, entry in local_by_name.items():
-        active.setdefault(name, dict(entry))
-    for name in disabled:
-        active.pop(name, None)
-    return list(active.values())
+            active.append(dict(entry))
+            seen.add(name)
+    return active
+
+
+def _normalized_name_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        name = str(item).strip()
+        if not name or name in seen:
+            continue
+        names.append(name)
+        seen.add(name)
+    return names
 
 
 def _inject_dotenv(path: Path) -> None:

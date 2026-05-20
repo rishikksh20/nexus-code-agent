@@ -511,13 +511,14 @@ def test_config_rejects_invalid_compaction_bounds(tmp_path):
         raise AssertionError("Expected ConfigError for invalid compaction limits")
 
 
-def test_config_accepts_structured_mcp_servers(tmp_path):
+def test_config_activates_enabled_local_mcp_servers(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     global_root = tmp_path / "global"
     init_workspace(workspace, global_root=global_root, project_name="workspace")
     (workspace / ".nexus" / "config.toml").write_text(
-        'mcp_servers = [{ name = "filesystem", command = ["uvx", "mcp-server-filesystem", "."], prefix = "fs_" }]\n',
+        'mcp_servers = [{ name = "filesystem", command = ["uvx", "mcp-server-filesystem", "."], prefix = "fs_" }]\n'
+        'enabled_mcp_servers = ["filesystem"]\n',
         encoding="utf-8",
     )
 
@@ -532,6 +533,21 @@ def test_config_accepts_structured_mcp_servers(tmp_path):
     ]
 
 
+def test_config_keeps_local_mcp_servers_inactive_until_enabled(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'mcp_servers = [{ name = "filesystem", command = ["uvx", "mcp-server-filesystem", "."], prefix = "fs_" }]\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.mcp_servers == []
+
+
 def test_config_accepts_extended_mcp_server_fields(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -542,7 +558,8 @@ def test_config_accepts_extended_mcp_server_fields(tmp_path):
         'name = "filesystem", transport = "stdio", command = ["uvx", "mcp-server-filesystem", "."], '
         'prefix = "fs_", env = { TOKEN = "abc" }, cwd = ".", startup_timeout_seconds = 2.5, '
         'tool_timeout_seconds = 10, disabled = false, disabled_tools = ["write_file"]'
-        " }]\n",
+        " }]\n"
+        'enabled_mcp_servers = ["filesystem"]\n',
         encoding="utf-8",
     )
 
@@ -559,7 +576,8 @@ def test_config_accepts_disabled_mcp_http_server(tmp_path):
     global_root = tmp_path / "global"
     init_workspace(workspace, global_root=global_root, project_name="workspace")
     (workspace / ".nexus" / "config.toml").write_text(
-        'mcp_servers = [{ name = "remote", transport = "streamable_http", url = "http://localhost:3333/mcp", disabled = true }]\n',
+        'mcp_servers = [{ name = "remote", transport = "streamable_http", url = "http://localhost:3333/mcp", disabled = true }]\n'
+        'enabled_mcp_servers = ["remote"]\n',
         encoding="utf-8",
     )
 

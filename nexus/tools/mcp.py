@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -100,6 +102,8 @@ class MCPClient:
         self._request_id = 0
         self._stderr_task: asyncio.Task[None] | None = None
         self._message_framing = "headers"
+        self._framing_rejected: asyncio.Event | None = None
+        self._framing_rejected_detail: str | None = None
 
     async def connect(self) -> None:
         try:
@@ -109,8 +113,9 @@ class MCPClient:
             if self._message_framing == "headers" and (
                 "timed out during initialize" in message
                 or "closed the connection during initialize" in message
+                or "rejected header framing during initialize" in message
             ):
-                await self.close()
+                await self.close(terminate="rejected header framing during initialize" in message)
                 self._message_framing = "lines"
                 await self._connect()
                 return
@@ -129,7 +134,15 @@ class MCPClient:
             env={**os.environ, **(self.server.env or {})},
             cwd=self.server.cwd,
         )
-        self._stderr_task = asyncio.create_task(_drain_stderr(self.server.name, self._process.stderr))
+        self._framing_rejected = asyncio.Event()
+        self._framing_rejected_detail = None
+        self._stderr_task = asyncio.create_task(
+            _drain_stderr(
+                self.server.name,
+                self._process.stderr,
+                on_line=self._handle_stderr_line,
+            )
+        )
         await self._rpc(
             "initialize",
             {
@@ -167,7 +180,7 @@ class MCPClient:
         response = await self._rpc("tools/call", {"name": name, "arguments": arguments}, timeout=self.server.tool_timeout_seconds)
         return _parse_tool_result(response)
 
-    async def close(self) -> None:
+    async def close(self, *, terminate: bool = False) -> None:
         stderr_task = self._stderr_task
         self._stderr_task = None
         if self._process is None:
@@ -176,7 +189,11 @@ class MCPClient:
             return
         process = self._process
         self._process = None
+        self._framing_rejected = None
+        self._framing_rejected_detail = None
         await _close_stream_writer(process.stdin)
+        if terminate:
+            _terminate_process(process)
         try:
             await asyncio.wait_for(process.wait(), timeout=1.0)
         except asyncio.TimeoutError:
@@ -230,11 +247,42 @@ class MCPClient:
     async def _read_response(self, request_id: int, method: str, *, timeout: float) -> dict[str, Any]:
         if self._process is None or self._process.stdout is None:
             raise RuntimeError("MCP client is not connected.")
+        framing_task: asyncio.Task[bool] | None = None
         while True:
+            response_task = asyncio.create_task(_read_jsonrpc_message(self._process.stdout))
+            if self._message_framing == "headers" and self._framing_rejected is not None:
+                framing_task = asyncio.create_task(self._framing_rejected.wait())
             try:
-                response = await asyncio.wait_for(_read_jsonrpc_message(self._process.stdout), timeout=timeout)
+                if framing_task is None:
+                    response = await asyncio.wait_for(response_task, timeout=timeout)
+                else:
+                    done, pending = await asyncio.wait(
+                        {response_task, framing_task},
+                        timeout=timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        raise asyncio.TimeoutError
+                    if framing_task in done:
+                        response_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await response_task
+                        detail = f": {self._framing_rejected_detail}" if self._framing_rejected_detail else ""
+                        raise RuntimeError(
+                            f"MCP server '{self.server.name}' rejected header framing during {method}{detail}"
+                        )
+                    response = response_task.result()
             except asyncio.TimeoutError as exc:
+                response_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await response_task
                 raise RuntimeError(f"MCP server '{self.server.name}' timed out during {method}.") from exc
+            finally:
+                if framing_task is not None:
+                    framing_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await framing_task
+                    framing_task = None
             if response is None:
                 raise RuntimeError(f"MCP server '{self.server.name}' closed the connection during {method}.")
             if response.get("id") != request_id:
@@ -243,6 +291,18 @@ class MCPClient:
                 raise RuntimeError(f"MCP server '{self.server.name}' returned an error: {response['error']}")
             result = response.get("result", {})
             return dict(result) if isinstance(result, dict) else {"result": result}
+
+    def _handle_stderr_line(self, text: str) -> None:
+        if self._message_framing != "headers" or self._framing_rejected is None:
+            return
+        normalized = text.lower()
+        if "content-length" not in normalized:
+            return
+        if "invalid json" not in normalized and "jsonrpcmessage" not in normalized:
+            return
+        if not self._framing_rejected.is_set():
+            self._framing_rejected_detail = text
+            self._framing_rejected.set()
 
 
 def _parse_tool_result(response: dict[str, Any]) -> MCPCallResult:
@@ -289,7 +349,12 @@ async def _read_jsonrpc_message(reader: asyncio.StreamReader) -> dict[str, Any] 
     return json.loads(body.decode("utf-8"))
 
 
-async def _drain_stderr(server_name: str, stream: asyncio.StreamReader | None) -> None:
+async def _drain_stderr(
+    server_name: str,
+    stream: asyncio.StreamReader | None,
+    *,
+    on_line: Callable[[str], None] | None = None,
+) -> None:
     if stream is None:
         return
     import logging
@@ -301,6 +366,8 @@ async def _drain_stderr(server_name: str, stream: asyncio.StreamReader | None) -
             return
         text = line.decode("utf-8", errors="replace").rstrip()
         if text:
+            if on_line is not None:
+                on_line(text)
             logger.debug("[MCP stderr:%s] %s", server_name, text)
 
 
