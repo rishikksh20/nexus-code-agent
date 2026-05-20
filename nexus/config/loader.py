@@ -270,17 +270,9 @@ def _normalize_config_layout(values: dict[str, Any]) -> dict[str, Any]:
 def _merge_agent_section(target: dict[str, Any], agents: dict[str, Any]) -> None:
     key_map = {
         "allowed_tools": "agent_allowed_tools",
-        "attached_tools": "agent_attached_tools",
-        "detached_tools": "agent_detached_tools",
         "allowed_skills": "agent_allowed_skills",
-        "attached_skills": "agent_attached_skills",
-        "detached_skills": "agent_detached_skills",
         "allowed_mcp_servers": "agent_allowed_mcp_servers",
         "allowed_mcps": "agent_allowed_mcp_servers",
-        "attached_mcp_servers": "agent_attached_mcp_servers",
-        "attached_mcps": "agent_attached_mcp_servers",
-        "detached_mcp_servers": "agent_detached_mcp_servers",
-        "detached_mcps": "agent_detached_mcp_servers",
     }
     for source, destination in key_map.items():
         if source in agents:
@@ -308,12 +300,21 @@ def _normalize_subagent_profile_aliases(entry: dict[str, Any]) -> dict[str, Any]
     normalized = dict(entry)
     alias_map = {
         "allowed_mcps": "allowed_mcp_servers",
-        "attached_mcps": "attached_mcp_servers",
-        "detached_mcps": "detached_mcp_servers",
     }
     for alias, canonical in alias_map.items():
         if alias in normalized and canonical not in normalized:
             normalized[canonical] = normalized[alias]
+    for obsolete in (
+        "attached_tools",
+        "detached_tools",
+        "attached_skills",
+        "detached_skills",
+        "attached_mcps",
+        "attached_mcp_servers",
+        "detached_mcps",
+        "detached_mcp_servers",
+    ):
+        normalized.pop(obsolete, None)
     for field_name in SUBAGENT_PROFILE_FIELDS:
         if field_name in normalized:
             normalized[field_name] = _coerce_scope_list_value(normalized[field_name])

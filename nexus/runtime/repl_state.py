@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from nexus.config.defaults import AgentConfig
@@ -51,6 +52,24 @@ class ReplState:
     current_system_prompt: str = ""
     current_system_prompt_task_input: str = ""
     should_exit: bool = False
+    current_turn_task: asyncio.Task | None = None
+    abort_requested: bool = False
+
+    def begin_running_turn(self, task: asyncio.Task | None = None) -> None:
+        self.current_turn_task = task or asyncio.current_task()
+        self.abort_requested = False
+
+    def clear_running_turn(self) -> None:
+        self.current_turn_task = None
+        self.abort_requested = False
+
+    def request_abort_current_turn(self) -> bool:
+        self.abort_requested = True
+        task = self.current_turn_task
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
 
     @property
     def paused_turn_prompt(self) -> str:
@@ -82,9 +101,10 @@ class ReplState:
     def build_system_prompt(self, prompt_text: str) -> str:
         self.current_system_prompt_task_input = prompt_text
         scoped_active_skills = supervisor_skill_names(self.config, self.active_skills)
+        scoped_tool_registry = _supervisor_prompt_tool_registry(self.config, self.tool_registry)
         sections = build_context_sections(
             self.config,
-            self.tool_registry,
+            scoped_tool_registry,
             task_input=prompt_text,
             execution_mode=self.mode.value,
             skill_registry=self.skill_registry,
@@ -167,6 +187,15 @@ class ReplState:
             self.session.summary = first_user
         if self.config.save_on_every_turn:
             self.session_store.save(self.session)
+
+
+def _supervisor_prompt_tool_registry(config: AgentConfig, registry: ToolRegistry) -> ToolRegistry:
+    available = supervisor_tool_names(config, registry)
+    scoped = ToolRegistry()
+    for record in registry.records():
+        if record.name in available:
+            scoped.register(record.tool, source=record.source, origin=record.origin)
+    return scoped
 
 
 def apply_events_to_messages(history: list[Message], events: list[AgentEvent]) -> list:

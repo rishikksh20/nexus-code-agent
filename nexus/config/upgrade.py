@@ -26,15 +26,19 @@ LEGACY_TOOL_NAME_ALIASES: dict[str, tuple[str, ...]] = {
 }
 LEGACY_AGENT_SCOPE_KEYS: dict[str, str] = {
     "agent_allowed_tools": "allowed_tools",
-    "agent_attached_tools": "attached_tools",
-    "agent_detached_tools": "detached_tools",
     "agent_allowed_skills": "allowed_skills",
-    "agent_attached_skills": "attached_skills",
-    "agent_detached_skills": "detached_skills",
     "agent_allowed_mcp_servers": "allowed_mcp_servers",
-    "agent_attached_mcp_servers": "attached_mcp_servers",
-    "agent_detached_mcp_servers": "detached_mcp_servers",
 }
+OBSOLETE_SCOPE_KEYS: frozenset[str] = frozenset(
+    {
+        "agent_attached_tools",
+        "agent_detached_tools",
+        "agent_attached_skills",
+        "agent_detached_skills",
+        "agent_attached_mcp_servers",
+        "agent_detached_mcp_servers",
+    }
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -91,7 +95,7 @@ def upgrade_config_file(path: Path, template_str: str) -> ConfigUpgradeReport:
     content = path.read_text(encoding="utf-8") if path.exists() else ""
     lines = _remove_deprecated_and_version_lines(content.splitlines())
     if _needs_agent_scope_migration(existing):
-        lines = _remove_top_level_assignments(lines, LEGACY_AGENT_SCOPE_KEYS)
+        lines = _remove_top_level_assignments(lines, {*LEGACY_AGENT_SCOPE_KEYS, *OBSOLETE_SCOPE_KEYS})
         lines = _remove_table(lines, "agents")
     if _needs_subagent_scope_migration(existing):
         lines = _remove_top_level_assignments(lines, {"subagent_profiles"})
@@ -244,7 +248,10 @@ def _render_toml_assignment(key: str, value: Any) -> list[str]:
 
 
 def _needs_agent_scope_migration(existing: dict[str, Any]) -> bool:
-    return bool(set(LEGACY_AGENT_SCOPE_KEYS) & set(existing))
+    if (set(LEGACY_AGENT_SCOPE_KEYS) | set(OBSOLETE_SCOPE_KEYS)) & set(existing):
+        return True
+    agents = existing.get("agents")
+    return isinstance(agents, dict) and bool(set(agents) & {key.removeprefix("agent_") for key in OBSOLETE_SCOPE_KEYS})
 
 
 def _needs_subagent_scope_migration(existing: dict[str, Any]) -> bool:
@@ -258,7 +265,13 @@ def _migrated_agent_scope(existing: dict[str, Any], template_agents: Any) -> dic
         migrated = {}
     current = existing.get("agents")
     if isinstance(current, dict):
-        migrated.update(current)
+        migrated.update(
+            {
+                key: value
+                for key, value in current.items()
+                if key in {"allowed_tools", "allowed_skills", "allowed_mcp_servers", "allowed_mcps"}
+            }
+        )
     for old_key, new_key in LEGACY_AGENT_SCOPE_KEYS.items():
         value = existing.get(old_key)
         if old_key not in existing:
@@ -282,10 +295,17 @@ def _subagent_profile_for_new_layout(entry: dict[str, Any]) -> dict[str, Any]:
     migrated = dict(entry)
     if "allowed_mcp_servers" in migrated and "allowed_mcps" not in migrated:
         migrated["allowed_mcps"] = migrated.pop("allowed_mcp_servers")
-    if "attached_mcp_servers" in migrated and "attached_mcps" not in migrated:
-        migrated["attached_mcps"] = migrated.pop("attached_mcp_servers")
-    if "detached_mcp_servers" in migrated and "detached_mcps" not in migrated:
-        migrated["detached_mcps"] = migrated.pop("detached_mcp_servers")
+    for obsolete in (
+        "attached_tools",
+        "detached_tools",
+        "attached_skills",
+        "detached_skills",
+        "attached_mcps",
+        "attached_mcp_servers",
+        "detached_mcps",
+        "detached_mcp_servers",
+    ):
+        migrated.pop(obsolete, None)
     return migrated
 
 

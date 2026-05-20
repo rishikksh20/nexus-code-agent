@@ -61,13 +61,14 @@ tell the user to run `/help` for the full command list.
 - `/memory`: inspect memory commands.
 - `/session`: manage sessions.
 - `/history`: inspect conversation history.
+- `/abort`: abort the currently running agent turn when the UI can accept commands concurrently.
 - `/mcp status`: inspect MCP server state.
 - `/mcp tools <server>`: show tools from an MCP server.
 - `/mcp reload`: reload MCP servers from config.
 - `/agent tools`, `/agent skills`, `/agent mcp`: inspect supervisor-scoped resources.
-- `/agent attach tool|skill|mcp <name>` and `/agent detach tool|skill|mcp <name>`: persist supervisor resource scope.
+- `/agent allow tool|skill|mcp <name>` and `/agent disallow tool|skill|mcp <name>`: persist supervisor allowlists.
 - `/sub-agent list`, `/sub-agent show <name>`, `/sub-agent tools <name>`: inspect cognitive sub-agent resources.
-- `/sub-agent attach <name> tool|skill|mcp <id>` and `/sub-agent detach <name> tool|skill|mcp <id>`: persist sub-agent resource scope.
+- `/sub-agent allow <name> tool|skill|mcp <id>` and `/sub-agent disallow <name> tool|skill|mcp <id>`: persist sub-agent allowlists.
 
 ## Config Pointers
 
@@ -77,8 +78,8 @@ tell the user to run `/help` for the full command list.
 - Skill activation uses `enabled_skills` and `disabled_skills` in workspace config.
 - CLI `--skill <name>` is run-only and does not edit config.
 - MCP server activation is maintained by MCP config; MCP tool names should not be hand-added to `allowed_tools`.
-- `/agent` and `/sub-agent` attach or detach only resources that are already globally active through `/skills` or `/mcp`.
-- Agent-scoped config lives under `[agents]` and `[[sub-agents]]`; sub-agent entries use `name`, `allowed_tools`, `allowed_mcps`, and `allowed_skills`. The generated config lists the four built-in sub-agents with their code allowlists. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are accepted as aliases. Empty `allowed_*` lists preserve default behavior; `allowed_* = "all"` means every normal workspace tool, active skill, or active MCP server for that scope.
+- `/agent` and `/sub-agent` allow or disallow only resources that are already globally active through `/skills` or `/mcp`.
+- Agent-scoped config lives under `[agents]` and `[[sub-agents]]`; sub-agent entries use `name`, `allowed_tools`, `allowed_mcps`, and `allowed_skills`. In advanced mode, empty supervisor `allowed_*` lists mean delegate through sub-agents by default; add `[agents]` allowlist entries for direct supervisor tools, skills, or MCP servers. The generated config lists the four built-in sub-agents with their code allowlists. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are accepted as aliases; obsolete attach/detach keys are ignored. Empty sub-agent `allowed_*` lists preserve sub-agent defaults; `allowed_* = "all"` means every normal workspace tool, active skill, or active MCP server for that scope.
 - Built-in and sub-agent tools may be listed in config tool filters.
 
 ## Answering Style

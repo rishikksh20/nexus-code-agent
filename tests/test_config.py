@@ -61,14 +61,10 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
     assert config.delegation_subagents == []
     assert config.config_version == 2
     assert config.agent_allowed_tools == []
-    assert config.agent_attached_tools == []
-    assert config.agent_detached_tools == []
     assert config.agent_allowed_skills == []
-    assert config.agent_attached_skills == []
-    assert config.agent_detached_skills == []
     assert config.agent_allowed_mcp_servers == []
-    assert config.agent_attached_mcp_servers == []
-    assert config.agent_detached_mcp_servers == []
+    assert not hasattr(config, "agent_attached_tools")
+    assert not hasattr(config, "agent_detached_tools")
     assert [entry["name"] for entry in config.subagent_profiles] == [
         "planning_analysis",
         "execution",
@@ -119,16 +115,13 @@ def test_config_accepts_agent_scope_fields(tmp_path):
     config = load_config(workspace, global_root=global_root)
 
     assert config.agent_allowed_tools == ["subagent_execution"]
-    assert config.agent_attached_tools == ["read_file"]
-    assert config.agent_detached_tools == ["bash"]
     assert config.agent_allowed_skills == ["nexus-agent"]
-    assert config.agent_attached_skills == ["review"]
-    assert config.agent_detached_skills == ["notes"]
     assert config.agent_allowed_mcp_servers == ["search"]
-    assert config.agent_attached_mcp_servers == ["filesystem"]
-    assert config.agent_detached_mcp_servers == ["git"]
+    assert not hasattr(config, "agent_attached_tools")
     assert config.subagent_profiles[0]["name"] == "execution"
     assert config.subagent_profiles[0]["allowed_tools"] == ["grep"]
+    assert "attached_tools" not in config.subagent_profiles[0]
+    assert "detached_mcp_servers" not in config.subagent_profiles[0]
 
 
 def test_config_accepts_agents_and_sub_agents_sections(tmp_path):
@@ -160,17 +153,12 @@ def test_config_accepts_agents_and_sub_agents_sections(tmp_path):
     config = load_config(workspace, global_root=global_root)
 
     assert config.agent_allowed_tools == ["subagent_execution"]
-    assert config.agent_attached_tools == ["read_file"]
-    assert config.agent_detached_tools == ["bash"]
     assert config.agent_allowed_skills == ["nexus-agent"]
-    assert config.agent_attached_skills == ["review"]
-    assert config.agent_detached_skills == ["notes"]
     assert config.agent_allowed_mcp_servers == ["search"]
-    assert config.agent_attached_mcp_servers == ["filesystem"]
-    assert config.agent_detached_mcp_servers == ["git"]
     assert config.subagent_profiles[0]["name"] == "execution"
     assert config.subagent_profiles[0]["allowed_tools"] == ["grep"]
     assert config.subagent_profiles[0]["allowed_mcp_servers"] == ["filesystem"]
+    assert "attached_tools" not in config.subagent_profiles[0]
 
 
 def test_config_accepts_all_scope_sentinel(tmp_path):
@@ -248,18 +236,17 @@ def test_config_upgrade_migrates_legacy_agent_scope_to_new_tables(tmp_path):
     assert report.subagent_scope_migrated is True
     assert "[agents]" in content
     assert 'allowed_tools = ["subagent_execution"]' in content
-    assert 'attached_tools = ["read_file"]' in content
-    assert 'detached_mcp_servers = ["git"]' in content
+    assert 'attached_tools = ["read_file"]' not in content
+    assert 'detached_mcp_servers = ["git"]' not in content
     assert "[[sub-agents]]" in content
     assert 'name = "execution"' in content
     assert 'allowed_mcps = ["filesystem"]' in content
     assert "agent_allowed_tools" not in content
     assert "subagent_profiles" not in content
     assert config.agent_allowed_tools == ["subagent_execution"]
-    assert config.agent_attached_tools == ["read_file"]
-    assert config.agent_detached_mcp_servers == ["git"]
     assert config.subagent_profiles[0]["allowed_tools"] == ["grep"]
     assert config.subagent_profiles[0]["allowed_mcp_servers"] == ["filesystem"]
+    assert "attached_tools" not in config.subagent_profiles[0]
 
 
 def test_config_upgrade_merges_legacy_agent_scope_into_existing_agents_table(tmp_path):
@@ -291,7 +278,7 @@ def test_config_upgrade_merges_legacy_agent_scope_into_existing_agents_table(tmp
     assert content.count("[agents]") == 1
     assert "agent_attached_tools" not in content
     assert config.agent_allowed_tools == ["subagent_execution"]
-    assert config.agent_attached_tools == ["read_file"]
+    assert not hasattr(config, "agent_attached_tools")
 
 
 def test_config_non_strict_uses_defaults_and_warning_when_toml_is_corrupt(tmp_path):
@@ -308,7 +295,7 @@ def test_config_non_strict_uses_defaults_and_warning_when_toml_is_corrupt(tmp_pa
     assert "using defaults" in config.config_warnings[0]
 
 
-def test_config_rejects_invalid_subagent_profile_scope_list(tmp_path):
+def test_config_ignores_obsolete_subagent_attach_detach_fields(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     global_root = tmp_path / "global"
@@ -318,12 +305,9 @@ def test_config_rejects_invalid_subagent_profile_scope_list(tmp_path):
         encoding="utf-8",
     )
 
-    try:
-        load_config(workspace, global_root=global_root)
-    except ConfigError as exc:
-        assert "attached_tools must be a list" in str(exc)
-    else:
-        raise AssertionError("Expected ConfigError for invalid subagent profile")
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.subagent_profiles == [{"name": "execution"}]
 
 
 def test_config_accepts_legacy_multi_agent_mode_without_reintroducing_old_fields(tmp_path):

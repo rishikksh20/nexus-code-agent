@@ -365,15 +365,16 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 | `/context [show\|usage]` | Print system prompt or show supervisor token/context-window usage, including tool, MCP, sub-agent, and skill prompt/schema estimates |
 | `/context agents\|agent \<id\>\|usage \<id\>` | Inspect per-agent context isolation, handoffs, and usage |
 | `/provider [list\|set \<param\> \<value\>]` | Show or update provider, model, temperature, and session parameters |
-| `/config [show\|set\|reset\|reload\|upgrade\|reinit [local\|global]]` | Inspect or edit configuration; `upgrade` merges new defaults and reloads tools |
+| `/config [show\|set\|reset\|reset-defaults\|reload\|upgrade\|reinit]` | Inspect or edit configuration; `reset-defaults` rewrites clean defaults |
 | `/skills [list\|show\|add\|remove\|reload]` | Manage session skills and skill-backed sub-agent tools |
-| `/agent [status\|tools\|skills\|mcp\|attach\|detach]` | Inspect and scope supervisor tools, skills, and MCP servers |
-| `/sub-agent [list\|show\|tools\|skills\|mcp\|attach\|detach]` | Inspect and scope cognitive sub-agent resources |
+| `/agent [status\|tools\|skills\|mcp\|allow\|disallow]` | Inspect and scope supervisor tools, skills, and MCP servers |
+| `/sub-agent [list\|show\|tools\|skills\|mcp\|allow\|disallow]` | Inspect and scope cognitive sub-agent resources |
 | `/session [new\|list\|resume\|save\|export]` | Manage sessions |
 | `/memory [list\|search\|save\|show]` | Workspace memory entries |
 | `/tools [reload]` | List registered tools or reload core, plugin, MCP, and sub-agent tools |
 | `/history [n]` | Show recent conversation messages |
 | `/mcp [status\|available\|activate\|deactivate\|tools\|refresh [server]\|reload]` | Inspect and manage MCP server activation, status, tools, and reloads |
+| `/abort` | Abort the currently running agent turn |
 | `/quit` or `/exit` | Save session and exit |
 
 ---
@@ -544,30 +545,22 @@ delegation_subagents = [
 
 Skill-backed sub-agent tools are also supported. Create a skill named `subagent-review` or `subagent_review` under `.nexus/skills/` or `~/.nexus/skills/`, then run `/skills reload`; it registers as `subagent_review` when `agent_mode = "advanced"`.
 
-Agent-scoped resources are layered on top of global activation. Use `/mcp activate` and `/skills activate` to make MCP servers and skills globally available, then use `/agent attach ...` or `/sub-agent attach ...` to expose active resources to the supervisor or one sub-agent. Attach/detach changes persist in `.nexus/config.toml`.
+Agent-scoped resources are layered on top of global activation. Use `/mcp activate` and `/skills activate` to make MCP servers and skills globally available, then use `[agents]` or `[[sub-agents]]` `allowed_*` lists to narrow or expand what each agent can see. `/agent allow ...` and `/sub-agent allow ...` update those allowlists in `.nexus/config.toml`.
 
 ```toml
 [agents]
 allowed_tools = []          # empty = default supervisor behavior; "all" = every normal workspace tool
-attached_tools = []
-detached_tools = []
 allowed_skills = []         # empty = all globally active skills; "all" = every active skill
-attached_skills = []
-detached_skills = []
 allowed_mcps = []           # empty = default MCP behavior; "all" = every active MCP server
-attached_mcp_servers = []
-detached_mcp_servers = []
 
 [[sub-agents]]
 name = "execution"
 allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_tests", "run_linter", "run_typecheck", "bash"]
 allowed_skills = []         # empty = no extra skill metadata by default; "all" = every active skill
 allowed_mcps = []           # empty = built-in sub-agent MCP inheritance/defaults; "all" = every active MCP server
-attached_tools = ["read_file"]
-detached_mcp_servers = ["git"]
 ```
 
-In advanced mode, the supervisor sees all built-in cognitive `subagent_*` tools by default. In basic mode, only sub-agents listed under `[[sub-agents]]` are loaded. Direct normal tools or MCP tools become supervisor-callable when listed in `[agents].allowed_tools` / `[agents].allowed_mcps`, or when attached with `/agent attach tool <name>` / `/agent attach mcp <server>`. Sub-agents start from their normal `allowed_tools`; a non-empty `[[sub-agents]].allowed_tools` list replaces that base, then attached resources are added and detached resources are removed. Set an `allowed_*` value to `"all"` to use every workspace-active tool, skill, or MCP server for that scope. Agent-scoped skills are shown as metadata only. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are still accepted as aliases.
+In advanced mode, the supervisor sees cognitive `subagent_*` tools by default and only the direct normal tools, MCP servers, and skills allowed under `[agents]`; work outside that supervisor allowlist should be delegated to an appropriate sub-agent. In basic mode, direct tools remain available unless narrowed by config. Sub-agents start from their normal `allowed_tools`; a non-empty `[[sub-agents]].allowed_tools` list replaces that base. Set an `allowed_*` value to `"all"` to use every workspace-active tool, skill, or MCP server for that scope. Agent-scoped skills are shown as metadata only. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are still accepted as aliases; obsolete attach/detach keys are ignored.
 
 Useful commands after editing `.nexus/config.toml`:
 
@@ -696,8 +689,8 @@ path when the task calls for it.
 /skills create-local review  — create .nexus/skills/review/SKILL.md
 /skills remove-local review  — remove a workspace-local skill
 /skills reload               — rescan skills and refresh the prompt
-/agent attach skill review   — attach active skill metadata to the supervisor
-/sub-agent attach review skill python-code-review — attach active skill metadata to a sub-agent
+/agent allow skill review   — allow active skill metadata for the supervisor
+/sub-agent allow review skill python-code-review — allow active skill metadata for a sub-agent
 ```
 
 `/skills add` and `/skills remove` remain aliases for activate/deactivate.

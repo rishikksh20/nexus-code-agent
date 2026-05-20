@@ -201,7 +201,7 @@ def _subagent_guidance_lines(records) -> list[str]:
         "",
         "Sub-agent input shape:",
         '```json',
-        '{"title": "Short task title", "instructions": "Role-specific objective, constraints, expected output, and stop condition", "input_packet_ids": ["packet-..."], "allowed_tools": ["optional", "override"]}',
+        '{"title": "Short task title", "instructions": "Role-specific objective, constraints, expected output, and stop condition", "input_packet_ids": ["packet-..."]}',
         '```',
         "",
         "Available cognitive tools:",

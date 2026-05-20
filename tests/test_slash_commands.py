@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 
@@ -73,6 +74,38 @@ async def test_slash_command_invalid_quoting_does_not_crash(tmp_path):
 
     assert handled is True
     assert "Invalid command syntax" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_abort_slash_command_cancels_running_turn(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("abort"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    async def never_finishes():
+        await asyncio.sleep(60)
+
+    task = asyncio.create_task(never_finishes())
+    state.begin_running_turn(task)
+    handled = await build_router().dispatch(state, "/abort")
+
+    assert handled is True
+    assert state.abort_requested is True
+    assert task.cancelled() or task.cancelling()
+    assert "Abort requested" in console.export_text()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 class _FakeMCPClient:
@@ -209,7 +242,7 @@ async def test_multi_agent_slash_command_is_not_registered(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_agent_attach_tool_persists_and_updates_supervisor_scope(tmp_path):
+async def test_agent_allow_tool_persists_and_updates_supervisor_scope(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
@@ -248,16 +281,53 @@ async def test_agent_attach_tool_persists_and_updates_supervisor_scope(tmp_path)
         console=console,
     )
 
-    handled = await build_router().dispatch(state, "/agent attach tool read_file")
+    handled = await build_router().dispatch(state, "/agent allow tool read_file")
 
     assert handled is True
-    assert state.config.agent_attached_tools == ["read_file"]
+    assert state.config.agent_allowed_tools == ["read_file"]
     assert "read_file" in supervisor_tool_names(state.config, state.tool_registry)
+    assert "subagent_execution" in supervisor_tool_names(state.config, state.tool_registry)
     assert "get_time" not in supervisor_tool_names(state.config, state.tool_registry)
     content = local_config.read_text(encoding="utf-8")
     assert "[agents]" in content
-    assert 'attached_tools = ["read_file"]' in content
-    assert "Attached tool for supervisor" in console.export_text()
+    assert 'allowed_tools = ["read_file"]' in content
+    assert "Allowed tool for supervisor" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_config_reset_defaults_rewrites_local_config(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    local_config.write_text(
+        'project_name = "workspace"\n'
+        'model_name = "custom-model"\n'
+        "[agents]\n"
+        'allowed_tools = ["read_file"]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=global_root)
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("config-reset-defaults"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/config reset-defaults")
+
+    content = local_config.read_text(encoding="utf-8")
+    assert handled is True
+    assert 'model_name = "custom-model"' not in content
+    assert 'allowed_tools = ["read_file"]' not in content
+    assert "[agents]" in content
+    assert "Reinitialized local config" in console.export_text()
 
 
 @pytest.mark.asyncio
@@ -294,15 +364,15 @@ async def test_subagent_commands_show_and_persist_resource_scope(tmp_path):
 
     router = build_router()
     assert await router.dispatch(state, "/sub-agent list") is True
-    assert await router.dispatch(state, "/sub-agent attach execution tool read_file") is True
+    assert await router.dispatch(state, "/sub-agent allow execution tool read_file") is True
     assert await router.dispatch(state, "/sub-agent tools execution") is True
 
     assert state.config.subagent_profiles[0]["name"] == "execution"
-    assert state.config.subagent_profiles[0]["attached_tools"] == ["read_file"]
+    assert state.config.subagent_profiles[0]["allowed_tools"] == ["get_time", "read_file"]
     assert "[[sub-agents]]" in config.local_config_file.read_text(encoding="utf-8")
     output = console.export_text()
     assert "Sub-Agents" in output
-    assert "Attached tool for sub-agent execution" in output
+    assert "Allowed tool for sub-agent execution" in output
     assert "read_file" in output
 
 
@@ -335,6 +405,72 @@ async def test_agent_allowed_config_restricts_tools_and_skills(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_advanced_supervisor_defaults_to_subagent_tools_only(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Execute focused work.",
+                goal_prompt="Do the task.",
+                allowed_tools=["read_file"],
+            ),
+            base_tool_registry=registry,
+            config=config,
+        ),
+        source="agent",
+        origin="execution",
+    )
+
+    assert supervisor_tool_names(config, registry) == {"subagent_execution"}
+    assert supervisor_skill_names(config, ["review", "notes"]) == []
+
+
+@pytest.mark.asyncio
+async def test_advanced_supervisor_prompt_uses_scoped_agent_resources(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(GetTimeTool(), source="mcp", origin="filesystem")
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Execute focused work.",
+                goal_prompt="Use scoped tools.",
+                allowed_tools=["read_file"],
+            ),
+            base_tool_registry=registry,
+            config=config,
+        ),
+        source="agent",
+        origin="execution",
+    )
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("supervisor-scoped-prompt"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True, width=200),
+        active_skills=["review"],
+    )
+
+    prepared = state.prepare_turn("edit the project", turn_id="turn", trace_id="trace")
+
+    assert prepared.context.metadata["supervisor_available_tools"] == ["subagent_execution"]
+    assert prepared.context.metadata["active_skills"] == []
+    assert "Available MCP tools:" not in prepared.system_prompt
+    assert "`subagent_execution`" in prepared.system_prompt
+
+
+@pytest.mark.asyncio
 async def test_agent_all_scope_uses_workspace_resources(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     config.agent_mode = "advanced"
@@ -357,14 +493,8 @@ async def test_subagent_profile_allowed_config_overrides_default_tools(tmp_path)
         {
             "name": "execution",
             "allowed_tools": ["read_file"],
-            "attached_tools": [],
-            "detached_tools": [],
             "allowed_skills": [],
-            "attached_skills": [],
-            "detached_skills": [],
             "allowed_mcp_servers": [],
-            "attached_mcp_servers": [],
-            "detached_mcp_servers": [],
         }
     ]
     registry = ToolRegistry()

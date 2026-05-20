@@ -226,6 +226,60 @@ async def test_execution_subagent_can_execute_allowed_write_tool(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_execution_subagent_uses_own_tools_not_supervisor_scope(tmp_path):
+    registry = ToolRegistry()
+    registry.register(_PlainReadTool(), source="core", origin="test")
+    registry.register(WriteFileTool(), source="core", origin="builtin")
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Writing through the execution sub-agent."),
+                tool_calls=(
+                    ToolCall(
+                        call_id="sub-write",
+                        tool_name="write_file",
+                        arguments={"path": "subagent-owned.txt", "content": "owned"},
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content='{"status": "completed", "summary": "Wrote file."}')),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Implement focused work.",
+            goal_prompt="Use normal tools to implement the assigned change.",
+            allowed_tools=["read_file", "write_file"],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+    context = ToolExecutionContext(
+        session_id="test-session",
+        working_directory=tmp_path,
+        metadata={
+            "auto_confirm": True,
+            "execution_mode": "auto",
+            "supervisor_available_tools": ["read_file", "subagent_execution"],
+        },
+    )
+
+    result = await tool.execute(
+        "sub-call",
+        {"title": "Write file", "instructions": "Create subagent-owned.txt with the requested content."},
+        context,
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["context"]["allowed_tools"] == ["read_file", "write_file"]
+    assert (tmp_path / "subagent-owned.txt").read_text(encoding="utf-8") == "owned"
+
+
+@pytest.mark.asyncio
 async def test_subagent_renders_inner_tool_start_before_read_executes(tmp_path):
     ui = _RecordingUI()
     registry = ToolRegistry()
@@ -266,7 +320,7 @@ async def test_subagent_renders_inner_tool_start_before_read_executes(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_subagent_attached_tool_can_execute_even_when_not_in_base_allowlist(tmp_path):
+async def test_subagent_allowed_tool_can_execute_even_when_not_in_base_allowlist(tmp_path):
     registry = ToolRegistry()
     registry.register(_PlainReadTool(), source="core", origin="test")
     config = SimpleNamespace(
@@ -276,12 +330,7 @@ async def test_subagent_attached_tool_can_execute_even_when_not_in_base_allowlis
         subagent_profiles=[
             {
                 "name": "execution",
-                "attached_tools": ["read_file"],
-                "detached_tools": [],
-                "attached_skills": [],
-                "detached_skills": [],
-                "attached_mcp_servers": [],
-                "detached_mcp_servers": [],
+                "allowed_tools": ["read_file"],
             }
         ],
     )
@@ -317,7 +366,7 @@ async def test_subagent_attached_tool_can_execute_even_when_not_in_base_allowlis
 
 
 @pytest.mark.asyncio
-async def test_subagent_detached_tool_and_call_time_narrowing_do_not_grant_tool(tmp_path):
+async def test_subagent_disallowed_tool_and_legacy_call_time_tools_do_not_grant_tool(tmp_path):
     registry = ToolRegistry()
     registry.register(_PlainReadTool(), source="core", origin="test")
     config = SimpleNamespace(
@@ -327,12 +376,7 @@ async def test_subagent_detached_tool_and_call_time_narrowing_do_not_grant_tool(
         subagent_profiles=[
             {
                 "name": "execution",
-                "attached_tools": ["read_file"],
-                "detached_tools": ["read_file"],
-                "attached_skills": [],
-                "detached_skills": [],
-                "attached_mcp_servers": [],
-                "detached_mcp_servers": [],
+                "allowed_tools": [],
             }
         ],
     )
@@ -371,8 +415,88 @@ async def test_subagent_detached_tool_and_call_time_narrowing_do_not_grant_tool(
     assert "Unknown tool name: read_file" in payload["raw_result"]
 
 
+def test_subagent_schema_does_not_allow_supervisor_tool_overrides():
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Execute focused work.",
+            goal_prompt="Use configured tools.",
+            allowed_tools=["write_file"],
+        )
+    )
+
+    assert "allowed_tools" not in tool.input_schema["properties"]
+    assert tool.input_schema["additionalProperties"] is False
+
+
 @pytest.mark.asyncio
-async def test_subagent_attached_skill_metadata_is_injected_without_skill_body(tmp_path):
+async def test_subagent_cannot_call_another_subagent_even_with_all_tools(tmp_path):
+    registry = ToolRegistry()
+    registry.register(_PlainReadTool(), source="core", origin="test")
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="review",
+                description="Review focused work.",
+                goal_prompt="Review only.",
+                allowed_tools=["read_file"],
+            ),
+            base_tool_registry=registry,
+        ),
+        source="agent",
+        origin="review",
+    )
+    config = SimpleNamespace(
+        model_name="fake",
+        temperature=0.0,
+        max_output_tokens=4096,
+        subagent_profiles=[
+            {
+                "name": "execution",
+                "allowed_tools": ["all"],
+            }
+        ],
+    )
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Delegating again."),
+                tool_calls=(
+                    ToolCall(
+                        call_id="nested-subagent",
+                        tool_name="subagent_review",
+                        arguments={"title": "Review", "instructions": "Review this."},
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content='{"status": "failed", "summary": "No nested sub-agent."}')),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Execute focused work.",
+            goal_prompt="Use configured tools.",
+            allowed_tools=None,
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=config,
+    )
+    context = ToolExecutionContext(session_id="test-session", working_directory=tmp_path)
+
+    result = await tool.execute("sub-call", {"title": "Execute", "instructions": "Try nested."}, context)
+
+    payload = json.loads(result.output)
+    assert result.is_error is True
+    assert payload["context"]["allowed_tools"] == ["read_file"]
+    assert "subagent_review" not in payload["context"]["allowed_tools"]
+    assert "Unknown tool name: subagent_review" in payload["raw_result"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_allowed_skill_metadata_is_injected_without_skill_body(tmp_path):
     class RecordingFakeModel(FakeModelClient):
         def __init__(self):
             super().__init__([
@@ -392,12 +516,7 @@ async def test_subagent_attached_skill_metadata_is_injected_without_skill_body(t
         subagent_profiles=[
             {
                 "name": "review",
-                "attached_tools": [],
-                "detached_tools": [],
-                "attached_skills": ["review"],
-                "detached_skills": [],
-                "attached_mcp_servers": [],
-                "detached_mcp_servers": [],
+                "allowed_skills": ["review"],
             }
         ],
     )
@@ -440,6 +559,120 @@ async def test_subagent_attached_skill_metadata_is_injected_without_skill_body(t
     assert "description=Review skill" in model.system_prompt
     assert "SKILL.md" in model.system_prompt
     assert "Always review carefully." not in model.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_subagent_allowed_mcp_server_tools_are_callable_and_prompted(tmp_path):
+    class RecordingFakeModel(FakeModelClient):
+        def __init__(self):
+            super().__init__(
+                [
+                    RuntimeResponse(
+                        message=Message(role="assistant", content="Reading MCP."),
+                        tool_calls=(ToolCall(call_id="sub-mcp-read", tool_name="fs_read", arguments={"path": "README.md"}),),
+                        finish_reason="tool_calls",
+                    ),
+                    RuntimeResponse(message=Message(role="assistant", content='{"status": "completed", "summary": "Read MCP."}')),
+                ]
+            )
+            self.system_prompt = ""
+
+        async def complete(self, request):
+            self.system_prompt = request.system_prompt
+            return await super().complete(request)
+
+    registry = ToolRegistry()
+    mcp_tool = _PlainReadTool()
+    mcp_tool.name = "fs_read"
+    registry.register(mcp_tool, source="mcp", origin="filesystem")
+    config = SimpleNamespace(
+        model_name="fake",
+        temperature=0.0,
+        max_output_tokens=4096,
+        subagent_profiles=[
+            {
+                "name": "execution",
+                "allowed_tools": [],
+                "allowed_mcps": ["filesystem"],
+            }
+        ],
+    )
+    model = RecordingFakeModel()
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Execute focused work.",
+            goal_prompt="Use scoped MCP tools.",
+            allowed_tools=[],
+            allowed_mcps=[],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=config,
+    )
+    context = ToolExecutionContext(session_id="test-session", working_directory=tmp_path)
+
+    result = await tool.execute("sub-call", {"title": "MCP", "instructions": "Use MCP."}, context)
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["context"]["allowed_tools"] == ["fs_read"]
+    assert payload["context"]["allowed_mcp_servers"] == ["filesystem"]
+    assert "Allowed MCP servers: filesystem" in model.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_subagent_mcp_tools_ignore_supervisor_mcp_scope(tmp_path):
+    registry = ToolRegistry()
+    mcp_tool = _PlainReadTool()
+    mcp_tool.name = "fs_write_tools"
+    registry.register(mcp_tool, source="mcp", origin="filesystem")
+    config = SimpleNamespace(
+        model_name="fake",
+        temperature=0.0,
+        max_output_tokens=4096,
+        subagent_profiles=[
+            {
+                "name": "execution",
+                "allowed_tools": [],
+                "allowed_mcps": ["filesystem"],
+            }
+        ],
+    )
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Using MCP write."),
+                tool_calls=(ToolCall(call_id="sub-mcp-write", tool_name="fs_write_tools", arguments={"path": "README.md"}),),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content='{"status": "completed", "summary": "Used MCP."}')),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Execute focused work.",
+            goal_prompt="Use scoped MCP tools.",
+            allowed_tools=[],
+            allowed_mcps=[],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=config,
+    )
+    context = ToolExecutionContext(
+        session_id="test-session",
+        working_directory=tmp_path,
+        metadata={"supervisor_available_tools": ["read_file", "subagent_execution"]},
+    )
+
+    result = await tool.execute("sub-call", {"title": "MCP", "instructions": "Use MCP."}, context)
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["context"]["allowed_tools"] == ["fs_write_tools"]
+    assert payload["context"]["allowed_mcp_servers"] == ["filesystem"]
 
 
 @pytest.mark.asyncio

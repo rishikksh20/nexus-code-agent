@@ -320,6 +320,8 @@ def _with_builtin_mcp_tools(definition: SubagentDefinition, registry: "ToolRegis
         description=definition.description,
         goal_prompt=definition.goal_prompt,
         allowed_tools=allowed,
+        allowed_skills=definition.allowed_skills,
+        allowed_mcps=definition.allowed_mcps,
         max_turns=definition.max_turns,
         timeout_seconds=definition.timeout_seconds,
     )

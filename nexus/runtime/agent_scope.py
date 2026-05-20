@@ -8,29 +8,15 @@ from nexus.tools.base import ToolRegistry
 
 SUPERVISOR_SCOPE_FIELDS: tuple[str, ...] = (
     "agent_allowed_tools",
-    "agent_attached_tools",
-    "agent_detached_tools",
     "agent_allowed_skills",
-    "agent_attached_skills",
-    "agent_detached_skills",
     "agent_allowed_mcp_servers",
-    "agent_attached_mcp_servers",
-    "agent_detached_mcp_servers",
 )
 
 SUBAGENT_PROFILE_FIELDS: tuple[str, ...] = (
     "allowed_tools",
-    "attached_tools",
-    "detached_tools",
     "allowed_skills",
-    "attached_skills",
-    "detached_skills",
     "allowed_mcps",
     "allowed_mcp_servers",
-    "attached_mcps",
-    "attached_mcp_servers",
-    "detached_mcps",
-    "detached_mcp_servers",
 )
 
 BUILTIN_SUBAGENT_NAMES: frozenset[str] = frozenset(
@@ -116,30 +102,28 @@ def all_mcp_tool_names(registry: ToolRegistry) -> set[str]:
 def supervisor_tool_names(config: Any, registry: ToolRegistry) -> set[str]:
     records = registry.records()
     all_names = {record.name for record in records}
-    normal_names = {record.name for record in records if record.source != "mcp"}
+    subagent_names = {record.name for record in records if record.name.startswith("subagent_")}
+    direct_normal_names = {
+        record.name
+        for record in records
+        if record.source != "mcp" and record.name not in subagent_names and record.name != "delegate_task"
+    }
     configured_tool_scope = getattr(config, "agent_allowed_tools", [])
     configured_mcp_scope = getattr(config, "agent_allowed_mcp_servers", [])
     configured_tools = set(explicit_scope_names(configured_tool_scope))
-    attached_tools = set(clean_string_list(getattr(config, "agent_attached_tools", [])))
-    detached_tools = set(clean_string_list(getattr(config, "agent_detached_tools", [])))
     configured_mcp = set(explicit_scope_names(configured_mcp_scope))
-    attached_mcp = set(clean_string_list(getattr(config, "agent_attached_mcp_servers", [])))
-    detached_mcp = set(clean_string_list(getattr(config, "agent_detached_mcp_servers", [])))
     all_configured_tools = is_all_scope(configured_tool_scope)
     all_configured_mcp = is_all_scope(configured_mcp_scope)
 
     if configured_tools or configured_mcp or all_configured_tools or all_configured_mcp:
-        allowed = set(normal_names) if all_configured_tools else configured_tools & normal_names
+        allowed = set(direct_normal_names) if all_configured_tools else configured_tools & direct_normal_names
         allowed |= all_mcp_tool_names(registry) if all_configured_mcp else mcp_tool_names_for_servers(registry, configured_mcp)
     elif str(getattr(config, "agent_mode", "basic")).strip().lower() == "advanced":
-        allowed = {record.name for record in records if record.name.startswith("subagent_")}
-        allowed |= attached_tools & normal_names
-        allowed |= mcp_tool_names_for_servers(registry, attached_mcp)
+        allowed = set()
     else:
         allowed = set(all_names)
-
-    allowed -= detached_tools
-    allowed -= mcp_tool_names_for_servers(registry, detached_mcp)
+    if str(getattr(config, "agent_mode", "basic")).strip().lower() == "advanced":
+        allowed |= subagent_names
     return allowed
 
 
@@ -148,15 +132,15 @@ def supervisor_skill_names(config: Any, active_skills: Iterable[str]) -> list[st
     active_set = set(active)
     configured_scope = getattr(config, "agent_allowed_skills", [])
     configured = explicit_scope_names(configured_scope)
-    attached = [name for name in clean_string_list(getattr(config, "agent_attached_skills", [])) if name in active_set]
-    detached = set(clean_string_list(getattr(config, "agent_detached_skills", [])))
     if is_all_scope(configured_scope):
         base = active
     elif configured:
         base = [name for name in configured if name in active_set]
+    elif str(getattr(config, "agent_mode", "basic")).strip().lower() == "advanced":
+        base = []
     else:
         base = active
-    return [name for name in _ordered_unique([*base, *attached]) if name not in detached]
+    return _ordered_unique(base)
 
 
 def subagent_skill_names(
@@ -171,16 +155,14 @@ def subagent_skill_names(
     active_set = set(active)
     configured_scope = profile.get("allowed_skills", [])
     configured = [name for name in explicit_scope_names(configured_scope) if name in active_set]
-    attached = [name for name in clean_string_list(profile.get("attached_skills", [])) if name in active_set]
-    detached = set(clean_string_list(profile.get("detached_skills", [])))
     if is_all_scope(configured_scope):
         configured = active
-    elif not configured and not attached:
+    elif not configured:
         if base_allowed_skills is None:
             configured = active
         elif base_allowed_skills != ():
             configured = [name for name in clean_string_list(list(base_allowed_skills)) if name in active_set]
-    return [name for name in _ordered_unique([*configured, *attached]) if name not in detached]
+    return _ordered_unique(configured)
 
 
 def subagent_tool_names(
@@ -190,7 +172,6 @@ def subagent_tool_names(
     *,
     base_allowed_tools: Iterable[str] | None,
     base_allowed_mcps: Iterable[str] | None | object = (),
-    caller_allowed_tools: Iterable[str] | None = None,
 ) -> set[str]:
     profile = subagent_profile(config, name)
     normal_candidate_names = {
@@ -223,15 +204,6 @@ def subagent_tool_names(
     elif base_allowed_mcps != ():
         allowed |= mcp_tool_names_for_servers(registry, clean_string_list(list(base_allowed_mcps)))
 
-    allowed |= set(clean_string_list(profile.get("attached_tools", []))) & normal_candidate_names
-    attached_mcp = clean_string_list(profile.get("attached_mcps", [])) or clean_string_list(profile.get("attached_mcp_servers", []))
-    detached_mcp = clean_string_list(profile.get("detached_mcps", [])) or clean_string_list(profile.get("detached_mcp_servers", []))
-    allowed |= mcp_tool_names_for_servers(registry, attached_mcp)
-    allowed -= set(clean_string_list(profile.get("detached_tools", [])))
-    allowed -= mcp_tool_names_for_servers(registry, detached_mcp)
-
-    if caller_allowed_tools is not None:
-        allowed &= set(clean_string_list(list(caller_allowed_tools)))
     return allowed
 
 

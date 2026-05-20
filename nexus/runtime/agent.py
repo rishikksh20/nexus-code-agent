@@ -826,7 +826,7 @@ def _tool_not_available_result(
         tool_name=tool_name,
         output=(
             f"Tool '{tool_name}' is not available to the supervisor in this context. "
-            f"Use an available supervisor tool or attach the resource first. Available supervisor tools: {available}."
+            f"Use an available supervisor tool or update the resource allowlist first. Available supervisor tools: {available}."
         ),
         is_error=True,
         metadata={
