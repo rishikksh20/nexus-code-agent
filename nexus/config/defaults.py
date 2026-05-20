@@ -29,6 +29,7 @@ class AgentConfig:
     max_sessions_retained: int = 50
     save_on_every_turn: bool = True
     skills_dir: Path = field(default_factory=Path)
+    skill_paths: list[Path] = field(default_factory=list)
     plugins_dir: Path = field(default_factory=Path)
     memory_dir: Path = field(default_factory=Path)
     session_dir: Path = field(default_factory=Path)
@@ -41,6 +42,13 @@ class AgentConfig:
     allowed_tools: list[str] = field(default_factory=list)
     denied_tools: list[str] = field(default_factory=list)
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
+    enabled_mcp_servers: list[str] = field(default_factory=list)
+    disabled_mcp_servers: list[str] = field(default_factory=list)
+    enabled_skills: list[str] = field(default_factory=list)
+    disabled_skills: list[str] = field(default_factory=list)
+    agent_allowed_tools: list[str] = field(default_factory=list)
+    agent_allowed_skills: list[str] = field(default_factory=list)
+    agent_allowed_mcp_servers: list[str] = field(default_factory=list)
     approval_policy: str = "on-request"
     allow_hidden_paths: bool = False
     developer_instructions: str = ""
@@ -50,6 +58,7 @@ class AgentConfig:
     context_prune_minimum_tokens: int = 20_000
     agent_mode: str = "basic"
     delegation_subagents: list[dict[str, Any]] = field(default_factory=list)
+    subagent_profiles: list[dict[str, Any]] = field(default_factory=list)
     sandbox_commands: bool = False
     sandbox_image: str = "nexus-sandbox:latest"
     sandbox_timeout_seconds: int = 30
@@ -62,6 +71,7 @@ class AgentConfig:
     local_root: Path = field(default_factory=Path)
     global_config_file: Path = field(default_factory=Path)
     local_config_file: Path = field(default_factory=Path)
+    config_warnings: list[str] = field(default_factory=list)
 
 
 def build_default_config(workspace_root: Path, global_root: Path | None = None) -> AgentConfig:
@@ -90,6 +100,8 @@ def config_to_plain_dict(config: AgentConfig) -> dict[str, Any]:
         value = getattr(config, item.name)
         if isinstance(value, Path):
             plain[item.name] = str(value)
+        elif isinstance(value, list) and any(isinstance(part, Path) for part in value):
+            plain[item.name] = [str(part) if isinstance(part, Path) else part for part in value]
         else:
             plain[item.name] = value
     return plain

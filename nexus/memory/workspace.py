@@ -22,6 +22,14 @@ class AgentDirs:
         return self.local_root / "skills"
 
     @property
+    def local_agents_dir(self) -> Path:
+        return self.local_root / "agents"
+
+    @property
+    def global_agents_dir(self) -> Path:
+        return self.global_root / "agents"
+
+    @property
     def global_config_file(self) -> Path:
         return self.global_root / "config.toml"
 
@@ -60,6 +68,8 @@ class AgentDirs:
     def ensure(self) -> None:
         for path in (self.global_root, self.local_root, self.sessions_dir, self.memory_dir, self.local_skills_dir):
             path.mkdir(parents=True, exist_ok=True)
+        # Agent directories are created on demand (not forced at init time) to
+        # avoid cluttering workspaces that never use YAML sub-agents.
 
 
 @dataclass(slots=True)

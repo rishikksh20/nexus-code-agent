@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from nexus.config.defaults import AgentConfig
@@ -10,6 +11,7 @@ from nexus.prompts import build_context_sections
 from nexus.context import CarryOverState, ContextBuilder, ContextCompactor, TokenEstimator, prune_tool_outputs
 from nexus.runtime.context_state import load_multi_agent_state, multi_agent_carry_over_lines, render_context_packet
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.agent_scope import skill_metadata_catalog, supervisor_skill_names, supervisor_tool_names
 from nexus.hooks import HookExecutor
 from nexus.runtime.sessions import SessionSnapshot, SessionStore, prepare_messages_for_model, sanitize_session_messages
 from nexus.security.manager import ApprovalManager
@@ -42,12 +44,32 @@ class ReplState:
     history: list[Message] = field(default_factory=list)
     skill_registry: SkillRegistry = field(default_factory=SkillRegistry)
     active_skills: list[str] = field(default_factory=list)
+    run_skills: list[str] = field(default_factory=list)
     mcp_servers: list[MCPServerRuntime] = field(default_factory=list)
     carry_over: CarryOverState = field(default_factory=CarryOverState)
     current_turn_id: str = ""
     current_trace_id: str = ""
     current_system_prompt: str = ""
+    current_system_prompt_task_input: str = ""
     should_exit: bool = False
+    current_turn_task: asyncio.Task | None = None
+    abort_requested: bool = False
+
+    def begin_running_turn(self, task: asyncio.Task | None = None) -> None:
+        self.current_turn_task = task or asyncio.current_task()
+        self.abort_requested = False
+
+    def clear_running_turn(self) -> None:
+        self.current_turn_task = None
+        self.abort_requested = False
+
+    def request_abort_current_turn(self) -> bool:
+        self.abort_requested = True
+        task = self.current_turn_task
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
 
     @property
     def paused_turn_prompt(self) -> str:
@@ -77,19 +99,27 @@ class ReplState:
         return stripped, False
 
     def build_system_prompt(self, prompt_text: str) -> str:
+        self.current_system_prompt_task_input = prompt_text
+        scoped_active_skills = supervisor_skill_names(self.config, self.active_skills)
+        scoped_tool_registry = _supervisor_prompt_tool_registry(self.config, self.tool_registry)
         sections = build_context_sections(
             self.config,
-            self.tool_registry,
+            scoped_tool_registry,
             task_input=prompt_text,
             execution_mode=self.mode.value,
             skill_registry=self.skill_registry,
-            active_skills=self.active_skills,
+            active_skills=scoped_active_skills,
             carry_over=self.carry_over,
             memory_entries=_load_all_memory(self.memory_store),
         )
         sections.carry_over.extend(multi_agent_carry_over_lines(self.session.metadata))
         self.current_system_prompt = ContextBuilder().build(sections)
         return self.current_system_prompt
+
+    def refresh_system_prompt(self) -> str:
+        """Rebuild the cached prompt after live tool/config changes."""
+        prompt_text = self.current_system_prompt_task_input or self.paused_turn_prompt
+        return self.build_system_prompt(prompt_text)
 
     def prepare_turn(
         self,
@@ -128,9 +158,13 @@ class ReplState:
             metadata={
                 "turn_id": turn_id,
                 "trace_id": trace_id,
-                "active_skills": list(self.active_skills),
+                "active_skills": supervisor_skill_names(self.config, self.active_skills),
+                "global_active_skills": list(self.active_skills),
+                "skill_catalog": skill_metadata_catalog(self.skill_registry),
+                "config": self.config,
                 "approval_policy": self.approval_manager.policy.value,
                 "allow_hidden_paths": self.config.allow_hidden_paths,
+                "supervisor_available_tools": sorted(supervisor_tool_names(self.config, self.tool_registry)),
                 "multi_agent_packet_summaries": {
                     packet.packet_id: render_context_packet(packet)
                     for packet in load_multi_agent_state(self.session.metadata).packets
@@ -153,6 +187,15 @@ class ReplState:
             self.session.summary = first_user
         if self.config.save_on_every_turn:
             self.session_store.save(self.session)
+
+
+def _supervisor_prompt_tool_registry(config: AgentConfig, registry: ToolRegistry) -> ToolRegistry:
+    available = supervisor_tool_names(config, registry)
+    scoped = ToolRegistry()
+    for record in registry.records():
+        if record.name in available:
+            scoped.register(record.tool, source=record.source, origin=record.origin)
+    return scoped
 
 
 def apply_events_to_messages(history: list[Message], events: list[AgentEvent]) -> list:

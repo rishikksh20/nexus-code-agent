@@ -54,7 +54,9 @@ def test_build_context_describes_cognitive_subagent_contract(tmp_path):
     assert '"input_packet_ids"' in sections.base_instruction
     assert "status: needs_clarification" in sections.base_instruction
     assert "local conversation and tool history as isolated private context" in sections.base_instruction
-    assert "Do not do substantial repo research or coding directly" in sections.base_instruction
+    assert "Default to delegation" in sections.base_instruction
+    assert "If both a normal tool and a sub-agent could handle the same substantive work" in sections.base_instruction
+    assert "Routing: use `subagent_planning_analysis`" in sections.base_instruction
 
 
 def test_build_context_includes_current_time_and_working_directory(tmp_path, monkeypatch):
@@ -100,11 +102,18 @@ def test_build_context_ignores_unreadable_knowledge_file(tmp_path, monkeypatch):
     assert sections.project_notes == [f"Project: {config.project_name}"]
 
 
-def test_build_context_includes_active_skill_and_carry_over(tmp_path):
+def test_build_context_includes_skill_metadata_only_and_carry_over(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     skill_root = tmp_path / "global" / "skills" / "review"
     skill_root.mkdir(parents=True)
-    (skill_root / "SKILL.md").write_text("# Review skill\n\nAlways review carefully.", encoding="utf-8")
+    (skill_root / "SKILL.md").write_text(
+        "---\n"
+        "name: review\n"
+        "description: Review skill\n"
+        "---\n\n"
+        "# Review skill\n\nAlways review carefully.",
+        encoding="utf-8",
+    )
     registry = ToolRegistry()
     registry.register(GetTimeTool())
     skill_registry = load_skill_registry(config.skills_dir)
@@ -118,7 +127,10 @@ def test_build_context_includes_active_skill_and_carry_over(tmp_path):
         carry_over=CarryOverState(summarized_history=["Earlier context compacted."], active_constraints=["Stay concise."]),
     )
 
-    assert any("review: Review skill (active)" in item for item in sections.skills)
+    assert any("name=review" in item for item in sections.skills)
+    assert any("description=Review skill" in item for item in sections.skills)
+    assert any("active=yes" in item for item in sections.skills)
+    assert any("SKILL.md" in item for item in sections.skills)
     assert not any("Always review carefully." in item for item in sections.skills)
     assert "Earlier context compacted." in sections.carry_over
 
