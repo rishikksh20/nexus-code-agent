@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 
@@ -20,12 +21,14 @@ from nexus.runtime.context_state import (
     upsert_task_context,
 )
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.agent_scope import subagent_skill_names, subagent_tool_names, supervisor_skill_names, supervisor_tool_names
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
 from nexus.runtime.slash_commands import build_router
+from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.skills import get_skill_roots, load_skill_registry
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool
+from nexus.tools.builtin import GetTimeTool, ReadFileTool
 
 
 @pytest.mark.asyncio
@@ -71,6 +74,38 @@ async def test_slash_command_invalid_quoting_does_not_crash(tmp_path):
 
     assert handled is True
     assert "Invalid command syntax" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_abort_slash_command_cancels_running_turn(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("abort"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    async def never_finishes():
+        await asyncio.sleep(60)
+
+    task = asyncio.create_task(never_finishes())
+    state.begin_running_turn(task)
+    handled = await build_router().dispatch(state, "/abort")
+
+    assert handled is True
+    assert state.abort_requested is True
+    assert task.cancelled() or task.cancelling()
+    assert "Abort requested" in console.export_text()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 class _FakeMCPClient:
@@ -204,6 +239,324 @@ async def test_multi_agent_slash_command_is_not_registered(tmp_path):
     assert status_handled is False
     output = console.export_text()
     assert "Multi-Agent Supervisor" not in output
+
+
+@pytest.mark.asyncio
+async def test_agent_allow_tool_persists_and_updates_supervisor_scope(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    local_config.write_text(
+        'agent_mode = "advanced"\n'
+        'allowed_tools = ["get_time", "read_file", "subagent_execution"]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Execute focused work.",
+                goal_prompt="Do the task.",
+                allowed_tools=["get_time"],
+            ),
+            base_tool_registry=registry,
+            config=config,
+        ),
+        source="agent",
+        origin="execution",
+    )
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("agent-scope"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/agent allow tool read_file")
+
+    assert handled is True
+    assert state.config.agent_allowed_tools == ["read_file"]
+    assert "read_file" in supervisor_tool_names(state.config, state.tool_registry)
+    assert "subagent_execution" in supervisor_tool_names(state.config, state.tool_registry)
+    assert "get_time" not in supervisor_tool_names(state.config, state.tool_registry)
+    content = local_config.read_text(encoding="utf-8")
+    assert "[agents]" in content
+    assert 'allowed_tools = ["read_file"]' in content
+    assert "Allowed tool for supervisor" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_config_reset_defaults_rewrites_local_config(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    local_config.write_text(
+        'project_name = "workspace"\n'
+        'model_name = "custom-model"\n'
+        "[agents]\n"
+        'allowed_tools = ["read_file"]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=global_root)
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("config-reset-defaults"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/config reset-defaults")
+
+    content = local_config.read_text(encoding="utf-8")
+    assert handled is True
+    assert 'model_name = "custom-model"' not in content
+    assert 'allowed_tools = ["read_file"]' not in content
+    assert "[agents]" in content
+    assert "Reinitialized local config" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_subagent_commands_show_and_persist_resource_scope(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Execute focused work.",
+                goal_prompt="Do the task.",
+                allowed_tools=["get_time"],
+            ),
+            base_tool_registry=registry,
+            config=config,
+        ),
+        source="agent",
+        origin="execution",
+    )
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("subagent-scope"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    router = build_router()
+    assert await router.dispatch(state, "/sub-agent list") is True
+    assert await router.dispatch(state, "/sub-agent allow execution tool read_file") is True
+    assert await router.dispatch(state, "/sub-agent tools execution") is True
+
+    assert state.config.subagent_profiles[0]["name"] == "execution"
+    assert state.config.subagent_profiles[0]["allowed_tools"] == ["get_time", "read_file"]
+    assert "[[sub-agents]]" in config.local_config_file.read_text(encoding="utf-8")
+    output = console.export_text()
+    assert "Sub-Agents" in output
+    assert "Allowed tool for sub-agent execution" in output
+    assert "read_file" in output
+
+
+@pytest.mark.asyncio
+async def test_agent_allowed_config_restricts_tools_and_skills(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    config.agent_allowed_tools = ["read_file"]
+    config.agent_allowed_skills = ["review"]
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("agent-allowed-config"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        active_skills=["review", "notes"],
+    )
+
+    await build_router().dispatch(state, "/agent status")
+
+    assert supervisor_tool_names(config, registry) == {"read_file"}
+    assert supervisor_skill_names(config, state.active_skills) == ["review"]
+    assert "Configured allowed tools" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_advanced_supervisor_defaults_to_subagent_tools_only(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Execute focused work.",
+                goal_prompt="Do the task.",
+                allowed_tools=["read_file"],
+            ),
+            base_tool_registry=registry,
+            config=config,
+        ),
+        source="agent",
+        origin="execution",
+    )
+
+    assert supervisor_tool_names(config, registry) == {"subagent_execution"}
+    assert supervisor_skill_names(config, ["review", "notes"]) == []
+
+
+@pytest.mark.asyncio
+async def test_advanced_supervisor_prompt_uses_scoped_agent_resources(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(GetTimeTool(), source="mcp", origin="filesystem")
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Execute focused work.",
+                goal_prompt="Use scoped tools.",
+                allowed_tools=["read_file"],
+            ),
+            base_tool_registry=registry,
+            config=config,
+        ),
+        source="agent",
+        origin="execution",
+    )
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("supervisor-scoped-prompt"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True, width=200),
+        active_skills=["review"],
+    )
+
+    prepared = state.prepare_turn("edit the project", turn_id="turn", trace_id="trace")
+
+    assert prepared.context.metadata["supervisor_available_tools"] == ["subagent_execution"]
+    assert prepared.context.metadata["active_skills"] == []
+    assert "Available MCP tools:" not in prepared.system_prompt
+    assert "`subagent_execution`" in prepared.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_all_scope_uses_workspace_resources(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    config.agent_allowed_tools = ["all"]
+    config.agent_allowed_mcp_servers = ["all"]
+    config.agent_allowed_skills = ["all"]
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(GetTimeTool(), source="mcp", origin="filesystem")
+
+    assert supervisor_tool_names(config, registry) == {"read_file", "get_time"}
+    assert supervisor_skill_names(config, ["review", "notes"]) == ["review", "notes"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_profile_allowed_config_overrides_default_tools(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    config.subagent_profiles = [
+        {
+            "name": "execution",
+            "allowed_tools": ["read_file"],
+            "allowed_skills": [],
+            "allowed_mcp_servers": [],
+        }
+    ]
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    definition = SubagentDefinition(
+        name="execution",
+        description="Execute focused work.",
+        goal_prompt="Do the task.",
+        allowed_tools=["get_time", "read_file"],
+    )
+    registry.register(
+        SubAgentTool(definition, base_tool_registry=registry, config=config),
+        source="agent",
+        origin="execution",
+    )
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("subagent-allowed-config"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    await build_router().dispatch(state, "/sub-agent tools execution")
+
+    assert subagent_tool_names(
+        config,
+        registry,
+        "execution",
+        base_allowed_tools=definition.allowed_tools,
+    ) == {"read_file"}
+    output = console.export_text()
+    assert "allowed" in output
+
+
+@pytest.mark.asyncio
+async def test_subagent_all_scope_uses_workspace_resources(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    config.subagent_profiles = [
+        {
+            "name": "execution",
+            "allowed_tools": ["all"],
+            "allowed_skills": ["all"],
+            "allowed_mcp_servers": ["all"],
+        }
+    ]
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(GetTimeTool(), source="mcp", origin="filesystem")
+
+    assert subagent_tool_names(
+        config,
+        registry,
+        "execution",
+        base_allowed_tools=["read_file"],
+    ) == {"read_file", "get_time"}
+    assert subagent_skill_names(config, "execution", ["review", "notes"]) == ["review", "notes"]
 
 
 @pytest.mark.asyncio
@@ -384,7 +737,8 @@ async def test_mcp_deactivate_refreshes_cached_system_prompt(tmp_path, monkeypat
     workspace.mkdir()
     init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
     (workspace / ".nexus" / "config.toml").write_text(
-        'mcp_servers = [{ name = "filesystem", transport = "stdio", command = ["fake-mcp"], prefix = "fs_" }]\n',
+        'mcp_servers = [{ name = "filesystem", transport = "stdio", command = ["fake-mcp"], prefix = "fs_" }]\n'
+        'enabled_mcp_servers = ["filesystem"]\n',
         encoding="utf-8",
     )
     config = load_config(workspace, global_root=tmp_path / "global")
@@ -444,12 +798,13 @@ async def test_mcp_refresh_unknown_server_reports_not_found(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_reload_loads_configured_servers(tmp_path):
+async def test_mcp_reload_loads_enabled_servers(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
     (workspace / ".nexus" / "config.toml").write_text(
-        'mcp_servers = [{ name = "broken", transport = "stdio", command = ["definitely-missing-mcp-server"], prefix = "mcp_broken_" }]\n',
+        'mcp_servers = [{ name = "broken", transport = "stdio", command = ["definitely-missing-mcp-server"], prefix = "mcp_broken_" }]\n'
+        'enabled_mcp_servers = ["broken"]\n',
         encoding="utf-8",
     )
     config = load_config(workspace, global_root=tmp_path / "global")
@@ -477,11 +832,44 @@ async def test_mcp_reload_loads_configured_servers(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_mcp_reload_skips_local_servers_that_are_not_enabled(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    init_workspace(workspace, global_root=tmp_path / "global", project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'mcp_servers = [{ name = "broken", transport = "stdio", command = ["definitely-missing-mcp-server"], prefix = "mcp_broken_" }]\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("slash-mcp-reload-inactive"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/mcp reload")
+
+    assert handled is True
+    assert state.mcp_servers == []
+    assert all(record.source != "mcp" for record in state.tool_registry.records())
+
+
+@pytest.mark.asyncio
 async def test_skills_slash_command_activates_skill(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     skill_root = config.skills_dir / "review"
     skill_root.mkdir(parents=True, exist_ok=True)
-    (skill_root / "SKILL.md").write_text("# Review skill\n\nAlways review carefully.", encoding="utf-8")
+    (skill_root / "SKILL.md").write_text(
+        "---\nname: review\ndescription: Review skill\n---\n\n# Review skill\n\nAlways review carefully.",
+        encoding="utf-8",
+    )
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")
     console = Console(record=True, no_color=True, width=200)
@@ -501,6 +889,121 @@ async def test_skills_slash_command_activates_skill(tmp_path):
 
     assert handled is True
     assert state.active_skills == ["review"]
+    assert state.config.enabled_skills == ["review"]
+
+
+@pytest.mark.asyncio
+async def test_skills_deactivate_refreshes_prompt_and_config(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    skill_root = config.skills_dir / "review"
+    skill_root.mkdir(parents=True, exist_ok=True)
+    (skill_root / "SKILL.md").write_text(
+        "---\nname: review\ndescription: Review skill\n---\n\nAlways review carefully.",
+        encoding="utf-8",
+    )
+    config.enabled_skills = ["review"]
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("skills-deactivate"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        skill_registry=load_skill_registry(config.skills_dir),
+        active_skills=["review"],
+    )
+    state.build_system_prompt("review this")
+    assert "name=review" in state.current_system_prompt
+    assert "active=yes" in state.current_system_prompt
+    assert "Always review carefully." not in state.current_system_prompt
+
+    handled = await build_router().dispatch(state, "/skills deactivate review")
+
+    assert handled is True
+    assert state.active_skills == []
+    assert state.config.disabled_skills == ["review"]
+    assert "active=no" in state.current_system_prompt
+    assert "Always review carefully." not in state.current_system_prompt
+
+
+@pytest.mark.asyncio
+async def test_skills_deactivate_removes_run_only_skill(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    skill_root = config.skills_dir / "review"
+    skill_root.mkdir(parents=True, exist_ok=True)
+    (skill_root / "SKILL.md").write_text(
+        "---\nname: review\ndescription: Review skill\n---\n\nAlways review carefully.",
+        encoding="utf-8",
+    )
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("skills-run-only-deactivate"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True, width=200),
+        skill_registry=load_skill_registry(config.skills_dir),
+        active_skills=["review"],
+        run_skills=["review"],
+    )
+
+    handled = await build_router().dispatch(state, "/skills deactivate review")
+
+    assert handled is True
+    assert state.active_skills == []
+    assert state.run_skills == []
+
+
+@pytest.mark.asyncio
+async def test_skills_create_and_remove_local_skill(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("skills-local"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        skill_registry=load_skill_registry(*get_skill_roots(config)),
+    )
+    router = build_router()
+
+    assert await router.dispatch(state, "/skills create-local code-review") is True
+    skill_file = config.local_root / "skills" / "code-review" / "SKILL.md"
+    assert skill_file.exists()
+    assert state.skill_registry.get("code-review") is not None
+
+    assert await router.dispatch(state, "/skills remove-local code-review") is True
+    assert not skill_file.exists()
+    assert state.skill_registry.get("code-review") is None
+
+
+@pytest.mark.asyncio
+async def test_skills_remove_local_refuses_builtin(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("skills-refuse-builtin"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+        skill_registry=load_skill_registry(*get_skill_roots(config)),
+    )
+
+    handled = await build_router().dispatch(state, "/skills remove-local nexus-agent")
+
+    assert handled is True
+    assert "Refusing to remove non-local skill" in console.export_text()
 
 
 @pytest.mark.asyncio
@@ -520,7 +1023,10 @@ async def test_skills_list_shows_subagent_type(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     skill_root = config.local_root / "skills" / "subagent-review"
     skill_root.mkdir(parents=True, exist_ok=True)
-    (skill_root / "SKILL.md").write_text("# Review skill\n\nAlways review carefully.", encoding="utf-8")
+    (skill_root / "SKILL.md").write_text(
+        "---\nname: subagent-review\ndescription: Review skill\n---\n\n# Review skill\n\nAlways review carefully.",
+        encoding="utf-8",
+    )
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")
     console = Console(record=True, no_color=True, width=200)
@@ -856,6 +1362,10 @@ async def test_skills_reload_registers_skill_backed_subagent_tools(tmp_path):
     skill_dir = config.local_root / "skills" / "subagent-review"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: subagent-review\n"
+        "description: Review code changes.\n"
+        "---\n\n"
         "# Review Skill\n\nInspect the selected code and report issues.\n",
         encoding="utf-8",
     )
@@ -881,6 +1391,60 @@ async def test_skills_reload_registers_skill_backed_subagent_tools(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_sub_agent_agents_reload_registers_and_updates_yaml_tools(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = load_config(
+        workspace,
+        global_root=tmp_path / "global",
+        cli_overrides={"agent_mode": "advanced"},
+    )
+    agents_dir = workspace / ".nexus" / "agents"
+    agents_dir.mkdir(parents=True)
+    yaml_path = agents_dir / "summarizer.yml"
+    yaml_path.write_text(
+        "name: summarizer\n"
+        "description: First summary agent.\n"
+        "goal_prompt: Summarize briefly.\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("yaml-agent-reload"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    router = build_router()
+    handled = await router.dispatch(state, "/sub-agent agents reload")
+
+    assert handled is True
+    assert state.tool_registry.record("subagent_summarizer").source == "agent-yaml"
+    assert state.tool_registry.record("subagent_summarizer").tool.description == "First summary agent."
+
+    yaml_path.write_text(
+        "name: summarizer\n"
+        "description: Updated summary agent.\n"
+        "goal_prompt: Summarize carefully.\n"
+        "max_turns: 9\n",
+        encoding="utf-8",
+    )
+    handled = await router.dispatch(state, "/sub-agent agents reload")
+
+    assert handled is True
+    record = state.tool_registry.record("subagent_summarizer")
+    assert record.source == "agent-yaml"
+    assert record.tool.description == "Updated summary agent."
+    assert record.tool._definition.max_turns == 9
+
+
+@pytest.mark.asyncio
 async def test_context_usage_command_shows_table(tmp_path):
     state, console = _make_state(tmp_path)
     router = build_router()
@@ -890,6 +1454,10 @@ async def test_context_usage_command_shows_table(tmp_path):
     output = console.export_text()
     assert "Context Usage" in output
     assert "Context window" in output
+    assert "Tool schemas" in output
+    assert "Sub-agent schemas" in output
+    assert "MCP schemas" in output
+    assert "Active skills prompt" in output
     assert "tokens" in output
 
 

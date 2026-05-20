@@ -193,7 +193,7 @@ class TextualTerminalUI(TerminalUI):
         )
 
     def print_help_hint(self) -> None:
-        self._write(Text("Type /help for commands, /skills for skill control, or /quit to exit.", style="dim"))
+        self._write(Text("Type /help for commands, /skills for skill control, /abort to stop a running turn, or /quit to exit.", style="dim"))
 
     def print_fake_provider_notice(self) -> None:
         self._write(
@@ -433,6 +433,21 @@ class TextualTerminalUI(TerminalUI):
         self._app.append_tool_output(call_id, stream_name, chunk)
 
 
+class PromptInput(Input):
+    """Input widget with terminal-style prompt history navigation."""
+
+    BINDINGS = [
+        ("up", "history_previous", "Previous prompt"),
+        ("down", "history_next", "Next prompt"),
+    ]
+
+    def action_history_previous(self) -> None:
+        cast("NexusTextualApp", self.app).action_prompt_history_previous()
+
+    def action_history_next(self) -> None:
+        cast("NexusTextualApp", self.app).action_prompt_history_next()
+
+
 class NexusTextualApp(App[None]):
     CSS = """
     Screen {
@@ -501,11 +516,18 @@ class NexusTextualApp(App[None]):
         self._transcript: Any = None
         self._status: Any = None
         self._input: Any = None
+        self._prompt_history = [
+            message.content
+            for message in state.history
+            if message.role == "user" and message.content.strip()
+        ]
+        self._prompt_history_index = len(self._prompt_history)
+        self._prompt_history_draft = ""
 
     def compose(self) -> ComposeResult:
         yield RichLog(id="transcript", wrap=True, highlight=False, markup=False)
         yield Static("", id="status")
-        yield Input(placeholder="Message Nexus or type /help", id="prompt")
+        yield PromptInput(placeholder="Message Nexus or type /help", id="prompt")
 
     def on_mount(self) -> None:
         self._transcript = self.query_one("#transcript", RichLog)
@@ -587,6 +609,10 @@ class NexusTextualApp(App[None]):
     async def on_input_submitted(self, event: Any) -> None:
         raw = _strip_mouse_escape_sequences(str(event.value or "")).strip()
         self._input.value = ""
+        if raw == "/abort" or raw.startswith("/abort "):
+            if await self.router.dispatch(self.state, raw):
+                self._record_prompt_history(raw)
+                return
         if self._pending_input is not None:
             pending = self._pending_input
             self._pending_input = None
@@ -596,6 +622,7 @@ class NexusTextualApp(App[None]):
             return
         if not raw:
             return
+        self._record_prompt_history(raw)
         if self._busy:
             self.ui.print_warning("A turn is already running.")
             return
@@ -634,6 +661,47 @@ class NexusTextualApp(App[None]):
         self.state.should_exit = True
         await self.finalize_session()
         self.exit()
+
+    def action_prompt_history_previous(self) -> None:
+        if self._pending_input is not None or self.focused is not self._input:
+            return
+        self._show_prompt_history_delta(-1)
+
+    def action_prompt_history_next(self) -> None:
+        if self._pending_input is not None or self.focused is not self._input:
+            return
+        self._show_prompt_history_delta(1)
+
+    def _record_prompt_history(self, value: str) -> None:
+        if not value:
+            return
+        self._prompt_history.append(value)
+        self._prompt_history_index = len(self._prompt_history)
+        self._prompt_history_draft = ""
+
+    def _show_prompt_history_delta(self, delta: int) -> None:
+        if self._input is None or not self._prompt_history:
+            return
+        if self._prompt_history_index == len(self._prompt_history):
+            self._prompt_history_draft = str(self._input.value or "")
+
+        if delta < 0:
+            if self._prompt_history_index == 0:
+                return
+            self._prompt_history_index -= 1
+            value = self._prompt_history[self._prompt_history_index]
+        else:
+            if self._prompt_history_index >= len(self._prompt_history):
+                return
+            self._prompt_history_index += 1
+            value = (
+                self._prompt_history[self._prompt_history_index]
+                if self._prompt_history_index < len(self._prompt_history)
+                else self._prompt_history_draft
+            )
+
+        self._input.value = value
+        self._input.cursor_position = len(value)
 
     async def finalize_session(self) -> None:
         if self._session_finalized:
@@ -684,6 +752,7 @@ class NexusTextualApp(App[None]):
 
     async def _handle_prompt(self, raw_input: str) -> None:
         self._busy = True
+        user_message_appended = False
         self.set_status("Thinking")
         self.ui.print(
             Panel(
@@ -710,9 +779,11 @@ class NexusTextualApp(App[None]):
                 resumed_paused_turn=resumed_paused_turn,
             )
             self.state.history.append(Message(role="user", content=raw_input))
+            user_message_appended = True
             if not resumed_paused_turn:
                 self.state.approval_manager.begin_turn()
             try:
+                self.state.begin_running_turn()
                 events = await run_orchestrated_turn(
                     self.state,
                     self.agent,
@@ -720,12 +791,20 @@ class NexusTextualApp(App[None]):
                     ui=self.ui,
                     approval_callback=self._approval_callback(),
                 )
+            except asyncio.CancelledError:
+                self.ui.print_warning("Turn aborted.")
+                if user_message_appended:
+                    self.state.history.pop()
+                return
             except Exception as exc:  # noqa: BLE001
                 from nexus.app import provider_error_message
 
                 self.ui.print_error(provider_error_message(exc, self.state.config))
-                self.state.history.pop()
+                if user_message_appended:
+                    self.state.history.pop()
                 return
+            finally:
+                self.state.clear_running_turn()
             self.state.apply_events(events)
             self.state.current_turn_id = ""
             self.state.current_trace_id = ""

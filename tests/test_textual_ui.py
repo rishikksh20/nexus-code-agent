@@ -5,6 +5,7 @@ import pytest
 from nexus.config import load_config
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.memory.store import MemoryStore
+from nexus.models import Message
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
@@ -72,3 +73,46 @@ async def test_textual_app_mounts_and_restores_console(tmp_path):
         assert state.console is app.ui
 
     assert state.console is original_console
+
+
+@pytest.mark.asyncio
+async def test_textual_prompt_history_uses_up_and_down_arrows(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+        history=[
+            Message(role="user", content="first instruction"),
+            Message(role="assistant", content="done"),
+            Message(role="user", content="/history 5"),
+        ],
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(
+        state,
+        agent,
+        build_router(),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        prompt = app.query_one("#prompt")
+        prompt.value = "draft"
+
+        await pilot.press("up")
+        assert prompt.value == "/history 5"
+
+        await pilot.press("up")
+        assert prompt.value == "first instruction"
+
+        await pilot.press("down")
+        assert prompt.value == "/history 5"
+
+        await pilot.press("down")
+        assert prompt.value == "draft"

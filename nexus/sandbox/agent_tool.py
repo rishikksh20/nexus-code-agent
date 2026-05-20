@@ -13,6 +13,7 @@ from typing import Any
 
 from nexus.models import AgentEventType, ConfirmationKind, Message, ToolCall, ToolExecutionContext, ToolResult
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.agent_scope import render_skill_metadata, subagent_skill_names, subagent_tool_names
 from nexus.security.manager import ApprovalScope
 from nexus.security.policy import ApprovalPolicy
 from nexus.tools.base import ToolKind
@@ -40,6 +41,10 @@ class SubagentDefinition:
         System prompt / goal injected into the cognitive sub-agent.
     allowed_tools:
         Restrict which normal tools the sub-agent may use. ``None`` = all.
+    allowed_skills:
+        Restrict which active skills are exposed as metadata. ``None`` = all.
+    allowed_mcps:
+        Restrict which active MCP servers' tools are exposed. ``None`` = all.
     max_turns:
         Maximum number of agent turns for the sub-agent.
     timeout_seconds:
@@ -50,6 +55,8 @@ class SubagentDefinition:
     description: str
     goal_prompt: str
     allowed_tools: list[str] | None = None
+    allowed_skills: list[str] | None = field(default_factory=list)
+    allowed_mcps: list[str] | None = field(default_factory=list)
     max_turns: int = 20
     timeout_seconds: float = 600.0
 
@@ -82,11 +89,6 @@ class SubAgentTool:
                     "Detailed bounded objective for the cognitive sub-agent. Include role, goal, constraints, "
                     "relevant file hints, expected JSON fields, and stop condition. Do not paste the full conversation."
                 ),
-            },
-            "allowed_tools": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional supervisor override for normal tool names the sub-agent may use. Omit to use the specialist's default allowlist.",
             },
             "input_packet_ids": {
                 "type": "array",
@@ -125,7 +127,6 @@ class SubAgentTool:
     ) -> ToolResult:
         title = str(arguments.get("title", "")).strip()
         instructions = str(arguments.get("instructions", "")).strip()
-        raw_tools: list[str] | None = arguments.get("allowed_tools")
         raw_packet_ids: list[str] | None = arguments.get("input_packet_ids")
         input_packet_ids = tuple(str(item) for item in raw_packet_ids or () if str(item).strip())
 
@@ -137,15 +138,10 @@ class SubAgentTool:
                 is_error=True,
             )
 
-        # Merge definition-level allowed_tools if caller didn't override
-        if raw_tools is None and self._definition and self._definition.allowed_tools:
-            raw_tools = self._definition.allowed_tools
-
         return await self._execute_direct(
             call_id,
             title=title,
             instructions=instructions,
-            allowed_tools=tuple(raw_tools) if raw_tools else (),
             input_packet_ids=input_packet_ids,
             outer_context=context,
         )
@@ -156,7 +152,6 @@ class SubAgentTool:
         *,
         title: str,
         instructions: str,
-        allowed_tools: tuple[str, ...],
         input_packet_ids: tuple[str, ...],
         outer_context: ToolExecutionContext,
     ) -> ToolResult:
@@ -174,17 +169,44 @@ class SubAgentTool:
             )
 
         registry = ToolRegistry()
-        allowed = set(allowed_tools)
+        scoped_config = outer_context.metadata.get("config", self._config)
+        effective_tool_names = subagent_tool_names(
+            scoped_config,
+            self._base_tool_registry,
+            self._definition.name if self._definition else "delegate",
+            base_allowed_tools=self._definition.allowed_tools if self._definition else None,
+            base_allowed_mcps=self._definition.allowed_mcps if self._definition else None,
+        )
         for record in self._base_tool_registry.records():
             if record.name == self.name or record.name.startswith("subagent_") or record.name == "delegate_task":
                 continue
-            if allowed and record.name not in allowed:
+            if record.name not in effective_tool_names:
                 continue
             registry.register(record.tool, source=record.source, origin=record.origin)
 
         model_factory = self._model_client_factory or (lambda: FakeModelClient())
         agent = Agent(model_client=model_factory(), tool_registry=registry)
         shared_context = _packet_summaries_from_context(outer_context, input_packet_ids)
+        active_skill_names = subagent_skill_names(
+            scoped_config,
+            self._definition.name if self._definition else "delegate",
+            outer_context.metadata.get("global_active_skills", outer_context.metadata.get("active_skills", [])),
+            base_allowed_skills=self._definition.allowed_skills if self._definition else None,
+        )
+        allowed_skill_metadata = render_skill_metadata(
+            outer_context.metadata.get("skill_catalog", {}),
+            active_skill_names,
+        )
+        allowed_mcp_servers = tuple(
+            sorted(
+                {
+                    record.origin
+                    for record in registry.records()
+                    if record.source == "mcp" and record.origin
+                }
+            )
+        )
+        allowed_tool_names = tuple(record.name for record in registry.records())
         sub_context = ToolExecutionContext(
             session_id=f"{outer_context.session_id}-subagent-{call_id}",
             working_directory=outer_context.working_directory,
@@ -196,15 +218,21 @@ class SubAgentTool:
                 "subagent": self.name,
                 "tool_display_prefix": self.name,
                 "supervisor_cognitive_tools_only": False,
+                "supervisor_available_tools": list(allowed_tool_names),
                 "input_packet_ids": list(input_packet_ids),
                 "shared_context": list(shared_context),
+                "active_skills": list(active_skill_names),
+                "active_mcp_servers": list(allowed_mcp_servers),
             },
         )
         system_prompt = _direct_subagent_system_prompt(
             self._definition,
             title=title,
             instructions=instructions,
-            allowed_tools=tuple(record.name for record in registry.records()),
+            allowed_tools=allowed_tool_names,
+            allowed_mcp_servers=allowed_mcp_servers,
+            allowed_skill_names=tuple(active_skill_names),
+            allowed_skill_metadata=allowed_skill_metadata,
             shared_context=shared_context,
             input_packet_ids=input_packet_ids,
         )
@@ -348,6 +376,8 @@ class SubAgentTool:
             "scope": "isolated",
             "input_packet_ids": list(input_packet_ids),
             "shared_context": list(shared_context),
+            "active_skills": list(active_skill_names),
+            "active_mcp_servers": list(allowed_mcp_servers),
             "allowed_tools": [record.name for record in registry.records()],
             "tool_call_count": tool_call_count,
             "message_count": len(history),
@@ -449,10 +479,16 @@ def _direct_subagent_system_prompt(
     title: str,
     instructions: str,
     allowed_tools: tuple[str, ...],
+    allowed_mcp_servers: tuple[str, ...],
+    allowed_skill_names: tuple[str, ...],
+    allowed_skill_metadata: tuple[str, ...],
     shared_context: tuple[str, ...],
     input_packet_ids: tuple[str, ...],
 ) -> str:
     tools_text = ", ".join(allowed_tools) if allowed_tools else "no tools"
+    mcps_text = ", ".join(allowed_mcp_servers) if allowed_mcp_servers else "none"
+    skill_names_text = ", ".join(allowed_skill_names) if allowed_skill_names else "none"
+    skills_text = "\n".join(allowed_skill_metadata) if allowed_skill_metadata else "(none)"
     shared_text = "\n".join(shared_context) if shared_context else "(none)"
     packet_text = ", ".join(input_packet_ids) if input_packet_ids else "(none)"
     role_prompt = definition.goal_prompt if definition is not None else "Complete the delegated cognitive task."
@@ -467,7 +503,10 @@ def _direct_subagent_system_prompt(
         f"Task instructions:\n{instructions}\n\n"
         f"Input packet ids: {packet_text}\n"
         f"Shared handoff context:\n{shared_text}\n\n"
-        f"Allowed normal tools: {tools_text}\n\n"
+        f"Allowed tools: {tools_text}\n"
+        f"Allowed MCP servers: {mcps_text}\n"
+        f"Allowed skills: {skill_names_text}\n\n"
+        f"Allowed skill metadata:\n{skills_text}\n\n"
         "If the task requires reading, editing, testing, or shell inspection, use the allowed normal tools before your final answer. "
         "Do not claim files were changed, tests were run, or code was inspected unless you actually used the relevant tools.\n\n"
         "Return only a JSON object with keys: status, summary, findings, changed_files, "
@@ -551,6 +590,8 @@ def _subagent_result_envelope(
         "input_packet_ids": list(input_packet_ids),
         "shared_context": context_snapshot.get("shared_context", []),
         "allowed_tools": context_snapshot.get("allowed_tools", []),
+        "allowed_mcp_servers": context_snapshot.get("active_mcp_servers", []),
+        "allowed_skills": context_snapshot.get("active_skills", []),
         "tool_call_count": context_snapshot.get("tool_call_count", 0),
         "message_count": context_snapshot.get("message_count", 0),
         "token_estimate": context_snapshot.get("token_estimate", 0),

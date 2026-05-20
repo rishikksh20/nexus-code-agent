@@ -106,6 +106,7 @@ nexus/                         # Main package
 │
 ├── runtime/                   # Core agent execution
 │   ├── agent.py               # Agent class — agentic loop, tool dispatch, hooks
+│   ├── agent_scope.py         # Supervisor/sub-agent tool, skill, and MCP visibility logic
 │   ├── repl.py                # Turn runner plus interactive REPL loop
 │   ├── repl_state.py          # ReplState — session, history, config, approval manager
 │   ├── slash_commands.py      # /command router and all slash-command handlers
@@ -130,6 +131,7 @@ nexus/                         # Main package
 │
 ├── skills/                    # Skill loading and registry
 │   ├── loader.py              # Discover and load Markdown skill files
+│   ├── parser.py              # SKILL.md YAML frontmatter + body parser
 │   ├── registry.py            # SkillRegistry
 │   └── models.py              # Skill dataclass
 │
@@ -160,8 +162,12 @@ nexus/                         # Main package
 │   └── terminal.py            # TerminalUI — Rich-backed console rendering
 │
 └── builtin_skills/
-    └── nexus-agent/
-        └── SKILL.md           # Built-in nexus-agent skill (auto-activated)
+    ├── nexus-agent/
+    │   └── SKILL.md           # Built-in Nexus self-help skill
+    ├── python-code-review/
+    │   └── SKILL.md           # PEP 8 + Google Style Guide code review skill
+    └── note-taking/
+        └── SKILL.md           # Append time-stamped notes to notes.toml
 
 tests/                         # Pytest test suite
 docs/                          # Architecture plans and tutorial reference material
@@ -356,16 +362,19 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 |---|---|
 | `/help` | Show all available slash commands |
 | `/mode [plan\|default\|auto]` | Show or switch execution mode |
-| `/context [show\|usage]` | Print system prompt or show token/context-window usage stats |
+| `/context [show\|usage]` | Print system prompt or show supervisor token/context-window usage, including tool, MCP, sub-agent, and skill prompt/schema estimates |
 | `/context agents\|agent \<id\>\|usage \<id\>` | Inspect per-agent context isolation, handoffs, and usage |
 | `/provider [list\|set \<param\> \<value\>]` | Show or update provider, model, temperature, and session parameters |
-| `/config [show\|set\|reset\|reload\|upgrade\|reinit [local\|global]]` | Inspect or edit configuration; `upgrade` merges new defaults and reloads tools |
+| `/config [show\|set\|reset\|reset-defaults\|reload\|upgrade\|reinit]` | Inspect or edit configuration; `reset-defaults` rewrites clean defaults |
 | `/skills [list\|show\|add\|remove\|reload]` | Manage session skills and skill-backed sub-agent tools |
+| `/agent [status\|tools\|skills\|mcp\|allow\|disallow]` | Inspect and scope supervisor tools, skills, and MCP servers |
+| `/sub-agent [list\|show\|tools\|skills\|mcp\|allow\|disallow]` | Inspect and scope cognitive sub-agent resources |
 | `/session [new\|list\|resume\|save\|export]` | Manage sessions |
 | `/memory [list\|search\|save\|show]` | Workspace memory entries |
 | `/tools [reload]` | List registered tools or reload core, plugin, MCP, and sub-agent tools |
 | `/history [n]` | Show recent conversation messages |
 | `/mcp [status\|available\|activate\|deactivate\|tools\|refresh [server]\|reload]` | Inspect and manage MCP server activation, status, tools, and reloads |
+| `/abort` | Abort the currently running agent turn |
 | `/quit` or `/exit` | Save session and exit |
 
 ---
@@ -395,15 +404,17 @@ Mode set to: auto
 Done. Added a module-level docstring describing the BaseTool protocol and ToolRegistry.
 
 > /context usage
-┌─ Context Usage ──────────────────────────────────────┐
-│ Provider          openai-compatible                   │
-│ Model             mistral-medium-latest               │
-│ Context window    131,072 tokens                      │
-│ System prompt     ~420 tokens                         │
-│ History           ~1,840 tokens                       │
-│ Total used        ~2,260 tokens  (1.7%)               │
-│ Compaction soft   85,197 tokens  (65%)                │
-│ Compaction hard   111,411 tokens (85%)                │
+┌─ Context Usage: supervisor ──────────────────────────┐
+│ Provider                       openai-compatible     │
+│ Model                          mistral-medium-latest │
+│ Context window                 131,072 tokens        │
+│ System prompt (est.)           ~420 tokens           │
+│ History (est.)                 ~1,840 tokens         │
+│ Tool schemas (est.)            ~900 tokens           │
+│ Sub-agent schemas (est.)       ~320 tokens           │
+│ MCP schemas (est.)             ~180 tokens           │
+│ Active skills prompt (est.)    ~240 tokens           │
+│ Total used incl. schemas       ~3,660 tokens (2.8%)  │
 └──────────────────────────────────────────────────────┘
 
 > /session save
@@ -534,6 +545,23 @@ delegation_subagents = [
 
 Skill-backed sub-agent tools are also supported. Create a skill named `subagent-review` or `subagent_review` under `.nexus/skills/` or `~/.nexus/skills/`, then run `/skills reload`; it registers as `subagent_review` when `agent_mode = "advanced"`.
 
+Agent-scoped resources are layered on top of global activation. Use `/mcp activate` and `/skills activate` to make MCP servers and skills globally available, then use `[agents]` or `[[sub-agents]]` `allowed_*` lists to narrow or expand what each agent can see. `/agent allow ...` and `/sub-agent allow ...` update those allowlists in `.nexus/config.toml`.
+
+```toml
+[agents]
+allowed_tools = []          # empty = default supervisor behavior; "all" = every normal workspace tool
+allowed_skills = []         # empty = all globally active skills; "all" = every active skill
+allowed_mcps = []           # empty = default MCP behavior; "all" = every active MCP server
+
+[[sub-agents]]
+name = "execution"
+allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_tests", "run_linter", "run_typecheck", "bash"]
+allowed_skills = []         # empty = no extra skill metadata by default; "all" = every active skill
+allowed_mcps = []           # empty = built-in sub-agent MCP inheritance/defaults; "all" = every active MCP server
+```
+
+In advanced mode, the supervisor sees cognitive `subagent_*` tools by default and only the direct normal tools, MCP servers, and skills allowed under `[agents]`; work outside that supervisor allowlist should be delegated to an appropriate sub-agent. In basic mode, direct tools remain available unless narrowed by config. Sub-agents start from their normal `allowed_tools`; a non-empty `[[sub-agents]].allowed_tools` list replaces that base. Set an `allowed_*` value to `"all"` to use every workspace-active tool, skill, or MCP server for that scope. Agent-scoped skills are shown as metadata only. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are still accepted as aliases; obsolete attach/detach keys are ignored.
+
 Useful commands after editing `.nexus/config.toml`:
 
 ```text
@@ -542,8 +570,53 @@ Useful commands after editing `.nexus/config.toml`:
 /tools reload          # rebuild the live tool registry from the current config
 /tools                 # confirm which subagent_* tools are registered
 /skills reload         # rescan skills and register skill-backed sub-agent tools
+/agent tools           # inspect supervisor-scoped tool visibility
+/sub-agent show execution # inspect one sub-agent's effective resources
 /context agents        # inspect sub-agent context isolation and handoffs
 ```
+
+### YAML Sub-Agents
+
+In addition to `delegation_subagents` in `config.toml`, you can define sub-agents as standalone `.yml` files — one file per agent. Nexus discovers them automatically from two directories:
+
+| Scope | Path | Priority |
+|---|---|---|
+| Global | `~/.nexus/agents/<name>.yml` | Base |
+| Local (workspace) | `.nexus/agents/<name>.yml` | Overrides global |
+
+**Minimal example** (`.nexus/agents/explore.yml`):
+
+```yaml
+name: explore
+description: Investigate a focused codebase question and summarize the answer.
+goal_prompt: |
+  Read the relevant code and summarize the answer. Do not modify files.
+allowed_tools:
+  - read_file
+  - glob
+  - grep
+  - list_dir
+  - lsp
+allowed_skills: []   # omit or leave empty to allow all active skills
+allowed_mcps: []     # omit or leave empty to allow all active MCP servers
+max_turns: 12
+timeout_seconds: 300
+```
+
+The file name (without `.yml`) must match the `name` field. The sub-agent is registered as `subagent_<name>` when `agent_mode = "advanced"` or the name appears in `delegation_subagents`.
+
+**REPL commands:**
+
+```text
+/sub-agent agents list               — list all discovered YAML agent files
+/sub-agent agents new <name>         — scaffold a local .nexus/agents/<name>.yml
+/sub-agent agents new <name> global  — scaffold a global ~/.nexus/agents/<name>.yml
+/sub-agent agents reload             — re-scan and register new YAML agents live
+/sub-agent agents promote <name>     — move local → global
+/sub-agent agents demote <name>      — move global → local
+```
+
+YAML agents participate in the same definition priority chain as built-in and config agents: built-ins → `delegation_subagents` → YAML files (YAML wins on name collision). `/tools reload` also rebuilds YAML agents. See [`docs/sub-agents-integration.md`](docs/sub-agents-integration.md) for the full field reference and examples.
 
 ### Approval Flow
 
@@ -573,31 +646,54 @@ High-risk bash commands always require confirmation regardless of execution mode
 
 ## Skills
 
-Skills are Markdown files that inject structured instructions or context into the agent's system prompt for the current session.
+Nexus supports Agent Skills: directory-based instruction packs with a required
+`SKILL.md` file containing YAML frontmatter and Markdown instructions. Skills
+are discovered as a catalogue, then activated by name for a workspace or one
+CLI run.
 
 ### Discovery Order
 
-Skills are loaded from three sources in priority order (later source overrides earlier on name collision):
+Later roots override earlier roots when skill names collide:
 
-1. **Built-in** — `nexus/builtin_skills/` (shipped with the package)
-2. **Global** — `~/.nexus/skills/`
-3. **Workspace** — `.nexus/skills/`
+1. Packaged built-ins — `nexus/builtin_skills/`
+2. Extra `skill_paths` from config
+3. Global catalogue — `~/.nexus/skills/`
+4. Workspace skills — `.nexus/skills/`
+5. Standard Agent Skills path — `.agents/skills/`
 
-### Built-in Skills
+### Activation
 
-| Skill | Auto-activated | Description |
-|---|---|---|
-| `nexus-agent` | Yes | Answers natural-language questions about Nexus commands, config, and providers |
+Workspace activation is stored in `.nexus/config.toml`:
+
+```toml
+skill_paths = []
+enabled_skills = ["nexus-agent"]
+disabled_skills = []
+```
+
+`enabled_skills` and `disabled_skills` accept exact names, glob patterns such
+as `review-*`, and regex patterns prefixed with `re:`.
+
+The system prompt includes skill metadata only: name, description, source,
+active state, and `SKILL.md` path. Full skill instructions stay in the skill
+file and can be inspected with `/skills show <name>` or read from the listed
+path when the task calls for it.
 
 ### Managing Skills in the REPL
 
 ```
-/skills list              — list all loaded skills (name, type, active status)
-/skills show nexus-agent  — print the full content of a skill file
-/skills add my-skill      — activate a skill for this session
-/skills remove my-skill   — deactivate a skill
-/skills reload            — rescan all skill directories
+/skills list                 — list discovered skills, source, path, and active state
+/skills show nexus-agent     — print the skill's SKILL.md
+/skills activate my-skill    — activate a skill in local config
+/skills deactivate my-skill  — deactivate a skill in local config
+/skills create-local review  — create .nexus/skills/review/SKILL.md
+/skills remove-local review  — remove a workspace-local skill
+/skills reload               — rescan skills and refresh the prompt
+/agent allow skill review   — allow active skill metadata for the supervisor
+/sub-agent allow review skill python-code-review — allow active skill metadata for a sub-agent
 ```
+
+`/skills add` and `/skills remove` remain aliases for activate/deactivate.
 
 ### Activating from the CLI
 
@@ -606,19 +702,22 @@ uv run nexus --skill my-skill --prompt "use the skill"
 uv run nexus --no-skills   # disable all skill loading
 ```
 
-### Creating a Custom Skill
+`--skill` is run-only and does not write config.
 
-Create a Markdown file in `.nexus/skills/` or `~/.nexus/skills/`:
+### Skill Format
 
 ```markdown
-# my-skill
+---
+name: code-review
+description: Review code changes for bugs, regressions, and missing tests. Use when the user asks for review.
+---
 
-<!-- description: Project-specific coding conventions -->
+# Code Review
 
-Always use double quotes for strings.
-Prefer `pathlib.Path` over `os.path`.
-Run `ruff check .` before marking any task complete.
+Inspect diffs first, report findings with file references, and keep summaries brief.
 ```
+
+See [`docs/skills.md`](docs/skills.md) for the full Nexus skill guide.
 
 ---
 
