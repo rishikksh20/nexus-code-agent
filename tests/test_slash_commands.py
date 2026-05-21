@@ -11,7 +11,7 @@ from nexus.cli.init import init_workspace
 from nexus.config import load_config
 from nexus.tools.mcp import MCPServerConfig, MCPServerRuntime, MCPToolSpec
 from nexus.memory.store import MemoryStore
-from nexus.models import Message, ToolCall
+from nexus.models import AgentEvent, AgentEventType, Message, ToolCall, ToolResult
 from nexus.runtime.context_state import (
     TaskContext,
     append_artifact_record,
@@ -21,6 +21,7 @@ from nexus.runtime.context_state import (
     upsert_task_context,
 )
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.session_checkpoints import checkpoint_snapshots_for_paths, create_checkpoint_from_events
 from nexus.runtime.agent_scope import subagent_skill_names, subagent_tool_names, supervisor_skill_names, supervisor_tool_names
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
@@ -1334,10 +1335,180 @@ async def test_session_export_slash_command_preserves_tool_call_metadata(tmp_pat
     assert payload[1]["tool_call_id"] == "call-1"
 
 
+@pytest.mark.asyncio
+async def test_session_checkpoints_slash_command_lists_checkpoints(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("session-checkpoints"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+    state.session.messages.append(Message(role="user", content="first checkpoint"))
+    create_checkpoint_from_events(
+        state.session,
+        [AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="stop")],
+        workspace=config.workspace_root,
+        turn_id="turn-1",
+    )
+
+    handled = await build_router().dispatch(state, "/session checkpoints")
+
+    output = console.export_text()
+    assert handled is True
+    assert "Session Checkpoints" in output
+    assert "turn-1" in output
+
+
+@pytest.mark.asyncio
+async def test_session_rewind_slash_command_restores_messages_and_files(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("session-rewind"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+    target = config.workspace_root / "hello.txt"
+    target.write_text("one\n", encoding="utf-8")
+    state.session.messages.append(Message(role="user", content="first"))
+    create_checkpoint_from_events(
+        state.session,
+        [
+            AgentEvent(
+                kind=AgentEventType.TOOL_RESULT,
+                payload=ToolResult(
+                    call_id="call-1",
+                    tool_name="write_file",
+                    output="Updated hello.txt",
+                    metadata={"affected_paths": ["hello.txt"]},
+                ),
+            ),
+            AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="stop"),
+        ],
+        workspace=config.workspace_root,
+        turn_id="turn-1",
+    )
+    checkpoint_id = state.session.metadata["checkpoints"][0]["id"]
+    pre_snapshots = checkpoint_snapshots_for_paths(config.workspace_root, {"hello.txt"})
+    target.write_text("two\n", encoding="utf-8")
+    state.session.messages.append(Message(role="user", content="second"))
+    create_checkpoint_from_events(
+        state.session,
+        [
+            AgentEvent(
+                kind=AgentEventType.TOOL_RESULT,
+                payload=ToolResult(
+                    call_id="call-2",
+                    tool_name="write_file",
+                    output="Updated hello.txt",
+                    metadata={
+                        "affected_paths": ["hello.txt"],
+                        "checkpoint_pre_snapshots": pre_snapshots,
+                    },
+                ),
+            ),
+            AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="stop"),
+        ],
+        workspace=config.workspace_root,
+        turn_id="turn-2",
+    )
+    state.history = list(state.session.messages)
+
+    handled = await build_router().dispatch(state, f"/session rewind {checkpoint_id}")
+
+    assert handled is True
+    assert state.session.session_id == "session-rewind"
+    assert [message.content for message in state.history] == ["first"]
+    assert target.read_text(encoding="utf-8") == "one\n"
+    assert "Rewound session" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_session_rewind_messages_only_leaves_files_unchanged(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("session-rewind-messages"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+    target = config.workspace_root / "hello.txt"
+    target.write_text("one\n", encoding="utf-8")
+    state.session.messages.append(Message(role="user", content="first"))
+    create_checkpoint_from_events(
+        state.session,
+        [
+            AgentEvent(
+                kind=AgentEventType.TOOL_RESULT,
+                payload=ToolResult(
+                    call_id="call-1",
+                    tool_name="write_file",
+                    output="Updated hello.txt",
+                    metadata={"affected_paths": ["hello.txt"]},
+                ),
+            ),
+            AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="stop"),
+        ],
+        workspace=config.workspace_root,
+        turn_id="turn-1",
+    )
+    checkpoint_id = state.session.metadata["checkpoints"][0]["id"]
+    target.write_text("two\n", encoding="utf-8")
+    state.session.messages.append(Message(role="user", content="second"))
+    state.history = list(state.session.messages)
+
+    handled = await build_router().dispatch(state, f"/session rewind {checkpoint_id} --messages-only")
+
+    assert handled is True
+    assert [message.content for message in state.history] == ["first"]
+    assert target.read_text(encoding="utf-8") == "two\n"
+    assert "Files unchanged" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_session_rewind_invalid_checkpoint_prints_error(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("session-rewind-missing"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    handled = await build_router().dispatch(state, "/session rewind chk-missing")
+
+    assert handled is True
+    assert "Checkpoint not found: chk-missing" in console.export_text()
+
+
 # ── /context usage ────────────────────────────────────────────────────────────
 
 def _make_state(tmp_path, *, extra_history=None):
-    from nexus.models import Message
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")

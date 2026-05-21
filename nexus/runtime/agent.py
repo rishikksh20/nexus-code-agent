@@ -22,6 +22,7 @@ from nexus.models import (
     UsageSnapshot,
 )
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.session_checkpoints import checkpoint_snapshots_for_paths
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
@@ -278,11 +279,21 @@ class Agent:
             },
         )
 
+        pre_snapshots = (
+            checkpoint_snapshots_for_paths(context.working_directory, affected_paths or set())
+            if tool.is_mutating and affected_paths
+            else []
+        )
         started_at = time.perf_counter()
         result = await tool.execute(tool_call.call_id, tool_call.arguments, context)
         if actor:
             result.metadata = {**result.metadata, "actor": actor}
         if tool.is_mutating:
+            if pre_snapshots and not (result.is_error and int(result.metadata.get("files_patched", 0) or 0) <= 0):
+                result.metadata = {
+                    **result.metadata,
+                    "checkpoint_pre_snapshots": pre_snapshots,
+                }
             result = _with_post_mutation_refresh(
                 result,
                 affected_paths or set(),

@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-from nexus.models import Message, ToolCall
+from nexus.models import AgentEvent, AgentEventType, Message, ToolCall, ToolResult
 from nexus.runtime.runtime_session import resolve_runtime_session
+from nexus.runtime.session_checkpoints import (
+    checkpoint_snapshots_for_paths,
+    create_checkpoint_from_events,
+    list_checkpoints,
+    rewind_to_checkpoint,
+)
 from nexus.runtime.sessions import SessionStore, new_snapshot, sanitize_session_messages
 
 
@@ -155,3 +161,123 @@ def test_resolve_runtime_session_resumes_latest_when_opted_in(tmp_path):
     assert resolved.session_id == "latest"
     assert resolved.messages[0].content == "previous task"
 
+
+def test_session_checkpoint_metadata_round_trips(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "hello.txt"
+    target.write_text("hello\n", encoding="utf-8")
+    snapshot = new_snapshot("checkpoint")
+    snapshot.messages.append(Message(role="user", content="write hello"))
+
+    checkpoint = create_checkpoint_from_events(
+        snapshot,
+        [
+            AgentEvent(
+                kind=AgentEventType.TOOL_RESULT,
+                payload=ToolResult(
+                    call_id="call-1",
+                    tool_name="write_file",
+                    output="Updated hello.txt",
+                    metadata={"affected_paths": ["hello.txt"]},
+                ),
+            ),
+            AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="stop"),
+        ],
+        workspace=workspace,
+        turn_id="turn-1",
+    )
+    assert checkpoint is not None
+
+    store = SessionStore(tmp_path / "sessions")
+    store.save(snapshot)
+    loaded = store.load("checkpoint")
+
+    checkpoints = list_checkpoints(loaded)
+    assert len(checkpoints) == 1
+    assert checkpoints[0]["turn_id"] == "turn-1"
+    assert checkpoints[0]["files"][0]["path"] == "hello.txt"
+    assert checkpoints[0]["files"][0]["content"] is not None
+
+
+def test_session_checkpoints_keep_last_ten(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    snapshot = new_snapshot("checkpoint-retention")
+    events = [AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="stop")]
+
+    for index in range(11):
+        snapshot.messages.append(Message(role="user", content=f"turn {index}"))
+        create_checkpoint_from_events(
+            snapshot,
+            events,
+            workspace=workspace,
+            turn_id=f"turn-{index}",
+        )
+
+    checkpoints = list_checkpoints(snapshot)
+    assert len(checkpoints) == 10
+    assert checkpoints[0]["turn_id"] == "turn-1"
+    assert checkpoints[-1]["turn_id"] == "turn-10"
+
+
+def test_session_rewind_restores_file_and_deletes_later_created_file(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "hello.txt"
+    later = workspace / "later.txt"
+    snapshot = new_snapshot("checkpoint-rewind")
+
+    target.write_text("one\n", encoding="utf-8")
+    snapshot.messages.append(Message(role="user", content="first"))
+    create_checkpoint_from_events(
+        snapshot,
+        [
+            AgentEvent(
+                kind=AgentEventType.TOOL_RESULT,
+                payload=ToolResult(
+                    call_id="call-1",
+                    tool_name="write_file",
+                    output="Updated hello.txt",
+                    metadata={"affected_paths": ["hello.txt"]},
+                ),
+            ),
+            AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="stop"),
+        ],
+        workspace=workspace,
+        turn_id="turn-1",
+    )
+    first_checkpoint = list_checkpoints(snapshot)[0]["id"]
+
+    pre_snapshots = checkpoint_snapshots_for_paths(workspace, {"hello.txt", "later.txt"})
+    target.write_text("two\n", encoding="utf-8")
+    later.write_text("created later\n", encoding="utf-8")
+    snapshot.messages.append(Message(role="user", content="second"))
+    create_checkpoint_from_events(
+        snapshot,
+        [
+            AgentEvent(
+                kind=AgentEventType.TOOL_RESULT,
+                payload=ToolResult(
+                    call_id="call-2",
+                    tool_name="write_file",
+                    output="Updated files",
+                    metadata={
+                        "affected_paths": ["hello.txt", "later.txt"],
+                        "checkpoint_pre_snapshots": pre_snapshots,
+                    },
+                ),
+            ),
+            AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="stop"),
+        ],
+        workspace=workspace,
+        turn_id="turn-2",
+    )
+
+    result = rewind_to_checkpoint(snapshot, first_checkpoint, workspace=workspace)
+
+    assert result.errors == []
+    assert target.read_text(encoding="utf-8") == "one\n"
+    assert not later.exists()
+    assert [message.content for message in snapshot.messages] == ["first"]
+    assert len(list_checkpoints(snapshot)) == 1

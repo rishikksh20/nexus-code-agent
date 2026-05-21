@@ -13,7 +13,8 @@ from nexus.runtime.context_state import load_multi_agent_state, multi_agent_carr
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.agent_scope import skill_metadata_catalog, supervisor_skill_names, supervisor_tool_names
 from nexus.hooks import HookExecutor
-from nexus.runtime.sessions import SessionSnapshot, SessionStore, prepare_messages_for_model, sanitize_session_messages
+from nexus.runtime.sessions import SessionSnapshot, SessionStore, prepare_messages_for_model
+from nexus.runtime.session_checkpoints import create_checkpoint_from_events
 from nexus.security.manager import ApprovalManager
 from nexus.skills import SkillRegistry
 from nexus.tools.base import ToolRegistry
@@ -185,6 +186,12 @@ class ReplState:
         if not self.session.summary:
             first_user = next((message.content for message in self.history if message.role == "user"), "")
             self.session.summary = first_user
+        create_checkpoint_from_events(
+            self.session,
+            events,
+            workspace=self.config.workspace_root,
+            turn_id=self.current_turn_id or _latest_turn_id(self.session.metadata),
+        )
         if self.config.save_on_every_turn:
             self.session_store.save(self.session)
 
@@ -251,6 +258,16 @@ def _is_continue_prompt(value: str) -> bool:
     normalized = value.strip().casefold().strip("`'\"")
     normalized = normalized.rstrip(".!?")
     return normalized == "continue"
+
+
+def _latest_turn_id(metadata: dict) -> str:
+    turns = metadata.get("turns")
+    if not isinstance(turns, list) or not turns:
+        return ""
+    last = turns[-1]
+    if not isinstance(last, dict):
+        return ""
+    return str(last.get("turn_id") or "")
 
 
 def _load_all_memory(store: MemoryStore) -> list[str]:

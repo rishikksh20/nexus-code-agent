@@ -35,6 +35,7 @@ from nexus.runtime.agent_scope import (
     supervisor_tool_names,
 )
 from nexus.runtime.repl_state import ReplState
+from nexus.runtime.session_checkpoints import list_checkpoints, rewind_to_checkpoint
 from nexus.runtime.sessions import message_to_dict, new_snapshot
 from nexus.tools.mcp import (
     MCPRefreshReport,
@@ -168,7 +169,7 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
         ("/skills [list|show|add|remove|reload]", "Inspect and activate session skills."),
         ("/config show [scope]", "Print config for merged, local, or global scope."),
         ("/config upgrade [local|global]", "Add new config keys/tool allowlist entries from latest Nexus defaults, then reload tools."),
-        ("/session [new|list|resume|save|export]", "Show current session or manage saved sessions."),
+        ("/session [new|list|resume|save|export|checkpoints|rewind]", "Show current session or manage saved sessions."),
         ("/tools [reload]", "List tools or reload the tool registry from config."),
         ("/memory list|search|save|show", "Inspect or update workspace memory."),
         ("/context [show|usage]", "Print the system prompt or show context/token usage stats."),
@@ -682,6 +683,9 @@ async def handle_session(state: ReplState, args: list[str]) -> None:
                 ("new",              "Save the current session and start a fresh one.",             "/session new"),
                 ("list",             "List all saved sessions with ID, timestamp, and summary.",   "/session list"),
                 ("resume <id>",      "Load a previous session's messages into context.",            "/session resume abc123"),
+                ("checkpoints",      "List rewind checkpoints for the current session.",            "/session checkpoints"),
+                ("rewind <id>",      "Rewind current session to a checkpoint and restore files.",   "/session rewind chk-1234abcd"),
+                ("rewind <id> --messages-only", "Rewind messages without restoring files.",         "/session rewind chk-1234abcd --messages-only"),
                 ("save",             "Persist the current session to disk.",                       "/session save"),
                 ("export <path>",    "Export session messages as JSON to a file.",                  "/session export /tmp/s.json"),
                 ("help",             "Show this help.",                                             "/session help"),
@@ -714,6 +718,39 @@ async def handle_session(state: ReplState, args: list[str]) -> None:
         _reset_session_runtime_state(state)
         state.console.print(f"Resumed session: {state.session.session_id}")
         return
+    if args and args[0].lower() == "checkpoints":
+        _print_session_checkpoints(state)
+        return
+    if args and args[0].lower() == "rewind":
+        if len(args) < 2:
+            state.console.print("Usage: /session rewind <checkpoint-id> [--messages-only]")
+            return
+        restore_files = "--messages-only" not in args[2:]
+        try:
+            result = rewind_to_checkpoint(
+                state.session,
+                args[1],
+                workspace=state.config.workspace_root,
+                restore_files=restore_files,
+            )
+        except ValueError as exc:
+            state.console.print(str(exc))
+            return
+        state.history = list(state.session.messages)
+        _reset_session_runtime_state(state)
+        state.session_store.save(state.session)
+        suffix = (
+            f" Restored {result.restored_files} file snapshot(s)."
+            if restore_files
+            else " Files unchanged."
+        )
+        state.console.print(
+            f"Rewound session to {result.checkpoint_id} "
+            f"({result.message_count} message(s)).{suffix}"
+        )
+        for error in result.errors:
+            state.console.print(f"Restore warning: {error}")
+        return
     if args and args[0].lower() == "save":
         state.session.messages = list(state.history)
         state.session_store.save(state.session)
@@ -728,6 +765,31 @@ async def handle_session(state: ReplState, args: list[str]) -> None:
     state.console.print(
         f"Session {state.session.session_id} with {len(state.history)} messages."
     )
+
+
+def _print_session_checkpoints(state: ReplState) -> None:
+    checkpoints = list_checkpoints(state.session)
+    if not checkpoints:
+        state.console.print("No checkpoints for this session.")
+        return
+    table = Table(title="Session Checkpoints")
+    table.add_column("Checkpoint")
+    table.add_column("Turn")
+    table.add_column("Created")
+    table.add_column("Messages")
+    table.add_column("Files")
+    table.add_column("Summary")
+    for checkpoint in checkpoints:
+        files = checkpoint.get("files", [])
+        table.add_row(
+            str(checkpoint.get("id", "")),
+            str(checkpoint.get("turn_id", "")) or "-",
+            str(checkpoint.get("created_at", "")),
+            str(checkpoint.get("message_count", 0)),
+            str(len(files) if isinstance(files, list) else 0),
+            str(checkpoint.get("summary", "")) or "-",
+        )
+    state.console.print(table)
 
 
 def _reset_session_runtime_state(state: ReplState) -> None:
