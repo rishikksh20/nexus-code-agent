@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tomllib
 
 import pytest
 from rich.console import Console
@@ -24,11 +25,32 @@ from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.agent_scope import subagent_skill_names, subagent_tool_names, supervisor_skill_names, supervisor_tool_names
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
-from nexus.runtime.slash_commands import build_router
+from nexus.runtime.slash_commands import _write_toml, build_router
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.skills import get_skill_roots, load_skill_registry
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import GetTimeTool, ReadFileTool
+
+
+def test_write_toml_preserves_nested_inline_tables(tmp_path):
+    config_path = tmp_path / ".nexus" / "config.toml"
+
+    _write_toml(
+        config_path,
+        {
+            "mcp_servers": [
+                {
+                    "name": "filesystem",
+                    "command": ["fake"],
+                    "env": {"TOKEN": "abc"},
+                    "prefix": "fs_",
+                }
+            ]
+        },
+    )
+
+    payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["mcp_servers"][0]["env"] == {"TOKEN": "abc"}
 
 
 @pytest.mark.asyncio

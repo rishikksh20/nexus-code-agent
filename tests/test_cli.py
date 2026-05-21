@@ -21,6 +21,16 @@ from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import GetTimeTool, WriteNoteTool
 
 
+class RecordingFakeModelClient(FakeModelClient):
+    def __init__(self, scripted=None) -> None:
+        super().__init__(scripted=scripted)
+        self.requests = []
+
+    async def complete(self, request):
+        self.requests.append(request)
+        return await super().complete(request)
+
+
 def test_args_to_config_overrides_maps_flags():
     overrides = args_to_config_overrides(mode="plan", model="demo", no_stream=True)
 
@@ -88,6 +98,40 @@ async def test_headless_runner_returns_final_response(tmp_path):
 
     assert result.exit_code == EXIT_OK
     assert result.response == "done"
+
+
+@pytest.mark.asyncio
+async def test_headless_resume_sends_original_paused_prompt_not_continue(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    model = RecordingFakeModelClient(
+        scripted=[RuntimeResponse(message=Message(role="assistant", content="done"))]
+    )
+    agent = Agent(model_client=model, tool_registry=registry)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("headless-resume"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True),
+    )
+    state.mark_paused_turn("finish the original task")
+
+    result = await run_headless(
+        state,
+        agent,
+        "continue",
+        auto_confirm=True,
+        output_path=None,
+        output_format="text",
+        quiet=True,
+    )
+
+    assert result.exit_code == EXIT_OK
+    assert state.history[0].content == "finish the original task"
+    assert model.requests[0].messages[-1].content == "finish the original task"
 
 
 @pytest.mark.asyncio

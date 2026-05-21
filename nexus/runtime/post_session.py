@@ -80,7 +80,7 @@ def _update_workspace_payload(
         "description": config.project_description,
         "tech_stack": tech_stack,
         "conventions": conventions,
-        "source_of_truth": ["docs/action-plan", "docs/openai-code-tutorial"],
+        "source_of_truth": list(existing.get("source_of_truth", [])),
         "key_files": {
             "README.md": "Primary operator documentation.",
             str(config.local_config_file.relative_to(config.workspace_root)): "Workspace-specific Nexus configuration.",

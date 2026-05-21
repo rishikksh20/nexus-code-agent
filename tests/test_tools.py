@@ -10,7 +10,7 @@ from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResp
 from nexus.security import ApprovalManager, ApprovalPolicy, ApprovalScope, PermissionChecker, PermissionDecision
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.agent_scope import subagent_skill_names, subagent_tool_names
-from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition, _record_inner_approval
+from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition, _record_inner_approval, _subagent_result_envelope
 from nexus.skills import Skill, SkillRegistry
 from nexus.tools.base import Tool, ToolKind, ToolRegistry
 from nexus.tools.builtin import GetTimeTool, MemoryTool, PythonLspTool, WriteFileTool
@@ -103,6 +103,44 @@ def test_permission_checker_denies_direct_nexus_memory_file_writes_with_memory_h
 
     assert result.decision is PermissionDecision.DENY
     assert "memory" in result.reason.lower()
+
+
+def test_subagent_result_envelope_preserves_structured_json_fields():
+    raw_result = json.dumps(
+        {
+            "status": "completed",
+            "summary": "Implemented the fix.",
+            "findings": [{"file": "nexus/app.py", "issue": "stale state"}],
+            "changed_files": ["nexus/app.py"],
+            "related_files": ["tests/test_app.py"],
+            "tests_run": ["uv run pytest tests/test_app.py"],
+            "risks": ["low"],
+            "clarifications_needed": [],
+            "recommended_next_action": "review",
+        }
+    )
+
+    envelope = _subagent_result_envelope(
+        tool_name="subagent_execution",
+        definition=SubagentDefinition(
+            name="execution",
+            description="Implement",
+            goal_prompt="Do the work.",
+        ),
+        task_id="task-1",
+        title="Fix app",
+        status="completed",
+        is_error=False,
+        raw_result=raw_result,
+        input_packet_ids=("packet-1",),
+        context_snapshot={"modified_files": [], "tool_call_count": 0, "message_count": 1},
+    )
+
+    payload = json.loads(envelope)
+    assert payload["summary"] == "Implemented the fix."
+    assert payload["findings"] == [{"file": "nexus/app.py", "issue": "stale state"}]
+    assert payload["tests_run"] == ["uv run pytest tests/test_app.py"]
+    assert payload["recommended_next_action"] == "review"
 
 
 @pytest.mark.asyncio

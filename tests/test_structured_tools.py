@@ -11,6 +11,7 @@ from nexus.tools.builtin import (
     CodeIndexTool,
     GitDiffTool,
     GitStatusTool,
+    RunLinterTool,
     RunTestsTool,
     RunTypecheckTool,
     SemanticSearchTool,
@@ -49,6 +50,38 @@ async def test_run_typecheck_returns_structured_metadata(tmp_path):
     assert not result.is_error
     assert result.metadata["passed"] is True
     assert result.metadata["exit_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_linter_fails_when_workspace_has_no_python_targets(tmp_path):
+    context = ToolExecutionContext(session_id="test", working_directory=tmp_path)
+
+    result = await RunLinterTool().execute("lint-1", {}, context)
+
+    assert result.is_error
+    assert "No Python files or packages" in result.output
+
+
+@pytest.mark.asyncio
+async def test_run_typecheck_fails_when_explicit_target_is_missing(tmp_path):
+    context = ToolExecutionContext(session_id="test", working_directory=tmp_path)
+
+    result = await RunTypecheckTool().execute("type-2", {"args": ["missing"]}, context)
+
+    assert result.is_error
+    assert "does not exist" in result.output
+
+
+@pytest.mark.asyncio
+async def test_run_typecheck_rejects_explicit_target_outside_workspace(tmp_path):
+    outside = tmp_path.parent / "outside.py"
+    outside.write_text("print('outside')\n", encoding="utf-8")
+    context = ToolExecutionContext(session_id="test", working_directory=tmp_path)
+
+    result = await RunTypecheckTool().execute("type-3", {"args": [str(outside)]}, context)
+
+    assert result.is_error
+    assert "outside the workspace" in result.output
 
 
 @pytest.mark.asyncio

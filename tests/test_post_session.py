@@ -32,6 +32,23 @@ def test_post_session_updates_workspace_and_profile_files(tmp_path):
     knowledge_text = config.knowledge_file.read_text(encoding="utf-8")
 
     assert facts_payload["session_count"] == 1
+    assert facts_payload["source_of_truth"] == []
     assert workspaces_payload["workspaces"][str(config.workspace_root)]["project_name"] == config.project_name
     assert "Preferred tool: get_time" in profile_text
     assert "Recent Tasks" in knowledge_text
+
+
+def test_post_session_preserves_existing_source_of_truth_without_inventing_defaults(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.local_root.mkdir(parents=True, exist_ok=True)
+    (config.local_root / "facts.json").write_text(
+        json.dumps({"source_of_truth": ["README.md"]}),
+        encoding="utf-8",
+    )
+    snapshot = new_snapshot("session-2")
+    snapshot.messages = [Message(role="user", content="Summarize this workspace.")]
+
+    run_post_session_updates(config, snapshot)
+
+    facts_payload = json.loads((config.local_root / "facts.json").read_text(encoding="utf-8"))
+    assert facts_payload["source_of_truth"] == ["README.md"]

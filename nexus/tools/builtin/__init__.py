@@ -25,6 +25,7 @@ from nexus.tools.builtin.todo import TodoTool
 from nexus.tools.builtin.web_fetch import WebFetchTool
 from nexus.tools.builtin.web_search import WebSearchTool
 from nexus.tools.builtin.write_file import WriteFileTool
+from nexus.tools.builtin.write_note import WriteNoteTool
 from nexus.tools.builtin.verification import RunFormatterTool, RunLinterTool, RunTestsTool, RunTypecheckTool
 
 __all__ = [
@@ -32,6 +33,7 @@ __all__ = [
     # File I/O
     "ReadFileTool",
     "WriteFileTool",
+    "WriteNoteTool",
     "EditTool",
     "InsertEditIntoFileTool",
     # Patching

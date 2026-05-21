@@ -590,6 +590,18 @@ class TestBashTool:
         assert "found" in result.output
 
     @pytest.mark.asyncio
+    async def test_rejects_cwd_outside_workspace(self, tool_context, tmp_path):
+        outside = tmp_path.parent / "outside-workspace"
+        outside.mkdir()
+
+        result = await BashTool().execute(
+            "c8", {"command": "pwd", "cwd": str(outside)}, tool_context
+        )
+
+        assert result.is_error
+        assert "outside the workspace" in result.output
+
+    @pytest.mark.asyncio
     async def test_missing_command_is_error(self, tool_context):
         result = await BashTool().execute("c6", {}, tool_context)
         assert result.is_error

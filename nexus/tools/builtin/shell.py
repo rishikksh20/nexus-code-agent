@@ -200,11 +200,21 @@ class ShellTool(Tool):
         timeout = int(arguments.get("timeout", 120))
         raw_cwd = arguments.get("cwd")
         if raw_cwd:
-            work_dir = resolve_path(context.working_directory, str(raw_cwd))
+            workspace = context.working_directory.resolve()
+            work_dir = resolve_path(workspace, str(raw_cwd))
+            try:
+                work_dir.relative_to(workspace)
+            except ValueError:
+                return ToolResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    output="Working directory is outside the workspace.",
+                    is_error=True,
+                )
             if not work_dir.exists():
                 return ToolResult(call_id=call_id, tool_name=self.name, output=f"Working directory does not exist: {work_dir}", is_error=True)
         else:
-            work_dir = context.working_directory
+            work_dir = context.working_directory.resolve()
 
         env = self._build_env()
         shell_cmd = ["cmd.exe", "/c", command] if sys.platform == "win32" else ["/bin/bash", "-c", command]

@@ -928,13 +928,14 @@ async def handle_tools(state: ReplState, args: list[str]) -> None:
     table.add_column("Description")
     for record in state.tool_registry.records():
         tool = record.tool
+        kind = getattr(tool, "kind", "tool")
         table.add_row(
             record.name,
-            getattr(tool.kind, "value", str(tool.kind)),
+            getattr(kind, "value", str(kind)),
             record.source,
             record.origin or "-",
-            "yes" if tool.is_mutating else "no",
-            tool.description,
+            "yes" if getattr(tool, "is_mutating", False) else "no",
+            str(getattr(tool, "description", "")),
         )
     state.console.print(table)
 
@@ -2003,8 +2004,6 @@ def _write_toml(path: Path, payload: dict[str, object]) -> None:
             lines.append("")
         lines.append(f"[{key}]")
         for child_key, child_value in table.items():
-            if isinstance(child_value, dict):
-                continue
             lines.append(f"{child_key} = {_render_toml_value(child_value)}")
     for key, entries in array_table_blocks:
         for entry in entries:
@@ -2012,8 +2011,6 @@ def _write_toml(path: Path, payload: dict[str, object]) -> None:
                 lines.append("")
             lines.append(f"[[{key}]]")
             for child_key, child_value in entry.items():
-                if isinstance(child_value, dict):
-                    continue
                 lines.append(f"{child_key} = {_render_toml_value(child_value)}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

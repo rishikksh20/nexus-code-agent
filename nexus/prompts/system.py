@@ -60,7 +60,7 @@ def build_base_instruction(
     if user_instructions:
         parts.append(_get_user_instructions_section(user_instructions))
 
-    # parts.append(_get_operational_section())
+    parts.append(_get_operational_section())
 
     return "\n\n".join(filter(None, parts))
 

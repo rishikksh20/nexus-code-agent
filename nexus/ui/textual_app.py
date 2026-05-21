@@ -778,7 +778,7 @@ class NexusTextualApp(App[None]):
                 effective_prompt=effective_prompt,
                 resumed_paused_turn=resumed_paused_turn,
             )
-            self.state.history.append(Message(role="user", content=raw_input))
+            self.state.history.append(Message(role="user", content=effective_prompt if resumed_paused_turn else raw_input))
             user_message_appended = True
             if not resumed_paused_turn:
                 self.state.approval_manager.begin_turn()
