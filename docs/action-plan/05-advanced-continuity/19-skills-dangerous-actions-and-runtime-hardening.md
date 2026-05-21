@@ -173,7 +173,7 @@ class DangerLevel(Enum):
 def classify_danger(tool_name: str, arguments: dict) -> DangerLevel:
     if tool_name in {"read_file", "glob", "search_memory", "skill"}:
         return DangerLevel.SAFE
-    if tool_name in {"write_note", "write_file"}:
+    if tool_name in {"write_file", "write_file"}:
         return DangerLevel.HIGH
     if tool_name in {"bash", "run_command", "delete_file"}:
         return DangerLevel.CRITICAL

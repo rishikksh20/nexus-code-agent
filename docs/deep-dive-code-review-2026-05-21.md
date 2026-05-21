@@ -19,9 +19,9 @@ Date: 2026-05-21
 
 - Baseline suite: `uv run pytest -q`
 - Focused repros:
-  - `BashTool` with `cwd` set outside the workspace.
+  - `ShellTool` with `cwd` set outside the workspace.
   - `nexus.runtime.slash_commands._write_toml()` writing an MCP config with nested `env`.
-  - `RunLinterTool` in a temporary workspace that does not contain `nexus/` or `tests/`.
+  - `RunPythonCheckTool` in a temporary workspace that does not contain `nexus/` or `tests/`.
   - paused-turn resume flow in `ReplState`.
   - `_subagent_result_envelope()` with a structured JSON sub-agent result.
 
@@ -46,7 +46,7 @@ The main problems are around boundary surfaces and feature completeness rather t
 
 ## Findings
 
-### High 1. `BashTool` can escape the workspace through `cwd`
+### High 1. `ShellTool` can escape the workspace through `cwd`
 
 Relevant code:
 
@@ -66,7 +66,7 @@ Why this matters:
 
 Validated behavior:
 
-- In a focused repro, `BashTool` executed `pwd` successfully with `cwd` set to a temporary directory outside the workspace.
+- In a focused repro, `ShellTool` executed `pwd` successfully with `cwd` set to a temporary directory outside the workspace.
 - The tool returned `is_error = False` and the output was the external temporary directory path, not the workspace path.
 
 Recommended fix:
@@ -81,13 +81,13 @@ Relevant code and missing surfaces:
 - `nexus/tools/builtin/__init__.py`
 - missing file: `nexus/tools/filesystem.py`
 - missing file: `nexus/runtime/sandbox.py`
-- missing export/class: `WriteNoteTool`
+- missing export/class: `WriteFileTool`
 
 Validated behavior:
 
 - `uv run pytest -q` failed during collection with 6 import errors.
 - Failures included:
-  - `tests/test_agent.py`, `tests/test_cli.py`, `tests/test_hooks.py`, and `tests/test_repl.py` importing `WriteNoteTool` from `nexus.tools.builtin`
+  - `tests/test_agent.py`, `tests/test_cli.py`, `tests/test_hooks.py`, and `tests/test_repl.py` importing `WriteFileTool` from `nexus.tools.builtin`
   - `tests/test_filesystem_tools.py` importing `nexus.tools.filesystem`
   - `tests/test_sandbox.py` importing `nexus.runtime.sandbox`
 
@@ -101,23 +101,22 @@ Recommended fix:
 - Either restore the compatibility shims that the test suite still expects, or deliberately remove the legacy expectations and update the tests and docs in the same change.
 - Do not leave the repository in the current half-migrated state.
 
-### High 3. `run_linter` and `run_typecheck` can report success without inspecting project code
+### High 3. `run_python_check` can report success without inspecting project code
 
 Relevant code:
 
-- `nexus/tools/builtin/verification.py::RunLinterTool`
-- `nexus/tools/builtin/verification.py::RunTypecheckTool`
+- `nexus/tools/builtin/verification.py::RunPythonCheckTool`
 - `nexus/tools/builtin/verification.py::_CommandTool.execute`
 
 What happens:
 
-- Both tools are hard-coded to `python -m compileall -q nexus tests`.
+- The tool was hard-coded to `python -m compileall -q nexus tests`.
 - `_CommandTool.execute()` marks the run as passed when `exit_code == 0`.
 - `compileall` can emit `Can't list 'nexus'` and `Can't list 'tests'` to stdout while still exiting with code 0.
 
 Validated behavior:
 
-- In a temporary workspace with no `nexus/` or `tests/`, `RunLinterTool` returned:
+- In a temporary workspace with no `nexus/` or `tests/`, `RunPythonCheckTool` returned:
   - `is_error = False`
   - `exit_code = 0`
   - `passed = true`
@@ -127,8 +126,6 @@ Why this matters:
 
 - The tool can produce a false-positive validation result.
 - This is especially problematic because the README and runtime model present Nexus as workspace-oriented and usable in custom workspaces.
-- `RunTypecheckTool` shares the same implementation pattern and command, so it carries the same risk.
-
 Recommended fix:
 
 - Make verification targets workspace-aware instead of repo-name-aware.
@@ -305,7 +302,7 @@ Relevant code:
 
 Assessment:
 
-- `run_tests`, `run_linter`, and `run_typecheck` are not dynamically derived from workspace content or config.
+- `run_tests`, `run_python_check`, and `run_python_check` are not dynamically derived from workspace content or config.
 - This limits Nexus as a general coding agent outside the main repo and makes validation quality depend on the current repository layout.
 
 Recommendation:
@@ -317,7 +314,7 @@ Recommendation:
 
 1. Fix the shell `cwd` escape. This is the strongest containment failure in the runtime.
 2. Restore a green baseline by resolving the missing compatibility surfaces or removing the stale expectations.
-3. Fix verification truthfulness for `run_linter` and `run_typecheck`.
+3. Fix verification truthfulness for `run_python_check` and `run_python_check`.
 4. Replace the lossy TOML rewrite path in slash commands.
 5. Parse and preserve structured sub-agent output.
 6. Repair paused-turn resume history.

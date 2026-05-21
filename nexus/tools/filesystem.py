@@ -11,11 +11,11 @@ from typing import Any
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import FileDiff, ToolConfirmation
 from nexus.tools.builtin import (
-    BashTool,
     GlobTool,
     GrepTool,
-    LsTool,
+    ListDirTool,
     ReadFileTool,
+    ShellTool,
     WriteFileTool,
 )
 from nexus.tools.builtin.edit_file import EditTool
@@ -156,13 +156,13 @@ def _write_path_error(path, workspace) -> str | None:
 
 
 __all__ = [
-    "BashTool",
     "GlobTool",
     "GrepTool",
-    "LsTool",
+    "ListDirTool",
     "ModifyFileTool",
     "ReadFileTool",
     "ReplaceTextTool",
+    "ShellTool",
     "WriteFileTool",
     "classify_bash_risk",
 ]

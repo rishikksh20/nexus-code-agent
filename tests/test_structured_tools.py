@@ -11,9 +11,8 @@ from nexus.tools.builtin import (
     CodeIndexTool,
     GitDiffTool,
     GitStatusTool,
-    RunLinterTool,
+    RunPythonCheckTool,
     RunTestsTool,
-    RunTypecheckTool,
     SemanticSearchTool,
 )
 
@@ -36,7 +35,7 @@ async def test_git_status_and_diff_return_structured_data(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_run_typecheck_returns_structured_metadata(tmp_path):
+async def test_run_python_check_returns_structured_metadata(tmp_path):
     package = tmp_path / "nexus"
     tests_dir = tmp_path / "tests"
     package.mkdir()
@@ -45,7 +44,7 @@ async def test_run_typecheck_returns_structured_metadata(tmp_path):
     (tests_dir / "test_placeholder.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
     context = ToolExecutionContext(session_id="test", working_directory=tmp_path)
 
-    result = await RunTypecheckTool().execute("type-1", {}, context)
+    result = await RunPythonCheckTool().execute("type-1", {}, context)
 
     assert not result.is_error
     assert result.metadata["passed"] is True
@@ -53,32 +52,32 @@ async def test_run_typecheck_returns_structured_metadata(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_run_linter_fails_when_workspace_has_no_python_targets(tmp_path):
+async def test_run_python_check_fails_when_workspace_has_no_python_targets(tmp_path):
     context = ToolExecutionContext(session_id="test", working_directory=tmp_path)
 
-    result = await RunLinterTool().execute("lint-1", {}, context)
+    result = await RunPythonCheckTool().execute("lint-1", {}, context)
 
     assert result.is_error
     assert "No Python files or packages" in result.output
 
 
 @pytest.mark.asyncio
-async def test_run_typecheck_fails_when_explicit_target_is_missing(tmp_path):
+async def test_run_python_check_fails_when_explicit_target_is_missing(tmp_path):
     context = ToolExecutionContext(session_id="test", working_directory=tmp_path)
 
-    result = await RunTypecheckTool().execute("type-2", {"args": ["missing"]}, context)
+    result = await RunPythonCheckTool().execute("type-2", {"args": ["missing"]}, context)
 
     assert result.is_error
     assert "does not exist" in result.output
 
 
 @pytest.mark.asyncio
-async def test_run_typecheck_rejects_explicit_target_outside_workspace(tmp_path):
+async def test_run_python_check_rejects_explicit_target_outside_workspace(tmp_path):
     outside = tmp_path.parent / "outside.py"
     outside.write_text("print('outside')\n", encoding="utf-8")
     context = ToolExecutionContext(session_id="test", working_directory=tmp_path)
 
-    result = await RunTypecheckTool().execute("type-3", {"args": [str(outside)]}, context)
+    result = await RunPythonCheckTool().execute("type-3", {"args": [str(outside)]}, context)
 
     assert result.is_error
     assert "outside the workspace" in result.output

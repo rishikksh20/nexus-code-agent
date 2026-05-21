@@ -261,7 +261,7 @@ allowed_tools:
   - write_file
   - glob
   - bash
-  - run_linter
+  - run_python_check
 max_turns: 10
 timeout_seconds: 180
 ```

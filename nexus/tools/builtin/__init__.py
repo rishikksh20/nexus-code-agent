@@ -9,31 +9,29 @@ This ``__init__.py`` re-exports every tool class so that callers can do either:
 from __future__ import annotations
 
 from nexus.tools.builtin.edit_file import EditTool
-from nexus.tools.builtin.code_search import CodeIndexTool, FindReferencesTool, SemanticSearchTool
+from nexus.tools.builtin.code_search import CodeIndexTool, SemanticSearchTool
 from nexus.tools.builtin.git import GitDiffTool, GitStatusTool
 from nexus.tools.builtin.glob import GlobTool
 from nexus.tools.builtin.grep import GrepTool
-from nexus.tools.builtin.list_dir import ListDirTool, LsTool
+from nexus.tools.builtin.list_dir import ListDirTool
 from nexus.tools.builtin.lsp import PythonLspTool
 from nexus.tools.builtin.memory import MemoryTool
 from nexus.tools.builtin.patch import ApplyPatchTool
 from nexus.tools.builtin.read_file import ReadFileTool
-from nexus.tools.builtin.shell import BashTool, ShellTool
+from nexus.tools.builtin.shell import ShellTool
 from nexus.tools.builtin.smart_edit import InsertEditIntoFileTool
 from nexus.tools.builtin.time import GetTimeTool
 from nexus.tools.builtin.todo import TodoTool
 from nexus.tools.builtin.web_fetch import WebFetchTool
 from nexus.tools.builtin.web_search import WebSearchTool
 from nexus.tools.builtin.write_file import WriteFileTool
-from nexus.tools.builtin.write_note import WriteNoteTool
-from nexus.tools.builtin.verification import RunFormatterTool, RunLinterTool, RunTestsTool, RunTypecheckTool
+from nexus.tools.builtin.verification import RunFormatterTool, RunPythonCheckTool, RunTestsTool
 
 __all__ = [
     "GetTimeTool",
     # File I/O
     "ReadFileTool",
     "WriteFileTool",
-    "WriteNoteTool",
     "EditTool",
     "InsertEditIntoFileTool",
     # Patching
@@ -42,20 +40,16 @@ __all__ = [
     "GlobTool",
     "GrepTool",
     "ListDirTool",
-    "LsTool",
     "PythonLspTool",
-    "FindReferencesTool",
     "CodeIndexTool",
     "SemanticSearchTool",
     "GitStatusTool",
     "GitDiffTool",
     "RunTestsTool",
-    "RunLinterTool",
-    "RunTypecheckTool",
+    "RunPythonCheckTool",
     "RunFormatterTool",
     # Execution
     "ShellTool",
-    "BashTool",
     # Memory & tasks
     "MemoryTool",
     "TodoTool",

@@ -467,14 +467,12 @@ All tools pass through the permission system and lifecycle hooks. **Risk level**
 | `glob` | low | No | Finds files by glob pattern within the workspace |
 | `grep` | low | No | Searches file content by regex; returns path, line number, match |
 | `lsp` | low | No | Inspects Python symbols, definitions, references, and hover details |
-| `find_references` | low | No | Finds Python symbol references through the LSP implementation |
 | `code_index` | low | No | Builds a lightweight Python AST/import/symbol index |
 | `semantic_search` | low | No | Searches Python code by concept using lexical and symbol matches |
 | `git_status` | low | No | Returns structured branch and working tree status |
 | `git_diff` | low | No | Returns working, staged, file, or ref diffs |
 | `run_tests` | low/medium | No | Runs tests with structured pass/fail metadata |
-| `run_linter` | low/medium | No | Runs structured lint-style verification |
-| `run_typecheck` | low/medium | No | Runs structured type/syntax verification |
+| `run_python_check` | low/medium | No | Runs structured Python syntax verification |
 | `run_formatter` | medium | Yes | Runs the formatter command with approval |
 | `list_dir` | low | No | Lists directory contents with file sizes |
 | `web_fetch` | low | No | Fetches a URL and returns the response body |
@@ -487,7 +485,7 @@ All tools pass through the permission system and lifecycle hooks. **Risk level**
 | `write_file` | **high** | Yes | Creates or fully overwrites a file — **always requires confirmation**, even in auto mode |
 | `bash` | **dynamic** | Yes | Runs a bash command; risk classified per command (see below) |
 
-Compatibility tool classes such as `write_note`, `modify_file`, and `replace_text` still exist for older tests/docs, but the normal core registry exposes the canonical tools above.
+Compatibility tool classes such as `modify_file` and `replace_text` still exist for older tests/docs, but the normal core registry exposes the canonical tools above.
 
 ### Cognitive Sub-Agent Tools
 
@@ -509,7 +507,7 @@ agent_mode = "advanced"
 allowed_tools = [
   "get_time", "read_file", "write_file", "edit", "insert_edit_into_file",
   "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff",
-  "run_tests", "run_linter", "run_typecheck", "bash",
+  "run_tests", "run_python_check", "bash",
   "subagent_planning_analysis", "subagent_execution",
   "subagent_review", "subagent_verification",
 ]
@@ -555,7 +553,7 @@ allowed_mcps = []           # empty = default MCP behavior; "all" = every active
 
 [[sub-agents]]
 name = "execution"
-allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_tests", "run_linter", "run_typecheck", "bash"]
+allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_tests", "run_python_check", "bash"]
 allowed_skills = []         # empty = no extra skill metadata by default; "all" = every active skill
 allowed_mcps = []           # empty = built-in sub-agent MCP inheritance/defaults; "all" = every active MCP server
 ```

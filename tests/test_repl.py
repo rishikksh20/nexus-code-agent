@@ -26,7 +26,7 @@ from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import EphemeralSessionStore, new_snapshot
 from nexus.runtime.turn_runner import collect_turn_events, prompt_for_confirmation
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool, MemoryTool, WriteNoteTool
+from nexus.tools.builtin import GetTimeTool, MemoryTool, WriteFileTool
 
 
 class _CaptureModelClient:
@@ -393,8 +393,8 @@ def test_apply_events_keeps_completed_tool_call_messages(tmp_path):
 def test_prompt_for_confirmation_accepts_yes_turn_aliases():
     request = ConfirmationRequest(
         kind=ConfirmationKind.APPROVAL,
-        tool_name="write_note",
-        prompt="Allow write_note?",
+        tool_name="write_file",
+        prompt="Allow write_file?",
         reason="Mutating tool requires confirmation.",
         payload={"approval_policy": "on-request"},
     )
@@ -465,10 +465,10 @@ async def test_collect_turn_events_requires_confirmation_for_each_mutating_call(
 async def test_collect_turn_events_executes_approved_call_without_regenerating_tool_call(tmp_path):
     state = _build_state(tmp_path)
     state.history.append(Message(role="user", content="write hello.py"))
-    state.tool_registry.register(WriteNoteTool())
+    state.tool_registry.register(WriteFileTool())
     tool_call = ToolCall(
         call_id="note-1",
-        tool_name="write_note",
+        tool_name="write_file",
         arguments={"path": "hello.txt", "content": "hello"},
     )
     model = _CountingFakeModelClient(
@@ -504,17 +504,17 @@ async def test_collect_turn_events_executes_approved_call_without_regenerating_t
 @pytest.mark.asyncio
 async def test_collect_turn_events_yes_turn_skips_later_non_dangerous_mutating_confirmations(tmp_path):
     state = _build_state(tmp_path)
-    state.tool_registry.register(WriteNoteTool())
+    state.tool_registry.register(WriteFileTool())
     state.history.append(Message(role="user", content="create two notes"))
 
     note_one = ToolCall(
         call_id="note-1",
-        tool_name="write_note",
+        tool_name="write_file",
         arguments={"path": "notes/one.txt", "content": "one"},
     )
     note_two = ToolCall(
         call_id="note-2",
-        tool_name="write_note",
+        tool_name="write_file",
         arguments={"path": "notes/two.txt", "content": "two"},
     )
     model = FakeModelClient(
@@ -554,7 +554,7 @@ async def test_collect_turn_events_yes_turn_skips_later_non_dangerous_mutating_c
 @pytest.mark.asyncio
 async def test_collect_turn_events_denied_nexus_memory_file_write_continues_turn(tmp_path):
     state = _build_state(tmp_path)
-    state.tool_registry.register(WriteNoteTool())
+    state.tool_registry.register(WriteFileTool())
     state.history.append(Message(role="user", content="remember my name"))
     model = FakeModelClient(
         scripted=[
@@ -563,7 +563,7 @@ async def test_collect_turn_events_denied_nexus_memory_file_write_continues_turn
                 tool_calls=(
                     ToolCall(
                         call_id="call-note",
-                        tool_name="write_note",
+                        tool_name="write_file",
                         arguments={
                             "path": ".nexus/memory/rishikesh_name.md",
                             "content": "Rishikesh",
@@ -583,7 +583,7 @@ async def test_collect_turn_events_denied_nexus_memory_file_write_continues_turn
 
     denied_results = [event.payload for event in events if event.kind == AgentEventType.TOOL_RESULT]
     assert len(denied_results) == 1
-    assert denied_results[0].tool_name == "write_note"
+    assert denied_results[0].tool_name == "write_file"
     assert denied_results[0].is_error is True
     assert "use the `memory` tool" in denied_results[0].output.lower()
     assert any(event.kind == AgentEventType.TOOL_DENIED for event in events)

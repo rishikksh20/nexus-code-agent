@@ -88,19 +88,9 @@ class RunTestsTool(_CommandTool):
     default_timeout = 600
 
 
-class RunLinterTool(_CommandTool):
-    name = "run_linter"
-    description = "Run a structured lint check. Defaults to `python -m compileall -q` over discovered Python targets in the workspace."
-    command = ("python", "-m", "compileall", "-q")
-    default_timeout = 180
-
-    def _build_command(self, cwd: Path, raw_args: list[str]) -> tuple[tuple[str, ...], str | None]:
-        return _compileall_command(self.command, cwd, raw_args)
-
-
-class RunTypecheckTool(_CommandTool):
-    name = "run_typecheck"
-    description = "Run a structured type/syntax check. Defaults to `python -m compileall -q` over discovered Python targets in the workspace."
+class RunPythonCheckTool(_CommandTool):
+    name = "run_python_check"
+    description = "Run a structured Python syntax check. Defaults to `python -m compileall -q` over discovered Python targets in the workspace."
     command = ("python", "-m", "compileall", "-q")
     default_timeout = 180
 

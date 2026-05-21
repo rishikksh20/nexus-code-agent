@@ -170,7 +170,7 @@ uv --directory /home/rishikesh/dev/exp/build-an-ai-agent/build-an-ai-agent run n
 
 ### Expected result
 
-If `write_note` is requested:
+If `write_file` is requested:
 
 - a confirmation prompt appears inline
 - the process waits for input

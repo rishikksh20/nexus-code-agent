@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from nexus.models import ToolExecutionContext
-from nexus.tools.builtin.shell import BashTool
+from nexus.tools.builtin.shell import ShellTool
 
 
 @pytest.mark.asyncio
@@ -20,7 +20,7 @@ async def test_bash_tool_streams_live_output_to_ui_callback(tmp_path):
         metadata={"ui": StreamingUI()},
     )
 
-    result = await BashTool().execute(
+    result = await ShellTool().execute(
         "c-stream",
         {"command": "printf hello && printf err >&2"},
         context,

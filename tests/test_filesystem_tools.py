@@ -7,10 +7,10 @@ from nexus.models import ToolExecutionContext
 from nexus.runtime.execution import ExecutionMode
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.tools.filesystem import (
-    BashTool,
+    ShellTool,
     GlobTool,
     GrepTool,
-    LsTool,
+    ListDirTool,
     ModifyFileTool,
     ReadFileTool,
     ReplaceTextTool,
@@ -472,15 +472,15 @@ class TestGrepTool:
 
 
 # ---------------------------------------------------------------------------
-# LsTool
+# ListDirTool
 # ---------------------------------------------------------------------------
 
-class TestLsTool:
+class TestListDirTool:
     @pytest.mark.asyncio
     async def test_lists_workspace_root(self, tool_context):
         (tool_context.working_directory / "file.txt").write_text("content")
         (tool_context.working_directory / "subdir").mkdir()
-        result = await LsTool().execute("c1", {}, tool_context)
+        result = await ListDirTool().execute("c1", {}, tool_context)
         assert not result.is_error
         assert "subdir/" in result.output
         assert "file.txt" in result.output
@@ -489,7 +489,7 @@ class TestLsTool:
     async def test_hides_dotfiles_by_default(self, tool_context):
         (tool_context.working_directory / ".hidden").write_text("")
         (tool_context.working_directory / "visible.txt").write_text("")
-        result = await LsTool().execute("c2", {}, tool_context)
+        result = await ListDirTool().execute("c2", {}, tool_context)
         assert not result.is_error
         assert ".hidden" not in result.output
         assert "visible.txt" in result.output
@@ -502,7 +502,7 @@ class TestLsTool:
             working_directory=tool_context.working_directory,
             metadata={"allow_hidden_paths": True},
         )
-        result = await LsTool().execute("c3", {"show_hidden": True}, allow_hidden_context)
+        result = await ListDirTool().execute("c3", {"show_hidden": True}, allow_hidden_context)
         assert not result.is_error
         assert ".hidden" in result.output
 
@@ -516,8 +516,8 @@ class TestLsTool:
             metadata={"allow_hidden_paths": True},
         )
 
-        default_result = await LsTool().execute("c7", {"show_hidden": True}, tool_context)
-        override_result = await LsTool().execute("c8", {"show_hidden": True}, allow_hidden_context)
+        default_result = await ListDirTool().execute("c7", {"show_hidden": True}, tool_context)
+        override_result = await ListDirTool().execute("c8", {"show_hidden": True}, allow_hidden_context)
 
         assert ".hidden" not in default_result.output
         assert ".hidden" in override_result.output
@@ -528,62 +528,62 @@ class TestLsTool:
         sub = tool_context.working_directory / "sub"
         sub.mkdir()
         (sub / "child.txt").write_text("")
-        result = await LsTool().execute("c4", {"path": "sub"}, tool_context)
+        result = await ListDirTool().execute("c4", {"path": "sub"}, tool_context)
         assert not result.is_error
         assert "child.txt" in result.output
 
     @pytest.mark.asyncio
     async def test_rejects_outside_workspace(self, tool_context):
-        result = await LsTool().execute("c5", {"path": "../.."}, tool_context)
+        result = await ListDirTool().execute("c5", {"path": "../.."}, tool_context)
         assert result.is_error
         assert "outside" in result.output.lower()
 
     @pytest.mark.asyncio
     async def test_nonexistent_path_is_error(self, tool_context):
-        result = await LsTool().execute("c6", {"path": "no_such_dir"}, tool_context)
+        result = await ListDirTool().execute("c6", {"path": "no_such_dir"}, tool_context)
         assert result.is_error
 
 
 # ---------------------------------------------------------------------------
-# BashTool
+# ShellTool
 # ---------------------------------------------------------------------------
 
-class TestBashTool:
+class TestShellTool:
     @pytest.mark.asyncio
     async def test_runs_simple_command(self, tool_context):
-        result = await BashTool().execute("c1", {"command": "echo hello"}, tool_context)
+        result = await ShellTool().execute("c1", {"command": "echo hello"}, tool_context)
         assert not result.is_error
         assert "hello" in result.output
         assert result.metadata["risk"] == "low"
 
     @pytest.mark.asyncio
     async def test_captures_stderr(self, tool_context):
-        result = await BashTool().execute(
+        result = await ShellTool().execute(
             "c2", {"command": "echo err >&2"}, tool_context
         )
         assert "[stderr]" in result.output or "err" in result.output
 
     @pytest.mark.asyncio
     async def test_nonzero_exit_is_error(self, tool_context):
-        result = await BashTool().execute("c3", {"command": "exit 1"}, tool_context)
+        result = await ShellTool().execute("c3", {"command": "exit 1"}, tool_context)
         assert result.is_error
         assert result.metadata["exit_code"] == 1
 
     @pytest.mark.asyncio
     async def test_risk_metadata_attached(self, tool_context):
-        result = await BashTool().execute("c4", {"command": "rm file.txt"}, tool_context)
+        result = await ShellTool().execute("c4", {"command": "rm file.txt"}, tool_context)
         assert result.metadata["risk"] == "medium"
 
     @pytest.mark.asyncio
     async def test_risk_metadata_uses_shared_classifier(self, tool_context):
         command = "echo ok | sh"
-        result = await BashTool().execute("c7", {"command": command}, tool_context)
+        result = await ShellTool().execute("c7", {"command": command}, tool_context)
         assert result.metadata["risk"] == classify_bash_risk(command)
 
     @pytest.mark.asyncio
     async def test_runs_in_workspace_root(self, tool_context):
         (tool_context.working_directory / "marker.txt").write_text("found")
-        result = await BashTool().execute(
+        result = await ShellTool().execute(
             "c5", {"command": "cat marker.txt"}, tool_context
         )
         assert not result.is_error
@@ -594,7 +594,7 @@ class TestBashTool:
         outside = tmp_path.parent / "outside-workspace"
         outside.mkdir()
 
-        result = await BashTool().execute(
+        result = await ShellTool().execute(
             "c8", {"command": "pwd", "cwd": str(outside)}, tool_context
         )
 
@@ -603,7 +603,7 @@ class TestBashTool:
 
     @pytest.mark.asyncio
     async def test_missing_command_is_error(self, tool_context):
-        result = await BashTool().execute("c6", {}, tool_context)
+        result = await ShellTool().execute("c6", {}, tool_context)
         assert result.is_error
 
 
@@ -618,14 +618,14 @@ class TestPermissionCheckerFilesystemTools:
     # --- bash low risk ---
 
     def test_bash_low_risk_allowed_in_default(self, tmp_path):
-        tool = BashTool()
+        tool = ShellTool()
         result = PermissionChecker().evaluate(
             tool, {"command": "cat README.md"}, ExecutionMode.DEFAULT, context=self._ctx(tmp_path)
         )
         assert result.decision is PermissionDecision.ALLOW
 
     def test_bash_low_risk_allowed_in_plan(self, tmp_path):
-        tool = BashTool()
+        tool = ShellTool()
         result = PermissionChecker().evaluate(
             tool, {"command": "ls -la"}, ExecutionMode.PLAN, context=self._ctx(tmp_path)
         )
@@ -634,21 +634,21 @@ class TestPermissionCheckerFilesystemTools:
     # --- bash medium risk ---
 
     def test_bash_medium_risk_confirm_in_default(self, tmp_path):
-        tool = BashTool()
+        tool = ShellTool()
         result = PermissionChecker().evaluate(
             tool, {"command": "mkdir newdir"}, ExecutionMode.DEFAULT, context=self._ctx(tmp_path)
         )
         assert result.decision is PermissionDecision.CONFIRM
 
     def test_bash_medium_risk_allowed_in_auto(self, tmp_path):
-        tool = BashTool()
+        tool = ShellTool()
         result = PermissionChecker().evaluate(
             tool, {"command": "mkdir newdir"}, ExecutionMode.AUTO, context=self._ctx(tmp_path)
         )
         assert result.decision is PermissionDecision.ALLOW
 
     def test_bash_medium_risk_denied_in_plan(self, tmp_path):
-        tool = BashTool()
+        tool = ShellTool()
         result = PermissionChecker().evaluate(
             tool, {"command": "rm file.txt"}, ExecutionMode.PLAN, context=self._ctx(tmp_path)
         )
@@ -657,7 +657,7 @@ class TestPermissionCheckerFilesystemTools:
     # --- bash high risk ---
 
     def test_bash_high_risk_confirm_in_default(self, tmp_path):
-        tool = BashTool()
+        tool = ShellTool()
         result = PermissionChecker().evaluate(
             tool, {"command": "rm -rf /"}, ExecutionMode.DEFAULT, context=self._ctx(tmp_path)
         )
@@ -665,14 +665,14 @@ class TestPermissionCheckerFilesystemTools:
 
     def test_bash_high_risk_confirm_even_in_auto(self, tmp_path):
         """High-risk bash always requires confirmation — auto mode does NOT bypass it."""
-        tool = BashTool()
+        tool = ShellTool()
         result = PermissionChecker().evaluate(
             tool, {"command": "sudo rm -rf /"}, ExecutionMode.AUTO, context=self._ctx(tmp_path)
         )
         assert result.decision is PermissionDecision.CONFIRM
 
     def test_bash_high_risk_denied_in_plan(self, tmp_path):
-        tool = BashTool()
+        tool = ShellTool()
         result = PermissionChecker().evaluate(
             tool, {"command": "rm -rf build/"}, ExecutionMode.PLAN, context=self._ctx(tmp_path)
         )
@@ -756,7 +756,7 @@ class TestPermissionCheckerFilesystemTools:
 
     def test_ls_allowed_in_plan(self, tmp_path):
         result = PermissionChecker().evaluate(
-            LsTool(), {}, ExecutionMode.PLAN, context=self._ctx(tmp_path)
+            ListDirTool(), {}, ExecutionMode.PLAN, context=self._ctx(tmp_path)
         )
         assert result.decision is PermissionDecision.ALLOW
 

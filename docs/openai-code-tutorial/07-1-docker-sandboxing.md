@@ -201,7 +201,7 @@ class SandboxedBashTool(BaseTool):
     """
     Runs shell commands inside a Docker sandbox.
 
-    Replaces an unrestricted BashTool. The model sees the same interface
+    Replaces an unrestricted ShellTool. The model sees the same interface
     but all execution is containerized — the host filesystem is read-only
     and the container has no network access.
     """
@@ -259,7 +259,7 @@ def build_agent(project_notes: str = "", mode = ExecutionMode.DEFAULT) -> Agent:
         print("  ✓ Sandboxed bash available (Docker)")
     else:
         print("  ⚠ Docker not available — bash tool not registered")
-        # Do NOT register an unsandboxed BashTool — too risky without isolation
+        # Do NOT register an unsandboxed ShellTool — too risky without isolation
 
     return Agent(...)
 ```

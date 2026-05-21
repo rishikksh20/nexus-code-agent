@@ -118,8 +118,8 @@ The current Nexus implementation now includes a minimal production hardening lay
 
 - `nexus doctor` checks runtime, safety, operational, and extension readiness from the live workspace config
 - JSON observability writes both `runtime.jsonl` and an aggregated `metrics.json` snapshot for lightweight production review
-- `write_note` has a bounded payload size so the default mutating file writer is less likely to be abused accidentally
-- runtime permission checks now inspect `write_note` arguments and hard-deny writes outside the workspace or into `.nexus/` managed state
+- `write_file` has a bounded payload size so the default mutating file writer is less likely to be abused accidentally
+- runtime permission checks now inspect `write_file` arguments and hard-deny writes outside the workspace or into `.nexus/` managed state
 
 These are still intentionally small mechanisms. They help make rollout deliberate without pretending the harness now needs a large deployment platform.
 

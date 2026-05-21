@@ -333,7 +333,3 @@ async def _read_process_stream(
         maybe_awaitable = callback(stream_name, text)
         if maybe_awaitable is not None:
             await maybe_awaitable
-
-
-# Alias — "BashTool" is the name used in tests and the filesystem shim
-BashTool = ShellTool

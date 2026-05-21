@@ -52,7 +52,7 @@ In the current Nexus runtime, the `PermissionChecker` is significantly extended 
 
 **Tool-specific policies (evaluated before the generic is_mutating check):**
 
-- `write_note`, `write_file`, `modify_file`, `replace_text` — the requested path is inspected and writes outside the workspace root or inside `.nexus/` managed state are hard-denied in all modes including `AUTO`.
+- `write_file`, `write_file`, `modify_file`, `replace_text` — the requested path is inspected and writes outside the workspace root or inside `.nexus/` managed state are hard-denied in all modes including `AUTO`.
 - `write_file` (HIGH RISK) — always returns `CONFIRM` regardless of mode (except `PLAN` which returns `DENY`). Even `AUTO` mode cannot bypass confirmation for a full-file overwrite.
 - `bash` — the command string is passed through `classify_bash_risk()` before a decision is made:
   - `LOW` risk (read-only commands such as `cat`, `grep`, `git status`) → `ALLOW` in all modes
@@ -238,7 +238,7 @@ This chapter is done when your harness is no longer relying on trust alone. The 
 
 The Nexus permission system (`nexus/runtime/permissions.py`) now handles four categories of tools beyond the minimal sketch in this chapter:
 
-**1. Path-policy hard denials** apply to `write_note`, `write_file`, `modify_file`, and `replace_text`. Writes outside the workspace root or inside `.nexus/` managed state are `DENY` regardless of mode.
+**1. Path-policy hard denials** apply to `write_file`, `write_file`, `modify_file`, and `replace_text`. Writes outside the workspace root or inside `.nexus/` managed state are `DENY` regardless of mode.
 
 **2. `write_file` (HIGH RISK)** always returns `CONFIRM` — even in `AUTO` mode. A full-file overwrite is considered too irreversible to auto-approve.
 
@@ -247,6 +247,6 @@ The Nexus permission system (`nexus/runtime/permissions.py`) now handles four ca
 - `medium` (targeted writes, redirects, package installs) → `DENY` in plan, `CONFIRM` in default, `ALLOW` in auto
 - `high` (rm -rf, sudo, pipe-to-shell, killall …) → `DENY` in plan, `CONFIRM` in both default **and** auto
 
-**4. Standard mutating logic** applies to `modify_file`, `replace_text`, `write_note`, and any plugin/MCP tools: `DENY` in plan, `CONFIRM` in default, `ALLOW` in auto.
+**4. Standard mutating logic** applies to `modify_file`, `replace_text`, `write_file`, and any plugin/MCP tools: `DENY` in plan, `CONFIRM` in default, `ALLOW` in auto.
 
 All read-only tools (`get_time`, `read_file`, `glob`, `grep`, `ls`) are `ALLOW` unless `auto_confirm_read_only` is disabled, in which case they are `CONFIRM` in `DEFAULT` mode.

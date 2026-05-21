@@ -52,7 +52,7 @@ class RecordingFakeModelClient(FakeModelClient):
             yield event
 
 
-def test_core_tools_do_not_register_legacy_write_note_alias(tmp_path):
+def test_core_tools_register_canonical_tool_surface(tmp_path):
     config = SimpleNamespace(memory_dir=tmp_path / "memory")
 
     tool_names = [tool.name for tool in get_core_tools(config)]
@@ -62,8 +62,8 @@ def test_core_tools_do_not_register_legacy_write_note_alias(tmp_path):
     assert "insert_edit_into_file" in tool_names
     assert "apply_patch" in tool_names
     assert "lsp" in tool_names
+    assert "run_python_check" in tool_names
     assert "modify_file" not in tool_names
-    assert "write_note" not in tool_names
     assert len(tool_names) == len(set(tool_names))
 
 

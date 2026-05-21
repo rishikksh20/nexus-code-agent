@@ -2,13 +2,11 @@
 
 from nexus.tools.base import FileDiff, Tool, ToolConfirmation, ToolKind, ToolRegistry
 from nexus.tools.builtin import (
-    BashTool,
     EditTool,
     GetTimeTool,
     GlobTool,
     GrepTool,
     ListDirTool,
-    LsTool,
     PythonLspTool,
     MemoryTool,
     ReadFileTool,
@@ -40,13 +38,11 @@ __all__ = [
     "ToolKind",
     "ToolRegistry",
     # Builtin tools
-    "BashTool",
     "EditTool",
     "GetTimeTool",
     "GlobTool",
     "GrepTool",
     "ListDirTool",
-    "LsTool",
     "PythonLspTool",
     "MemoryTool",
     "ReadFileTool",

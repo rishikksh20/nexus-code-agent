@@ -17,7 +17,7 @@ from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
 from nexus.memory.store import MemoryStore
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool, WriteNoteTool
+from nexus.tools.builtin import GetTimeTool, WriteFileTool
 
 
 @pytest.mark.asyncio
@@ -167,12 +167,12 @@ async def test_agent_emits_clarification_notification(tool_context):
         scripted=[
             RuntimeResponse(
                 message=Message(role="assistant", content="Need a path."),
-                tool_calls=(ToolCall(call_id="clarify-1", tool_name="write_note", arguments={"content": "hi"}),),
+                tool_calls=(ToolCall(call_id="clarify-1", tool_name="write_file", arguments={"content": "hi"}),),
             )
         ]
     )
     registry = ToolRegistry()
-    registry.register(WriteNoteTool())
+    registry.register(WriteFileTool())
     agent = Agent(model_client=model, tool_registry=registry, hooks=hooks)
 
     events = [
@@ -306,7 +306,7 @@ async def test_audit_trail_records_mutating_actions(tmp_path):
         HookEvent.NOTIFICATION,
         {
             "event": "confirmation_requested",
-            "tool_name": "write_note",
+            "tool_name": "write_file",
             "reason": "Mutating tool requires confirmation.",
             "session_id": "session-1",
             "turn_id": "turn-1",
@@ -318,7 +318,7 @@ async def test_audit_trail_records_mutating_actions(tmp_path):
     await hooks.emit(
         HookEvent.POST_TOOL_USE,
         {
-            "tool_name": "write_note",
+            "tool_name": "write_file",
             "arguments": {"path": "notes/out.txt"},
             "call_id": "call-1",
             "session_id": "session-1",

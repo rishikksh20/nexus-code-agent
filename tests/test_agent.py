@@ -9,7 +9,7 @@ from nexus.runtime.execution import ExecutionMode
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.security import ApprovalManager, PermissionDecision
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import BashTool, GetTimeTool, WriteFileTool, WriteNoteTool
+from nexus.tools.builtin import GetTimeTool, ShellTool, WriteFileTool
 
 
 class RecordingModelClient(FakeModelClient):
@@ -86,7 +86,7 @@ async def test_agent_requires_confirmation_for_mutating_tool(tool_context):
         tool_calls=(
             ToolCall(
                 call_id="2",
-                tool_name="write_note",
+                tool_name="write_file",
                 arguments={"path": "notes/out.txt", "content": "hello"},
             ),
         ),
@@ -98,7 +98,7 @@ async def test_agent_requires_confirmation_for_mutating_tool(tool_context):
         ]
     )
     registry = ToolRegistry()
-    registry.register(WriteNoteTool())
+    registry.register(WriteFileTool())
     agent = Agent(model_client=model, tool_registry=registry)
 
     events = [
@@ -110,7 +110,7 @@ async def test_agent_requires_confirmation_for_mutating_tool(tool_context):
     ]
 
     confirmation = next(event for event in events if event.kind == "confirmation_requested")
-    assert confirmation.payload.tool_name == "write_note"
+    assert confirmation.payload.tool_name == "write_file"
 
     denied_model = FakeModelClient(scripted=[initial_response])
     denied_agent = Agent(model_client=denied_model, tool_registry=registry)
@@ -175,7 +175,7 @@ async def test_agent_confirmation_request_includes_shell_command_preview(tool_co
         finish_reason="tool_calls",
     )
     registry = ToolRegistry()
-    registry.register(BashTool())
+    registry.register(ShellTool())
     agent = Agent(
         model_client=FakeModelClient(scripted=[initial_response]),
         tool_registry=registry,
@@ -213,7 +213,7 @@ async def test_agent_turn_wide_approval_still_requires_confirmation_for_dangerou
         ]
     )
     registry = ToolRegistry()
-    registry.register(BashTool())
+    registry.register(ShellTool())
     approval_manager = ApprovalManager()
     approval_manager.record_turn_wide_mutating_approval()
     agent = Agent(model_client=model, tool_registry=registry)
@@ -235,19 +235,19 @@ async def test_agent_turn_wide_approval_still_requires_confirmation_for_dangerou
 
 def test_agent_plans_same_batch_preapproved_tool_calls(tool_context):
     registry = ToolRegistry()
-    registry.register(WriteNoteTool())
-    registry.register(BashTool())
+    registry.register(WriteFileTool())
+    registry.register(ShellTool())
     agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
     approval_manager = ApprovalManager()
     approval_manager.record_turn_wide_mutating_approval()
     note_one = ToolCall(
         call_id="note-1",
-        tool_name="write_note",
+        tool_name="write_file",
         arguments={"path": "notes/one.txt", "content": "one"},
     )
     note_two = ToolCall(
         call_id="note-2",
-        tool_name="write_note",
+        tool_name="write_file",
         arguments={"path": "notes/two.txt", "content": "two"},
     )
     dangerous_shell = ToolCall(
@@ -270,18 +270,18 @@ def test_agent_plans_same_batch_preapproved_tool_calls(tool_context):
 
 def test_agent_filters_same_file_preapproved_mutations(tool_context):
     registry = ToolRegistry()
-    registry.register(WriteNoteTool())
+    registry.register(WriteFileTool())
     agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
     approval_manager = ApprovalManager()
     approval_manager.record_turn_wide_mutating_approval()
     first = ToolCall(
         call_id="note-1",
-        tool_name="write_note",
+        tool_name="write_file",
         arguments={"path": "notes/same.txt", "content": "one"},
     )
     second = ToolCall(
         call_id="note-2",
-        tool_name="write_note",
+        tool_name="write_file",
         arguments={"path": "notes/same.txt", "content": "two"},
     )
 
@@ -301,12 +301,12 @@ def test_agent_filters_same_file_preapproved_mutations(tool_context):
 async def test_agent_blocks_same_file_mutations_in_one_model_response_and_refreshes_after_write(tool_context):
     first = ToolCall(
         call_id="note-1",
-        tool_name="write_note",
+        tool_name="write_file",
         arguments={"path": "notes/same.txt", "content": "one"},
     )
     second = ToolCall(
         call_id="note-2",
-        tool_name="write_note",
+        tool_name="write_file",
         arguments={"path": "notes/same.txt", "content": "two"},
     )
     model = FakeModelClient(
@@ -320,7 +320,7 @@ async def test_agent_blocks_same_file_mutations_in_one_model_response_and_refres
         ]
     )
     registry = ToolRegistry()
-    registry.register(WriteNoteTool())
+    registry.register(WriteFileTool())
     agent = Agent(model_client=model, tool_registry=registry)
 
     events = [
@@ -392,7 +392,7 @@ async def test_agent_requests_clarification_for_missing_required_tool_argument(t
                 tool_calls=(
                     ToolCall(
                         call_id="3",
-                        tool_name="write_note",
+                        tool_name="write_file",
                         arguments={"content": "hello"},
                     ),
                 ),
@@ -401,7 +401,7 @@ async def test_agent_requests_clarification_for_missing_required_tool_argument(t
         ]
     )
     registry = ToolRegistry()
-    registry.register(WriteNoteTool())
+    registry.register(WriteFileTool())
     agent = Agent(model_client=model, tool_registry=registry)
 
     events = [
@@ -417,7 +417,7 @@ async def test_agent_requests_clarification_for_missing_required_tool_argument(t
 
 
 @pytest.mark.asyncio
-async def test_agent_hard_denies_write_note_outside_workspace_even_in_auto_mode(tool_context):
+async def test_agent_hard_denies_write_file_outside_workspace_even_in_auto_mode(tool_context):
     model = FakeModelClient(
         scripted=[
             RuntimeResponse(
@@ -425,7 +425,7 @@ async def test_agent_hard_denies_write_note_outside_workspace_even_in_auto_mode(
                 tool_calls=(
                     ToolCall(
                         call_id="4",
-                        tool_name="write_note",
+                        tool_name="write_file",
                         arguments={"path": "../escape.txt", "content": "hello"},
                     ),
                 ),
@@ -434,7 +434,7 @@ async def test_agent_hard_denies_write_note_outside_workspace_even_in_auto_mode(
         ]
     )
     registry = ToolRegistry()
-    registry.register(WriteNoteTool())
+    registry.register(WriteFileTool())
     agent = Agent(model_client=model, tool_registry=registry)
 
     events = [
@@ -453,7 +453,7 @@ async def test_agent_hard_denies_write_note_outside_workspace_even_in_auto_mode(
 
 
 @pytest.mark.asyncio
-async def test_agent_hard_denies_write_note_into_internal_nexus_state(tool_context):
+async def test_agent_hard_denies_write_file_into_internal_nexus_state(tool_context):
     model = FakeModelClient(
         scripted=[
             RuntimeResponse(
@@ -461,7 +461,7 @@ async def test_agent_hard_denies_write_note_into_internal_nexus_state(tool_conte
                 tool_calls=(
                     ToolCall(
                         call_id="5",
-                        tool_name="write_note",
+                        tool_name="write_file",
                         arguments={"path": ".nexus/config.toml", "content": "provider = \"fake\""},
                     ),
                 ),
@@ -470,7 +470,7 @@ async def test_agent_hard_denies_write_note_into_internal_nexus_state(tool_conte
         ]
     )
     registry = ToolRegistry()
-    registry.register(WriteNoteTool())
+    registry.register(WriteFileTool())
     agent = Agent(model_client=model, tool_registry=registry)
 
     events = [

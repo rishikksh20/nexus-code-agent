@@ -183,10 +183,10 @@ uv --directory /home/rishikesh/dev/exp/build-an-ai-agent/build-an-ai-agent run n
 
 ### Expected result
 
-If the model requests a mutating tool such as `write_note`, Nexus should prompt inline, for example:
+If the model requests a mutating tool such as `write_file`, Nexus should prompt inline, for example:
 
 ```text
-Allow tool 'write_note'? [y/N]:
+Allow tool 'write_file'? [y/N]:
 ```
 
 It should wait for your input instead of immediately exiting.
@@ -225,7 +225,7 @@ Expected:
 
 - does the prompt appear in a way that is easy to notice?
 - does the app explain what the tool wants to do?
-- is plain `Allow tool 'write_note'?` enough context, or should it show arguments/path too?
+- is plain `Allow tool 'write_file'?` enough context, or should it show arguments/path too?
 
 ---
 

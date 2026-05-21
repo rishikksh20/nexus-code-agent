@@ -656,8 +656,7 @@ def _advanced_mode_required_tool_names() -> tuple[str, ...]:
         "git_status",
         "git_diff",
         "run_tests",
-        "run_linter",
-        "run_typecheck",
+        "run_python_check",
         "bash",
     )
 

@@ -92,8 +92,8 @@ class GetTimeTool:
         return ToolResult(call_id=call_id, tool_name=self.name, output=now)
 
 
-class WriteNoteTool:
-    name = "write_note"
+class WriteFileTool:
+    name = "write_file"
     description = "Write a short note into the current working directory."
     is_mutating = True
 
@@ -204,7 +204,7 @@ The current Nexus tool surface has grown well beyond the two-tool sketch in this
 | Tool | `is_mutating` | Risk | Notes |
 |---|---|---|---|
 | `get_time` | No | low | UTC timestamp. |
-| `write_note` | Yes | medium | Short note file; payload-size cap; workspace restricted. |
+| `write_file` | Yes | medium | Short note file; payload-size cap; workspace restricted. |
 | `read_file` | No | low | File contents or a line range; workspace restricted. |
 | `write_file` | Yes | **high** | Full file create / overwrite; always confirmed (even in auto mode). |
 | `modify_file` | Yes | medium | Replace a line range in an existing file. |

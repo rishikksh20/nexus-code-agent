@@ -85,8 +85,7 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
         "git_status",
         "git_diff",
         "run_tests",
-        "run_linter",
-        "run_typecheck",
+        "run_python_check",
         "bash",
     ]
     assert execution_profile["allowed_mcp_servers"] == []
@@ -343,8 +342,7 @@ def test_config_normalizes_legacy_subagent_tool_names(tmp_path):
     assert "subagent_review" in config.allowed_tools
     assert "subagent_verification" in config.allowed_tools
     assert "run_tests" in config.allowed_tools
-    assert "run_linter" in config.allowed_tools
-    assert "run_typecheck" in config.allowed_tools
+    assert "run_python_check" in config.allowed_tools
     assert "git_status" in config.allowed_tools
     assert "bash" in config.allowed_tools
 
@@ -702,7 +700,7 @@ def test_config_rejects_overlapping_tool_filters(tmp_path):
     global_root = tmp_path / "global"
     init_workspace(workspace, global_root=global_root, project_name="workspace")
     (workspace / ".nexus" / "config.toml").write_text(
-        'allowed_tools = ["get_time", "write_note"]\ndenied_tools = ["write_note"]\n',
+        'allowed_tools = ["get_time", "write_file"]\ndenied_tools = ["write_file"]\n',
         encoding="utf-8",
     )
 

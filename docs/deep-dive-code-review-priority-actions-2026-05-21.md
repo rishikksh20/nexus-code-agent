@@ -4,12 +4,12 @@ Date: 2026-05-21
 
 ## P0
 
-1. Lock `BashTool` to the workspace for `cwd` resolution.
+1. Lock `ShellTool` to the workspace for `cwd` resolution.
 2. Re-establish a passing test baseline by fixing missing compatibility surfaces:
-   - `WriteNoteTool`
+   - `WriteFileTool`
    - `nexus.tools.filesystem`
    - `nexus.runtime.sandbox`
-3. Fix `run_linter` and `run_typecheck` so they fail when their targets do not exist and stop reporting false-positive success.
+3. Fix `run_python_check` so it fails when targets do not exist and stops reporting false-positive success.
 
 ## P1
 
@@ -27,9 +27,9 @@ Date: 2026-05-21
 ## Validation Snapshot
 
 - `uv run pytest -q` currently fails at collection with 6 import errors.
-- `BashTool` accepted an external `cwd` and executed successfully outside the workspace.
+- `ShellTool` accepted an external `cwd` and executed successfully outside the workspace.
 - `_write_toml()` dropped nested MCP `env` data during serialization.
-- `RunLinterTool` reported success in an empty temporary workspace while stdout said it could not list `nexus` or `tests`.
+- `RunPythonCheckTool` reported success in an empty temporary workspace while stdout said it could not list `nexus` or `tests`.
 - paused-turn resume sent `continue` as the last user message while the original task only survived in the system prompt.
 - the sub-agent envelope ignored structured fields from a valid JSON result.
 

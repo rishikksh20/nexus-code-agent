@@ -389,11 +389,11 @@ A student building on this will hit rate limits in production and have no framew
 
 ---
 
-### Remaining Gap 3 — No BashTool for Local Execution
+### Remaining Gap 3 — No ShellTool for Local Execution
 
-Chapter 07-1 covers `SandboxedBashTool` for Docker. But there is no unsandboxed `BashTool` for local/trusted execution. The most commonly needed agent capability ("run this shell command") is unimplemented outside the Docker path.
+Chapter 07-1 covers `SandboxedBashTool` for Docker. But there is no unsandboxed `ShellTool` for local/trusted execution. The most commonly needed agent capability ("run this shell command") is unimplemented outside the Docker path.
 
-A reader who doesn't have Docker (or doesn't need the overhead) has no reference implementation for the most basic "execute arbitrary commands" tool. Writing it incorrectly (e.g., using `shell=True` without sanitization) is a significant security risk. The tutorial should provide a safe local `BashTool` with a clear security warning.
+A reader who doesn't have Docker (or doesn't need the overhead) has no reference implementation for the most basic "execute arbitrary commands" tool. Writing it incorrectly (e.g., using `shell=True` without sanitization) is a significant security risk. The tutorial should provide a safe local `ShellTool` with a clear security warning.
 
 ---
 
