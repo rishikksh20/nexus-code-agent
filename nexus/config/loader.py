@@ -52,6 +52,13 @@ def load_config(
         if strict:
             raise
         defaults = build_default_config(workspace_root, global_root=global_root)
+        merged = config_to_plain_dict(defaults)
+        merged.update(_read_environment(defaults))
+        merged = _apply_agent_mode_profile(merged)
+        merged = _apply_provider_defaults(merged)
+        for field_name, value in merged.items():
+            if hasattr(defaults, field_name):
+                setattr(defaults, field_name, _coerce_value(value, getattr(defaults, field_name)))
         defaults.global_config_file = (global_config_path or defaults.global_config_file).expanduser()
         defaults.local_config_file = local_config_path or defaults.local_config_file
         defaults.config_warnings.append(

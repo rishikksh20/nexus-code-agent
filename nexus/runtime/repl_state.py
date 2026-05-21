@@ -54,6 +54,7 @@ class ReplState:
     should_exit: bool = False
     current_turn_task: asyncio.Task | None = None
     abort_requested: bool = False
+    model_client_reloader: Callable[[AgentConfig], None] | None = None
 
     def begin_running_turn(self, task: asyncio.Task | None = None) -> None:
         self.current_turn_task = task or asyncio.current_task()
@@ -120,6 +121,11 @@ class ReplState:
         """Rebuild the cached prompt after live tool/config changes."""
         prompt_text = self.current_system_prompt_task_input or self.paused_turn_prompt
         return self.build_system_prompt(prompt_text)
+
+    def reload_model_client(self) -> None:
+        """Rebuild the live model client after provider config changes."""
+        if self.model_client_reloader is not None:
+            self.model_client_reloader(self.config)
 
     def prepare_turn(
         self,

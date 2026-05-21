@@ -93,6 +93,10 @@ def upgrade_config_file(path: Path, template_str: str) -> ConfigUpgradeReport:
     template = tomllib.loads(template_str)
     existing = _read_top_level_toml(path)
     content = path.read_text(encoding="utf-8") if path.exists() else ""
+    if content and not _can_parse_toml(content):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(template_str.rstrip() + "\n", encoding="utf-8")
+        return before
     lines = _remove_deprecated_and_version_lines(content.splitlines())
     if _needs_agent_scope_migration(existing):
         lines = _remove_top_level_assignments(lines, {*LEGACY_AGENT_SCOPE_KEYS, *OBSOLETE_SCOPE_KEYS})
@@ -210,6 +214,14 @@ def _read_top_level_toml(path: Path) -> dict[str, Any]:
     except tomllib.TOMLDecodeError:
         return {}
     return dict(data)
+
+
+def _can_parse_toml(content: str) -> bool:
+    try:
+        tomllib.loads(_normalize_bare_all_assignments(content))
+    except tomllib.TOMLDecodeError:
+        return False
+    return True
 
 
 def _normalize_bare_all_assignments(content: str) -> str:

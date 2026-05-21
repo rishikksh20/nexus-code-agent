@@ -1138,6 +1138,7 @@ async def test_provider_set_slash_command_updates_model_name(tmp_path):
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")
     console = Console(record=True, no_color=True, width=200)
+    reloaded_models: list[str] = []
     state = ReplState(
         config=config,
         mode=ExecutionMode.DEFAULT,
@@ -1146,6 +1147,7 @@ async def test_provider_set_slash_command_updates_model_name(tmp_path):
         tool_registry=registry,
         memory_store=MemoryStore(config.memory_dir),
         console=console,
+        model_client_reloader=lambda cfg: reloaded_models.append(cfg.model_name),
     )
 
     router = build_router()
@@ -1153,6 +1155,7 @@ async def test_provider_set_slash_command_updates_model_name(tmp_path):
 
     assert handled is True
     assert state.config.model_name == "gpt-4o"
+    assert reloaded_models == ["gpt-4o"]
     output = console.export_text()
     assert "model_name" in output
     assert "gpt-4o" in output
@@ -1200,6 +1203,7 @@ async def test_config_upgrade_reloads_config_and_workspace_dotenv(tmp_path, monk
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")
     console = Console(record=True, no_color=True, width=200)
+    reloaded_models: list[str] = []
     state = ReplState(
         config=config,
         mode=ExecutionMode.DEFAULT,
@@ -1208,12 +1212,14 @@ async def test_config_upgrade_reloads_config_and_workspace_dotenv(tmp_path, monk
         tool_registry=registry,
         memory_store=MemoryStore(config.memory_dir),
         console=console,
+        model_client_reloader=lambda cfg: reloaded_models.append(cfg.model_name),
     )
 
     handled = await build_router().dispatch(state, "/config upgrade local")
 
     assert handled is True
     assert state.config.model_name == "env-after-upgrade"
+    assert reloaded_models[-1] == "env-after-upgrade"
     assert "reloaded" in console.export_text()
     os.environ.pop("MODEL", None)
 

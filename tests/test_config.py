@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from nexus.cli.init import init_workspace
 from nexus.config import load_config
 from nexus.config.loader import ConfigError
@@ -296,6 +298,69 @@ def test_config_non_strict_uses_defaults_and_warning_when_toml_is_corrupt(tmp_pa
     assert config.project_name == "workspace"
     assert config.config_warnings
     assert "using defaults" in config.config_warnings[0]
+
+
+def test_config_non_strict_still_applies_dotenv_when_toml_is_corrupt(tmp_path, monkeypatch):
+    monkeypatch.delenv("PROVIDER", raising=False)
+    monkeypatch.delenv("MODEL", raising=False)
+    monkeypatch.delenv("BASE_URL", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text("project_name = [\n", encoding="utf-8")
+    (workspace / ".env").write_text(
+        "PROVIDER=openai-compatible\n"
+        "MODEL=dotenv-model\n"
+        "BASE_URL=https://example.test/v1\n"
+        "API_KEY=dotenv-key\n",
+        encoding="utf-8",
+    )
+
+    try:
+        config = load_config(workspace, global_root=global_root, strict=False)
+
+        assert config.provider == "openai-compatible"
+        assert config.model_name == "dotenv-model"
+        assert config.api_base_url == "https://example.test/v1"
+        assert config.api_key == "dotenv-key"
+        assert config.config_warnings
+    finally:
+        for key in ("PROVIDER", "MODEL", "BASE_URL", "API_KEY"):
+            os.environ.pop(key, None)
+
+
+def test_config_upgrade_rewrites_corrupt_toml_instead_of_appending_template(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    local_config.write_text(
+        'project_name = "workspace"\n'
+        "[agents]\n"
+        "project_name = \"nested-duplicate\"\n"
+        "[agents]\n"
+        "allowed_tools = []\n",
+        encoding="utf-8",
+    )
+
+    report = upgrade_config_file(
+        local_config,
+        __import__("nexus.cli.init", fromlist=["_local_config_toml"])._local_config_toml(
+            workspace_root=workspace,
+            project_name="workspace",
+            project_description="",
+        ),
+    )
+    config = load_config(workspace, global_root=global_root)
+    content = local_config.read_text(encoding="utf-8")
+
+    assert report.needs_upgrade is True
+    assert config.project_name == "workspace"
+    assert content.count("project_name") == 1
+    assert content.count("[agents]") == 1
 
 
 def test_config_ignores_obsolete_subagent_attach_detach_fields(tmp_path):

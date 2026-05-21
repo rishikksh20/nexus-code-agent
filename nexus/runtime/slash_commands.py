@@ -548,6 +548,8 @@ async def handle_provider(state: ReplState, args: list[str]) -> None:
             global_config_path=state.config.global_config_file,
             cli_overrides={key: _coerce_toml_value(value)},
         )
+        state.reload_model_client()
+        state.refresh_system_prompt()
         state.console.print(f"Updated {key} = {getattr(state.config, key)!r}")
         return
     if args[0].lower() == "set" and len(args) <= 2:
@@ -1916,6 +1918,8 @@ def _reload_config(state: ReplState) -> None:
         global_config_path=state.config.global_config_file,
         strict=False,
     )
+    state.reload_model_client()
+    state.refresh_system_prompt()
     for warning in getattr(state.config, "config_warnings", []) or []:
         print_warning = getattr(state.console, "print_warning", None)
         if print_warning is not None:

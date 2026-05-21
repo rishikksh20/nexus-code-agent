@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from urllib import error
 
 import pytest
@@ -170,6 +171,55 @@ async def test_openai_compatible_client_retries_transient_errors(monkeypatch):
     )
 
     assert attempts["count"] == 2
+    assert response.message.content == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_client_waits_on_http_429(monkeypatch):
+    attempts = {"count": 0}
+    delays: list[float] = []
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise error.HTTPError(
+                "https://example.test/v1/chat/completions",
+                429,
+                "rate limited",
+                {"Retry-After": "6"},
+                BytesIO(b'{"error":"slow down"}'),
+            )
+        return _FakeHTTPResponse(
+            {
+                "model": "demo-model",
+                "choices": [{"message": {"content": "recovered"}, "finish_reason": "stop"}],
+            }
+        )
+
+    async def _record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    monkeypatch.setattr("asyncio.sleep", _record_sleep)
+
+    client = OpenAICompatibleModelClient(
+        api_base_url="https://example.test/v1",
+        retries=2,
+        base_delay=0.0,
+        jitter=0.0,
+    )
+
+    response = await client.complete(
+        RuntimeRequest(
+            model_name="demo-model",
+            system_prompt="system",
+            messages=(Message(role="user", content="hello"),),
+        )
+    )
+
+    assert attempts["count"] == 2
+    assert delays == [6.0]
     assert response.message.content == "recovered"
 
 
