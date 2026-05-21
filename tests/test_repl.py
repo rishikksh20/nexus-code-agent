@@ -256,6 +256,44 @@ def _build_state(tmp_path, **overrides) -> ReplState:
     )
 
 
+def test_apply_events_persists_bounded_tool_output(tmp_path):
+    state = _build_state(
+        tmp_path,
+        tool_output_max_chars=20,
+        context_prune_protect_tokens=1000,
+        context_prune_minimum_tokens=1000,
+    )
+    tool_call = ToolCall(call_id="call-1", tool_name="bash", arguments={})
+    state.history.extend(
+        [
+            Message(role="user", content="older"),
+            Message(role="assistant", content="call", tool_calls=(tool_call,)),
+            Message(role="tool", content="old output", name="bash", tool_call_id="call-0"),
+            Message(role="user", content="latest"),
+        ]
+    )
+
+    state.apply_events(
+        [
+            AgentEvent(
+                kind=AgentEventType.MODEL_RESPONSE,
+                payload=RuntimeResponse(
+                    message=Message(role="assistant", content="call", tool_calls=(tool_call,)),
+                    tool_calls=(tool_call,),
+                ),
+            ),
+            AgentEvent(
+                kind=AgentEventType.TOOL_RESULT,
+                payload=ToolResult(call_id="call-1", tool_name="bash", output="x" * 80 + "TAIL"),
+            ),
+        ]
+    )
+
+    persisted = [message for message in state.session.messages if message.role == "tool"]
+    assert persisted[-1].content.startswith("[Tool output truncated")
+    assert persisted[-1].content.endswith("TAIL")
+
+
 @pytest.mark.asyncio
 async def test_collect_turn_events_forwards_request_settings_from_config(tmp_path):
     state = _build_state(tmp_path, temperature=0.7, max_output_tokens=321)

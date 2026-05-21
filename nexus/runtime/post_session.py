@@ -14,6 +14,7 @@ from nexus.runtime.sessions import SessionSnapshot
 
 
 logger = logging.getLogger(__name__)
+_POST_SESSION_TRANSCRIPT_MAX_CHARS = 200_000
 
 
 FACT_PATTERNS = {
@@ -28,7 +29,17 @@ def run_post_session_updates(config: AgentConfig, snapshot: SessionSnapshot, *, 
         return
     dirs = AgentDirs(workspace_root=config.workspace_root.resolve(), global_root=config.global_root.resolve())
     dirs.ensure()
-    transcript = "\n".join(message.content for message in snapshot.messages if message.content)
+    transcript_parts: list[str] = []
+    running_chars = 0
+    for message in reversed(snapshot.messages):
+        if message.role == "tool" or not message.content:
+            continue
+        content = message.content
+        running_chars += len(content)
+        transcript_parts.append(content)
+        if running_chars >= _POST_SESSION_TRANSCRIPT_MAX_CHARS:
+            break
+    transcript = "\n".join(reversed(transcript_parts))
     facts = extract_facts(transcript)
     try:
         workspace_payload = _load_json(dirs.facts_file, default={})

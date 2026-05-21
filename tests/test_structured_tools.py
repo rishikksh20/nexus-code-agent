@@ -15,6 +15,8 @@ from nexus.tools.builtin import (
     RunTestsTool,
     SemanticSearchTool,
 )
+from nexus.tools.builtin.verification import _run_command
+from nexus.tools.builtin.web_fetch import _get_with_safe_redirects, _validate_public_http_url
 
 
 @pytest.mark.asyncio
@@ -97,6 +99,48 @@ async def test_run_tests_returns_structured_metadata_for_focused_pytest():
     assert not result.is_error
     assert result.metadata["passed"] is True
     assert result.metadata["exit_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_verification_command_uses_bounded_output_buffer(tmp_path):
+    result = await _run_command(
+        ("python", "-c", "import sys; sys.stdout.write('x' * 120 + 'TAIL')"),
+        cwd=tmp_path,
+        timeout=30,
+        max_output_chars=50,
+    )
+
+    assert result["exit_code"] == 0
+    assert result["stdout_truncated"] is True
+    assert "TAIL" in result["stdout"]
+    assert len(result["stdout"]) <= 50
+
+
+def test_web_fetch_rejects_local_and_private_network_urls():
+    assert _validate_public_http_url("http://localhost:8000") is not None
+    assert _validate_public_http_url("http://127.0.0.1:8000") is not None
+    assert _validate_public_http_url("http://169.254.169.254/latest/meta-data") is not None
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_rejects_redirect_to_private_network_url():
+    class Response:
+        status_code = 302
+        headers = {"location": "http://127.0.0.1/admin"}
+        url = "http://93.184.216.34/start"
+
+    class Client:
+        calls = 0
+
+        async def get(self, url):
+            self.calls += 1
+            return Response()
+
+    client = Client()
+
+    with pytest.raises(ValueError):
+        await _get_with_safe_redirects(client, "http://93.184.216.34/start")
+    assert client.calls == 1
 
 
 @pytest.mark.asyncio

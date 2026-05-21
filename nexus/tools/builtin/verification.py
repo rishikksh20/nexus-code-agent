@@ -57,7 +57,7 @@ class _CommandTool(Tool):
         command, validation_error = self._build_command(cwd, raw_args)
         if validation_error is not None:
             return ToolResult(call_id=call_id, tool_name=self.name, output=validation_error, is_error=True)
-        result = await _run_command(command, cwd=cwd, timeout=timeout)
+        result = await _run_command(command, cwd=cwd, timeout=timeout, max_output_chars=_max_output_chars(context))
         payload = {
             "tool": self.name,
             "command": list(command),
@@ -66,6 +66,9 @@ class _CommandTool(Tool):
             "exit_code": result["exit_code"],
             "stdout_tail": _tail(result["stdout"]),
             "stderr_tail": _tail(result["stderr"]),
+            "stdout_truncated": result["stdout_truncated"],
+            "stderr_truncated": result["stderr_truncated"],
+            "output_truncated": result["stdout_truncated"] or result["stderr_truncated"],
             "timed_out": result["timed_out"],
         }
         return ToolResult(
@@ -122,7 +125,7 @@ class RunFormatterTool(_CommandTool):
         )
 
 
-async def _run_command(command: tuple[str, ...], *, cwd: Path, timeout: int) -> dict[str, Any]:
+async def _run_command(command: tuple[str, ...], *, cwd: Path, timeout: int, max_output_chars: int = 100 * 1024) -> dict[str, Any]:
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -131,22 +134,88 @@ async def _run_command(command: tuple[str, ...], *, cwd: Path, timeout: int) -> 
             cwd=cwd,
         )
     except FileNotFoundError as exc:
-        return {"exit_code": 127, "stdout": "", "stderr": str(exc), "timed_out": False}
+        return {
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": str(exc),
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "timed_out": False,
+        }
 
+    stdout_buffer = _BoundedByteBuffer(max_output_chars)
+    stderr_buffer = _BoundedByteBuffer(max_output_chars)
+    stdout_task = asyncio.create_task(_read_stream(process.stdout, stdout_buffer))
+    stderr_task = asyncio.create_task(_read_stream(process.stderr, stderr_buffer))
     try:
-        stdout_data, stderr_data = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        await asyncio.wait_for(asyncio.gather(process.wait(), stdout_task, stderr_task), timeout=timeout)
         timed_out = False
     except asyncio.TimeoutError:
         process.kill()
-        stdout_data, stderr_data = await process.communicate()
+        await process.wait()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         timed_out = True
 
     return {
         "exit_code": process.returncode if process.returncode is not None else 124,
-        "stdout": stdout_data.decode("utf-8", errors="replace"),
-        "stderr": stderr_data.decode("utf-8", errors="replace"),
+        "stdout": stdout_buffer.value.decode("utf-8", errors="replace"),
+        "stderr": stderr_buffer.value.decode("utf-8", errors="replace"),
+        "stdout_truncated": stdout_buffer.truncated,
+        "stderr_truncated": stderr_buffer.truncated,
         "timed_out": timed_out,
     }
+
+
+async def _read_stream(stream: asyncio.StreamReader | None, sink: "_BoundedByteBuffer") -> None:
+    if stream is None:
+        return
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            return
+        sink.append(chunk)
+
+
+class _BoundedByteBuffer:
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max(1, max_bytes)
+        self._parts: list[bytes] = []
+        self._size = 0
+        self.truncated = False
+
+    @property
+    def value(self) -> bytes:
+        return b"".join(self._parts)
+
+    def append(self, chunk: bytes) -> None:
+        if len(chunk) >= self.max_bytes:
+            self._parts = [chunk[-self.max_bytes:]]
+            self._size = self.max_bytes
+            self.truncated = True
+            return
+        self._parts.append(chunk)
+        self._size += len(chunk)
+        while self._size > self.max_bytes and self._parts:
+            overflow = self._size - self.max_bytes
+            first = self._parts[0]
+            if overflow >= len(first):
+                self._parts.pop(0)
+                self._size -= len(first)
+                self.truncated = True
+                continue
+            self._parts[0] = first[overflow:]
+            self._size -= overflow
+            self.truncated = True
+            break
+
+
+def _max_output_chars(context: ToolExecutionContext) -> int:
+    config = context.metadata.get("config")
+    raw_value = getattr(config, "tool_output_max_chars", 100 * 1024)
+    try:
+        return max(1, int(raw_value))
+    except (TypeError, ValueError):
+        return 100 * 1024
 
 
 def _resolve_cwd(context: ToolExecutionContext, raw_cwd: str) -> Path | None:

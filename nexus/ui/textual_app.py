@@ -329,6 +329,9 @@ class TextualTerminalUI(TerminalUI):
             self._tool_args_by_call_id.pop(result.call_id, None)
             self._tool_preview_by_call_id.pop(result.call_id, None)
             self._tool_actor_by_call_id.pop(result.call_id, None)
+            self._app._streaming_tool_outputs.discard(result.call_id)
+            self._app._streaming_tool_output_chars.pop(result.call_id, None)
+            self._app._streaming_tool_output_capped.discard(result.call_id)
             self.start_thinking()
             return
 
@@ -513,6 +516,8 @@ class NexusTextualApp(App[None]):
         self._spinner_frame = 0
         self._status_text = ""
         self._streaming_tool_outputs: set[str] = set()
+        self._streaming_tool_output_chars: dict[str, int] = {}
+        self._streaming_tool_output_capped: set[str] = set()
         self._transcript: Any = None
         self._status: Any = None
         self._input: Any = None
@@ -521,11 +526,14 @@ class NexusTextualApp(App[None]):
             for message in state.history
             if message.role == "user" and message.content.strip()
         ]
+        self._prompt_history_limit = max(1, int(getattr(state.config, "prompt_history_max_entries", 200)))
+        self._prompt_history = self._prompt_history[-self._prompt_history_limit :]
         self._prompt_history_index = len(self._prompt_history)
         self._prompt_history_draft = ""
 
     def compose(self) -> ComposeResult:
-        yield RichLog(id="transcript", wrap=True, highlight=False, markup=False)
+        max_lines = max(1, int(getattr(self.state.config, "textual_transcript_max_lines", 5000)))
+        yield RichLog(id="transcript", wrap=True, highlight=False, markup=False, max_lines=max_lines)
         yield Static("", id="status")
         yield PromptInput(placeholder="Message Nexus or type /help", id="prompt")
 
@@ -590,6 +598,19 @@ class NexusTextualApp(App[None]):
         self.has_open_assistant_stream = False
 
     def append_tool_output(self, call_id: str, stream_name: str, chunk: str) -> None:
+        max_chars = max(1, int(getattr(self.state.config, "tool_output_max_chars", 100 * 1024)))
+        current_chars = self._streaming_tool_output_chars.get(call_id, 0)
+        if current_chars >= max_chars:
+            if call_id not in self._streaming_tool_output_capped:
+                self._streaming_tool_output_capped.add(call_id)
+                self.write(Text(f"[live output capped at {max_chars} chars]", style="dim"))
+            return
+        remaining = max_chars - current_chars
+        capped_now = False
+        if len(chunk) > remaining:
+            chunk = chunk[:remaining]
+            capped_now = True
+        self._streaming_tool_output_chars[call_id] = current_chars + len(chunk)
         if call_id not in self._streaming_tool_outputs:
             self._streaming_tool_outputs.add(call_id)
             self.write(
@@ -605,6 +626,9 @@ class NexusTextualApp(App[None]):
         style = "red" if stream_name == "stderr" else "default"
         prefix = "[stderr] " if stream_name == "stderr" else ""
         self.write(Text(prefix + chunk.rstrip("\n"), style=style))
+        if capped_now and call_id not in self._streaming_tool_output_capped:
+            self._streaming_tool_output_capped.add(call_id)
+            self.write(Text(f"[live output capped at {max_chars} chars]", style="dim"))
 
     async def on_input_submitted(self, event: Any) -> None:
         raw = _strip_mouse_escape_sequences(str(event.value or "")).strip()
@@ -676,6 +700,8 @@ class NexusTextualApp(App[None]):
         if not value:
             return
         self._prompt_history.append(value)
+        if len(self._prompt_history) > self._prompt_history_limit:
+            del self._prompt_history[: len(self._prompt_history) - self._prompt_history_limit]
         self._prompt_history_index = len(self._prompt_history)
         self._prompt_history_draft = ""
 

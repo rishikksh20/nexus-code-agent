@@ -60,6 +60,10 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
     assert config.agent_mode == "basic"
     assert config.delegation_subagents == []
     assert config.config_version == 2
+    assert config.textual_transcript_max_lines == 5000
+    assert config.prompt_history_max_entries == 200
+    assert config.tool_output_max_chars == 102400
+    assert config.shell_inherit_environment is False
     assert config.agent_allowed_tools == []
     assert config.agent_allowed_skills == []
     assert config.agent_allowed_mcp_servers == []

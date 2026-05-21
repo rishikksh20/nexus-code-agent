@@ -296,6 +296,15 @@ def test_redact_payload_replaces_sensitive_keys():
     assert redacted == {"api_key": "[REDACTED]", "nested": {"token": "[REDACTED]"}, "safe": "ok"}
 
 
+def test_redact_payload_scrubs_secret_values_in_text():
+    payload = {"output_preview": "API_KEY=sk-1234567890abcdefghijklmnop and safe text"}
+
+    redacted = redact_payload(payload)
+
+    assert "sk-1234567890" not in redacted["output_preview"]
+    assert "[REDACTED]" in redacted["output_preview"]
+
+
 @pytest.mark.asyncio
 async def test_audit_trail_records_mutating_actions(tmp_path):
     hooks = HookExecutor()

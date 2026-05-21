@@ -26,6 +26,10 @@ class AgentConfig:
     show_thinking_indicator: bool = True
     color_output: bool = True
     textual_ui: bool = True
+    textual_transcript_max_lines: int = 5000
+    prompt_history_max_entries: int = 200
+    tool_output_max_chars: int = 100 * 1024
+    shell_inherit_environment: bool = False
     max_sessions_retained: int = 50
     save_on_every_turn: bool = True
     skills_dir: Path = field(default_factory=Path)

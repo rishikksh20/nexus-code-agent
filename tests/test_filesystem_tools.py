@@ -63,6 +63,10 @@ class TestClassifyBashRisk:
     def test_medium_risk_pip_install(self):
         assert classify_bash_risk("pip install requests") == "medium"
 
+    def test_medium_risk_env_dump(self):
+        assert classify_bash_risk("env") == "medium"
+        assert classify_bash_risk("printenv") == "medium"
+
     def test_high_risk_rm_rf(self):
         assert classify_bash_risk("rm -rf /tmp/test") == "high"
 
@@ -637,6 +641,13 @@ class TestPermissionCheckerFilesystemTools:
         tool = ShellTool()
         result = PermissionChecker().evaluate(
             tool, {"command": "mkdir newdir"}, ExecutionMode.DEFAULT, context=self._ctx(tmp_path)
+        )
+        assert result.decision is PermissionDecision.CONFIRM
+
+    def test_bash_env_dump_confirms_in_default(self, tmp_path):
+        tool = ShellTool()
+        result = PermissionChecker().evaluate(
+            tool, {"command": "env"}, ExecutionMode.DEFAULT, context=self._ctx(tmp_path)
         )
         assert result.decision is PermissionDecision.CONFIRM
 
