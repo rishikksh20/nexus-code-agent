@@ -64,6 +64,13 @@ class _CountingFakeModelClient(FakeModelClient):
         return await super().complete(request)
 
 
+class _ExplodingModelClient:
+    async def chat_completion(self, request: RuntimeRequest, *, stream: bool = True):
+        del request, stream
+        raise RuntimeError("provider stream exploded")
+        yield  # pragma: no cover
+
+
 class _RecordingAgent:
     def __init__(self) -> None:
         self.messages: list[Message] = []
@@ -308,6 +315,20 @@ async def test_collect_turn_events_forwards_request_settings_from_config(tmp_pat
     assert model.requests
     assert model.requests[0].temperature == 0.7
     assert model.requests[0].max_output_tokens == 321
+
+
+@pytest.mark.asyncio
+async def test_collect_turn_events_surfaces_model_batch_exceptions(tmp_path, caplog):
+    state = _build_state(tmp_path)
+    state.history.append(Message(role="user", content="hello"))
+    agent = Agent(model_client=_ExplodingModelClient(), tool_registry=state.tool_registry)
+    caplog.set_level("ERROR", logger="nexus.runtime.turn_runner")
+
+    events = await collect_turn_events(state, agent, prompt_text="hello")
+
+    error_event = next(event for event in events if event.kind == AgentEventType.AGENT_ERROR)
+    assert "provider stream exploded" in str(error_event.payload)
+    assert "turn_runner.batch.exception" in caplog.text
 
 
 @pytest.mark.asyncio

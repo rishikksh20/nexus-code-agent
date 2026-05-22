@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 
 from collections.abc import AsyncGenerator
@@ -27,6 +28,9 @@ from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
 from nexus.security.manager import ApprovalManager
 from nexus.tools.base import FileDiff, ToolConfirmation, ToolRegistry, tool_to_schema
+
+
+logger = logging.getLogger(__name__)
 
 
 TOOL_CALL_LIMIT_FINISH_REASON = "tool_call_limit"
@@ -346,6 +350,17 @@ class Agent:
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
             )
+            logger.debug(
+                "agent.model_batch.start session_id=%s actor=%s turn_index=%s max_turns=%s model=%s messages=%s last_role=%s tool_schemas=%s",
+                context.session_id,
+                _tool_actor(context) or "supervisor",
+                turn_index + 1,
+                max_turns,
+                model_name,
+                len(request.messages),
+                request.messages[-1].role if request.messages else "",
+                len(request.tool_schemas),
+            )
 
             # ----------------------------------------------------------------
             # Stream from the model client
@@ -353,6 +368,7 @@ class Agent:
             response_text = ""
             stream_tool_calls: list[ToolCall] = []
             usage: UsageSnapshot | None = None
+            stream_finish_reason: str | None = None
 
             stream = cast(AsyncGenerator[StreamEvent, None], self.model_client.chat_completion(request, stream=True))
             async for stream_event in stream:
@@ -368,10 +384,31 @@ class Agent:
 
                 elif stream_event.type == StreamEventType.MESSAGE_COMPLETE:
                     usage = stream_event.usage
+                    stream_finish_reason = stream_event.finish_reason or stream_finish_reason
 
                 elif stream_event.type == StreamEventType.ERROR:
+                    logger.warning(
+                        "agent.model_batch.error session_id=%s actor=%s turn_index=%s error=%s",
+                        context.session_id,
+                        _tool_actor(context) or "supervisor",
+                        turn_index + 1,
+                        stream_event.error,
+                    )
                     yield AgentEvent.agent_error(stream_event.error)
                     return
+
+            if not response_text and not stream_tool_calls:
+                logger.warning(
+                    "agent.model_batch.empty_response session_id=%s actor=%s turn_index=%s finish_reason=%s messages=%s last_role=%s",
+                    context.session_id,
+                    _tool_actor(context) or "supervisor",
+                    turn_index + 1,
+                    stream_finish_reason,
+                    len(request.messages),
+                    request.messages[-1].role if request.messages else "",
+                )
+                yield AgentEvent.agent_error(_empty_provider_response_message(stream_finish_reason))
+                return
 
             if response_text:
                 yield AgentEvent.text_complete(response_text)
@@ -387,12 +424,22 @@ class Agent:
             should_record_message = bool(message.content or message.tool_calls)
             if should_record_message:
                 history.append(message)
+            logger.debug(
+                "agent.model_batch.end session_id=%s actor=%s turn_index=%s response_chars=%s tool_calls=%s finish_reason=%s recorded=%s",
+                context.session_id,
+                _tool_actor(context) or "supervisor",
+                turn_index + 1,
+                len(response_text),
+                len(tool_calls),
+                "tool_calls" if tool_calls else (stream_finish_reason or "stop"),
+                should_record_message,
+            )
 
             runtime_response = RuntimeResponse(
                 message=message,
                 tool_calls=tool_calls,
                 usage=usage,
-                finish_reason="tool_calls" if tool_calls else "stop",
+                finish_reason="tool_calls" if tool_calls else (stream_finish_reason or "stop"),
             )
 
             if usage is not None:
@@ -717,15 +764,39 @@ class Agent:
                         result = event.payload
                     yield event
                 if result is None:
+                    logger.warning(
+                        "agent.tool_result.missing session_id=%s actor=%s tool_name=%s call_id=%s",
+                        context.session_id,
+                        _tool_actor(context) or "supervisor",
+                        tool_call.tool_name,
+                        tool_call.call_id,
+                    )
                     continue
                 tool_calls_executed += 1
                 tool_result_messages.append(_tool_result_message(result))
+                logger.debug(
+                    "agent.tool_result.recorded session_id=%s actor=%s tool_name=%s call_id=%s is_error=%s output_chars=%s",
+                    context.session_id,
+                    _tool_actor(context) or "supervisor",
+                    result.tool_name,
+                    result.call_id,
+                    result.is_error,
+                    len(result.output),
+                )
                 loop_detector.record_action("tool_call", tool_name=tool_call.tool_name)
 
             # Add all tool results to history after the complete batch, then prune
             # and check for loops — matching the reference-code execution model.
             for msg in tool_result_messages:
                 history.append(msg)
+            if tool_result_messages:
+                logger.debug(
+                    "agent.tool_results.appended session_id=%s actor=%s count=%s next_turn_index=%s",
+                    context.session_id,
+                    _tool_actor(context) or "supervisor",
+                    len(tool_result_messages),
+                    turn_index + 2,
+                )
             prune_tool_outputs(history, protect_tokens=2000, minimum_tokens=500)
             loop_error = loop_detector.check_for_loop()
             if loop_error:
@@ -766,6 +837,16 @@ def _tool_name_text(tool_name: Any) -> str:
     if isinstance(tool_name, str):
         return tool_name or "(empty)"
     return repr(tool_name)
+
+
+def _empty_provider_response_message(finish_reason: str | None) -> str:
+    reason = str(finish_reason or "").strip()
+    if reason:
+        return (
+            "Provider returned an empty assistant response with no tool calls "
+            f"(finish_reason={reason})."
+        )
+    return "Provider returned an empty assistant response with no tool calls."
 
 
 def _unknown_tool_result(

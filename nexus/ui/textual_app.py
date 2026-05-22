@@ -771,6 +771,14 @@ class NexusTextualApp(App[None]):
                 or environ.get("GOOGLE_API_KEY")
                 or environ.get("API_KEY")
             )
+        elif cfg.provider == "cohere":
+            has_key = bool(
+                cfg.api_key
+                or environ.get("COHERE_API_KEY")
+                or environ.get("CO_API_KEY")
+                or environ.get("NEXUS_API_KEY")
+                or environ.get("API_KEY")
+            )
         else:
             has_key = True
         if not has_key:

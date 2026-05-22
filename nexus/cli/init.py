@@ -54,7 +54,7 @@ def _global_config_toml() -> str:
             '#   API_KEY=your_key_here',
             '#   BASE_URL=https://api.mistral.ai/v1',
             '# You can also use provider-specific env vars:',
-            '#   MISTRAL_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, NEXUS_API_KEY',
+            '#   MISTRAL_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, COHERE_API_KEY, GEMINI_API_KEY, NEXUS_API_KEY',
             '# Or override any value directly in this file.',
             '# Switch to provider = "fake" for local offline use (no API key required).',
             f'config_version = {CURRENT_CONFIG_VERSION}',

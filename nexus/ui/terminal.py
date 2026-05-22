@@ -294,7 +294,7 @@ class TerminalUI:
         self._console.print(
             Panel(
                 Text(
-                    f"No API key found for provider {provider}. Add API_KEY to .env (or a provider-specific key such as MISTRAL_API_KEY / OPENAI_API_KEY) before starting a live session.",
+                    f"No API key found for provider {provider}. Add API_KEY to .env (or a provider-specific key such as MISTRAL_API_KEY / COHERE_API_KEY / OPENAI_API_KEY) before starting a live session.",
                     style="warning",
                 ),
                 title=Text("Provider setup required", style="warning"),
@@ -755,6 +755,8 @@ class TerminalUI:
         has_key = bool(
             config.api_key
             or environ.get("ANTHROPIC_API_KEY")
+            or environ.get("COHERE_API_KEY")
+            or environ.get("CO_API_KEY")
             or environ.get("GEMINI_API_KEY")
             or environ.get("GOOGLE_API_KEY")
             or environ.get("MISTRAL_API_KEY")

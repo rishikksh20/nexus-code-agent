@@ -584,6 +584,7 @@ def _print_provider_list(state: ReplState) -> None:
     table.add_column("Active")
     rows: tuple[tuple[str, str], ...] = (
         ("anthropic", "Anthropic Messages API (requires ANTHROPIC_API_KEY)."),
+        ("cohere", "Cohere Chat API v2 (requires COHERE_API_KEY or CO_API_KEY)."),
         ("fake", "Deterministic local fake client. No API key required."),
         ("gemini", "Google Gemini API (requires GEMINI_API_KEY or GOOGLE_API_KEY)."),
         ("mistral", "Mistral AI API endpoint (requires MISTRAL_API_KEY)."),

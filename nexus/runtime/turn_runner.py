@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from typing import cast
@@ -25,6 +26,7 @@ from nexus.ui import TerminalUI
 
 
 ConfirmationCallback = Callable[[ConfirmationRequest], Awaitable[ConfirmationResponse]]
+logger = logging.getLogger(__name__)
 
 
 def prompt_for_confirmation(
@@ -117,7 +119,7 @@ async def run_agent_turn(
                 turn_id=turn_id,
                 trace_id=trace_id,
                 started_at=started_at,
-                status="completed",
+                status=_turn_status_from_events(batch),
             )
             return committed_events
 
@@ -222,22 +224,52 @@ async def _run_model_batch(
     auto_confirm: bool,
 ) -> list[AgentEvent]:
     batch: list[AgentEvent] = []
-    async for event in agent.run(
-        messages,
-        context,
-        system_prompt=system_prompt,
-        model_name=state.config.model_name,
-        mode=state.mode,
-        approval_manager=state.approval_manager,
-        auto_confirm=auto_confirm,
-        auto_confirm_read_only=state.config.auto_confirm_read_only,
-        temperature=state.config.temperature,
-        max_output_tokens=state.config.max_output_tokens,
-        max_turns=state.config.max_loop_iterations,
-        max_tool_calls_per_turn=state.config.max_tool_calls_per_turn,
-    ):
-        _render_event(ui, state, event)
-        batch.append(event)
+    logger.debug(
+        "turn_runner.batch.start session_id=%s turn_id=%s trace_id=%s messages=%s last_role=%s model=%s",
+        context.session_id,
+        context.metadata.get("turn_id", ""),
+        context.metadata.get("trace_id", ""),
+        len(messages),
+        messages[-1].role if messages else "",
+        state.config.model_name,
+    )
+    try:
+        async for event in agent.run(
+            messages,
+            context,
+            system_prompt=system_prompt,
+            model_name=state.config.model_name,
+            mode=state.mode,
+            approval_manager=state.approval_manager,
+            auto_confirm=auto_confirm,
+            auto_confirm_read_only=state.config.auto_confirm_read_only,
+            temperature=state.config.temperature,
+            max_output_tokens=state.config.max_output_tokens,
+            max_turns=state.config.max_loop_iterations,
+            max_tool_calls_per_turn=state.config.max_tool_calls_per_turn,
+        ):
+            _render_event(ui, state, event)
+            batch.append(event)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "turn_runner.batch.exception session_id=%s turn_id=%s trace_id=%s events=%s error=%s",
+            context.session_id,
+            context.metadata.get("turn_id", ""),
+            context.metadata.get("trace_id", ""),
+            len(batch),
+            exc,
+        )
+        error_event = AgentEvent.agent_error(str(exc) or exc.__class__.__name__)
+        _render_event(ui, state, error_event)
+        batch.append(error_event)
+    logger.debug(
+        "turn_runner.batch.end session_id=%s turn_id=%s trace_id=%s events=%s status=%s",
+        context.session_id,
+        context.metadata.get("turn_id", ""),
+        context.metadata.get("trace_id", ""),
+        len(batch),
+        _turn_status_from_events(batch),
+    )
     return batch
 
 
@@ -307,6 +339,10 @@ def _render_event(ui: TerminalUI | None, state: ReplState, event: AgentEvent) ->
         show_tool_calls=state.config.show_tool_calls,
         show_thinking_indicator=state.config.show_thinking_indicator,
     )
+
+
+def _turn_status_from_events(events: list[AgentEvent]) -> str:
+    return "failed" if any(event.kind == AgentEventType.AGENT_ERROR for event in events) else "completed"
 
 
 def _finish_turn(

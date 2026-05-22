@@ -19,7 +19,7 @@ Nexus is a CLI-first coding agent implemented as a Python package under `nexus/`
 - `nexus/config/` contains defaults, TOML/env/CLI merge logic, validation, and model-context limit helpers.
 - `nexus/tools/` contains the first-party tool system, MCP adapters, registry helpers, compatibility filesystem tools, and sub-agent tool registration.
 - `nexus/security/` contains approval policies, approval state, permission checks, and shell-risk classification.
-- `nexus/integrations/` contains provider adapters: fake, OpenAI-compatible HTTP providers, native Ollama, native Anthropic, native Gemini, and retry support.
+- `nexus/integrations/` contains provider adapters: fake, OpenAI-compatible HTTP providers, native Ollama, native Anthropic, Cohere Chat API v2, native Gemini, and retry support.
 - `nexus/extensions/`, `nexus/hooks/`, `nexus/skills/`, `nexus/memory/`, `nexus/context/`, `nexus/sandbox/`, and `nexus/observability/` provide optional runtime capabilities around the core loop.
 
 ## Runtime Flow
@@ -114,6 +114,7 @@ Provider selection is validated in `nexus/config/loader.py`.
 Valid providers:
 
 - `anthropic`
+- `cohere`
 - `fake`
 - `gemini`
 - `mistral`
@@ -127,6 +128,7 @@ Valid providers:
 - `OpenAICompatibleModelClient` for OpenAI-compatible HTTP APIs, including Mistral/OpenAI-style endpoints.
 - `OllamaModelClient` for local Ollama.
 - `AnthropicModelClient` for Anthropic.
+- `CohereModelClient` for Cohere Chat API v2.
 - `GeminiModelClient` for Gemini.
 
 Config supports provider-specific defaults, API-key resolution, and model context-limit adjustments.

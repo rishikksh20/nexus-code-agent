@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -17,6 +18,8 @@ from nexus.runtime.agent_scope import render_skill_metadata, subagent_skill_name
 from nexus.security.manager import ApprovalScope
 from nexus.security.policy import ApprovalPolicy
 from nexus.tools.base import ToolKind
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # SubagentDefinition — pre-configured cognitive persona
@@ -244,6 +247,21 @@ class SubAgentTool:
         failed_tool_outputs: list[dict[str, str]] = []
         modified_files: list[str] = []
         deadline = asyncio.get_running_loop().time() + float(getattr(self._definition, "timeout_seconds", 600.0) or 600.0)
+        logger.debug(
+            "subagent.execute.start outer_session_id=%s sub_session_id=%s tool_name=%s call_id=%s title_chars=%s "
+            "instruction_chars=%s allowed_tools=%s allowed_skills=%s allowed_mcps=%s max_turns=%s timeout_seconds=%s",
+            outer_context.session_id,
+            sub_context.session_id,
+            self.name,
+            call_id,
+            len(title),
+            len(instructions),
+            len(allowed_tool_names),
+            len(active_skill_names),
+            len(allowed_mcp_servers),
+            int(getattr(self._definition, "max_turns", 20) or 20),
+            float(getattr(self._definition, "timeout_seconds", 600.0) or 600.0),
+        )
 
         for _ in range(int(getattr(self._definition, "max_turns", 20) or 20)):
             try:
@@ -269,6 +287,20 @@ class SubAgentTool:
                 error = f"Sub-agent timed out after {float(getattr(self._definition, 'timeout_seconds', 600.0) or 600.0):g}s."
                 final_response = error
                 break
+            logger.debug(
+                "subagent.execute.batch outer_session_id=%s sub_session_id=%s tool_name=%s call_id=%s events=%s "
+                "tool_results=%s agent_errors=%s confirmations=%s history_messages=%s status=%s",
+                outer_context.session_id,
+                sub_context.session_id,
+                self.name,
+                call_id,
+                len(events),
+                sum(1 for event in events if event.kind == AgentEventType.TOOL_RESULT),
+                sum(1 for event in events if event.kind == AgentEventType.AGENT_ERROR),
+                sum(1 for event in events if event.kind == AgentEventType.CONFIRMATION_REQUESTED),
+                len(history),
+                status,
+            )
 
             confirmation = next((event for event in events if event.kind == AgentEventType.CONFIRMATION_REQUESTED), None)
             if confirmation is not None:
@@ -319,6 +351,17 @@ class SubAgentTool:
                         error = f"Sub-agent timed out after {float(getattr(self._definition, 'timeout_seconds', 600.0) or 600.0):g}s."
                         final_response = error
                         break
+                    logger.debug(
+                        "subagent.execute.resume_batch outer_session_id=%s sub_session_id=%s tool_name=%s "
+                        "call_id=%s events=%s tool_results=%s agent_errors=%s",
+                        outer_context.session_id,
+                        sub_context.session_id,
+                        self.name,
+                        call_id,
+                        len(resume_events),
+                        sum(1 for event in resume_events if event.kind == AgentEventType.TOOL_RESULT),
+                        sum(1 for event in resume_events if event.kind == AgentEventType.AGENT_ERROR),
+                    )
                     for event in resume_events:
                         if event.kind == AgentEventType.TOOL_RESULT:
                             tool_call_count += 1
@@ -403,6 +446,22 @@ class SubAgentTool:
         )
         if len(output) > self._MAX_OUTPUT_BYTES:
             output = output[: self._MAX_OUTPUT_BYTES] + "\n\u2026[truncated]"
+
+        log = logger.warning if is_failed else logger.debug
+        log(
+            "subagent.execute.end outer_session_id=%s sub_session_id=%s tool_name=%s call_id=%s status=%s "
+            "is_error=%s tool_calls=%s history_messages=%s output_chars=%s modified_files=%s",
+            outer_context.session_id,
+            sub_context.session_id,
+            self.name,
+            call_id,
+            status,
+            is_failed,
+            tool_call_count,
+            len(history),
+            len(output),
+            len(context_snapshot["modified_files"]),
+        )
 
         return ToolResult(
             call_id=call_id,

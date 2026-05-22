@@ -436,7 +436,7 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     valid_modes = {"plan", "default", "auto"}
     valid_agent_modes = {"basic", "advanced"}
     valid_log_formats = {"text", "json"}
-    valid_providers = {"anthropic", "fake", "gemini", "mistral", "openai", "openai-compatible", "ollama"}
+    valid_providers = {"anthropic", "cohere", "fake", "gemini", "mistral", "openai", "openai-compatible", "ollama"}
     valid_approval_policies = {
         "on-request", "approve-turn", "approve-session", "auto", "plan"
     }
@@ -608,6 +608,7 @@ def _apply_provider_defaults(values: dict[str, Any]) -> dict[str, Any]:
     resolved = dict(values)
     provider = str(resolved.get("provider", "")).strip().lower()
     api_base_url = str(resolved.get("api_base_url", "")).strip()
+    default_compatible_base_url = "https://api.mistral.ai/v1"
     if provider == "mistral":
         # MISTRAL_BASE_URL always takes priority; fall back to the hardcoded default
         # when api_base_url has not been set explicitly via TOML or env.
@@ -616,6 +617,12 @@ def _apply_provider_defaults(values: dict[str, Any]) -> dict[str, Any]:
             resolved["api_base_url"] = mistral_base_url_env
         elif not api_base_url:
             resolved["api_base_url"] = "https://api.mistral.ai/v1"
+    elif provider == "cohere":
+        cohere_base_url_env = os.getenv("COHERE_BASE_URL") or os.getenv("CO_API_BASE_URL")
+        if cohere_base_url_env:
+            resolved["api_base_url"] = cohere_base_url_env
+        elif not api_base_url or api_base_url.rstrip("/") == default_compatible_base_url:
+            resolved["api_base_url"] = "https://api.cohere.com"
     elif provider in {"anthropic", "gemini"}:
         # Native SDK providers do not use api_base_url by default.
         if not api_base_url:

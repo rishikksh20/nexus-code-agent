@@ -523,6 +523,38 @@ def test_config_accepts_mistral_provider_with_default_base_url(tmp_path):
     assert config.api_base_url == "https://api.mistral.ai/v1"
 
 
+def test_config_accepts_cohere_provider_with_default_base_url(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+
+    config = load_config(
+        workspace,
+        global_root=global_root,
+        cli_overrides={"provider": "cohere", "api_base_url": ""},
+    )
+
+    assert config.provider == "cohere"
+    assert config.api_base_url == "https://api.cohere.com"
+
+
+def test_config_cohere_overrides_builtin_mistral_base_url(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+
+    config = load_config(
+        workspace,
+        global_root=global_root,
+        cli_overrides={"provider": "cohere"},
+    )
+
+    assert config.provider == "cohere"
+    assert config.api_base_url == "https://api.cohere.com"
+
+
 def test_config_accepts_native_sdk_providers_without_base_url(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
