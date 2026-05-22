@@ -80,7 +80,7 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
             effective_prompt=effective_prompt,
             resumed_paused_turn=resumed_paused_turn,
         )
-        state.history.append(Message(role="user", content=raw_input))
+        state.history.append(Message(role="user", content=effective_prompt if resumed_paused_turn else raw_input))
         if not resumed_paused_turn:
             state.approval_manager.begin_turn()
         try:

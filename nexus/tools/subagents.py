@@ -231,7 +231,7 @@ def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
                 "probe readiness, collect logs, and stop the process in the same command. If a bash command "
                 "times out, do not retry the same command unchanged."
             ),
-            allowed_tools=["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_tests", "run_linter", "run_typecheck", "bash"],
+            allowed_tools=["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_tests", "run_python_check", "bash"],
             max_turns=14,
             timeout_seconds=600,
         ),
@@ -259,7 +259,7 @@ def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
                 "it in the same command. If a bash command times out, do not retry the same command "
                 "unchanged; report the timeout and relevant output."
             ),
-            allowed_tools=["run_tests", "run_linter", "run_typecheck", "git_status", "bash"],
+            allowed_tools=["run_tests", "run_python_check", "git_status", "bash"],
             max_turns=6,
             timeout_seconds=600,
         ),

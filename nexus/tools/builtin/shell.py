@@ -40,6 +40,7 @@ _HIGH_RISK_REGEXES: list[re.Pattern[str]] = [
 ]
 
 _MEDIUM_RISK_REGEXES: list[re.Pattern[str]] = [
+    re.compile(r"^\s*(env|printenv)\b"),
     re.compile(r"\brm\b"),
     re.compile(r"\bmv\b"),
     re.compile(r"\bcp\b"),
@@ -60,7 +61,7 @@ _LOW_RISK_BASE_COMMANDS: frozenset[str] = frozenset({
     "cat", "echo", "printf", "pwd", "date", "ls", "ll", "la",
     "find", "locate", "grep", "rg", "ag", "awk", "wc",
     "head", "tail", "sort", "uniq", "diff",
-    "which", "type", "command", "env", "printenv",
+    "which", "type", "command",
     "uname", "hostname", "whoami", "id", "groups",
     "ps", "pgrep",
     "file", "stat", "du", "df", "lsof",
@@ -200,13 +201,24 @@ class ShellTool(Tool):
         timeout = int(arguments.get("timeout", 120))
         raw_cwd = arguments.get("cwd")
         if raw_cwd:
-            work_dir = resolve_path(context.working_directory, str(raw_cwd))
+            workspace = context.working_directory.resolve()
+            work_dir = resolve_path(workspace, str(raw_cwd))
+            try:
+                work_dir.relative_to(workspace)
+            except ValueError:
+                return ToolResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    output="Working directory is outside the workspace.",
+                    is_error=True,
+                )
             if not work_dir.exists():
                 return ToolResult(call_id=call_id, tool_name=self.name, output=f"Working directory does not exist: {work_dir}", is_error=True)
         else:
-            work_dir = context.working_directory
+            work_dir = context.working_directory.resolve()
 
-        env = self._build_env()
+        max_output_chars = _max_output_chars(context)
+        env = self._build_env(context)
         shell_cmd = ["cmd.exe", "/c", command] if sys.platform == "win32" else ["/bin/bash", "-c", command]
 
         process = await asyncio.create_subprocess_exec(
@@ -218,14 +230,14 @@ class ShellTool(Tool):
             start_new_session=True,
         )
 
-        stdout_parts: list[bytes] = []
-        stderr_parts: list[bytes] = []
+        stdout_buffer = _BoundedByteBuffer(max_output_chars)
+        stderr_buffer = _BoundedByteBuffer(max_output_chars)
         stream_output = _stream_output_callback(context, call_id, self.name)
         stdout_task = asyncio.create_task(
             _read_process_stream(
                 process.stdout,
                 "stdout",
-                stdout_parts,
+                stdout_buffer,
                 stream_output,
             )
         )
@@ -233,7 +245,7 @@ class ShellTool(Tool):
             _read_process_stream(
                 process.stderr,
                 "stderr",
-                stderr_parts,
+                stderr_buffer,
                 stream_output,
             )
         )
@@ -257,32 +269,71 @@ class ShellTool(Tool):
             await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             return ToolResult(call_id=call_id, tool_name=self.name, output=f"Command timed out after {timeout}s", is_error=True, metadata={"timeout": True})
 
-        stdout_data = b"".join(stdout_parts)
-        stderr_data = b"".join(stderr_parts)
+        stdout_data = stdout_buffer.value
+        stderr_data = stderr_buffer.value
         stdout = stdout_data.decode("utf-8", errors="replace")
         stderr = stderr_data.decode("utf-8", errors="replace")
         exit_code = process.returncode
 
         output = stdout.rstrip()
+        if stdout_buffer.truncated:
+            output = f"[stdout truncated to last {max_output_chars} bytes]\n{output}" if output else f"[stdout truncated to last {max_output_chars} bytes]"
         if stderr.strip():
-            output += "\n--- stderr ---\n" + stderr.rstrip()
+            stderr_output = stderr.rstrip()
+            if stderr_buffer.truncated:
+                stderr_output = f"[stderr truncated to last {max_output_chars} bytes]\n{stderr_output}"
+            output += "\n--- stderr ---\n" + stderr_output
         if exit_code != 0:
             output += f"\nExit code: {exit_code}"
 
-        # Cap at 100 KB to protect context window
-        if len(output) > 100 * 1024:
-            output = output[: 100 * 1024] + "\n... [output truncated]"
+        output_truncated = stdout_buffer.truncated or stderr_buffer.truncated
+        if len(output) > max_output_chars:
+            output = output[-max_output_chars:]
+            output = f"[combined output truncated to last {max_output_chars} chars]\n{output}"
+            output_truncated = True
 
         return ToolResult(
             call_id=call_id,
             tool_name=self.name,
             output=output,
             is_error=exit_code != 0,
-            metadata={"exit_code": exit_code, "risk": classify_bash_risk(command)},
+            metadata={
+                "exit_code": exit_code,
+                "risk": classify_bash_risk(command),
+                "output_truncated": output_truncated,
+                "stdout_truncated": stdout_buffer.truncated,
+                "stderr_truncated": stderr_buffer.truncated,
+            },
         )
 
-    def _build_env(self) -> dict[str, str]:
-        return os.environ.copy()
+    def _build_env(self, context: ToolExecutionContext) -> dict[str, str]:
+        config = context.metadata.get("config")
+        if bool(getattr(config, "shell_inherit_environment", False)):
+            return os.environ.copy()
+        safe_names = {
+            "PATH",
+            "HOME",
+            "PWD",
+            "SHELL",
+            "TERM",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "USER",
+            "USERNAME",
+            "LOGNAME",
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+        }
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key in safe_names or key.startswith(("LC_", "LANG"))
+        }
+        env.setdefault("PATH", os.defpath)
+        return env
 
 
 StreamOutputCallback = Callable[[str, str], Awaitable[None] | None]
@@ -307,7 +358,7 @@ def _stream_output_callback(
 async def _read_process_stream(
     stream: asyncio.StreamReader | None,
     stream_name: str,
-    sink: list[bytes],
+    sink: "_BoundedByteBuffer",
     callback: StreamOutputCallback | None,
 ) -> None:
     if stream is None:
@@ -325,5 +376,43 @@ async def _read_process_stream(
             await maybe_awaitable
 
 
-# Alias — "BashTool" is the name used in tests and the filesystem shim
-BashTool = ShellTool
+class _BoundedByteBuffer:
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max(1, max_bytes)
+        self._parts: list[bytes] = []
+        self._size = 0
+        self.truncated = False
+
+    @property
+    def value(self) -> bytes:
+        return b"".join(self._parts)
+
+    def append(self, chunk: bytes) -> None:
+        if len(chunk) >= self.max_bytes:
+            self._parts = [chunk[-self.max_bytes:]]
+            self._size = self.max_bytes
+            self.truncated = True
+            return
+        self._parts.append(chunk)
+        self._size += len(chunk)
+        while self._size > self.max_bytes and self._parts:
+            overflow = self._size - self.max_bytes
+            first = self._parts[0]
+            if overflow >= len(first):
+                self._parts.pop(0)
+                self._size -= len(first)
+                self.truncated = True
+                continue
+            self._parts[0] = first[overflow:]
+            self._size -= overflow
+            self.truncated = True
+            break
+
+
+def _max_output_chars(context: ToolExecutionContext) -> int:
+    config = context.metadata.get("config")
+    raw_value = getattr(config, "tool_output_max_chars", 100 * 1024)
+    try:
+        return max(1, int(raw_value))
+    except (TypeError, ValueError):
+        return 100 * 1024

@@ -52,6 +52,13 @@ def load_config(
         if strict:
             raise
         defaults = build_default_config(workspace_root, global_root=global_root)
+        merged = config_to_plain_dict(defaults)
+        merged.update(_read_environment(defaults))
+        merged = _apply_agent_mode_profile(merged)
+        merged = _apply_provider_defaults(merged)
+        for field_name, value in merged.items():
+            if hasattr(defaults, field_name):
+                setattr(defaults, field_name, _coerce_value(value, getattr(defaults, field_name)))
         defaults.global_config_file = (global_config_path or defaults.global_config_file).expanduser()
         defaults.local_config_file = local_config_path or defaults.local_config_file
         defaults.config_warnings.append(
@@ -475,6 +482,9 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         "compaction_keep_recent",
         "max_loop_iterations",
         "max_tool_calls_per_turn",
+        "textual_transcript_max_lines",
+        "prompt_history_max_entries",
+        "tool_output_max_chars",
         "max_sessions_retained",
         "sandbox_timeout_seconds",
         "context_prune_protect_tokens",
@@ -656,8 +666,7 @@ def _advanced_mode_required_tool_names() -> tuple[str, ...]:
         "git_status",
         "git_diff",
         "run_tests",
-        "run_linter",
-        "run_typecheck",
+        "run_python_check",
         "bash",
     )
 

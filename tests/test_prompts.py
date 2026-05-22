@@ -165,6 +165,19 @@ def test_base_instruction_mentions_hidden_path_read_restrictions(tmp_path):
     assert "do not rely on direct `.nexus` reads" in sections.base_instruction
 
 
+def test_base_instruction_includes_operational_guidelines(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())
+
+    sections = build_context_sections(config, registry, task_input="fix this")
+
+    assert "Operational Guidelines" in sections.base_instruction
+    assert "understand" in sections.base_instruction
+    assert "implement" in sections.base_instruction
+    assert "verify" in sections.base_instruction
+
+
 def test_context_does_not_duplicate_tool_descriptions(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()

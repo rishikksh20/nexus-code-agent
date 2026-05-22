@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,12 @@ from nexus.observability.metrics import RuntimeMetricsCollector
 logger = logging.getLogger(__name__)
 
 SENSITIVE_KEYS = {"api_key", "authorization", "token", "cookie", "password"}
+_SECRET_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)\b(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*([^\s,;]+)"),
+    re.compile(r"\b(sk-[A-Za-z0-9_-]{16,})\b"),
+    re.compile(r"\b([A-Za-z0-9_/-]{24,}\.[A-Za-z0-9_/-]{24,}\.[A-Za-z0-9_/-]{16,})\b"),
+    re.compile(r"\b([A-Za-z0-9+/]{32,}={0,2})\b"),
+)
 
 
 class JsonlRuntimeLogger:
@@ -159,7 +166,24 @@ def redact_payload(payload: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(value, dict):
             redacted[key] = redact_payload(value)
         elif isinstance(value, list):
-            redacted[key] = [redact_payload(item) if isinstance(item, dict) else item for item in value]
+            redacted[key] = [
+                redact_payload(item)
+                if isinstance(item, dict)
+                else _redact_text(item)
+                if isinstance(item, str)
+                else item
+                for item in value
+            ]
+        elif isinstance(value, str):
+            redacted[key] = _redact_text(value)
         else:
             redacted[key] = value
+    return redacted
+
+
+def _redact_text(value: str) -> str:
+    redacted = value
+    redacted = _SECRET_VALUE_PATTERNS[0].sub(lambda match: f"{match.group(1)}=[REDACTED]", redacted)
+    for pattern in _SECRET_VALUE_PATTERNS[1:]:
+        redacted = pattern.sub("[REDACTED]", redacted)
     return redacted

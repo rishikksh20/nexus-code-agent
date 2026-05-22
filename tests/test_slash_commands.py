@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tomllib
 
 import pytest
 from rich.console import Console
@@ -24,11 +25,32 @@ from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.agent_scope import subagent_skill_names, subagent_tool_names, supervisor_skill_names, supervisor_tool_names
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
-from nexus.runtime.slash_commands import build_router
+from nexus.runtime.slash_commands import _write_toml, build_router
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.skills import get_skill_roots, load_skill_registry
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import GetTimeTool, ReadFileTool
+
+
+def test_write_toml_preserves_nested_inline_tables(tmp_path):
+    config_path = tmp_path / ".nexus" / "config.toml"
+
+    _write_toml(
+        config_path,
+        {
+            "mcp_servers": [
+                {
+                    "name": "filesystem",
+                    "command": ["fake"],
+                    "env": {"TOKEN": "abc"},
+                    "prefix": "fs_",
+                }
+            ]
+        },
+    )
+
+    payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["mcp_servers"][0]["env"] == {"TOKEN": "abc"}
 
 
 @pytest.mark.asyncio
@@ -1116,6 +1138,7 @@ async def test_provider_set_slash_command_updates_model_name(tmp_path):
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")
     console = Console(record=True, no_color=True, width=200)
+    reloaded_models: list[str] = []
     state = ReplState(
         config=config,
         mode=ExecutionMode.DEFAULT,
@@ -1124,6 +1147,7 @@ async def test_provider_set_slash_command_updates_model_name(tmp_path):
         tool_registry=registry,
         memory_store=MemoryStore(config.memory_dir),
         console=console,
+        model_client_reloader=lambda cfg: reloaded_models.append(cfg.model_name),
     )
 
     router = build_router()
@@ -1131,6 +1155,7 @@ async def test_provider_set_slash_command_updates_model_name(tmp_path):
 
     assert handled is True
     assert state.config.model_name == "gpt-4o"
+    assert reloaded_models == ["gpt-4o"]
     output = console.export_text()
     assert "model_name" in output
     assert "gpt-4o" in output
@@ -1178,6 +1203,7 @@ async def test_config_upgrade_reloads_config_and_workspace_dotenv(tmp_path, monk
     registry = ToolRegistry()
     registry.register(GetTimeTool(), source="core", origin="builtin")
     console = Console(record=True, no_color=True, width=200)
+    reloaded_models: list[str] = []
     state = ReplState(
         config=config,
         mode=ExecutionMode.DEFAULT,
@@ -1186,12 +1212,14 @@ async def test_config_upgrade_reloads_config_and_workspace_dotenv(tmp_path, monk
         tool_registry=registry,
         memory_store=MemoryStore(config.memory_dir),
         console=console,
+        model_client_reloader=lambda cfg: reloaded_models.append(cfg.model_name),
     )
 
     handled = await build_router().dispatch(state, "/config upgrade local")
 
     assert handled is True
     assert state.config.model_name == "env-after-upgrade"
+    assert reloaded_models[-1] == "env-after-upgrade"
     assert "reloaded" in console.export_text()
     os.environ.pop("MODEL", None)
 

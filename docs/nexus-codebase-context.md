@@ -65,14 +65,13 @@ Default first-party tools:
 - `apply_patch`
 - `glob`
 - `grep`
-- `find_references`
+- `lsp`
 - `code_index`
 - `semantic_search`
 - `git_status`
 - `git_diff`
 - `run_tests`
-- `run_linter`
-- `run_typecheck`
+- `run_python_check`
 - `run_formatter`
 - `list_dir`
 - `bash`
@@ -81,7 +80,7 @@ Default first-party tools:
 - `web_fetch`
 - `web_search`
 
-Compatibility classes still exist for older tests and extension boundaries, including `write_note`, `modify_file`, and `replace_text`, but they are not registered by the normal core registry. The current public default surface should be documented with the canonical tool names above.
+Compatibility classes still exist for older tests and extension boundaries, including `modify_file` and `replace_text`, but they are not registered by the normal core registry. The current public default surface should be documented with the canonical tool names above.
 
 Tools expose:
 

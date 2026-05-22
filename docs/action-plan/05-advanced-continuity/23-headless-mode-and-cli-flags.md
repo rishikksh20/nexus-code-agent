@@ -484,13 +484,13 @@ def _build_agent(config, args):
     """
     from integrations.fake_model import FakeModelClient
     from tools.registry import ToolRegistry
-    from tools.builtin import GetTimeTool, WriteNoteTool
+    from tools.builtin import GetTimeTool, WriteFileTool
     from runtime.agent import Agent
 
     registry = ToolRegistry()
     registry.register(GetTimeTool())
-    if "write_note" not in (config.denied_tools or []):
-        registry.register(WriteNoteTool())
+    if "write_file" not in (config.denied_tools or []):
+        registry.register(WriteFileTool())
 
     model = FakeModelClient()
     return Agent(model, registry)

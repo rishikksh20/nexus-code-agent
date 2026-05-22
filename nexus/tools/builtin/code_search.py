@@ -9,46 +9,11 @@ from typing import Any
 
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import Tool, ToolKind
-from nexus.tools.builtin.lsp import PythonLspTool
 from nexus.tools.utils import allow_hidden_reads, root_walk
 
 
 _SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "venv", "__pycache__", "node_modules", ".nexus", "reference_code"})
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-
-
-class FindReferencesTool(Tool):
-    name = "find_references"
-    description = "Find Python symbol references using the Nexus LSP implementation."
-    kind = ToolKind.READ
-    is_mutating = False
-    input_schema: dict[str, Any] = {
-        "type": "object",
-        "properties": {
-            "file_path": {"type": "string", "description": "Python source file path."},
-            "symbol": {"type": "string", "description": "Symbol name to find."},
-            "line": {"type": "integer", "minimum": 1},
-            "character": {"type": "integer", "minimum": 1},
-        },
-        "required": ["file_path"],
-        "additionalProperties": False,
-    }
-
-    async def execute(
-        self,
-        call_id: str,
-        arguments: dict[str, Any],
-        context: ToolExecutionContext,
-    ) -> ToolResult:
-        lsp_args = {"operation": "find_references", **arguments}
-        result = await PythonLspTool().execute(call_id, lsp_args, context)
-        return ToolResult(
-            call_id=call_id,
-            tool_name=self.name,
-            output=result.output,
-            is_error=result.is_error,
-            metadata=result.metadata,
-        )
 
 
 class CodeIndexTool(Tool):

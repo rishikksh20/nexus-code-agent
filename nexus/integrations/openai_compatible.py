@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import random
 import threading
 from collections.abc import AsyncGenerator
 from os import environ
 from typing import Any
 from urllib import error, request as urllib_request
 
-from nexus.integrations.retry import call_with_backoff
+from nexus.integrations.retry import call_with_backoff, retry_delay
 from nexus.models import (
     Message,
     RuntimeRequest,
@@ -119,6 +118,17 @@ class OpenAICompatibleAdapter:
 class RetryableProviderError(RuntimeError):
     """Transient provider error that should be retried with backoff."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
 
 class OpenAICompatibleModelClient:
     """Minimal OpenAI-compatible model client for live provider calls."""
@@ -198,7 +208,12 @@ class OpenAICompatibleModelClient:
                         yield ev
                     return
                 if attempt < self.retries - 1:
-                    delay = self.base_delay * (2 ** attempt) + random.uniform(0, self.jitter)
+                    delay = retry_delay(
+                        RetryableProviderError(last_error or "Provider request failed."),
+                        attempt=attempt,
+                        base_delay=self.base_delay,
+                        jitter=self.jitter,
+                    )
                     await asyncio.sleep(delay)
             # All retries exhausted — surface the last error.
             yield StreamEvent(type=StreamEventType.ERROR, error=last_error or "Provider request failed after retries.")
@@ -254,7 +269,14 @@ class OpenAICompatibleModelClient:
             except error.HTTPError as exc:
                 details = _http_error_details(exc)
                 if exc.code in {408, 409, 429, 500, 502, 503, 504}:
-                    loop.call_soon_threadsafe(queue.put_nowait, RetryableProviderError(details))
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait,
+                        RetryableProviderError(
+                            details,
+                            status_code=exc.code,
+                            retry_after=_retry_after_seconds(exc.headers),
+                        ),
+                    )
                 else:
                     loop.call_soon_threadsafe(queue.put_nowait, RuntimeError(details))
             except error.URLError as exc:
@@ -366,7 +388,11 @@ class OpenAICompatibleModelClient:
         except error.HTTPError as exc:
             details = _http_error_details(exc)
             if exc.code in {408, 409, 429, 500, 502, 503, 504}:
-                raise RetryableProviderError(details) from exc
+                raise RetryableProviderError(
+                    details,
+                    status_code=exc.code,
+                    retry_after=_retry_after_seconds(exc.headers),
+                ) from exc
             raise RuntimeError(details) from exc
         except error.URLError as exc:
             raise RetryableProviderError(f"Provider connection failed: {exc.reason}") from exc
@@ -406,6 +432,19 @@ def _http_error_details(exc: error.HTTPError) -> str:
     if raw:
         return f"Provider request failed with HTTP {exc.code}: {raw}"
     return f"Provider request failed with HTTP {exc.code}."
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    if headers is None or not hasattr(headers, "get"):
+        return None
+    raw = headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = float(str(raw).strip())
+    except ValueError:
+        return None
+    return seconds if seconds > 0 else None
 
 
 def _is_retryable_provider_error(exc: Exception) -> bool:

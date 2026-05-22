@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from nexus.models import Message
 from nexus.context import CarryOverState, ContextCompactor, TokenEstimator, compact_messages, prune_tool_outputs
+from nexus.memory.store import MemoryEntry
+from nexus.runtime.repl_state import _load_all_memory
 from nexus.runtime.context_state import (
     AgentSessionState,
     TaskContext,
@@ -75,6 +77,27 @@ def test_prune_tool_outputs_replaces_frozen_messages_in_place():
 
     assert pruned == 1
     assert messages[2].content.startswith("[Tool output cleared")
+
+
+def test_load_all_memory_uses_single_store_read_path():
+    class Store:
+        def __init__(self):
+            self.load_all_calls = 0
+
+        def load_all(self):
+            self.load_all_calls += 1
+            return [MemoryEntry(key="alpha", content="remember this")]
+
+        def list_keys(self):
+            raise AssertionError("list_keys should not be used by prompt memory loading")
+
+        def load(self, key):
+            raise AssertionError("load should not be used by prompt memory loading")
+
+    store = Store()
+
+    assert _load_all_memory(store) == ["alpha: remember this"]
+    assert store.load_all_calls == 1
 
 
 def test_multi_agent_state_helpers_create_stable_packet_ids_and_records():

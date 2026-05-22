@@ -37,6 +37,13 @@ class MemoryStore:
     def list_keys(self) -> list[str]:
         return sorted(self._load_data()["entries"])
 
+    def load_all(self) -> list[MemoryEntry]:
+        entries = self._load_data()["entries"]
+        return [
+            MemoryEntry(key=key, content=content, keywords=(key,))
+            for key, content in sorted(entries.items())
+        ]
+
     def search(self, query: str) -> list[MemoryEntry]:
         lowered = query.lower()
         matches: list[MemoryEntry] = []

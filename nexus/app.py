@@ -155,6 +155,7 @@ class NexusApp:
         Equivalent to ``CLI.run_interactive`` in the reference code.
         """
         runtime_session = self._build_runtime_session(params)
+        runtime_session.state.model_client_reloader = self._reload_model_client
         await run_repl(
             runtime_session.state,
             self._agent,
@@ -290,6 +291,13 @@ class NexusApp:
                 provider_name=self.config.provider,
             )
         raise ValueError(f"Unsupported provider: {self.config.provider}")
+
+    def _reload_model_client(self, config) -> None:
+        """Apply a live config update to the app and running agent client."""
+        self.config = config
+        self._apply_model_context_limits()
+        if self._agent is not None:
+            self._agent.model_client = self._build_model_client()
 
     def _apply_model_context_limits(self) -> None:
         """Auto-tune compaction thresholds to fit the active model's context window.

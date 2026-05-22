@@ -254,7 +254,7 @@ default_mode = "default"
 
 # Hard-restrict which tools can run in this project.
 # Empty list means all registered tools are allowed.
-allowed_tools = ["read_file", "search_memory", "get_time", "write_note"]
+allowed_tools = ["read_file", "search_memory", "get_time", "write_file"]
 
 # Tools that are always denied in this project regardless of mode.
 denied_tools = ["run_command"]

@@ -724,7 +724,7 @@ Operationally, cost control is as important as permission control.
 
 ---
 
-### 3. Add a safe local `BashTool` alongside the Docker version
+### 3. Add a safe local `ShellTool` alongside the Docker version
 
 **Problem**
 
@@ -736,7 +736,7 @@ Many readers want a basic local execution tool first, either because they are pr
 
 **Recommended change**
 
-Provide a clearly labeled local `BashTool` chapter section with:
+Provide a clearly labeled local `ShellTool` chapter section with:
 
 - strong security warnings,
 - safe invocation patterns,
@@ -997,7 +997,7 @@ These changes will likely improve completion and reduce confusion.
 
 1. retry/backoff guidance,
 2. cost tracking and budgets,
-3. local `BashTool`,
+3. local `ShellTool`,
 4. Anthropic/provider-neutral adapter guidance,
 5. evaluation/benchmarking appendix,
 6. observability guidance.

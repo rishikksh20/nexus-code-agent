@@ -276,13 +276,13 @@ The roadmap below focuses on what should come next, section by section.
 ### Current State
 
 - execution modes are implemented
-- `write_note` has argument-aware hard-deny rules
+- `write_file` has argument-aware hard-deny rules
 - mutating actions produce audit records with rollback notes
 - dangerous actions are visible, but rollback is still descriptive rather than automated
 
 ### Next Steps
 
-1. Generalize argument-aware permission rules beyond `write_note`.
+1. Generalize argument-aware permission rules beyond `write_file`.
 2. Improve dangerous-action classification.
 3. Add stronger safety boundaries for external tool sources.
 4. Make rollback guidance more actionable where possible.

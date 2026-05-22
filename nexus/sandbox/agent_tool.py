@@ -584,7 +584,13 @@ def _subagent_result_envelope(
     input_packet_ids: tuple[str, ...],
     context_snapshot: dict[str, Any],
 ) -> str:
-    normalized_status = status if status == "needs_clarification" else _infer_result_status(raw_result, is_error=is_error)
+    structured_result = _parse_structured_result(raw_result)
+    result_status = _string_field(structured_result, "status")
+    normalized_status = (
+        result_status
+        if result_status
+        else status if status == "needs_clarification" else _infer_result_status(raw_result, is_error=is_error)
+    )
     context = {
         "scope": "isolated",
         "input_packet_ids": list(input_packet_ids),
@@ -603,14 +609,19 @@ def _subagent_result_envelope(
         "role": definition.name if definition else "delegate",
         "task_id": task_id,
         "title": title,
-        "summary": _summary_line(raw_result),
+        "summary": _string_field(structured_result, "summary") or _summary_line(raw_result),
         "raw_result": raw_result,
-        "clarifications_needed": _clarifications_from_result(raw_result),
-        "changed_files": _list_field_from_snapshot(context_snapshot, "modified_files"),
-        "related_files": _list_field_from_snapshot(context_snapshot, "related_files"),
-        "tests_run": _list_field_from_snapshot(context_snapshot, "tests_run"),
+        "findings": _list_field_from_result(structured_result, "findings"),
+        "risks": _list_field_from_result(structured_result, "risks"),
+        "clarifications_needed": _list_field_from_result(structured_result, "clarifications_needed") or _clarifications_from_result(raw_result),
+        "changed_files": _list_field_from_result(structured_result, "changed_files") or _list_field_from_snapshot(context_snapshot, "modified_files"),
+        "related_files": _list_field_from_result(structured_result, "related_files") or _list_field_from_snapshot(context_snapshot, "related_files"),
+        "tests_run": _list_field_from_result(structured_result, "tests_run") or _list_field_from_snapshot(context_snapshot, "tests_run"),
         "context": context,
-        "recommended_next_action": "ask_user" if normalized_status == "needs_clarification" else "continue",
+        "recommended_next_action": (
+            _string_field(structured_result, "recommended_next_action")
+            or ("ask_user" if normalized_status == "needs_clarification" else "continue")
+        ),
         "runtime_status": status,
     }
     return json.dumps(payload, indent=2, sort_keys=True)
@@ -684,3 +695,35 @@ def _list_field_from_snapshot(snapshot: dict[str, Any], key: str) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if str(item).strip()]
+
+
+def _parse_structured_result(raw_result: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw_result)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _string_field(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    return str(value).strip() if isinstance(value, str) and value.strip() else ""
+
+
+def _list_field_from_result(payload: dict[str, Any], key: str) -> list[Any]:
+    value = payload.get(key)
+    if not isinstance(value, list):
+        return []
+    normalized: list[Any] = []
+    for item in value:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                normalized.append(text)
+        elif isinstance(item, dict):
+            normalized.append(item)
+        else:
+            text = str(item).strip()
+            if text:
+                normalized.append(item)
+    return normalized

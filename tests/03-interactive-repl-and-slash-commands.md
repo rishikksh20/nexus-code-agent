@@ -136,7 +136,7 @@ Optional invalid-value check:
 ### Expected result
 
 - registered tools are listed
-- built-in tools such as `get_time` and `write_note` should be visible if enabled
+- built-in tools such as `get_time` and `write_file` should be visible if enabled
 
 ### Gap checklist
 

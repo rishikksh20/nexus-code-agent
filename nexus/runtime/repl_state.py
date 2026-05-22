@@ -54,6 +54,7 @@ class ReplState:
     should_exit: bool = False
     current_turn_task: asyncio.Task | None = None
     abort_requested: bool = False
+    model_client_reloader: Callable[[AgentConfig], None] | None = None
 
     def begin_running_turn(self, task: asyncio.Task | None = None) -> None:
         self.current_turn_task = task or asyncio.current_task()
@@ -121,6 +122,11 @@ class ReplState:
         prompt_text = self.current_system_prompt_task_input or self.paused_turn_prompt
         return self.build_system_prompt(prompt_text)
 
+    def reload_model_client(self) -> None:
+        """Rebuild the live model client after provider config changes."""
+        if self.model_client_reloader is not None:
+            self.model_client_reloader(self.config)
+
     def prepare_turn(
         self,
         prompt_text: str,
@@ -181,6 +187,12 @@ class ReplState:
         usage_updates = apply_events_to_messages(self.history, events)
         for usage in usage_updates:
             _accumulate_usage(self, usage)
+        _bound_durable_tool_outputs(
+            self.history,
+            max_chars=self.config.tool_output_max_chars,
+            protect_tokens=self.config.context_prune_protect_tokens,
+            minimum_tokens=self.config.context_prune_minimum_tokens,
+        )
         self.session.messages = list(self.history)
         if not self.session.summary:
             first_user = next((message.content for message in self.history if message.role == "user"), "")
@@ -260,13 +272,38 @@ def _load_all_memory(store: MemoryStore) -> list[str]:
     persistent memory regardless of which session it is in.  Multi-line values
     are preserved; the caller (ContextBuilder) wraps each item in a list bullet.
     """
-    keys = store.list_keys()
     entries: list[str] = []
-    for key in keys:
-        entry = store.load(key)
-        if entry is None:
-            continue
+    for entry in store.load_all():
         content = entry.content.strip()
         if content:
-            entries.append(f"{key}: {content}")
+            entries.append(f"{entry.key}: {content}")
     return entries
+
+
+def _bound_durable_tool_outputs(
+    history: list[Message],
+    *,
+    max_chars: int,
+    protect_tokens: int,
+    minimum_tokens: int,
+) -> None:
+    if max_chars > 0:
+        for index, message in enumerate(history):
+            if message.role != "tool" or len(message.content) <= max_chars:
+                continue
+            suffix = message.content[-max_chars:]
+            history[index] = Message(
+                role=message.role,
+                content=(
+                    f"[Tool output truncated for durable history to last {max_chars} chars]\n"
+                    f"{suffix}"
+                ),
+                name=message.name,
+                tool_calls=message.tool_calls,
+                tool_call_id=message.tool_call_id,
+            )
+    prune_tool_outputs(
+        history,
+        protect_tokens=protect_tokens,
+        minimum_tokens=minimum_tokens,
+    )

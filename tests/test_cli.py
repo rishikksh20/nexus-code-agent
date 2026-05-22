@@ -18,7 +18,17 @@ from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool, WriteNoteTool
+from nexus.tools.builtin import GetTimeTool, WriteFileTool
+
+
+class RecordingFakeModelClient(FakeModelClient):
+    def __init__(self, scripted=None) -> None:
+        super().__init__(scripted=scripted)
+        self.requests = []
+
+    async def complete(self, request):
+        self.requests.append(request)
+        return await super().complete(request)
 
 
 def test_args_to_config_overrides_maps_flags():
@@ -91,6 +101,40 @@ async def test_headless_runner_returns_final_response(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_headless_resume_sends_original_paused_prompt_not_continue(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    model = RecordingFakeModelClient(
+        scripted=[RuntimeResponse(message=Message(role="assistant", content="done"))]
+    )
+    agent = Agent(model_client=model, tool_registry=registry)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("headless-resume"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True),
+    )
+    state.mark_paused_turn("finish the original task")
+
+    result = await run_headless(
+        state,
+        agent,
+        "continue",
+        auto_confirm=True,
+        output_path=None,
+        output_format="text",
+        quiet=True,
+    )
+
+    assert result.exit_code == EXIT_OK
+    assert state.history[0].content == "finish the original task"
+    assert model.requests[0].messages[-1].content == "finish the original task"
+
+
+@pytest.mark.asyncio
 async def test_headless_runner_accumulates_usage_metadata(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
@@ -144,7 +188,7 @@ async def test_headless_runner_accumulates_usage_metadata(tmp_path):
 async def test_headless_runner_exits_when_clarification_is_required(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
-    registry.register(WriteNoteTool())
+    registry.register(WriteFileTool())
     agent = Agent(
         model_client=FakeModelClient(
             scripted=[
@@ -153,7 +197,7 @@ async def test_headless_runner_exits_when_clarification_is_required(tmp_path):
                     tool_calls=(
                         ToolCall(
                             call_id="clarify-1",
-                            tool_name="write_note",
+                            tool_name="write_file",
                             arguments={"content": "hello"},
                         ),
                     ),
@@ -191,7 +235,7 @@ async def test_headless_runner_exits_when_clarification_is_required(tmp_path):
 async def test_headless_runner_accepts_tty_confirmation_input(tmp_path, monkeypatch):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
-    registry.register(WriteNoteTool())
+    registry.register(WriteFileTool())
     agent = Agent(
         model_client=FakeModelClient(
             scripted=[
@@ -200,7 +244,7 @@ async def test_headless_runner_accepts_tty_confirmation_input(tmp_path, monkeypa
                     tool_calls=(
                         ToolCall(
                             call_id="confirm-1",
-                            tool_name="write_note",
+                            tool_name="write_file",
                             arguments={"path": "notes/out.txt", "content": "hello"},
                         ),
                     ),
@@ -211,7 +255,7 @@ async def test_headless_runner_accepts_tty_confirmation_input(tmp_path, monkeypa
                     tool_calls=(
                         ToolCall(
                             call_id="confirm-1b",
-                            tool_name="write_note",
+                            tool_name="write_file",
                             arguments={"path": "notes/out.txt", "content": "hello"},
                         ),
                     ),
@@ -254,7 +298,7 @@ async def test_headless_runner_accepts_tty_confirmation_input(tmp_path, monkeypa
 async def test_headless_runner_exits_when_confirmation_is_required_without_tty(tmp_path, monkeypatch):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
-    registry.register(WriteNoteTool())
+    registry.register(WriteFileTool())
     agent = Agent(
         model_client=FakeModelClient(
             scripted=[
@@ -263,7 +307,7 @@ async def test_headless_runner_exits_when_confirmation_is_required_without_tty(t
                     tool_calls=(
                         ToolCall(
                             call_id="confirm-2",
-                            tool_name="write_note",
+                            tool_name="write_file",
                             arguments={"path": "notes/out.txt", "content": "hello"},
                         ),
                     ),
@@ -296,7 +340,7 @@ async def test_headless_runner_exits_when_confirmation_is_required_without_tty(t
     )
 
     assert result.exit_code == EXIT_NEEDS_CONFIRM
-    assert result.error == "Allow tool 'write_note'?"
+    assert result.error == "Allow tool 'write_file'?"
 
 
 @pytest.mark.asyncio

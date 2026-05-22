@@ -98,7 +98,3 @@ class ListDirTool(Tool):
             output="\n".join(lines),
             metadata={"path": str(dir_path), "entries": len(items)},
         )
-
-
-# Alias kept for backward compatibility with tests/code that imported LsTool
-LsTool = ListDirTool

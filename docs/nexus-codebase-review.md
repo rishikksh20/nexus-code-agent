@@ -8,7 +8,7 @@ Scope: live Nexus codebase only. `reference_code/` was intentionally excluded pe
 
 Nexus is now architecturally centered on a clean single-agent turn loop with optional cognitive sub-agent tools. The strongest part of the design is the approval invariant: user-facing approval lives in `nexus/runtime/turn_runner.py`, while `Agent.run()` remains event-driven and can resume exact pending tool calls through `resume_tool_calls`.
 
-The biggest problem is not the core loop. The biggest problem is contract drift: some tests and docs still describe legacy tool/module surfaces such as `WriteNoteTool`, `nexus.tools.filesystem`, and `nexus.runtime.sandbox` that no longer exist. As of this review, `uv run pytest` does not collect successfully.
+The biggest problem is not the core loop. The biggest problem is contract drift: some tests and docs still describe legacy tool/module surfaces such as `WriteFileTool`, `nexus.tools.filesystem`, and `nexus.runtime.sandbox` that no longer exist. As of this review, `uv run pytest` does not collect successfully.
 
 Verification performed:
 
@@ -73,7 +73,7 @@ The key invariant is provider-safe ordering: an assistant message with `tool_cal
 
 `uv run pytest` currently fails during collection with 6 import errors:
 
-- `WriteNoteTool` is imported by `tests/test_agent.py`, `tests/test_cli.py`, `tests/test_hooks.py`, and `tests/test_repl.py`, but `nexus/tools/builtin/__init__.py` exports only canonical tools.
+- `WriteFileTool` is imported by `tests/test_agent.py`, `tests/test_cli.py`, `tests/test_hooks.py`, and `tests/test_repl.py`, but `nexus/tools/builtin/__init__.py` exports only canonical tools.
 - `nexus.tools.filesystem` is imported by `tests/test_filesystem_tools.py`, but that module is absent.
 - `nexus.runtime.sandbox` is imported by `tests/test_sandbox.py`, but sandbox code now lives under `nexus/sandbox/`.
 - Legacy orchestration tests previously imported removed planning helpers from `nexus.runtime.orchestration`, but that module is now only a pass-through.
@@ -171,14 +171,12 @@ Default first-party tools registered by `nexus/tools/registry.py`:
 - `grep`
 - `list_dir`
 - `lsp`
-- `find_references`
 - `code_index`
 - `semantic_search`
 - `git_status`
 - `git_diff`
 - `run_tests`
-- `run_linter`
-- `run_typecheck`
+- `run_python_check`
 - `run_formatter`
 - `bash`
 - `memory`
@@ -193,7 +191,7 @@ Advanced mode adds built-in cognitive tools:
 - `subagent_review`
 - `subagent_verification`
 
-Compatibility aliases such as `write_note`, `modify_file`, and `replace_text` are not present in the live default tool surface.
+Compatibility aliases such as `modify_file` and `replace_text` are not present in the live default tool surface.
 
 ## Current Provider Surface
 

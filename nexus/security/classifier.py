@@ -48,7 +48,6 @@ _SAFE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*echo\b"),
     re.compile(r"^\s*pwd\b"),
     re.compile(r"^\s*which\b"),
-    re.compile(r"^\s*env\b"),
     re.compile(r"^\s*git\s+(status|log|diff|show|branch|tag|remote|fetch)\b"),
     re.compile(r"^\s*find\b"),
     re.compile(r"^\s*(python|python3|node)\b"),

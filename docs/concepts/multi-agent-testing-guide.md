@@ -88,14 +88,14 @@ Manual prompts:
 ```text
 Use git_status and summarize the working tree.
 Use git_diff to review the current working changes.
-Run run_typecheck and summarize the result.
+Run run_python_check and summarize the result.
 ```
 
 Expected behavior:
 
 - `git_status` returns branch and changed-file metadata.
 - `git_diff` returns a working/staged diff or `(no diff)`.
-- `run_typecheck` returns JSON with `passed`, `exit_code`, stdout tail, and stderr tail.
+- `run_python_check` returns JSON with `passed`, `exit_code`, stdout tail, and stderr tail.
 
 ## 5. Real Provider Trial
 
@@ -135,8 +135,8 @@ Advanced mode disabled:
 Verification failure:
 
 - Introduce a temporary syntax error in a throwaway branch.
-- Ask the agent to run `run_typecheck`.
-- Expected: `run_typecheck` reports the failure, and the supervisor explains the blocker rather than running hidden mutation loops.
+- Ask the agent to run `run_python_check`.
+- Expected: `run_python_check` reports the failure, and the supervisor explains the blocker rather than running hidden mutation loops.
 
 ## Current Boundary
 
