@@ -26,12 +26,33 @@ logger = logging.getLogger(__name__)
 
 _MAX_COHERE_TOOL_RESULT_CHARS = 20_000
 _TOOL_RESULT_TRUNCATION_MARKER = "\n\n[... Cohere tool result truncated ...]\n\n"
+_COHERE_STRICT_TOOLS_MAX_FIELDS = 200
+_NEXUS_STRICT_TOOL_REASON_FIELD = "_nexus_tool_call_reason"
+_NEXUS_STRICT_TOOL_REASON = "Cohere strict tool schema compatibility."
+_COHERE_STRICT_UNSUPPORTED_SCHEMA_KEYS = {
+    "allOf",
+    "maximum",
+    "maxItems",
+    "maxLength",
+    "minItems",
+    "minimum",
+    "minLength",
+    "not",
+    "oneOf",
+    "uniqueItems",
+}
 
 
 class CohereAdapter:
     """Translate Nexus runtime objects to and from Cohere Chat API v2 payloads."""
 
     def to_wire_request(self, request: RuntimeRequest) -> dict[str, Any]:
+        tools = self.tools(request.tool_schemas)
+        strict_tools = _cohere_strict_tools_compatible(tools)
+        if strict_tools:
+            tools = [_cohere_strict_tool_schema(tool) for tool in tools]
+        strict_reason_tool_names = _cohere_strict_reason_tool_names(tools) if strict_tools else set()
+
         messages: list[dict[str, Any]] = [{"role": "system", "content": request.system_prompt}]
         for message in request.messages:
             if message.role == "assistant" and message.tool_calls:
@@ -44,7 +65,11 @@ class CohereAdapter:
                         "type": "function",
                         "function": {
                             "name": tc.tool_name,
-                            "arguments": json.dumps(tc.arguments),
+                            "arguments": json.dumps(
+                                _with_cohere_strict_reason_argument(tc.arguments)
+                                if tc.tool_name in strict_reason_tool_names
+                                else tc.arguments
+                            ),
                         },
                     }
                     for tc in message.tool_calls
@@ -70,9 +95,10 @@ class CohereAdapter:
             "messages": messages,
             "temperature": request.temperature,
         }
-        tools = self.tools(request.tool_schemas)
         if tools:
             payload["tools"] = tools
+            if strict_tools:
+                payload["strict_tools"] = True
         if request.max_output_tokens is not None:
             payload["max_tokens"] = request.max_output_tokens
         return payload
@@ -444,7 +470,7 @@ class CohereModelClient:
                 tool_call=ToolCall(
                     call_id=tool["id"],
                     tool_name=tool["name"],
-                    arguments=_json_dict(tool["arguments"]),
+                    arguments=_strip_cohere_strict_reason_arguments(_json_dict(tool["arguments"])),
                 ),
             )
         logger.debug(
@@ -583,8 +609,121 @@ def _tool_call_from_payload(payload: dict[str, Any]) -> ToolCall:
     return ToolCall(
         call_id=str(payload.get("id", "")),
         tool_name=str(fn.get("name", "")),
-        arguments=_json_dict(str(fn.get("arguments") or "")),
+        arguments=_strip_cohere_strict_reason_arguments(_json_dict(str(fn.get("arguments") or ""))),
     )
+
+
+def _cohere_strict_tools_compatible(tools: list[dict[str, Any]]) -> bool:
+    if not tools:
+        return False
+    strict_tools = [_cohere_strict_tool_schema(tool) for tool in tools]
+    return (
+        sum(_schema_field_count(_function_parameters(tool)) for tool in strict_tools)
+        <= _COHERE_STRICT_TOOLS_MAX_FIELDS
+    )
+
+
+def _cohere_strict_tool_schema(tool: dict[str, Any]) -> dict[str, Any]:
+    strict_tool = json.loads(json.dumps(tool))
+    fn = strict_tool.setdefault("function", {})
+    parameters = fn.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {"type": "object", "properties": {}}
+    fn["parameters"] = _cohere_strict_schema(parameters)
+    return strict_tool
+
+
+def _cohere_strict_reason_tool_names(tools: list[dict[str, Any]]) -> set[str]:
+    names: set[str] = set()
+    for tool in tools:
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(fn, dict):
+            continue
+        parameters = fn.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        required = parameters.get("required")
+        if isinstance(required, list) and _NEXUS_STRICT_TOOL_REASON_FIELD in required:
+            name = str(fn.get("name", "")).strip()
+            if name:
+                names.add(name)
+    return names
+
+
+def _cohere_strict_schema(schema: Any) -> Any:
+    if isinstance(schema, list):
+        return [_cohere_strict_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    cleaned: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in _COHERE_STRICT_UNSUPPORTED_SCHEMA_KEYS:
+            continue
+        cleaned[key] = _cohere_strict_schema(value)
+
+    if cleaned.get("type") == "object":
+        properties = cleaned.get("properties")
+        if not isinstance(properties, dict):
+            properties = {}
+        required = cleaned.get("required")
+        required_names = [str(item) for item in required] if isinstance(required, list) else []
+        if not required_names:
+            properties = {
+                **properties,
+                _NEXUS_STRICT_TOOL_REASON_FIELD: {
+                    "type": "string",
+                    "description": "Brief reason for calling this tool.",
+                },
+            }
+            required_names = [_NEXUS_STRICT_TOOL_REASON_FIELD]
+        cleaned["properties"] = properties
+        cleaned["required"] = required_names
+
+    return cleaned
+
+
+def _function_parameters(tool: dict[str, Any]) -> dict[str, Any]:
+    fn = tool.get("function") if isinstance(tool, dict) else None
+    parameters = fn.get("parameters") if isinstance(fn, dict) else None
+    return parameters if isinstance(parameters, dict) else {"type": "object", "properties": {}}
+
+
+def _schema_field_count(schema: Any) -> int:
+    if isinstance(schema, list):
+        return sum(_schema_field_count(item) for item in schema)
+    if not isinstance(schema, dict):
+        return 0
+    count = 0
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        count += len(properties)
+    for value in schema.values():
+        count += _schema_field_count(value)
+    return count
+
+
+def _with_cohere_strict_reason_argument(arguments: dict[str, Any]) -> dict[str, Any]:
+    if _NEXUS_STRICT_TOOL_REASON_FIELD in arguments:
+        return arguments
+    return {**arguments, _NEXUS_STRICT_TOOL_REASON_FIELD: _NEXUS_STRICT_TOOL_REASON}
+
+
+def _strip_cohere_strict_reason_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: (
+            _strip_cohere_strict_reason_arguments(value)
+            if isinstance(value, dict)
+            else [
+                _strip_cohere_strict_reason_arguments(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+            if isinstance(value, list)
+            else value
+        )
+        for key, value in arguments.items()
+        if key != _NEXUS_STRICT_TOOL_REASON_FIELD
+    }
 
 
 def _tool_result_content(content: str) -> str:

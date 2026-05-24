@@ -5,6 +5,7 @@ import os
 from nexus.cli.init import init_workspace
 from nexus.config import load_config
 from nexus.config.loader import ConfigError
+from nexus.config.model_limits import get_model_context_limit
 from nexus.config.upgrade import upgrade_config_file
 
 
@@ -574,6 +575,11 @@ def test_config_accepts_native_sdk_providers_without_base_url(tmp_path):
 
     assert anthropic.api_base_url == ""
     assert gemini.api_base_url == ""
+
+
+def test_gemini_model_context_limits_are_current():
+    assert get_model_context_limit("gemini-2.5-flash") == 1_048_576
+    assert get_model_context_limit("gemini-2.5-pro") == 1_048_576
 
 
 def test_config_uses_mistral_base_url_env_override(tmp_path, monkeypatch):

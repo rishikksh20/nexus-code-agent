@@ -16,6 +16,12 @@ from nexus.models import (
 )
 
 
+_GEMINI_UNSUPPORTED_SCHEMA_KEYS = {
+    "additionalProperties",
+    "additional_properties",
+}
+
+
 class GeminiAdapter:
     """Translate Nexus runtime objects to Google Gen AI SDK payloads."""
 
@@ -31,10 +37,27 @@ class GeminiAdapter:
                 {
                     "name": name,
                     "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters") or {"type": "object"},
+                    "parameters": _gemini_schema(fn.get("parameters") or {"type": "object"}),
                 }
             )
         return [{"function_declarations": declarations}] if declarations else []
+
+    @staticmethod
+    def typed_tools(types: Any, tool_schemas: tuple[dict[str, Any], ...]) -> list[Any]:
+        declarations: list[Any] = []
+        for schema in tool_schemas:
+            fn = schema.get("function") or {}
+            name = fn.get("name")
+            if not name:
+                continue
+            declarations.append(
+                types.FunctionDeclaration(
+                    name=name,
+                    description=fn.get("description", ""),
+                    parameters_json_schema=_gemini_schema(fn.get("parameters") or {"type": "object"}),
+                )
+            )
+        return [types.Tool(function_declarations=declarations)] if declarations else []
 
     @staticmethod
     def contents(messages: tuple[Message, ...]) -> list[dict[str, Any]]:
@@ -72,12 +95,49 @@ class GeminiAdapter:
                 contents.append({"role": role, "parts": [{"text": msg.content}]})
         return contents
 
+    @staticmethod
+    def typed_contents(types: Any, messages: tuple[Message, ...]) -> list[Any]:
+        contents: list[Any] = []
+        for msg in messages:
+            if msg.role == "system":
+                continue
+            if msg.role == "tool":
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_function_response(
+                                name=msg.name or msg.tool_call_id or "tool",
+                                response={"result": msg.content or ""},
+                            )
+                        ],
+                    )
+                )
+                continue
+            if msg.role == "assistant" and msg.tool_calls:
+                parts: list[Any] = []
+                if msg.content:
+                    parts.append(types.Part.from_text(text=msg.content))
+                parts.extend(
+                    types.Part.from_function_call(name=tc.tool_name, args=tc.arguments)
+                    for tc in msg.tool_calls
+                )
+                contents.append(types.Content(role="model", parts=parts))
+                continue
+            role = "model" if msg.role == "assistant" else "user"
+            if msg.content:
+                contents.append(
+                    types.Content(role=role, parts=[types.Part.from_text(text=msg.content)])
+                )
+        return contents
+
 
 class GeminiModelClient:
     """Small native Google Gen AI SDK client with stream and non-stream support."""
 
-    def __init__(self, *, api_key: str | None = None) -> None:
+    def __init__(self, *, api_key: str | None = None, api_version: str | None = None) -> None:
         self.api_key = resolve_gemini_api_key(api_key)
+        self.api_version = resolve_gemini_api_version(api_version)
         self.adapter = GeminiAdapter()
         self._call_counter = 0
 
@@ -111,7 +171,7 @@ class GeminiModelClient:
     ) -> AsyncGenerator[StreamEvent, None]:
         client, types = self._client_and_types()
         config = self._config(types, request)
-        contents = self.adapter.contents(request.messages)
+        contents = self.adapter.typed_contents(types, request.messages)
 
         try:
             if stream:
@@ -142,7 +202,7 @@ class GeminiModelClient:
         }
         if request.max_output_tokens is not None:
             kwargs["max_output_tokens"] = request.max_output_tokens
-        tools = self.adapter.tools(request.tool_schemas)
+        tools = self.adapter.typed_tools(types, request.tool_schemas)
         if tools:
             kwargs["tools"] = tools
         return types.GenerateContentConfig(**kwargs)
@@ -182,7 +242,16 @@ class GeminiModelClient:
             from google.genai import types
         except ImportError as exc:
             raise RuntimeError("Gemini provider requires the `google-genai` package.") from exc
-        return genai.Client(api_key=self.api_key), types
+        kwargs: dict[str, Any] = {"api_key": self.api_key}
+        http_options = self._http_options(types)
+        if http_options is not None:
+            kwargs["http_options"] = http_options
+        return genai.Client(**kwargs), types
+
+    def _http_options(self, types: Any) -> Any:
+        if not self.api_version:
+            return None
+        return types.HttpOptions(api_version=self.api_version)
 
 
 def _parts(response: Any) -> list[Any]:
@@ -222,5 +291,22 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
+def _gemini_schema(schema: Any) -> Any:
+    if isinstance(schema, list):
+        return [_gemini_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    return {
+        key: _gemini_schema(value)
+        for key, value in schema.items()
+        if key not in _GEMINI_UNSUPPORTED_SCHEMA_KEYS
+    }
+
+
 def resolve_gemini_api_key(explicit: str | None = None) -> str | None:
     return explicit or environ.get("GEMINI_API_KEY") or environ.get("GOOGLE_API_KEY") or environ.get("API_KEY")
+
+
+def resolve_gemini_api_version(explicit: str | None = None) -> str | None:
+    return explicit or environ.get("GEMINI_API_VERSION") or environ.get("GOOGLE_GENAI_API_VERSION") or None

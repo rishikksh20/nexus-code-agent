@@ -81,7 +81,7 @@ async def run_textual_repl(
         session_resumed=session_resumed,
     )
     try:
-        await app.run_async(mouse=True)
+        await app.run_async(mouse=False)
     finally:
         await app.finalize_session()
 
@@ -488,8 +488,13 @@ class NexusTextualApp(App[None]):
     TITLE = "Nexus"
     SUB_TITLE = "Coding Agent"
     BINDINGS = [
-        ("ctrl+c", "quit", "Quit"),
+        ("ctrl+c", "copy_or_quit", "Copy selected text or quit"),
         ("ctrl+d", "quit", "Quit"),
+        ("ctrl+q", "quit", "Quit"),
+        ("pageup", "scroll_transcript_page_up", "Scroll up"),
+        ("pagedown", "scroll_transcript_page_down", "Scroll down"),
+        ("home", "scroll_transcript_home", "Scroll home"),
+        ("end", "scroll_transcript_end", "Scroll end"),
     ]
 
     def __init__(
@@ -582,6 +587,15 @@ class NexusTextualApp(App[None]):
         if self._spinner_timer is not None:
             self._spinner_timer.stop()
             self._spinner_timer = None
+
+    def _flash_status(self, message: str, *, seconds: float = 1.5) -> None:
+        self._status_text = ""
+        if self._spinner_timer is not None:
+            self._spinner_timer.stop()
+            self._spinner_timer = None
+        if self._status is not None:
+            self._status.update(message)
+        self.set_timer(seconds, lambda: self.clear_status(expected=""))
 
     def append_assistant_delta(self, content: str) -> None:
         if not self.has_open_assistant_stream:
@@ -685,6 +699,30 @@ class NexusTextualApp(App[None]):
         self.state.should_exit = True
         await self.finalize_session()
         self.exit()
+
+    async def action_copy_or_quit(self) -> None:
+        selected_text = self.screen.get_selected_text()
+        if selected_text:
+            self.copy_to_clipboard(selected_text)
+            self._flash_status("Copied selection")
+            return
+        await self.action_quit()
+
+    def action_scroll_transcript_page_up(self) -> None:
+        if self._transcript is not None:
+            self._transcript.scroll_page_up(animate=False)
+
+    def action_scroll_transcript_page_down(self) -> None:
+        if self._transcript is not None:
+            self._transcript.scroll_page_down(animate=False)
+
+    def action_scroll_transcript_home(self) -> None:
+        if self._transcript is not None:
+            self._transcript.scroll_home(animate=False)
+
+    def action_scroll_transcript_end(self) -> None:
+        if self._transcript is not None:
+            self._transcript.scroll_end(animate=False)
 
     def action_prompt_history_previous(self) -> None:
         if self._pending_input is not None or self.focused is not self._input:

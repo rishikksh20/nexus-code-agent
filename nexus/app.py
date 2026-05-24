@@ -391,6 +391,13 @@ def provider_error_message(exc: Exception, config) -> str:
             "check that your API key is valid and not expired."
         )
     if "403" in msg or "forbidden" in msg.lower():
+        if provider == "gemini" and "project has been denied access" in msg.lower():
+            return (
+                "Gemini denied access for the Google project behind the selected API key. "
+                "Use a Gemini API key from an allowed Google AI Studio or Google Cloud project, "
+                "enable Gemini API access for that project, and prefer [bold]GEMINI_API_KEY[/bold] "
+                "in [bold].env[/bold] instead of a stale generic [bold]API_KEY[/bold]."
+            )
         return (
             f"Access denied by provider [bold]{provider}[/bold] — "
             "check API key permissions and account status."
