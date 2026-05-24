@@ -64,7 +64,7 @@ Add:
 
 Update:
 
-- `pyproject.toml`: add `sentry-sdk>=2.60.0` or a compatible current v2 pin.
+- `pyproject.toml`: add `sentry-sdk>=2.60.0` or a compatible current v2 pin. If Nexus wants a lean default install, expose it as an optional extra, but still keep the runtime import lazy.
 - `nexus/config/defaults.py`: add Sentry config fields to `AgentConfig`.
 - `nexus/config/loader.py`: validate Sentry fields and add `SENTRY_*` aliases if desired.
 - `nexus/config/upgrade.py`: backfill new config keys.
@@ -192,6 +192,9 @@ class SentryClientProtocol(Protocol):
     def add_breadcrumb(self, **kwargs: Any) -> None: ...
     def set_tag(self, key: str, value: Any) -> None: ...
     def set_context(self, key: str, value: dict[str, Any]) -> None: ...
+    def start_transaction(self, **kwargs: Any) -> Any: ...
+    def start_span(self, **kwargs: Any) -> Any: ...
+    def update_current_span(self, **kwargs: Any) -> None: ...
     def flush(self, timeout: float | None = None) -> bool: ...
 
 
@@ -215,7 +218,9 @@ Implementation notes:
 - Pass `max_value_length=settings.max_value_length`.
 - Use `before_send`, `before_send_transaction`, `before_breadcrumb`, and `before_send_log` to run the same redaction rules as `redact_payload()`.
 - Set `in_app_include=["nexus"]` and `project_root=str(config.workspace_root)` so stack traces highlight Nexus frames.
+- Add `LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)` if relying on Python logging records for hook/plugin/resource exceptions; otherwise keep explicit capture calls at the runtime boundaries below.
 - Use `shutdown_timeout`/`flush()` for CLI/headless mode.
+- Reuse the existing `nexus.models.CorrelationContext` where a typed correlation object is useful; otherwise keep hook payloads as dictionaries to match the current hook layer.
 
 ## Redaction Policy
 
@@ -258,6 +263,8 @@ class SentryHookService:
         hooks.register(HookEvent.TURN_START, self.on_turn_start)
         hooks.register(HookEvent.TURN_END, self.on_turn_end)
 ```
+
+All registered handler methods must be `async def` because `HookExecutor` awaits hook handlers.
 
 Handler behavior:
 
