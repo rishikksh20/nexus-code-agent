@@ -5,7 +5,7 @@ These instructions apply to agent work in this repository.
 ## Scope
 
 - Work in the live Nexus codebase by default.
-- Ignore `reference_code/` for normal search, review, implementation, tests, and documentation updates.
+- Ignore `reference_code/` and `workspace/` for normal search, review, implementation, tests, and documentation updates.
 - Open `reference_code/` only when the user explicitly asks for a comparison or reference-code review.
 - Prefer current patterns in `nexus/`, `tests/`, `README.md`, and `docs/nexus-codebase-context.md`.
 
