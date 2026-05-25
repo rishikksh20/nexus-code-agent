@@ -69,6 +69,20 @@ async def run_headless(
         )
     except Exception as exc:  # noqa: BLE001
         from nexus.app import _provider_error_message
+        from nexus.observability import capture_exception_from_hooks
+
+        capture_exception_from_hooks(
+            state.hooks,
+            exc,
+            context={
+                "session_id": state.session.session_id,
+                "turn_id": state.current_turn_id,
+                "trace_id": state.current_trace_id,
+                "provider": state.config.provider,
+                "model": state.config.model_name,
+                "headless": True,
+            },
+        )
         state.console.print_error(_provider_error_message(exc, state.config))
         return HeadlessResult(
             exit_code=EXIT_ERROR,

@@ -1108,6 +1108,16 @@ uv run nexus doctor
 uv run nexus doctor --output-format json
 ```
 
+Sentry remote monitoring is optional and metadata-only by default. Enable it with a DSN in config or env:
+
+```bash
+AGENT_SENTRY_ENABLED=true
+SENTRY_DSN=https://public@example.ingest.sentry.io/123
+SENTRY_ENVIRONMENT=production
+```
+
+Sentry events include session, turn, trace, provider/model, tool name/source, approval, MCP, usage, and duration fields. Raw prompts and tool outputs are not sent unless `sentry_include_prompts` or `sentry_include_tool_outputs` is explicitly enabled.
+
 ---
 
 ## Running Tests

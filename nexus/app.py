@@ -31,7 +31,7 @@ from nexus.config import config_to_plain_dict, ensure_config_dirs, load_config
 from nexus.config.loader import ConfigError
 from nexus.config.model_limits import get_model_context_limit
 from nexus.extensions.plugins import PluginLoader
-from nexus.hooks import HookExecutor, setup_hooks
+from nexus.hooks import HookEvent, HookExecutor, setup_hooks
 from nexus.integrations.anthropic import AnthropicModelClient, resolve_anthropic_api_key
 from nexus.integrations.cohere import CohereModelClient, resolve_cohere_api_key
 from nexus.integrations.fake_model import FakeModelClient
@@ -43,6 +43,7 @@ from nexus.integrations.openai_compatible import (
     resolve_provider_api_key,
 )
 from nexus.runtime.agent import Agent
+from nexus.observability import sentry_monitor_from_hooks
 from nexus.runtime.post_session import run_post_session_updates
 from nexus.runtime.repl import run_repl
 from nexus.runtime.runtime_session import RuntimeSession, resolve_runtime_session
@@ -252,6 +253,17 @@ class NexusApp:
             logger.warning("Skipping MCP server %s: %s", server.name, exc)
             runtime.last_error = str(exc)
             resources.mcp_servers.append(runtime)
+            if self._hooks is not None:
+                await self._hooks.emit(
+                    HookEvent.NOTIFICATION,
+                    {
+                        "event": "mcp_server_error",
+                        "server_name": server.name,
+                        "transport": server.transport,
+                        "command_name": server.command[0] if server.command else "",
+                        "error": str(exc),
+                    },
+                )
             return
 
         resources.mcp_servers.append(runtime)
@@ -489,14 +501,17 @@ async def _run_app(config, console: TerminalUI, params: dict) -> int:
     )
 
     app = NexusApp(config, console)
-    await app.initialize(load_plugins=not params["no_plugins"])
     try:
+        await app.initialize(load_plugins=not params["no_plugins"])
         prompt = resolve_prompt(params)
         if prompt is not None:
             return await app.run_single(prompt, params)
         return await app.run_interactive(params)
     finally:
         await app.close()
+        monitor = sentry_monitor_from_hooks(app._hooks)
+        if monitor is not None:
+            monitor.flush()
 
 
 def _dispatch_doctor(output_format: str) -> int:
@@ -518,11 +533,14 @@ async def _run_doctor(config, console: TerminalUI, *, output_format: str) -> int
     """Build NexusApp, collect health-check data, then tear down."""
     ensure_config_dirs(config)
     app = NexusApp(config, console)
-    await app.initialize()
     try:
+        await app.initialize()
         report = build_doctor_report(config, app._registry, app._resources)
     finally:
         await app.close()
+        monitor = sentry_monitor_from_hooks(app._hooks)
+        if monitor is not None:
+            monitor.flush()
     console.print_doctor_report(report, output_format=output_format)
     return exit_code_for_report(report)
 

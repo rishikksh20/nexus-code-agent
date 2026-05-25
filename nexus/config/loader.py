@@ -367,6 +367,9 @@ def _read_environment(defaults: AgentConfig) -> dict[str, Any]:
         ("MODEL", "model_name"),
         ("API_KEY", "api_key"),
         ("BASE_URL", "api_base_url"),
+        ("SENTRY_DSN", "sentry_dsn"),
+        ("SENTRY_ENVIRONMENT", "sentry_environment"),
+        ("SENTRY_RELEASE", "sentry_release"),
     ]
     for env_key, field_name in _generic_aliases:
         if field_name not in overrides:
@@ -500,6 +503,20 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     temperature = values["temperature"]
     if not 0.0 <= temperature <= 2.0:
         raise ConfigError("temperature must be between 0.0 and 2.0.")
+
+    for field_name in (
+        "sentry_sample_rate",
+        "sentry_traces_sample_rate",
+        "sentry_profiles_sample_rate",
+        "sentry_profile_session_sample_rate",
+    ):
+        if not 0.0 <= float(values[field_name]) <= 1.0:
+            raise ConfigError(f"{field_name} must be between 0.0 and 1.0.")
+    for field_name in ("sentry_max_breadcrumbs", "sentry_max_value_length"):
+        if int(values[field_name]) <= 0:
+            raise ConfigError(f"{field_name} must be greater than 0.")
+    if float(values["sentry_flush_timeout_seconds"]) <= 0:
+        raise ConfigError("sentry_flush_timeout_seconds must be greater than 0.")
 
     mcp_servers = values["mcp_servers"]
     if not isinstance(mcp_servers, list):

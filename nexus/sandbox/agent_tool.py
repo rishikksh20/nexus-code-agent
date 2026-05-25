@@ -188,7 +188,11 @@ class SubAgentTool:
             registry.register(record.tool, source=record.source, origin=record.origin)
 
         model_factory = self._model_client_factory or (lambda: FakeModelClient())
-        agent = Agent(model_client=model_factory(), tool_registry=registry)
+        agent = Agent(
+            model_client=model_factory(),
+            tool_registry=registry,
+            hooks=outer_context.metadata.get("hooks"),
+        )
         shared_context = _packet_summaries_from_context(outer_context, input_packet_ids)
         active_skill_names = subagent_skill_names(
             scoped_config,

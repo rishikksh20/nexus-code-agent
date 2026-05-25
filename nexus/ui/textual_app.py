@@ -870,7 +870,20 @@ class NexusTextualApp(App[None]):
                 return
             except Exception as exc:  # noqa: BLE001
                 from nexus.app import provider_error_message
+                from nexus.observability import capture_exception_from_hooks
 
+                capture_exception_from_hooks(
+                    self.state.hooks,
+                    exc,
+                    context={
+                        "session_id": self.state.session.session_id,
+                        "turn_id": self.state.current_turn_id,
+                        "trace_id": self.state.current_trace_id,
+                        "provider": self.state.config.provider,
+                        "model": self.state.config.model_name,
+                        "textual": True,
+                    },
+                )
                 self.ui.print_error(provider_error_message(exc, self.state.config))
                 if user_message_appended:
                     self.state.history.pop()

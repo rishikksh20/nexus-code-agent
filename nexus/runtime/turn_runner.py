@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from typing import cast
 from uuid import uuid4
 
 from nexus.context import ContextCompactor, TokenEstimator
+from nexus.hooks import HookEvent
 from nexus.models import (
     AgentEvent,
     AgentEventType,
@@ -18,6 +21,7 @@ from nexus.models import (
     ToolCall,
     ToolExecutionContext,
 )
+from nexus.observability import capture_exception_from_hooks, sentry_monitor_from_hooks
 from nexus.runtime.agent import Agent
 from nexus.runtime.repl_state import ReplState, apply_events_to_messages
 from nexus.security.manager import ApprovalScope
@@ -69,144 +73,201 @@ async def run_agent_turn(
     turn_id = state.current_turn_id or uuid4().hex[:12]
     trace_id = state.current_trace_id or uuid4().hex
     started_at = time.perf_counter()
+    start_payload = _turn_lifecycle_payload(
+        state,
+        turn_id=turn_id,
+        trace_id=trace_id,
+        status="started",
+        started_at=started_at,
+    )
+    if state.hooks is not None:
+        await state.hooks.emit(HookEvent.TURN_START, start_payload)
 
-    while True:
-        prepared_turn = state.prepare_turn(
-            prompt_text,
-            turn_id=turn_id,
-            trace_id=trace_id,
-            history=working_history,
-            compactor_factory=ContextCompactor,
-            estimator_factory=TokenEstimator,
+    monitor = sentry_monitor_from_hooks(state.hooks)
+    transaction = (
+        monitor.start_transaction(
+            name="nexus.turn",
+            op="nexus.turn",
+            attributes=start_payload,
         )
-        prepared_turn.context.metadata["approval_callback"] = approval_callback
-        prepared_turn.context.metadata["approval_manager"] = state.approval_manager
-        prepared_turn.context.metadata["execution_mode"] = state.mode.value
-        prepared_turn.context.metadata["auto_confirm"] = auto_confirm
-        prepared_turn.context.metadata["auto_confirm_read_only"] = state.config.auto_confirm_read_only
-        prepared_turn.context.metadata["ui"] = ui
-        prepared_turn.context.metadata["stream_output"] = state.config.stream_output
-        prepared_turn.context.metadata["show_tool_calls"] = state.config.show_tool_calls
-        prepared_turn.context.metadata["supervisor_cognitive_tools_only"] = (
-            str(getattr(state.config, "agent_mode", "basic")).strip().lower() == "advanced"
-        )
+        if monitor is not None
+        else None
+    )
+    transaction_context = transaction if transaction is not None else nullcontext()
 
-        batch = await _run_model_batch(
+    try:
+        with transaction_context:
+            while True:
+                prepared_turn = state.prepare_turn(
+                    prompt_text,
+                    turn_id=turn_id,
+                    trace_id=trace_id,
+                    history=working_history,
+                    compactor_factory=ContextCompactor,
+                    estimator_factory=TokenEstimator,
+                )
+                prepared_turn.context.metadata["approval_callback"] = approval_callback
+                prepared_turn.context.metadata["approval_manager"] = state.approval_manager
+                prepared_turn.context.metadata["execution_mode"] = state.mode.value
+                prepared_turn.context.metadata["auto_confirm"] = auto_confirm
+                prepared_turn.context.metadata["auto_confirm_read_only"] = state.config.auto_confirm_read_only
+                prepared_turn.context.metadata["ui"] = ui
+                prepared_turn.context.metadata["hooks"] = state.hooks
+                prepared_turn.context.metadata["stream_output"] = state.config.stream_output
+                prepared_turn.context.metadata["show_tool_calls"] = state.config.show_tool_calls
+                prepared_turn.context.metadata["supervisor_cognitive_tools_only"] = (
+                    str(getattr(state.config, "agent_mode", "basic")).strip().lower() == "advanced"
+                )
+
+                batch = await _run_model_batch(
+                    state,
+                    agent,
+                    prepared_turn.model_messages,
+                    prepared_turn.context,
+                    system_prompt=prepared_turn.system_prompt,
+                    ui=ui,
+                    auto_confirm=auto_confirm,
+                )
+
+                confirmation_index = _first_unresolved_confirmation_index(batch)
+                if confirmation_index is not None:
+                    _commit_history_safe_prefix(
+                        working_history,
+                        committed_events,
+                        batch[:confirmation_index],
+                    )
+
+                confirmation = None if confirmation_index is None else batch[confirmation_index]
+                if confirmation is None:
+                    committed_events.extend(batch)
+                    await _finish_turn(
+                        state,
+                        committed_events,
+                        initial_prompt_text=initial_prompt_text,
+                        turn_id=turn_id,
+                        trace_id=trace_id,
+                        started_at=started_at,
+                        status=_turn_status_from_events(batch),
+                    )
+                    return committed_events
+
+                confirmation_request = cast(ConfirmationRequest, confirmation.payload)
+
+                if auto_confirm and confirmation_request.kind is ConfirmationKind.APPROVAL:
+                    state.approval_manager.record_approval(
+                        confirmation_request.tool_name,
+                        approval_scope_for_policy(state.approval_manager.policy),
+                        arguments=confirmation_request.arguments,
+                    )
+                    await _resume_approved_tool_calls(
+                        state,
+                        agent,
+                        prepared_turn.context,
+                        batch,
+                        confirmation_index,
+                        confirmation_request,
+                        working_history,
+                        committed_events,
+                        ui=ui,
+                        include_preapproved_batch=state.approval_manager.policy is ApprovalPolicy.APPROVE_TURN,
+                    )
+                    continue
+
+                if approval_callback is None:
+                    pending_events = [*committed_events, cast(AgentEvent, confirmation)]
+                    await _finish_turn(
+                        state,
+                        pending_events,
+                        initial_prompt_text=initial_prompt_text,
+                        turn_id=turn_id,
+                        trace_id=trace_id,
+                        started_at=started_at,
+                        status="awaiting_confirmation",
+                    )
+                    return pending_events
+
+                response = await approval_callback(confirmation_request)
+                if confirmation_request.kind is ConfirmationKind.APPROVAL and response.approved:
+                    record_approval_response(state, confirmation_request, response)
+                    await _resume_approved_tool_calls(
+                        state,
+                        agent,
+                        prepared_turn.context,
+                        batch,
+                        confirmation_index,
+                        confirmation_request,
+                        working_history,
+                        committed_events,
+                        ui=ui,
+                        include_preapproved_batch=(
+                            response.scope == ApprovalScope.TURN.value
+                            and supports_turn_wide_approval(confirmation_request)
+                        ),
+                    )
+                    continue
+
+                if confirmation_request.kind is ConfirmationKind.APPROVAL and response.denied:
+                    state.approval_manager.record_refusal(
+                        confirmation_request.tool_name,
+                        arguments=confirmation_request.arguments,
+                    )
+                    continue
+
+                if confirmation_request.kind is ConfirmationKind.CLARIFICATION and response.clarification:
+                    clarification_text = (
+                        f"Clarification for {confirmation_request.tool_name} "
+                        f"({confirmation_request.payload.get('field', 'value')}): {response.clarification}"
+                    )
+                    clarification_message = Message(role="user", content=clarification_text)
+                    state.history.append(clarification_message)
+                    working_history.append(clarification_message)
+                    prompt_text = clarification_text
+                    continue
+
+                pending_events = [*committed_events, cast(AgentEvent, confirmation)]
+                await _finish_turn(
+                    state,
+                    pending_events,
+                    initial_prompt_text=initial_prompt_text,
+                    turn_id=turn_id,
+                    trace_id=trace_id,
+                    started_at=started_at,
+                    status="stopped",
+                )
+                return pending_events
+    except asyncio.CancelledError:
+        await _emit_turn_end(
             state,
-            agent,
-            prepared_turn.model_messages,
-            prepared_turn.context,
-            system_prompt=prepared_turn.system_prompt,
-            ui=ui,
-            auto_confirm=auto_confirm,
-        )
-
-        confirmation_index = _first_unresolved_confirmation_index(batch)
-        if confirmation_index is not None:
-            _commit_history_safe_prefix(
-                working_history,
-                committed_events,
-                batch[:confirmation_index],
-            )
-
-        confirmation = None if confirmation_index is None else batch[confirmation_index]
-        if confirmation is None:
-            committed_events.extend(batch)
-            _finish_turn(
-                state,
-                committed_events,
-                initial_prompt_text=initial_prompt_text,
-                turn_id=turn_id,
-                trace_id=trace_id,
-                started_at=started_at,
-                status=_turn_status_from_events(batch),
-            )
-            return committed_events
-
-        confirmation_request = cast(ConfirmationRequest, confirmation.payload)
-
-        if auto_confirm and confirmation_request.kind is ConfirmationKind.APPROVAL:
-            state.approval_manager.record_approval(
-                confirmation_request.tool_name,
-                approval_scope_for_policy(state.approval_manager.policy),
-                arguments=confirmation_request.arguments,
-            )
-            await _resume_approved_tool_calls(
-                state,
-                agent,
-                prepared_turn.context,
-                batch,
-                confirmation_index,
-                confirmation_request,
-                working_history,
-                committed_events,
-                ui=ui,
-                include_preapproved_batch=state.approval_manager.policy is ApprovalPolicy.APPROVE_TURN,
-            )
-            continue
-
-        if approval_callback is None:
-            pending_events = [*committed_events, cast(AgentEvent, confirmation)]
-            _finish_turn(
-                state,
-                pending_events,
-                initial_prompt_text=initial_prompt_text,
-                turn_id=turn_id,
-                trace_id=trace_id,
-                started_at=started_at,
-                status="awaiting_confirmation",
-            )
-            return pending_events
-
-        response = await approval_callback(confirmation_request)
-        if confirmation_request.kind is ConfirmationKind.APPROVAL and response.approved:
-            record_approval_response(state, confirmation_request, response)
-            await _resume_approved_tool_calls(
-                state,
-                agent,
-                prepared_turn.context,
-                batch,
-                confirmation_index,
-                confirmation_request,
-                working_history,
-                committed_events,
-                ui=ui,
-                include_preapproved_batch=(
-                    response.scope == ApprovalScope.TURN.value
-                    and supports_turn_wide_approval(confirmation_request)
-                ),
-            )
-            continue
-
-        if confirmation_request.kind is ConfirmationKind.APPROVAL and response.denied:
-            state.approval_manager.record_refusal(
-                confirmation_request.tool_name,
-                arguments=confirmation_request.arguments,
-            )
-            continue
-
-        if confirmation_request.kind is ConfirmationKind.CLARIFICATION and response.clarification:
-            clarification_text = (
-                f"Clarification for {confirmation_request.tool_name} "
-                f"({confirmation_request.payload.get('field', 'value')}): {response.clarification}"
-            )
-            clarification_message = Message(role="user", content=clarification_text)
-            state.history.append(clarification_message)
-            working_history.append(clarification_message)
-            prompt_text = clarification_text
-            continue
-
-        pending_events = [*committed_events, cast(AgentEvent, confirmation)]
-        _finish_turn(
-            state,
-            pending_events,
-            initial_prompt_text=initial_prompt_text,
+            events=committed_events,
             turn_id=turn_id,
             trace_id=trace_id,
             started_at=started_at,
-            status="stopped",
+            status="cancelled",
         )
-        return pending_events
+        raise
+    except Exception as exc:
+        capture_exception_from_hooks(
+            state.hooks,
+            exc,
+            context=_turn_lifecycle_payload(
+                state,
+                turn_id=turn_id,
+                trace_id=trace_id,
+                status="failed",
+                started_at=started_at,
+                error=str(exc),
+            ),
+        )
+        await _emit_turn_end(
+            state,
+            events=committed_events,
+            turn_id=turn_id,
+            trace_id=trace_id,
+            started_at=started_at,
+            status="failed",
+            error=str(exc),
+        )
+        raise
 
 
 # Backward-compatible name used by existing tests and earlier docs.
@@ -251,6 +312,34 @@ async def _run_model_batch(
             _render_event(ui, state, event)
             batch.append(event)
     except Exception as exc:  # noqa: BLE001
+        error_area = str(getattr(exc, "_nexus_error_area", "model"))
+        if not getattr(exc, "_nexus_sentry_captured", False):
+            capture_exception_from_hooks(
+                state.hooks,
+                exc,
+                context={
+                    "session_id": context.session_id,
+                    "turn_id": context.metadata.get("turn_id", ""),
+                    "trace_id": context.metadata.get("trace_id", ""),
+                    "provider": state.config.provider,
+                    "model": state.config.model_name,
+                    "events": len(batch),
+                    "error_area": error_area,
+                },
+            )
+        if state.hooks is not None and error_area != "tool":
+            await state.hooks.emit(
+                HookEvent.NOTIFICATION,
+                {
+                    "event": "model_error",
+                    "session_id": context.session_id,
+                    "turn_id": context.metadata.get("turn_id", ""),
+                    "trace_id": context.metadata.get("trace_id", ""),
+                    "provider": state.config.provider,
+                    "model": state.config.model_name,
+                    "error": str(exc) or exc.__class__.__name__,
+                },
+            )
         logger.exception(
             "turn_runner.batch.exception session_id=%s turn_id=%s trace_id=%s events=%s error=%s",
             context.session_id,
@@ -345,7 +434,7 @@ def _turn_status_from_events(events: list[AgentEvent]) -> str:
     return "failed" if any(event.kind == AgentEventType.AGENT_ERROR for event in events) else "completed"
 
 
-def _finish_turn(
+async def _finish_turn(
     state: ReplState,
     events: list[AgentEvent],
     *,
@@ -356,12 +445,21 @@ def _finish_turn(
     status: str,
 ) -> None:
     _sync_paused_turn_state(state, events, prompt_text=initial_prompt_text)
+    duration_ms = (time.perf_counter() - started_at) * 1000
     _record_turn_telemetry(
         state,
         events,
         turn_id=turn_id,
         trace_id=trace_id,
-        duration_ms=(time.perf_counter() - started_at) * 1000,
+        duration_ms=duration_ms,
+        status=status,
+    )
+    await _emit_turn_end(
+        state,
+        events=events,
+        turn_id=turn_id,
+        trace_id=trace_id,
+        started_at=started_at,
         status=status,
     )
 
@@ -511,6 +609,80 @@ def _turn_finished_with_tool_call_limit(events: list[AgentEvent]) -> bool:
     return bool(turn_completed and turn_completed.payload == "tool_call_limit")
 
 
+async def _emit_turn_end(
+    state: ReplState,
+    *,
+    events: list[AgentEvent],
+    turn_id: str,
+    trace_id: str,
+    started_at: float,
+    status: str,
+    error: str | None = None,
+) -> None:
+    if state.hooks is None:
+        return
+    await state.hooks.emit(
+        HookEvent.TURN_END,
+        _turn_lifecycle_payload(
+            state,
+            turn_id=turn_id,
+            trace_id=trace_id,
+            status=status,
+            started_at=started_at,
+            events=events,
+            error=error,
+        ),
+    )
+
+
+def _turn_lifecycle_payload(
+    state: ReplState,
+    *,
+    turn_id: str,
+    trace_id: str,
+    status: str,
+    started_at: float,
+    events: list[AgentEvent] | None = None,
+    error: str | None = None,
+) -> dict:
+    usage, tool_calls = _turn_usage_and_tool_calls(events or [])
+    payload = {
+        "session_id": state.session.session_id,
+        "turn_id": turn_id,
+        "trace_id": trace_id,
+        "mode": state.mode.value,
+        "agent_mode": getattr(state.config, "agent_mode", "basic"),
+        "provider": state.config.provider,
+        "model": state.config.model_name,
+        "status": status,
+        "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        "tool_calls": tool_calls,
+    }
+    if usage is not None:
+        payload["usage"] = {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+            "estimated_cost_usd": usage.estimated_cost_usd,
+            "provider": usage.provider,
+            "model": usage.model,
+        }
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _turn_usage_and_tool_calls(events: list[AgentEvent]):
+    usage = None
+    tool_calls = 0
+    for event in events:
+        if event.kind == "model_response" and event.payload.usage is not None:
+            usage = event.payload.usage
+        elif event.kind == "tool_call_requested":
+            tool_calls += 1
+    return usage, tool_calls
+
+
 def _record_turn_telemetry(
     state: ReplState,
     events: list[AgentEvent],
@@ -520,13 +692,7 @@ def _record_turn_telemetry(
     duration_ms: float,
     status: str,
 ) -> None:
-    usage = None
-    tool_calls = 0
-    for event in events:
-        if event.kind == "model_response" and event.payload.usage is not None:
-            usage = event.payload.usage
-        elif event.kind == "tool_call_requested":
-            tool_calls += 1
+    usage, tool_calls = _turn_usage_and_tool_calls(events)
     turns = state.session.metadata.setdefault("turns", [])
     turns.append(
         {
