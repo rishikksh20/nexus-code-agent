@@ -322,7 +322,7 @@ uv run --directory workspace nexus --prompt "summarize this project"
 | `--resume-last` | | Resume the latest saved session for this workspace |
 | `--no-session` | | Skip session persistence for this run |
 | `--model NAME` | `-m` | Override the model from config |
-| `--provider NAME` | | Override the provider (`anthropic`, `fake`, `gemini`, `mistral`, `ollama`, `openai`, `openai-compatible`) |
+| `--provider NAME` | | Override the provider (`anthropic`, `cohere`, `fake`, `gemini`, `mistral`, `ollama`, `openai`, `openai-compatible`) |
 | `--allow-hidden-paths` | | Allow hidden/private path reads except `.nexus/`, which remains blocked |
 | `--mode MODE` | | Execution mode: `plan`, `default`, or `auto` |
 | `--config FILE` | `-c` | Path to a local config TOML file |
@@ -736,7 +736,7 @@ The simplest way to configure the provider is a `.env` file in the workspace roo
 
 ```bash
 # .env
-PROVIDER=openai-compatible          # or: mistral, openai, anthropic, gemini, ollama, fake
+PROVIDER=openai-compatible          # or: mistral, openai, anthropic, cohere, gemini, ollama, fake
 MODEL=mistral-medium-latest         # any model supported by the endpoint
 API_KEY=your_api_key_here           # generic key — works for any provider
 BASE_URL=https://api.mistral.ai/v1  # any OpenAI-compatible endpoint
@@ -750,6 +750,7 @@ BASE_URL=https://api.mistral.ai/v1  # any OpenAI-compatible endpoint
 | `mistral` | `MISTRAL_API_KEY` → `NEXUS_API_KEY` → `OPENAI_API_KEY` → `API_KEY` |
 | `openai` | `OPENAI_API_KEY` → `NEXUS_API_KEY` → `API_KEY` |
 | `anthropic` | `ANTHROPIC_API_KEY` → `API_KEY` |
+| `cohere` | `COHERE_API_KEY` → `CO_API_KEY` → `NEXUS_API_KEY` → `API_KEY` |
 | `gemini` | `GEMINI_API_KEY` → `GOOGLE_API_KEY` → `API_KEY` |
 | `ollama` | No API key required |
 
@@ -759,6 +760,7 @@ BASE_URL=https://api.mistral.ai/v1  # any OpenAI-compatible endpoint
 |---|---|
 | `openai-compatible` / `openai` | `BASE_URL` env var → `api_base_url` in config |
 | `mistral` | `MISTRAL_BASE_URL` → defaults to `https://api.mistral.ai/v1` |
+| `cohere` | `COHERE_BASE_URL` / `CO_API_BASE_URL` → defaults to `https://api.cohere.com` |
 | `ollama` | `OLLAMA_HOST` → `BASE_URL` → defaults to `http://localhost:11434` |
 | `anthropic` / `gemini` | Native SDK providers; `api_base_url` is unused by default |
 
@@ -1031,6 +1033,7 @@ The compaction prompt (`nexus/prompts/compression.py`) uses a structured 7-secti
 | OpenAI | `openai` | Requires `BASE_URL` (or `api_base_url`) and `OPENAI_API_KEY` |
 | Ollama | `ollama` | Native local Ollama client; defaults to `http://localhost:11434`; no API key required |
 | Anthropic | `anthropic` | Native Anthropic SDK client; key via `ANTHROPIC_API_KEY` |
+| Cohere | `cohere` | Native HTTP Cohere Chat API v2 client; key via `COHERE_API_KEY` or `CO_API_KEY` |
 | Gemini | `gemini` | Native Google GenAI SDK client; key via `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
 
 **Common endpoint examples:**
@@ -1058,6 +1061,11 @@ OLLAMA_HOST=http://localhost:11434
 PROVIDER=anthropic
 MODEL=claude-sonnet-4-5
 ANTHROPIC_API_KEY=your_key_here
+
+# Cohere
+PROVIDER=cohere
+MODEL=command-a-plus-05-2026
+COHERE_API_KEY=your_key_here
 
 # Gemini
 PROVIDER=gemini
@@ -1099,6 +1107,16 @@ echo 'log_format = "json"' >> .nexus/config.toml
 uv run nexus doctor
 uv run nexus doctor --output-format json
 ```
+
+Sentry remote monitoring is optional and metadata-only by default. Enable it with a DSN in config or env:
+
+```bash
+AGENT_SENTRY_ENABLED=true
+SENTRY_DSN=https://public@example.ingest.sentry.io/123
+SENTRY_ENVIRONMENT=production
+```
+
+Sentry events include session, turn, trace, provider/model, tool name/source, approval, MCP, usage, and duration fields. Raw prompts and tool outputs are not sent unless `sentry_include_prompts` or `sentry_include_tool_outputs` is explicitly enabled.
 
 ---
 

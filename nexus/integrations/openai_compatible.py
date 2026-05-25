@@ -8,6 +8,13 @@ from os import environ
 from typing import Any
 from urllib import error, request as urllib_request
 
+from nexus.integrations.cohere import (
+    _cohere_strict_reason_tool_names,
+    _cohere_strict_tool_schema,
+    _cohere_strict_tools_compatible,
+    _strip_cohere_strict_reason_arguments,
+    _with_cohere_strict_reason_argument,
+)
 from nexus.integrations.retry import call_with_backoff, retry_delay
 from nexus.models import (
     Message,
@@ -24,10 +31,24 @@ from nexus.models import (
 class OpenAICompatibleAdapter:
     """Translate internal runtime types to and from an OpenAI-compatible wire format."""
 
-    def __init__(self, *, provider_name: str = "openai-compatible") -> None:
+    def __init__(
+        self,
+        *,
+        provider_name: str = "openai-compatible",
+        cohere_compatibility: bool = False,
+    ) -> None:
         self.provider_name = provider_name
+        self.cohere_compatibility = cohere_compatibility
 
     def to_wire_request(self, request: RuntimeRequest) -> dict[str, Any]:
+        tools = list(request.tool_schemas)
+        cohere_strict_tools = False
+        strict_reason_tool_names: set[str] = set()
+        if self.cohere_compatibility and _cohere_strict_tools_compatible(tools):
+            cohere_strict_tools = True
+            tools = [_cohere_compatible_strict_tool_schema(tool) for tool in tools]
+            strict_reason_tool_names = _cohere_strict_reason_tool_names(tools)
+
         messages = [{"role": "system", "content": request.system_prompt}]
         for message in request.messages:
             if message.role == "assistant" and message.tool_calls:
@@ -41,7 +62,11 @@ class OpenAICompatibleAdapter:
                             "type": "function",
                             "function": {
                                 "name": tc.tool_name,
-                                "arguments": json.dumps(tc.arguments),
+                                "arguments": json.dumps(
+                                    _with_cohere_strict_reason_argument(tc.arguments)
+                                    if tc.tool_name in strict_reason_tool_names
+                                    else tc.arguments
+                                ),
                             },
                         }
                         for tc in message.tool_calls
@@ -71,7 +96,7 @@ class OpenAICompatibleAdapter:
         payload: dict[str, Any] = {
             "model": request.model_name,
             "messages": messages,
-            "tools": list(request.tool_schemas),
+            "tools": tools,
             "temperature": request.temperature,
         }
         if request.max_output_tokens is not None:
@@ -82,11 +107,7 @@ class OpenAICompatibleAdapter:
         choice = payload["choices"][0]
         message_payload = choice["message"]
         tool_calls = tuple(
-            ToolCall(
-                call_id=tool_call["id"],
-                tool_name=tool_call["function"]["name"],
-                arguments=json.loads(tool_call["function"]["arguments"]),
-            )
+            _tool_call_from_openai_payload(tool_call)
             for tool_call in message_payload.get("tool_calls") or ()
         )
         message = Message(
@@ -154,7 +175,10 @@ class OpenAICompatibleModelClient:
         self.retries = retries
         self.base_delay = base_delay
         self.jitter = jitter
-        self.adapter = OpenAICompatibleAdapter(provider_name=provider_name)
+        self.adapter = OpenAICompatibleAdapter(
+            provider_name=provider_name,
+            cohere_compatibility=_is_cohere_compatibility_base_url(normalized_base),
+        )
 
     async def complete(self, request: RuntimeRequest) -> RuntimeResponse:
         wire_payload = self.adapter.to_wire_request(request)
@@ -204,6 +228,10 @@ class OpenAICompatibleModelClient:
                         return
                     events.append(event)
                 if not got_retryable_error:
+                    if not _stream_events_have_assistant_output(events):
+                        async for event in self._non_stream_events(wire_payload):
+                            yield event
+                        return
                     for ev in events:
                         yield ev
                     return
@@ -216,28 +244,38 @@ class OpenAICompatibleModelClient:
                     )
                     await asyncio.sleep(delay)
             # All retries exhausted — surface the last error.
+            if last_error and _looks_like_http_500(last_error):
+                async for event in self._non_stream_events(wire_payload):
+                    yield event
+                return
             yield StreamEvent(type=StreamEventType.ERROR, error=last_error or "Provider request failed after retries.")
         else:
-            response_payload = await call_with_backoff(
-                lambda: asyncio.to_thread(self._send_request, wire_payload),
-                retries=self.retries,
-                base_delay=self.base_delay,
-                jitter=self.jitter,
-                retryable=_is_retryable_provider_error,
-            )
-            runtime_response = self.adapter.from_wire_response(response_payload)
-            if runtime_response.message.content:
-                yield StreamEvent(
-                    type=StreamEventType.TEXT_DELTA,
-                    text_delta=TextDelta(content=runtime_response.message.content),
-                )
-            for tc in runtime_response.tool_calls:
-                yield StreamEvent(type=StreamEventType.TOOL_CALL_COMPLETE, tool_call=tc)
+            async for event in self._non_stream_events(wire_payload):
+                yield event
+
+    async def _non_stream_events(self, wire_payload: dict[str, Any]) -> AsyncGenerator[StreamEvent, None]:
+        wire_payload = {**wire_payload}
+        wire_payload.pop("stream", None)
+        response_payload = await call_with_backoff(
+            lambda: asyncio.to_thread(self._send_request, wire_payload),
+            retries=self.retries,
+            base_delay=self.base_delay,
+            jitter=self.jitter,
+            retryable=_is_retryable_provider_error,
+        )
+        runtime_response = self.adapter.from_wire_response(response_payload)
+        if runtime_response.message.content:
             yield StreamEvent(
-                type=StreamEventType.MESSAGE_COMPLETE,
-                finish_reason=runtime_response.finish_reason,
-                usage=runtime_response.usage,
+                type=StreamEventType.TEXT_DELTA,
+                text_delta=TextDelta(content=runtime_response.message.content),
             )
+        for tc in runtime_response.tool_calls:
+            yield StreamEvent(type=StreamEventType.TOOL_CALL_COMPLETE, tool_call=tc)
+        yield StreamEvent(
+            type=StreamEventType.MESSAGE_COMPLETE,
+            finish_reason=runtime_response.finish_reason,
+            usage=runtime_response.usage,
+        )
 
     async def _stream_sse(self, payload: dict[str, Any]) -> AsyncGenerator[StreamEvent, None]:
         """Read an SSE stream in a background thread and yield parsed StreamEvents."""
@@ -257,9 +295,9 @@ class OpenAICompatibleModelClient:
                 with urllib_request.urlopen(req, timeout=self.timeout_seconds) as resp:
                     for raw in resp:
                         line = raw.decode("utf-8").strip()
-                        if not line.startswith("data: "):
+                        if not line.startswith("data:"):
                             continue
-                        data_str = line[6:]
+                        data_str = line.partition(":")[2].strip()
                         if data_str == "[DONE]":
                             break
                         try:
@@ -329,6 +367,7 @@ class OpenAICompatibleModelClient:
 
             choice = choices[0]
             delta = choice.get("delta") or {}
+            message = choice.get("message") or {}
 
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
@@ -337,6 +376,11 @@ class OpenAICompatibleModelClient:
                 yield StreamEvent(
                     type=StreamEventType.TEXT_DELTA,
                     text_delta=TextDelta(content=delta["content"]),
+                )
+            elif message.get("content"):
+                yield StreamEvent(
+                    type=StreamEventType.TEXT_DELTA,
+                    text_delta=TextDelta(content=message["content"]),
                 )
 
             # Accumulate tool-call argument fragments.
@@ -351,6 +395,19 @@ class OpenAICompatibleModelClient:
                     tool_calls_acc[idx]["name"] += fn["name"]
                 if fn.get("arguments"):
                     tool_calls_acc[idx]["arguments"] += fn["arguments"]
+
+            for idx, tool_call in enumerate(message.get("tool_calls") or []):
+                if not isinstance(tool_call, dict):
+                    continue
+                try:
+                    parsed = _tool_call_from_openai_payload(tool_call)
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    continue
+                tool_calls_acc[idx] = {
+                    "id": parsed.call_id,
+                    "name": parsed.tool_name,
+                    "arguments": json.dumps(parsed.arguments),
+                }
 
         # Emit completed tool calls once the stream ends.
         for idx in sorted(tool_calls_acc):
@@ -421,10 +478,54 @@ def _request_headers(api_key: str | None) -> dict[str, str]:
     return headers
 
 
+def _stream_events_have_assistant_output(events: list[StreamEvent]) -> bool:
+    for event in events:
+        if event.type == StreamEventType.TEXT_DELTA and event.text_delta and event.text_delta.content:
+            return True
+        if event.type == StreamEventType.TOOL_CALL_COMPLETE and event.tool_call:
+            return True
+    return False
+
+
+def _cohere_compatible_strict_tool_schema(tool: dict[str, Any]) -> dict[str, Any]:
+    strict_tool = _cohere_strict_tool_schema(tool)
+    fn = strict_tool.get("function")
+    if isinstance(fn, dict):
+        fn["strict"] = True
+    return strict_tool
+
+
+def _tool_call_from_openai_payload(tool_call: dict[str, Any]) -> ToolCall:
+    fn = tool_call["function"]
+    arguments = fn.get("arguments") or "{}"
+    if isinstance(arguments, dict):
+        parsed_arguments = arguments
+    else:
+        parsed_arguments = json.loads(str(arguments))
+    return ToolCall(
+        call_id=str(tool_call["id"]),
+        tool_name=str(fn["name"]),
+        arguments=(
+            _strip_cohere_strict_reason_arguments(parsed_arguments)
+            if isinstance(parsed_arguments, dict)
+            else {"_raw": parsed_arguments}
+        ),
+    )
+
+
 def _chat_completions_url(api_base_url: str) -> str:
     if api_base_url.endswith("/chat/completions"):
         return api_base_url
     return f"{api_base_url}/chat/completions"
+
+
+def _is_cohere_compatibility_base_url(api_base_url: str) -> bool:
+    normalized = api_base_url.lower()
+    return "cohere.ai/compatibility" in normalized or "cohere.com/compatibility" in normalized
+
+
+def _looks_like_http_500(message: str) -> bool:
+    return "http 500" in message.lower()
 
 
 def _http_error_details(exc: error.HTTPError) -> str:

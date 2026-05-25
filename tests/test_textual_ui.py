@@ -18,7 +18,7 @@ from nexus.ui.textual_app import NexusTextualApp, _strip_mouse_escape_sequences
 
 
 @pytest.mark.asyncio
-async def test_textual_repl_keeps_mouse_enabled_for_scrolling(monkeypatch):
+async def test_textual_repl_leaves_mouse_available_for_terminal_selection(monkeypatch):
     from nexus.ui import textual_app
 
     calls: list[dict[str, object]] = []
@@ -37,7 +37,7 @@ async def test_textual_repl_keeps_mouse_enabled_for_scrolling(monkeypatch):
 
     await textual_app.run_textual_repl(None, None, None)  # type: ignore[arg-type]
 
-    assert calls[0]["mouse"] is True
+    assert calls[0]["mouse"] is False
     assert calls[1]["finalized"] is True
 
 
@@ -119,6 +119,32 @@ async def test_textual_prompt_history_uses_up_and_down_arrows(tmp_path):
 
         await pilot.press("down")
         assert prompt.value == "draft"
+
+
+@pytest.mark.asyncio
+async def test_textual_ctrl_c_copies_selected_text_before_quitting(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.screen.get_selected_text = lambda: "copy me"  # type: ignore[method-assign]
+
+        await app.action_copy_or_quit()
+
+        assert app.clipboard == "copy me"
+        assert state.should_exit is False
 
 
 @pytest.mark.asyncio

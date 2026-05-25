@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from io import BytesIO
 from urllib import error
 
@@ -9,6 +10,13 @@ import pytest
 from nexus.app import _build_model_client
 from nexus.config import load_config
 from nexus.integrations.anthropic import AnthropicAdapter, AnthropicModelClient
+from nexus.integrations.cohere import (
+    CohereAdapter,
+    CohereModelClient,
+    _MAX_COHERE_TOOL_RESULT_CHARS,
+    _TOOL_RESULT_TRUNCATION_MARKER,
+    _chat_url as cohere_chat_url,
+)
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.integrations.gemini import GeminiAdapter, GeminiModelClient
 from nexus.integrations.ollama import OllamaModelClient
@@ -280,6 +288,248 @@ async def test_openai_compatible_stream_accumulates_partial_tool_calls_without_u
 
 
 @pytest.mark.asyncio
+async def test_openai_compatible_stream_accepts_full_message_chunks(monkeypatch):
+    lines = [
+        (
+            'data:{"model":"command-demo","choices":[{"message":{"role":"assistant",'
+            '"content":"done"},"finish_reason":"stop"}]}\n'
+        ),
+        "data: [DONE]\n",
+    ]
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return _FakeStreamingHTTPResponse(lines)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = OpenAICompatibleModelClient(
+        api_base_url="https://api.cohere.ai/compatibility/v1",
+        api_key="secret",
+        provider_name="openai-compatible",
+    )
+
+    events = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="command-demo",
+                system_prompt="system",
+                messages=(Message(role="user", content="hello"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert [event.type for event in events] == [
+        StreamEventType.TEXT_DELTA,
+        StreamEventType.MESSAGE_COMPLETE,
+    ]
+    assert events[0].text_delta is not None
+    assert events[0].text_delta.content == "done"
+    assert events[1].finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_stream_accepts_full_message_tool_calls(monkeypatch):
+    lines = [
+        (
+            'data: {"model":"command-demo","choices":[{"message":{"role":"assistant",'
+            '"tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file",'
+            '"arguments":"{\\"path\\":\\"README.md\\"}"}}]},"finish_reason":"tool_calls"}]}\n'
+        ),
+        "data: [DONE]\n",
+    ]
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return _FakeStreamingHTTPResponse(lines)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = OpenAICompatibleModelClient(
+        api_base_url="https://api.cohere.ai/compatibility/v1",
+        api_key="secret",
+        provider_name="openai-compatible",
+    )
+
+    events = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="command-demo",
+                system_prompt="system",
+                messages=(Message(role="user", content="read README"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert [event.type for event in events] == [
+        StreamEventType.TOOL_CALL_COMPLETE,
+        StreamEventType.MESSAGE_COMPLETE,
+    ]
+    assert events[0].tool_call == ToolCall("call-1", "read_file", {"path": "README.md"})
+    assert events[1].finish_reason == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_stream_falls_back_when_provider_stream_is_empty(monkeypatch):
+    requests: list[dict[str, object]] = []
+
+    def _fake_urlopen(req, timeout):
+        del timeout
+        body = json.loads(req.data.decode("utf-8"))
+        requests.append(body)
+        if body.get("stream") is True:
+            return _FakeStreamingHTTPResponse(
+                [
+                    'data: {"model":"command-demo","choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+                    "data: [DONE]\n",
+                ]
+            )
+        return _FakeHTTPResponse(
+            {
+                "model": "command-demo",
+                "choices": [{"message": {"content": "non-stream recovered"}, "finish_reason": "stop"}],
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = OpenAICompatibleModelClient(
+        api_base_url="https://api.cohere.ai/compatibility/v1",
+        api_key="secret",
+        provider_name="openai-compatible",
+    )
+
+    events = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="command-demo",
+                system_prompt="system",
+                messages=(Message(role="user", content="hello"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert [request.get("stream") for request in requests] == [True, None]
+    assert [event.type for event in events] == [
+        StreamEventType.TEXT_DELTA,
+        StreamEventType.MESSAGE_COMPLETE,
+    ]
+    assert events[0].text_delta is not None
+    assert events[0].text_delta.content == "non-stream recovered"
+    assert events[1].finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_stream_falls_back_from_http_500(monkeypatch):
+    requests: list[dict[str, object]] = []
+
+    def _fake_urlopen(req, timeout):
+        del timeout
+        body = json.loads(req.data.decode("utf-8"))
+        requests.append(body)
+        if body.get("stream") is True:
+            raise error.HTTPError(
+                req.full_url,
+                500,
+                "internal error",
+                {},
+                BytesIO(b'{"error":"stream failed"}'),
+            )
+        return _FakeHTTPResponse(
+            {
+                "model": "command-demo",
+                "choices": [{"message": {"content": "non-stream recovered"}, "finish_reason": "stop"}],
+            }
+        )
+
+    async def _no_sleep(delay):
+        return None
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+
+    client = OpenAICompatibleModelClient(
+        api_base_url="https://api.cohere.ai/compatibility/v1",
+        api_key="secret",
+        provider_name="openai-compatible",
+        retries=2,
+        base_delay=0.0,
+        jitter=0.0,
+    )
+
+    events = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="command-demo",
+                system_prompt="system",
+                messages=(Message(role="user", content="hello"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert [request.get("stream") for request in requests] == [True, True, None]
+    assert events[0].text_delta is not None
+    assert events[0].text_delta.content == "non-stream recovered"
+    assert events[1].finish_reason == "stop"
+
+
+def test_openai_compatible_cohere_base_normalizes_tools_for_strict_compatibility():
+    adapter = OpenAICompatibleAdapter(
+        provider_name="openai-compatible",
+        cohere_compatibility=True,
+    )
+    payload = adapter.to_wire_request(
+        RuntimeRequest(
+            model_name="command-demo",
+            system_prompt="system",
+            messages=(
+                Message(role="user", content="list files"),
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=(ToolCall("call-1", "list_dir", {"path": "."}),),
+                ),
+            ),
+            tool_schemas=(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "list_dir",
+                        "description": "List files",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                }
+                            },
+                        },
+                    },
+                },
+            ),
+        )
+    )
+
+    fn = payload["tools"][0]["function"]
+    parameters = fn["parameters"]
+    assert fn["strict"] is True
+    assert "parallel_tool_calls" not in payload
+    assert "_nexus_tool_call_reason" in parameters["required"]
+    assert "minLength" not in parameters["properties"]["path"]
+    assistant_args = json.loads(payload["messages"][-1]["tool_calls"][0]["function"]["arguments"])
+    assert "_nexus_tool_call_reason" in assistant_args
+
+
+@pytest.mark.asyncio
 async def test_openai_compatible_stream_retries_socket_timeouts(monkeypatch):
     attempts = {"count": 0}
     lines = [
@@ -370,6 +620,17 @@ def test_build_model_client_uses_provider_config(tmp_path):
     assert isinstance(_build_model_client(anthropic_config), AnthropicModelClient)
     assert isinstance(_build_model_client(gemini_config), GeminiModelClient)
 
+    cohere_config = load_config(
+        tmp_path,
+        global_root=tmp_path / "global",
+        cli_overrides={"provider": "cohere", "api_base_url": "", "api_key": "secret"},
+    )
+
+    cohere_client = _build_model_client(cohere_config)
+
+    assert isinstance(cohere_client, CohereModelClient)
+    assert cohere_client.api_base_url == "https://api.cohere.com"
+
 
 def test_openai_adapter_skips_invalid_legacy_assistant_and_tool_messages():
     adapter = OpenAICompatibleAdapter(provider_name="openai-compatible")
@@ -424,6 +685,520 @@ def test_anthropic_adapter_converts_tools_and_messages():
     ]
     assert messages[1]["content"][0]["type"] == "tool_use"
     assert messages[2]["content"][0]["type"] == "tool_result"
+
+
+def test_cohere_adapter_converts_tools_and_messages():
+    tool_schema = {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }
+    adapter = CohereAdapter()
+
+    payload = adapter.to_wire_request(
+        RuntimeRequest(
+            model_name="command-demo",
+            system_prompt="system",
+            messages=(
+                Message(role="user", content="read README"),
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=(ToolCall("call-1", "read_file", {"path": "README.md"}),),
+                ),
+                Message(role="tool", content="plain tool output", name="read_file", tool_call_id="call-1"),
+            ),
+            tool_schemas=(tool_schema,),
+        )
+    )
+
+    assert payload["messages"] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "read README"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "README.md"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": '{"result": "plain tool output"}'},
+    ]
+    assert payload["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }
+    ]
+    assert payload["strict_tools"] is True
+
+
+def test_cohere_adapter_strict_tools_normalizes_optional_tool_schemas_and_strips_reason_args():
+    tool_schema = {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List files",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Directory path.",
+                    }
+                },
+                "additionalProperties": False,
+            },
+        },
+    }
+    adapter = CohereAdapter()
+
+    payload = adapter.to_wire_request(
+        RuntimeRequest(
+            model_name="command-demo",
+            system_prompt="system",
+            messages=(
+                Message(role="user", content="list files"),
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=(ToolCall("call-1", "list_dir", {"path": "."}),),
+                ),
+            ),
+            tool_schemas=(tool_schema,),
+        )
+    )
+
+    parameters = payload["tools"][0]["function"]["parameters"]
+    assert payload["strict_tools"] is True
+    assert "_nexus_tool_call_reason" in parameters["required"]
+    assert "minLength" not in parameters["properties"]["path"]
+    assistant_args = json.loads(payload["messages"][-1]["tool_calls"][0]["function"]["arguments"])
+    assert assistant_args["_nexus_tool_call_reason"] == "Cohere strict tool schema compatibility."
+
+    response = adapter.from_wire_response(
+        {
+            "finish_reason": "TOOL_CALL",
+            "message": {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-2",
+                        "type": "function",
+                        "function": {
+                            "name": "list_dir",
+                            "arguments": json.dumps(
+                                {
+                                    "path": ".",
+                                    "_nexus_tool_call_reason": "Need workspace files.",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            },
+        },
+        "command-demo",
+    )
+
+    assert response.tool_calls == (ToolCall("call-2", "list_dir", {"path": "."}),)
+
+
+def test_cohere_adapter_bounds_large_tool_results():
+    adapter = CohereAdapter()
+    large_output = "x" * (_MAX_COHERE_TOOL_RESULT_CHARS + 100)
+
+    payload = adapter.to_wire_request(
+        RuntimeRequest(
+            model_name="command-demo",
+            system_prompt="system",
+            messages=(
+                Message(role="user", content="list files"),
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=(ToolCall("call-1", "list_dir", {"path": "."}),),
+                ),
+                Message(role="tool", content=large_output, name="list_dir", tool_call_id="call-1"),
+            ),
+        )
+    )
+
+    content = json.loads(payload["messages"][-1]["content"])
+    assert content["truncated"] is True
+    assert content["original_chars"] == len(large_output)
+    assert _TOOL_RESULT_TRUNCATION_MARKER in content["result"]
+    assert len(content["result"]) == _MAX_COHERE_TOOL_RESULT_CHARS
+
+
+@pytest.mark.asyncio
+async def test_cohere_client_posts_v2_chat_non_stream(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        captured["authorization"] = req.get_header("Authorization")
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _FakeHTTPResponse(
+            {
+                "id": "chat-1",
+                "finish_reason": "COMPLETE",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "done"}],
+                },
+                "usage": {"tokens": {"input_tokens": 4, "output_tokens": 2}},
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = CohereModelClient(api_key="secret")
+
+    response = await client.complete(
+        RuntimeRequest(
+            model_name="command-demo",
+            system_prompt="system",
+            messages=(Message(role="user", content="hello"),),
+        )
+    )
+
+    assert captured["url"] == "https://api.cohere.com/v2/chat"
+    assert captured["authorization"] == "Bearer secret"
+    assert captured["body"] == {
+        "model": "command-demo",
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "hello"},
+        ],
+        "temperature": 0.0,
+        "stream": False,
+    }
+    assert response.message.content == "done"
+    assert response.usage is not None
+    assert response.usage.provider == "cohere"
+    assert response.usage.total_tokens == 6
+
+
+@pytest.mark.asyncio
+async def test_cohere_client_uses_longer_rate_limit_cooldown(monkeypatch):
+    attempts = {"count": 0}
+    delays: list[float] = []
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        attempts["count"] += 1
+        if attempts["count"] < 4:
+            raise error.HTTPError(
+                "https://api.cohere.com/v2/chat",
+                429,
+                "too many requests",
+                {},
+                BytesIO(b'{"message":"too many requests"}'),
+            )
+        return _FakeHTTPResponse(
+            {
+                "id": "chat-1",
+                "finish_reason": "COMPLETE",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "recovered"}]},
+            }
+        )
+
+    async def _record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    monkeypatch.setattr("asyncio.sleep", _record_sleep)
+
+    client = CohereModelClient(api_key="secret", jitter=0.0)
+
+    response = await client.complete(
+        RuntimeRequest(
+            model_name="command-demo",
+            system_prompt="system",
+            messages=(Message(role="user", content="hello"),),
+        )
+    )
+
+    assert attempts["count"] == 4
+    assert delays == [10.0, 15.0, 20.0]
+    assert response.message.content == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_cohere_client_respects_longer_retry_after(monkeypatch):
+    attempts = {"count": 0}
+    delays: list[float] = []
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise error.HTTPError(
+                "https://api.cohere.com/v2/chat",
+                429,
+                "too many requests",
+                {"Retry-After": "30"},
+                BytesIO(b'{"message":"too many requests"}'),
+            )
+        return _FakeHTTPResponse(
+            {
+                "id": "chat-1",
+                "finish_reason": "COMPLETE",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "recovered"}]},
+            }
+        )
+
+    async def _record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    monkeypatch.setattr("asyncio.sleep", _record_sleep)
+
+    client = CohereModelClient(api_key="secret", jitter=0.0)
+
+    response = await client.complete(
+        RuntimeRequest(
+            model_name="command-demo",
+            system_prompt="system",
+            messages=(Message(role="user", content="hello"),),
+        )
+    )
+
+    assert delays == [30.0]
+    assert response.message.content == "recovered"
+
+
+def test_cohere_chat_url_normalizes_v2_base_url():
+    assert cohere_chat_url("https://api.cohere.com") == "https://api.cohere.com/v2/chat"
+    assert cohere_chat_url("https://api.cohere.com/v2") == "https://api.cohere.com/v2/chat"
+    assert cohere_chat_url("https://api.cohere.com/v2/chat") == "https://api.cohere.com/v2/chat"
+
+
+@pytest.mark.asyncio
+async def test_cohere_stream_message_end_error_surfaces_as_error(monkeypatch):
+    lines = [
+        'data: {"type":"message-end","delta":{"finish_reason":"ERROR","error":"backend failed"}}\n',
+    ]
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return _FakeStreamingHTTPResponse(lines)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = CohereModelClient(api_key="secret")
+
+    events = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="command-demo",
+                system_prompt="system",
+                messages=(Message(role="user", content="hello"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert [event.type for event in events] == [StreamEventType.ERROR]
+    assert events[0].error == "backend failed"
+
+
+@pytest.mark.asyncio
+async def test_cohere_stream_message_end_error_logs_diagnostics(monkeypatch, caplog):
+    lines = [
+        'data: {"type":"message-end","delta":{"finish_reason":"ERROR","error":"backend failed"}}\n',
+    ]
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return _FakeStreamingHTTPResponse(lines)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    caplog.set_level(logging.WARNING, logger="nexus.integrations.cohere")
+
+    client = CohereModelClient(api_key="secret")
+
+    _ = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="command-demo",
+                system_prompt="system",
+                messages=(Message(role="user", content="hello"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert "cohere.sse.message_end_error" in caplog.text
+    assert "backend failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cohere_stream_reads_text_from_content_start(monkeypatch):
+    lines = [
+        'data: {"type":"content-start","delta":{"message":{"content":{"type":"text","text":"Done."}}}}\n',
+        'data: {"type":"message-end","delta":{"finish_reason":"COMPLETE"}}\n',
+    ]
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return _FakeStreamingHTTPResponse(lines)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = CohereModelClient(api_key="secret")
+
+    events = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="command-demo",
+                system_prompt="system",
+                messages=(
+                    Message(role="user", content="list files"),
+                    Message(
+                        role="assistant",
+                        content="",
+                        tool_calls=(ToolCall("call-1", "list_dir", {"path": "."}),),
+                    ),
+                    Message(role="tool", content="README.md", name="list_dir", tool_call_id="call-1"),
+                ),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert [event.type for event in events] == [
+        StreamEventType.TEXT_DELTA,
+        StreamEventType.MESSAGE_COMPLETE,
+    ]
+    assert events[0].text_delta is not None
+    assert events[0].text_delta.content == "Done."
+
+
+@pytest.mark.asyncio
+async def test_cohere_stream_logs_tool_result_payload_shape(monkeypatch, caplog):
+    lines = [
+        'data: {"type":"content-start","delta":{"message":{"content":{"type":"text","text":"Done."}}}}\n',
+        'data: {"type":"message-end","delta":{"finish_reason":"COMPLETE"}}\n',
+    ]
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return _FakeStreamingHTTPResponse(lines)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    caplog.set_level(logging.DEBUG, logger="nexus.integrations.cohere")
+
+    client = CohereModelClient(api_key="secret")
+
+    _ = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="command-demo",
+                system_prompt="system",
+                messages=(
+                    Message(role="user", content="delegate"),
+                    Message(
+                        role="assistant",
+                        content="",
+                        tool_calls=(ToolCall("call-1", "subagent_execution", {"title": "Do", "instructions": "Do it"}),),
+                    ),
+                    Message(
+                        role="tool",
+                        content='{"status":"completed","summary":"done"}',
+                        name="subagent_execution",
+                        tool_call_id="call-1",
+                    ),
+                ),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert "cohere.chat_completion.start" in caplog.text
+    assert "role_sequence=system > user > assistant:tool_calls=1 > tool:call-1" in caplog.text
+    assert "tool_results=1" in caplog.text
+    assert "last_tool_content_json_object=True" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cohere_stream_accumulates_tool_call_deltas(monkeypatch):
+    lines = [
+        'data: {"type":"content-delta","delta":{"message":{"content":{"text":"checking "}}}}\n',
+        (
+            'data: {"type":"tool-call-start","index":0,"delta":{"message":{"tool_calls":'
+            '{"id":"call-1","type":"function","function":{"name":"read_file"}}}}}\n'
+        ),
+        (
+            'data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":'
+            '{"function":{"arguments":"{\\"path\\":"}}}}}\n'
+        ),
+        (
+            'data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":'
+            '{"function":{"arguments":"\\"README.md\\"}"}}}}}\n'
+        ),
+        (
+            'data: {"type":"message-end","delta":{"finish_reason":"TOOL_CALL",'
+            '"usage":{"tokens":{"input_tokens":5,"output_tokens":1}}}}\n'
+        ),
+    ]
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return _FakeStreamingHTTPResponse(lines)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = CohereModelClient(api_key="secret")
+
+    events = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="command-demo",
+                system_prompt="system",
+                messages=(Message(role="user", content="read README"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert [event.type for event in events] == [
+        StreamEventType.TEXT_DELTA,
+        StreamEventType.TOOL_CALL_COMPLETE,
+        StreamEventType.MESSAGE_COMPLETE,
+    ]
+    assert events[0].text_delta is not None
+    assert events[0].text_delta.content == "checking "
+    assert events[1].tool_call == ToolCall("call-1", "read_file", {"path": "README.md"})
+    assert events[2].finish_reason == "TOOL_CALL"
+    assert events[2].usage is not None
+    assert events[2].usage.provider == "cohere"
 
 
 class _FakeAnthropicStreamContext:
@@ -525,6 +1300,126 @@ def test_gemini_adapter_converts_tools_and_messages():
     assert contents[1]["role"] == "model"
     assert contents[1]["parts"][0]["function_call"]["name"] == "grep"
     assert contents[2]["parts"][0]["function_response"]["response"] == {"result": "match"}
+
+
+def test_gemini_adapter_strips_additional_properties_from_tool_schemas():
+    tool_schema = {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write a file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "metadata": {
+                        "type": "object",
+                        "properties": {"author": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additional_properties": False,
+                            "properties": {"name": {"type": "string"}},
+                        },
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    tools = GeminiAdapter.tools((tool_schema,))
+    parameters = tools[0]["function_declarations"][0]["parameters"]
+
+    assert "additionalProperties" not in json.dumps(parameters)
+    assert "additional_properties" not in json.dumps(parameters)
+    assert "additionalProperties" in json.dumps(tool_schema)
+
+
+def test_gemini_adapter_builds_current_google_genai_types():
+    from google.genai import types
+
+    tool_schema = {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search text",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    tools = GeminiAdapter.typed_tools(types, (tool_schema,))
+    contents = GeminiAdapter.typed_contents(
+        types,
+        (
+            Message(role="user", content="search"),
+            Message(role="assistant", content="", tool_calls=(ToolCall("call-1", "grep", {"pattern": "x"}),)),
+            Message(role="tool", content="match", name="grep", tool_call_id="call-1"),
+        ),
+    )
+
+    tool_payload = tools[0].model_dump(by_alias=True, exclude_none=True)
+    function_declaration = tool_payload["functionDeclarations"][0]
+    assert function_declaration["name"] == "grep"
+    assert "parametersJsonSchema" in function_declaration
+    assert "parameters" not in function_declaration
+    assert "additionalProperties" not in json.dumps(function_declaration)
+
+    content_payloads = [
+        content.model_dump(by_alias=True, exclude_none=True)
+        for content in contents
+    ]
+    assert [content["role"] for content in content_payloads] == ["user", "model", "user"]
+    assert content_payloads[1]["parts"][0]["functionCall"]["name"] == "grep"
+    assert content_payloads[2]["parts"][0]["functionResponse"]["response"] == {"result": "match"}
+
+
+def test_gemini_client_uses_sdk_default_api_version_and_typed_config():
+    from google.genai import types
+
+    client = GeminiModelClient(api_key="secret")
+    request = RuntimeRequest(
+        model_name="gemini-2.5-flash",
+        system_prompt="system",
+        messages=(Message(role="user", content="search"),),
+        max_output_tokens=128,
+        tool_schemas=(
+            {
+                "type": "function",
+                "function": {
+                    "name": "grep",
+                    "description": "Search text",
+                    "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}},
+                },
+            },
+        ),
+    )
+
+    config = client._config(types, request).model_dump(by_alias=True, exclude_none=True)
+
+    assert client._http_options(types) is None
+    assert config["systemInstruction"] == "system"
+    assert config["maxOutputTokens"] == 128
+    assert "functionDeclarations" in config["tools"][0]
+
+
+def test_gemini_client_allows_explicit_api_version_override():
+    from google.genai import types
+
+    client = GeminiModelClient(api_key="secret", api_version="v1")
+
+    assert client._http_options(types).model_dump(by_alias=True, exclude_none=True) == {
+        "apiVersion": "v1"
+    }
 
 
 def test_gemini_response_events_allow_mixed_text_tool_calls_without_usage():

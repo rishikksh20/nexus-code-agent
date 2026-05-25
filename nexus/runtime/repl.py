@@ -98,7 +98,20 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
             continue
         except Exception as exc:  # noqa: BLE001
             from nexus.app import provider_error_message
+            from nexus.observability import capture_exception_from_hooks
 
+            capture_exception_from_hooks(
+                state.hooks,
+                exc,
+                context={
+                    "session_id": state.session.session_id,
+                    "turn_id": state.current_turn_id,
+                    "trace_id": state.current_trace_id,
+                    "provider": state.config.provider,
+                    "model": state.config.model_name,
+                    "interactive": True,
+                },
+            )
             ui.print_error(provider_error_message(exc, state.config))
             state.history.pop()
             continue
@@ -158,6 +171,14 @@ def _print_provider_notice_or_warning(state: ReplState) -> None:
             or environ.get("ANTHROPIC_API_KEY")
             or environ.get("GEMINI_API_KEY")
             or environ.get("GOOGLE_API_KEY")
+            or environ.get("API_KEY")
+        )
+    elif cfg.provider == "cohere":
+        has_key = bool(
+            cfg.api_key
+            or environ.get("COHERE_API_KEY")
+            or environ.get("CO_API_KEY")
+            or environ.get("NEXUS_API_KEY")
             or environ.get("API_KEY")
         )
     else:

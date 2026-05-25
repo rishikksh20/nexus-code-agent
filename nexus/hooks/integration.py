@@ -52,11 +52,15 @@ def setup_hooks(config: "AgentConfig") -> HookExecutor:
         JsonlAuditTrail,
         JsonlRuntimeLogger,
         RuntimeMetricsCollector,
+        SentryHookService,
         register_audit_hooks,
         register_default_runtime_hooks,
+        setup_sentry_monitor,
     )
 
     hooks = HookExecutor()
+    monitor = setup_sentry_monitor(config)
+    hooks.sentry_monitor = monitor
 
     # Audit trail — always active.
     register_audit_hooks(
@@ -73,5 +77,8 @@ def setup_hooks(config: "AgentConfig") -> HookExecutor:
                 config.log_dir / "metrics.json"
             ),
         )
+
+    if monitor.enabled():
+        SentryHookService(monitor, monitor.settings).register(hooks)
 
     return hooks

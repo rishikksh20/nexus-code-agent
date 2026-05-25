@@ -106,6 +106,7 @@ def build_doctor_report(config, registry, resources) -> DoctorReport:
                 _directory_writable_check("session_dir", config.session_dir),
                 _directory_writable_check("memory_dir", config.memory_dir),
                 _directory_writable_check("log_dir", config.log_dir),
+                *_sentry_checks(config),
             ],
         ),
         DoctorGate(
@@ -211,3 +212,41 @@ def _mcp_check(config, resources) -> DoctorCheck:
         status="pass",
         detail="Connected MCP servers: " + ", ".join(sorted(registered)),
     )
+
+
+def _sentry_checks(config) -> list[DoctorCheck]:
+    if not getattr(config, "sentry_enabled", False):
+        return [
+            DoctorCheck(
+                name="sentry",
+                status="pass",
+                detail="Sentry remote monitoring is disabled.",
+            )
+        ]
+    checks = [
+        _warn_if(
+            "sentry_dsn",
+            not bool(str(getattr(config, "sentry_dsn", "")).strip()),
+            "sentry_enabled is true but sentry_dsn is empty.",
+            pass_detail=f"Sentry enabled for environment {config.sentry_environment}.",
+        ),
+        _warn_if(
+            "sentry_pii",
+            bool(getattr(config, "sentry_send_default_pii", False)),
+            "sentry_send_default_pii is true; keep this false for production agent turns unless explicitly required.",
+            pass_detail="Sentry default PII collection is disabled.",
+        ),
+    ]
+    prompt_or_output_capture = bool(
+        getattr(config, "sentry_include_prompts", False)
+        or getattr(config, "sentry_include_tool_outputs", False)
+    )
+    checks.append(
+        _warn_if(
+            "sentry_payload_capture",
+            prompt_or_output_capture,
+            "Sentry prompt/tool-output capture is enabled; metadata-only monitoring is safer by default.",
+            pass_detail="Sentry prompt and tool-output capture are disabled.",
+        )
+    )
+    return checks

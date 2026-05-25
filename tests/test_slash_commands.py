@@ -1122,6 +1122,7 @@ async def test_provider_list_slash_command_shows_all_providers(tmp_path):
     assert handled is True
     output = console.export_text()
     assert "fake" in output
+    assert "cohere" in output
     assert "openai" in output
     assert "openai-compatible" in output
     assert "mistral" in output

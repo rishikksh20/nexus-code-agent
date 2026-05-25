@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import time
 
 from collections.abc import AsyncGenerator
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -21,12 +23,16 @@ from nexus.models import (
     ToolResult,
     UsageSnapshot,
 )
+from nexus.observability import capture_exception_from_hooks, sentry_monitor_from_hooks
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
 from nexus.security.manager import ApprovalManager
 from nexus.tools.base import FileDiff, ToolConfirmation, ToolRegistry, tool_to_schema
+
+
+logger = logging.getLogger(__name__)
 
 
 TOOL_CALL_LIMIT_FINISH_REASON = "tool_call_limit"
@@ -279,7 +285,48 @@ class Agent:
         )
 
         started_at = time.perf_counter()
-        result = await tool.execute(tool_call.call_id, tool_call.arguments, context)
+        monitor = sentry_monitor_from_hooks(self.hooks)
+        span = (
+            monitor.start_span(
+                op="nexus.tool",
+                name=tool.name,
+                attributes={
+                    "nexus.tool.name": tool.name,
+                    "nexus.tool.source": record.source,
+                    "nexus.tool.origin": record.origin,
+                    "nexus.tool.kind": getattr(getattr(tool, "kind", None), "value", getattr(tool, "kind", "")),
+                    "nexus.tool.is_mutating": tool.is_mutating,
+                    "nexus.tool.call_id": tool_call.call_id,
+                    **_correlation_payload(context, tool_call_id=tool_call.call_id),
+                },
+            )
+            if monitor is not None
+            else None
+        )
+        try:
+            with (span if span is not None else nullcontext()):
+                result = await tool.execute(tool_call.call_id, tool_call.arguments, context)
+        except Exception as exc:
+            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            failed_payload = {
+                "tool_name": tool.name,
+                "tool_source": record.source,
+                "tool_origin": record.origin,
+                "arguments": tool_call.arguments,
+                "call_id": tool_call.call_id,
+                "session_id": context.session_id,
+                "is_mutating": tool.is_mutating,
+                "is_error": True,
+                "duration_ms": duration_ms,
+                "output": str(exc) or exc.__class__.__name__,
+                "exception_type": exc.__class__.__name__,
+                **_correlation_payload(context, tool_call_id=tool_call.call_id),
+            }
+            await self.hooks.emit(HookEvent.POST_TOOL_USE, failed_payload)
+            capture_exception_from_hooks(self.hooks, exc, context=failed_payload)
+            setattr(exc, "_nexus_sentry_captured", True)
+            setattr(exc, "_nexus_error_area", "tool")
+            raise
         if actor:
             result.metadata = {**result.metadata, "actor": actor}
         if tool.is_mutating:
@@ -346,6 +393,17 @@ class Agent:
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
             )
+            logger.debug(
+                "agent.model_batch.start session_id=%s actor=%s turn_index=%s max_turns=%s model=%s messages=%s last_role=%s tool_schemas=%s",
+                context.session_id,
+                _tool_actor(context) or "supervisor",
+                turn_index + 1,
+                max_turns,
+                model_name,
+                len(request.messages),
+                request.messages[-1].role if request.messages else "",
+                len(request.tool_schemas),
+            )
 
             # ----------------------------------------------------------------
             # Stream from the model client
@@ -353,25 +411,86 @@ class Agent:
             response_text = ""
             stream_tool_calls: list[ToolCall] = []
             usage: UsageSnapshot | None = None
+            stream_finish_reason: str | None = None
 
             stream = cast(AsyncGenerator[StreamEvent, None], self.model_client.chat_completion(request, stream=True))
-            async for stream_event in stream:
-                if stream_event.type == StreamEventType.TEXT_DELTA:
-                    if stream_event.text_delta and stream_event.text_delta.content:
-                        chunk = stream_event.text_delta.content
-                        response_text += chunk
-                        yield AgentEvent.text_delta(chunk)
+            monitor = sentry_monitor_from_hooks(self.hooks)
+            span = (
+                monitor.start_span(
+                    op="gen_ai.chat",
+                    name=model_name,
+                    attributes={
+                        "gen_ai.request.model": model_name,
+                        "gen_ai.system": _provider_name_from_context(context),
+                        "gen_ai.request.max_tokens": max_output_tokens,
+                        "gen_ai.request.temperature": temperature,
+                        "nexus.session_id": context.session_id,
+                        **_correlation_payload(context),
+                    },
+                )
+                if monitor is not None
+                else None
+            )
+            with (span if span is not None else nullcontext()):
+                async for stream_event in stream:
+                    if stream_event.type == StreamEventType.TEXT_DELTA:
+                        if stream_event.text_delta and stream_event.text_delta.content:
+                            chunk = stream_event.text_delta.content
+                            response_text += chunk
+                            yield AgentEvent.text_delta(chunk)
 
-                elif stream_event.type == StreamEventType.TOOL_CALL_COMPLETE:
-                    if stream_event.tool_call:
-                        stream_tool_calls.append(stream_event.tool_call)
+                    elif stream_event.type == StreamEventType.TOOL_CALL_COMPLETE:
+                        if stream_event.tool_call:
+                            stream_tool_calls.append(stream_event.tool_call)
 
-                elif stream_event.type == StreamEventType.MESSAGE_COMPLETE:
-                    usage = stream_event.usage
+                    elif stream_event.type == StreamEventType.MESSAGE_COMPLETE:
+                        usage = stream_event.usage
+                        stream_finish_reason = stream_event.finish_reason or stream_finish_reason
+                        if monitor is not None and usage is not None:
+                            monitor.update_current_span(
+                                attributes={
+                                    "gen_ai.usage.input_tokens": usage.prompt_tokens,
+                                    "gen_ai.usage.output_tokens": usage.completion_tokens,
+                                    "gen_ai.usage.total_tokens": usage.total_tokens,
+                                }
+                            )
 
-                elif stream_event.type == StreamEventType.ERROR:
-                    yield AgentEvent.agent_error(stream_event.error)
-                    return
+                    elif stream_event.type == StreamEventType.ERROR:
+                        logger.warning(
+                            "agent.model_batch.error session_id=%s actor=%s turn_index=%s error=%s",
+                            context.session_id,
+                            _tool_actor(context) or "supervisor",
+                            turn_index + 1,
+                            stream_event.error,
+                        )
+                        await self.hooks.emit(
+                            HookEvent.NOTIFICATION,
+                            {
+                                "event": "model_error",
+                                "session_id": context.session_id,
+                                **_correlation_payload(context),
+                                "provider": _provider_name_from_context(context),
+                                "model": model_name,
+                                "turn_index": turn_index + 1,
+                                "actor": _tool_actor(context) or "supervisor",
+                                "error": stream_event.error,
+                            },
+                        )
+                        yield AgentEvent.agent_error(stream_event.error)
+                        return
+
+            if not response_text and not stream_tool_calls:
+                logger.warning(
+                    "agent.model_batch.empty_response session_id=%s actor=%s turn_index=%s finish_reason=%s messages=%s last_role=%s",
+                    context.session_id,
+                    _tool_actor(context) or "supervisor",
+                    turn_index + 1,
+                    stream_finish_reason,
+                    len(request.messages),
+                    request.messages[-1].role if request.messages else "",
+                )
+                yield AgentEvent.agent_error(_empty_provider_response_message(stream_finish_reason))
+                return
 
             if response_text:
                 yield AgentEvent.text_complete(response_text)
@@ -387,12 +506,22 @@ class Agent:
             should_record_message = bool(message.content or message.tool_calls)
             if should_record_message:
                 history.append(message)
+            logger.debug(
+                "agent.model_batch.end session_id=%s actor=%s turn_index=%s response_chars=%s tool_calls=%s finish_reason=%s recorded=%s",
+                context.session_id,
+                _tool_actor(context) or "supervisor",
+                turn_index + 1,
+                len(response_text),
+                len(tool_calls),
+                "tool_calls" if tool_calls else (stream_finish_reason or "stop"),
+                should_record_message,
+            )
 
             runtime_response = RuntimeResponse(
                 message=message,
                 tool_calls=tool_calls,
                 usage=usage,
-                finish_reason="tool_calls" if tool_calls else "stop",
+                finish_reason="tool_calls" if tool_calls else (stream_finish_reason or "stop"),
             )
 
             if usage is not None:
@@ -717,15 +846,39 @@ class Agent:
                         result = event.payload
                     yield event
                 if result is None:
+                    logger.warning(
+                        "agent.tool_result.missing session_id=%s actor=%s tool_name=%s call_id=%s",
+                        context.session_id,
+                        _tool_actor(context) or "supervisor",
+                        tool_call.tool_name,
+                        tool_call.call_id,
+                    )
                     continue
                 tool_calls_executed += 1
                 tool_result_messages.append(_tool_result_message(result))
+                logger.debug(
+                    "agent.tool_result.recorded session_id=%s actor=%s tool_name=%s call_id=%s is_error=%s output_chars=%s",
+                    context.session_id,
+                    _tool_actor(context) or "supervisor",
+                    result.tool_name,
+                    result.call_id,
+                    result.is_error,
+                    len(result.output),
+                )
                 loop_detector.record_action("tool_call", tool_name=tool_call.tool_name)
 
             # Add all tool results to history after the complete batch, then prune
             # and check for loops — matching the reference-code execution model.
             for msg in tool_result_messages:
                 history.append(msg)
+            if tool_result_messages:
+                logger.debug(
+                    "agent.tool_results.appended session_id=%s actor=%s count=%s next_turn_index=%s",
+                    context.session_id,
+                    _tool_actor(context) or "supervisor",
+                    len(tool_result_messages),
+                    turn_index + 2,
+                )
             prune_tool_outputs(history, protect_tokens=2000, minimum_tokens=500)
             loop_error = loop_detector.check_for_loop()
             if loop_error:
@@ -766,6 +919,16 @@ def _tool_name_text(tool_name: Any) -> str:
     if isinstance(tool_name, str):
         return tool_name or "(empty)"
     return repr(tool_name)
+
+
+def _empty_provider_response_message(finish_reason: str | None) -> str:
+    reason = str(finish_reason or "").strip()
+    if reason:
+        return (
+            "Provider returned an empty assistant response with no tool calls "
+            f"(finish_reason={reason})."
+        )
+    return "Provider returned an empty assistant response with no tool calls."
 
 
 def _unknown_tool_result(
@@ -925,6 +1088,12 @@ def _tool_call_limit_pause_message(max_tool_calls_per_turn: int) -> str:
 def _risk_level_name(value: Any) -> str:
     raw_value = getattr(value, "value", value)
     return str(raw_value).strip().lower().split(".")[-1]
+
+
+def _provider_name_from_context(context: ToolExecutionContext) -> str:
+    config = context.metadata.get("config")
+    provider = getattr(config, "provider", "")
+    return str(provider or "").strip()
 
 
 def _correlation_payload(context: ToolExecutionContext, *, tool_call_id: str | None = None) -> dict[str, Any]:

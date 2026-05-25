@@ -46,6 +46,12 @@ MODEL_CONTEXT_LIMITS: dict[str, int] = {
     "o1-mini": 128_000,
     "o3": 200_000,
     "o3-mini": 200_000,
+    # --- Gemini ---
+    "gemini-2.5-flash": 1_048_576,
+    "gemini-2.5-flash-lite": 1_048_576,
+    "gemini-2.5-pro": 1_048_576,
+    "gemini-2.0-flash": 1_048_576,
+    "gemini-2.0-flash-lite": 1_048_576,
     # --- Fake / development ---
     "fake-model": 8_192,
 }

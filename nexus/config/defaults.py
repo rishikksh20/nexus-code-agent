@@ -41,6 +41,25 @@ class AgentConfig:
     log_level: str = "WARNING"
     log_format: str = "text"
     log_dir: Path = field(default_factory=Path)
+    sentry_enabled: bool = False
+    sentry_dsn: str = ""
+    sentry_environment: str = "development"
+    sentry_release: str = ""
+    sentry_sample_rate: float = 1.0
+    sentry_traces_sample_rate: float = 0.1
+    sentry_profiles_sample_rate: float = 0.0
+    sentry_profile_session_sample_rate: float = 0.0
+    sentry_enable_logs: bool = True
+    sentry_send_default_pii: bool = False
+    sentry_include_prompts: bool = False
+    sentry_include_tool_outputs: bool = False
+    sentry_capture_tool_errors: bool = False
+    sentry_capture_provider_errors: bool = True
+    sentry_capture_mcp_errors: bool = True
+    sentry_max_breadcrumbs: int = 100
+    sentry_max_value_length: int = 4096
+    sentry_flush_timeout_seconds: float = 2.0
+    sentry_debug: bool = False
     project_name: str = ""
     project_description: str = ""
     allowed_tools: list[str] = field(default_factory=list)

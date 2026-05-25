@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from nexus.integrations.fake_model import FakeModelClient
@@ -20,6 +22,44 @@ class RecordingModelClient(FakeModelClient):
     async def chat_completion(self, request, *, stream: bool = True):
         self.requests.append(request)
         yield StreamEvent(type=StreamEventType.MESSAGE_COMPLETE)
+
+
+@pytest.mark.asyncio
+async def test_agent_surfaces_empty_provider_response_as_error(tool_context):
+    model = RecordingModelClient()
+    registry = ToolRegistry()
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="hello")],
+            tool_context,
+        )
+    ]
+
+    errors = [event for event in events if event.kind == "AGENT_ERROR"]
+    assert errors
+    assert "empty assistant response" in str(errors[0].payload["error"])
+
+
+@pytest.mark.asyncio
+async def test_agent_logs_empty_provider_response_diagnostics(tool_context, caplog):
+    model = RecordingModelClient()
+    registry = ToolRegistry()
+    agent = Agent(model_client=model, tool_registry=registry)
+    caplog.set_level(logging.WARNING, logger="nexus.runtime.agent")
+
+    _ = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="hello")],
+            tool_context,
+        )
+    ]
+
+    assert "agent.model_batch.empty_response" in caplog.text
+    assert "last_role=user" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -509,4 +549,5 @@ async def test_agent_does_not_emit_empty_assistant_message(tool_context):
     ]
 
     assert not any(event.kind == "model_response" for event in events)
-    assert any(event.kind == "turn_completed" for event in events)
+    assert not any(event.kind == "turn_completed" for event in events)
+    assert any(event.kind == "AGENT_ERROR" for event in events)

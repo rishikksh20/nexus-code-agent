@@ -6,10 +6,11 @@ import json
 import pytest
 from rich.console import Console
 
-from nexus.app import main
+from nexus.app import main, provider_error_message
 from nexus.cli.args import args_to_config_overrides
 from nexus.cli.headless import EXIT_NEEDS_CONFIRM, EXIT_OK, run_headless
 from nexus.config import load_config
+from nexus.config.defaults import AgentConfig
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.memory.store import MemoryStore
 from nexus.models import Message, RuntimeResponse, ToolCall, UsageSnapshot
@@ -61,6 +62,19 @@ def test_cli_rejects_stream_and_no_stream_together():
     exit_code = main(["--stream", "--no-stream", "--prompt", "hello"])
 
     assert exit_code == 2
+
+
+def test_gemini_project_denied_error_message_is_actionable():
+    config = AgentConfig(provider="gemini", model_name="gemini-2.5-flash", api_key="test-key")
+
+    message = provider_error_message(
+        RuntimeError("403 PERMISSION_DENIED. Your project has been denied access."),
+        config,
+    )
+
+    assert "Gemini denied access" in message
+    assert "GEMINI_API_KEY" in message
+    assert "API_KEY" in message
 
 
 @pytest.mark.asyncio

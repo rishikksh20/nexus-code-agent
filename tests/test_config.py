@@ -5,6 +5,7 @@ import os
 from nexus.cli.init import init_workspace
 from nexus.config import load_config
 from nexus.config.loader import ConfigError
+from nexus.config.model_limits import get_model_context_limit
 from nexus.config.upgrade import upgrade_config_file
 
 
@@ -523,6 +524,38 @@ def test_config_accepts_mistral_provider_with_default_base_url(tmp_path):
     assert config.api_base_url == "https://api.mistral.ai/v1"
 
 
+def test_config_accepts_cohere_provider_with_default_base_url(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+
+    config = load_config(
+        workspace,
+        global_root=global_root,
+        cli_overrides={"provider": "cohere", "api_base_url": ""},
+    )
+
+    assert config.provider == "cohere"
+    assert config.api_base_url == "https://api.cohere.com"
+
+
+def test_config_cohere_overrides_builtin_mistral_base_url(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+
+    config = load_config(
+        workspace,
+        global_root=global_root,
+        cli_overrides={"provider": "cohere"},
+    )
+
+    assert config.provider == "cohere"
+    assert config.api_base_url == "https://api.cohere.com"
+
+
 def test_config_accepts_native_sdk_providers_without_base_url(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -542,6 +575,11 @@ def test_config_accepts_native_sdk_providers_without_base_url(tmp_path):
 
     assert anthropic.api_base_url == ""
     assert gemini.api_base_url == ""
+
+
+def test_gemini_model_context_limits_are_current():
+    assert get_model_context_limit("gemini-2.5-flash") == 1_048_576
+    assert get_model_context_limit("gemini-2.5-pro") == 1_048_576
 
 
 def test_config_uses_mistral_base_url_env_override(tmp_path, monkeypatch):
