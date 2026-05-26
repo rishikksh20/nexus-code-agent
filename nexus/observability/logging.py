@@ -12,6 +12,7 @@ from nexus.observability.metrics import RuntimeMetricsCollector
 
 
 logger = logging.getLogger(__name__)
+TEXT_RUNTIME_LOG_FILENAME = "console.log.txt"
 
 SENSITIVE_KEYS = {"api_key", "authorization", "token", "cookie", "password"}
 _SECRET_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -38,6 +39,26 @@ class JsonlRuntimeLogger:
                 handle.write(json.dumps(record, default=str) + "\n")
         except (OSError, TypeError, ValueError) as exc:
             logger.warning("Failed to write runtime log event %s: %s", event, exc)
+
+
+def configure_root_text_logging(*, level: int, log_dir: Path) -> Path:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / TEXT_RUNTIME_LOG_FILENAME
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logging.basicConfig(
+        level=level,
+        handlers=[stream_handler, file_handler],
+        force=True,
+    )
+    logging.captureWarnings(True)
+    return log_path
 
 
 def register_default_runtime_hooks(

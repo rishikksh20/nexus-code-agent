@@ -555,6 +555,45 @@ async def test_agent_stops_with_continue_message_when_tool_call_limit_is_reached
 
 
 @pytest.mark.asyncio
+async def test_agent_stops_with_continue_message_when_max_turns_is_reached(tool_context):
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Checking time."),
+                tool_calls=(
+                    ToolCall(call_id="time-1", tool_name="get_time", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="check the time")],
+            tool_context,
+            max_turns=1,
+        )
+    ]
+
+    text_complete = next(
+        event
+        for event in reversed(events)
+        if event.kind == "TEXT_COMPLETE" and "max_loop_iterations" in str(event.payload)
+    )
+    turn_completed = next(event for event in events if event.kind == "turn_completed")
+    tool_results = [event for event in events if event.kind == "tool_result"]
+
+    assert len(tool_results) == 1
+    assert "Write `continue`" in text_complete.payload
+    assert turn_completed.payload == "max_turns"
+
+
+@pytest.mark.asyncio
 async def test_agent_requests_clarification_for_missing_required_tool_argument(tool_context):
     model = FakeModelClient(
         scripted=[

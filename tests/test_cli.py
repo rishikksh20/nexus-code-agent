@@ -4,10 +4,12 @@ import builtins
 import json
 
 import pytest
+from click.testing import CliRunner
 from rich.console import Console
 
 from nexus.app import main, provider_error_message
 from nexus.cli.args import args_to_config_overrides
+from nexus.cli.args import cli
 from nexus.cli.headless import EXIT_NEEDS_CONFIRM, EXIT_OK, run_headless
 from nexus.config import load_config
 from nexus.config.defaults import AgentConfig
@@ -62,6 +64,13 @@ def test_cli_rejects_stream_and_no_stream_together():
     exit_code = main(["--stream", "--no-stream", "--prompt", "hello"])
 
     assert exit_code == 2
+
+
+def test_cli_accepts_debug_alias_for_verbose_flag():
+    result = CliRunner().invoke(cli, ["--debug", "--stream", "--no-stream", "--prompt", "hello"])
+
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
 
 
 def test_gemini_project_denied_error_message_is_actionable():

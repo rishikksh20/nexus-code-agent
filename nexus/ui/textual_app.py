@@ -875,7 +875,7 @@ class NexusTextualApp(App[None]):
         if self.session_resumed:
             self.ui.print_session_resumed(self.state.session.session_id, len(self.state.history))
         if self.state.has_paused_turn():
-            self.ui.print_muted("A previous task was paused after hitting the tool-call limit. Type `continue` to resume it, or enter a new prompt to start something else.")
+            self.ui.print_muted("A previous task was paused after hitting a turn limit. Type `continue` to resume it, or enter a new prompt to start something else.")
         self.ui.print_help_hint()
         self._print_provider_notice_or_warning()
 

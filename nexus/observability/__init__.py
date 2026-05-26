@@ -9,7 +9,12 @@ from nexus.observability.langfuse import (
 	langfuse_settings_from_config,
 	setup_langfuse_monitor,
 )
-from nexus.observability.logging import JsonlRuntimeLogger, redact_payload, register_default_runtime_hooks
+from nexus.observability.logging import (
+	JsonlRuntimeLogger,
+	configure_root_text_logging,
+	redact_payload,
+	register_default_runtime_hooks,
+)
 from nexus.observability.metrics import RuntimeMetricsCollector
 from nexus.observability.sentry import (
 	SentryHookService,
@@ -34,6 +39,7 @@ __all__ = [
 	"JsonlAuditTrail",
 	"JsonlRuntimeLogger",
 	"JsonlSpanExporter",
+	"configure_root_text_logging",
 	"LangfuseHookService",
 	"LangfuseMonitor",
 	"LangfuseSettings",

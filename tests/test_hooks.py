@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 from rich.console import Console
@@ -9,7 +10,7 @@ from nexus.cli.headless import run_headless
 from nexus.config import load_config
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import ConfirmationKind, Message, RuntimeResponse, ToolCall, UsageSnapshot
-from nexus.observability import JsonlAuditTrail, JsonlRuntimeLogger, RuntimeMetricsCollector, redact_payload, register_audit_hooks, register_default_runtime_hooks
+from nexus.observability import JsonlAuditTrail, JsonlRuntimeLogger, RuntimeMetricsCollector, configure_root_text_logging, redact_payload, register_audit_hooks, register_default_runtime_hooks
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookEvent, HookExecutor
@@ -76,7 +77,7 @@ async def test_agent_emits_tool_hooks(tool_context):
     assert payloads["post"][0]["tool_name"] == "get_time"
     assert payloads["pre"][0]["tool_call_id"] == "call-1"
     assert payloads["post"][0]["duration_ms"] >= 0
-    assert payloads["notify"][0]["event"] == "model_usage"
+    assert any(payload["event"] == "model_usage" for payload in payloads["notify"])
 
 
 @pytest.mark.asyncio
@@ -138,19 +139,26 @@ async def test_headless_logging_records_prompt_tool_and_stop(tmp_path):
     )
 
     records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    event_names = [record["event"] for record in records]
+    notifications = [record for record in records if record["event"] == "notification"]
 
     assert result.response == "Done."
-    assert [record["event"] for record in records] == [
-        "user_prompt_submit",
-        "notification",
-        "pre_tool_use",
-        "post_tool_use",
-        "notification",
-        "stop",
+    assert event_names[0] == "user_prompt_submit"
+    assert "turn_start" in event_names
+    assert "pre_tool_use" in event_names
+    assert "post_tool_use" in event_names
+    assert "turn_end" in event_names
+    assert event_names[-1] == "stop"
+    assert [record["payload"]["event"] for record in notifications] == [
+        "model_start",
+        "model_end",
+        "model_usage",
+        "model_start",
+        "model_end",
+        "model_usage",
     ]
-    assert records[1]["payload"]["event"] == "model_usage"
-    assert records[1]["payload"]["total_tokens"] == 17
-    assert records[4]["payload"]["total_tokens"] == 10
+    assert notifications[2]["payload"]["total_tokens"] == 17
+    assert notifications[5]["payload"]["total_tokens"] == 10
 
 
 @pytest.mark.asyncio
@@ -214,6 +222,26 @@ async def test_jsonl_logger_ignores_file_write_failures(tmp_path, monkeypatch):
     monkeypatch.setattr(type(logger.path), "open", _fail_open)
 
     await logger.log("notification", {"event": "model_usage"})
+
+
+def test_configure_root_text_logging_writes_warning_and_error_to_text_file(tmp_path):
+    log_path = configure_root_text_logging(level=logging.WARNING, log_dir=tmp_path / "logs")
+    test_logger = logging.getLogger("nexus.test.textlog")
+    try:
+        test_logger.warning("warning message for text log")
+        test_logger.error("error message for text log")
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+    finally:
+        for handler in list(logging.getLogger().handlers):
+            handler.close()
+            logging.getLogger().removeHandler(handler)
+
+    contents = log_path.read_text(encoding="utf-8")
+
+    assert "warning message for text log" in contents
+    assert "error message for text log" in contents
+    assert "nexus.test.textlog" in contents
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 TOOL_CALL_LIMIT_FINISH_REASON = "tool_call_limit"
+MAX_TURNS_FINISH_REASON = "max_turns"
 INVALID_TOOL_CALL_RETRY_LIMIT = 2
 
 
@@ -1037,7 +1038,16 @@ class Agent:
                     content=f"[Loop detected] {loop_error} Try a different approach.",
                 ))
 
-        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="max_turns")
+        pause_message = _max_turns_pause_message(max_turns)
+        yield AgentEvent.text_complete(pause_message)
+        yield AgentEvent(
+            kind=AgentEventType.MODEL_RESPONSE,
+            payload=RuntimeResponse(
+                message=Message(role="assistant", content=pause_message),
+                finish_reason=MAX_TURNS_FINISH_REASON,
+            ),
+        )
+        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload=MAX_TURNS_FINISH_REASON)
 
     async def _run_tool_call(
         self,
@@ -1766,7 +1776,7 @@ def _missing_required_argument_result(
             alias_hints.append("You supplied 'new_text'; use 'new_string' for the replacement text.")
         if any(field in missing_fields for field in {"old_string", "new_string"}):
             alias_hints.append(
-                "The edit tool requires 'path', 'old_string', and 'new_string'. Use write_file for full-file rewrites."
+                "The edit tool requires 'path', 'old_string', and 'new_string'. old_string must be the current snippet from disk, preferably with a few surrounding lines so the match is unique. Use write_file only for new files or true full-file rewrites."
             )
     alias_hint = f" {' '.join(alias_hints)}" if alias_hints else ""
     if retry_count > retry_limit:
@@ -1823,6 +1833,14 @@ def _tool_call_limit_pause_message(max_tool_calls_per_turn: int) -> str:
     return (
         "Tool call limit reached for this turn "
         f"({max_tool_calls_per_turn}). Write `continue` to resume the previous task."
+    )
+
+
+def _max_turns_pause_message(max_turns: int) -> str:
+    return (
+        "Single-query turn limit reached "
+        f"({max_turns}). Write `continue` to resume the previous task, "
+        "or increase `max_loop_iterations` to allow more turns per query."
     )
 
 

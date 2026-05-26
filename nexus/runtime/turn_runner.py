@@ -20,9 +20,10 @@ from nexus.models import (
     RuntimeResponse,
     ToolCall,
     ToolExecutionContext,
+    ToolResult,
 )
 from nexus.observability import capture_exception_from_hooks, sentry_monitor_from_hooks
-from nexus.runtime.agent import Agent
+from nexus.runtime.agent import Agent, MAX_TURNS_FINISH_REASON, TOOL_CALL_LIMIT_FINISH_REASON
 from nexus.runtime.repl_state import ReplState, apply_events_to_messages
 from nexus.security.manager import ApprovalScope
 from nexus.security.policy import ApprovalPolicy
@@ -604,18 +605,21 @@ def _model_response_for_pending_tool_calls(
 
 
 def _sync_paused_turn_state(state: ReplState, events: list[AgentEvent], *, prompt_text: str) -> None:
-    if _turn_finished_with_tool_call_limit(events):
+    if _turn_finished_with_resumable_pause(events):
         state.mark_paused_turn(prompt_text)
         return
     state.clear_paused_turn()
 
 
-def _turn_finished_with_tool_call_limit(events: list[AgentEvent]) -> bool:
+def _turn_finished_with_resumable_pause(events: list[AgentEvent]) -> bool:
     turn_completed = next(
         (event for event in reversed(events) if event.kind == AgentEventType.TURN_COMPLETED),
         None,
     )
-    return bool(turn_completed and turn_completed.payload == "tool_call_limit")
+    return bool(
+        turn_completed
+        and turn_completed.payload in {TOOL_CALL_LIMIT_FINISH_REASON, MAX_TURNS_FINISH_REASON}
+    )
 
 
 async def _emit_turn_end(
@@ -656,6 +660,7 @@ def _turn_lifecycle_payload(
 ) -> dict:
     usage, tool_calls = _turn_usage_and_tool_calls(events or [])
     response = _turn_response_text(events or [])
+    turn_steps = _turn_steps(events or [])
     payload = {
         "session_id": state.session.session_id,
         "turn_id": turn_id,
@@ -668,6 +673,7 @@ def _turn_lifecycle_payload(
         "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
         "tool_calls": tool_calls,
         "response": response,
+        "turn_steps": turn_steps,
     }
     if usage is not None:
         payload["usage"] = {
@@ -702,6 +708,73 @@ def _turn_response_text(events: list[AgentEvent]) -> str:
         if payload.message.content:
             return payload.message.content
     return ""
+
+
+def _turn_steps(events: list[AgentEvent]) -> list[dict[str, object]]:
+    steps: list[dict[str, object]] = []
+    tool_inputs_by_call_id: dict[str, dict[str, object]] = {}
+    for event in events:
+        if event.kind == AgentEventType.MODEL_RESPONSE:
+            payload = cast(RuntimeResponse, event.payload)
+            serialized_tool_calls = [_serialize_tool_call(tool_call) for tool_call in payload.tool_calls]
+            for tool_call in serialized_tool_calls:
+                call_id = str(tool_call.get("call_id", "") or "")
+                if call_id:
+                    tool_inputs_by_call_id[call_id] = tool_call
+            steps.append(
+                {
+                    "kind": "model_response",
+                    "content": payload.message.content,
+                    "finish_reason": payload.finish_reason,
+                    "tool_calls": serialized_tool_calls,
+                    "usage": _serialize_usage(payload.usage),
+                }
+            )
+            continue
+        if event.kind == AgentEventType.TOOL_RESULT:
+            result = cast(ToolResult, event.payload)
+            matched_input = tool_inputs_by_call_id.get(result.call_id)
+            steps.append(
+                {
+                    "kind": "tool_execution",
+                    "call_id": result.call_id,
+                    "tool_name": result.tool_name,
+                    "is_error": result.is_error,
+                    "input": matched_input
+                    or {
+                        "call_id": result.call_id,
+                        "tool_name": result.tool_name,
+                        "arguments": {},
+                    },
+                    "output": {
+                        "content": result.output,
+                        "metadata": dict(result.metadata),
+                    },
+                    "is_subagent": result.tool_name == "delegate_task" or result.tool_name.startswith("subagent_"),
+                }
+            )
+    return steps
+
+
+def _serialize_tool_call(tool_call: ToolCall) -> dict[str, object]:
+    return {
+        "call_id": tool_call.call_id,
+        "tool_name": tool_call.tool_name,
+        "arguments": dict(tool_call.arguments),
+    }
+
+
+def _serialize_usage(usage) -> dict[str, object] | None:
+    if usage is None:
+        return None
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+        "estimated_cost_usd": usage.estimated_cost_usd,
+        "provider": usage.provider,
+        "model": usage.model,
+    }
 
 
 def _record_turn_telemetry(

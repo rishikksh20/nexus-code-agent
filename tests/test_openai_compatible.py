@@ -1147,6 +1147,70 @@ async def test_cohere_stream_logs_tool_result_payload_shape(monkeypatch, caplog)
 
 
 @pytest.mark.asyncio
+async def test_cohere_stream_logs_deltas_at_info_and_keeps_debug_for_lifecycle(monkeypatch, caplog):
+    lines = [
+        'data: {"type":"content-delta","delta":{"message":{"content":{"text":"checking "}}}}\n',
+        (
+            'data: {"type":"tool-call-start","index":0,"delta":{"message":{"tool_calls":'
+            '{"id":"call-1","type":"function","function":{"name":"read_file"}}}}}\n'
+        ),
+        (
+            'data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":'
+            '{"function":{"arguments":"{\\"path\\":\\"README.md\\"}"}}}}}\n'
+        ),
+        'data: {"type":"message-end","delta":{"finish_reason":"TOOL_CALL"}}\n',
+    ]
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return _FakeStreamingHTTPResponse(lines)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    caplog.set_level(logging.DEBUG, logger="nexus.integrations.cohere")
+
+    client = CohereModelClient(api_key="secret")
+
+    _ = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="command-demo",
+                system_prompt="system",
+                messages=(Message(role="user", content="inspect"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    records = [record for record in caplog.records if record.name == "nexus.integrations.cohere"]
+
+    assert any(
+        record.levelno == logging.INFO and "cohere.sse.text_delta type=content-delta" in record.getMessage()
+        for record in records
+    )
+    assert any(
+        record.levelno == logging.INFO and "cohere.sse.tool_call_delta" in record.getMessage()
+        for record in records
+    )
+    assert any(
+        record.levelno == logging.DEBUG and "cohere.sse.event type=tool-call-start" in record.getMessage()
+        for record in records
+    )
+    assert any(
+        record.levelno == logging.DEBUG and "cohere.sse.event type=message-end" in record.getMessage()
+        for record in records
+    )
+    assert not any(
+        record.levelno == logging.DEBUG and "cohere.sse.event type=content-delta" in record.getMessage()
+        for record in records
+    )
+    assert not any(
+        record.levelno == logging.DEBUG and "cohere.sse.tool_call_delta" in record.getMessage()
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
 async def test_cohere_stream_accumulates_tool_call_deltas(monkeypatch):
     lines = [
         'data: {"type":"content-delta","delta":{"message":{"content":{"text":"checking "}}}}\n',

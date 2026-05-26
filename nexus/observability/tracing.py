@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from nexus.hooks import HookEvent, HookExecutor
+from nexus.observability.event_descriptions import (
+    describe_model_observation,
+    describe_notification_event,
+    describe_tool_observation,
+    describe_turn_observation,
+    split_notification_payload,
+)
 from nexus.observability.logging import redact_payload
 
 
@@ -173,6 +180,8 @@ class OtelMonitor:
                     "nexus.status": payload.get("status"),
                     "nexus.prompt_name": self.settings.prompt_name,
                     "nexus.prompt_version": self.settings.prompt_version,
+                    "nexus.session_scope": "nexus.session_id",
+                    "nexus.description": describe_turn_observation(payload),
                 }
             ),
         )
@@ -228,6 +237,7 @@ class OtelMonitor:
                 "nexus.prompt_version": payload.get("prompt_version") or self.settings.prompt_version,
                 "nexus.system_prompt_hash": payload.get("system_prompt_hash"),
                 "nexus.system_prompt_chars": payload.get("system_prompt_chars"),
+                "nexus.description": describe_model_observation(payload, phase="start"),
             },
             input_payload=_generation_input(payload, self.settings),
         )
@@ -251,6 +261,7 @@ class OtelMonitor:
                 "nexus.usage.completion_tokens": usage.get("completion_tokens"),
                 "nexus.usage.total_tokens": usage.get("total_tokens"),
                 "nexus.usage.estimated_cost_usd": usage.get("estimated_cost_usd"),
+                "nexus.description": describe_model_observation(payload, phase="end"),
             },
         )
         if payload.get("error"):
@@ -273,6 +284,7 @@ class OtelMonitor:
                 **_base_context(payload),
                 **_tool_context(payload),
                 "nexus.span_type": "tool",
+                "nexus.description": describe_tool_observation(payload),
             },
             input_payload=_tool_input(payload, self.settings),
         )
@@ -292,6 +304,7 @@ class OtelMonitor:
                 "nexus.duration_ms": payload.get("duration_ms"),
                 "nexus.is_error": bool(payload.get("is_error")),
                 "nexus.exception_type": payload.get("exception_type"),
+                "nexus.description": describe_tool_observation(payload, phase="end"),
             },
         )
         if payload.get("is_error"):
@@ -303,17 +316,22 @@ class OtelMonitor:
         root = self._root_for_payload(payload)
         if root is None:
             return
+        event_name = str(payload.get("event", name) or name)
+        input_payload, output_payload = split_notification_payload(payload)
         span = self._start_child_span(
             root,
             name,
             {
                 **_base_context(payload),
                 "nexus.span_type": "event",
-                "nexus.event": payload.get("event", name),
+                "nexus.event": event_name,
+                "nexus.description": describe_notification_event(event_name, payload),
             },
-            input_payload=_notification_input(payload, self.settings),
+            input_payload=_notification_input(input_payload, self.settings),
         )
         if span is not None:
+            if output_payload is not None:
+                _add_payload_event(span, "output", _event_io_payload(output_payload, enabled=self.settings.trace_content))
             span.end()
 
     def capture_log_record(self, record: logging.LogRecord) -> None:

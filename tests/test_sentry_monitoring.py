@@ -10,7 +10,13 @@ from nexus.config import load_config
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import Message, RuntimeResponse, ToolCall, ToolExecutionContext
-from nexus.observability.sentry import SentryHookService, SentryMonitor, describe_sentry_dsn, sentry_settings_from_config
+from nexus.observability.sentry import (
+    SentryHookService,
+    SentryMonitor,
+    _SentrySDKClient,
+    describe_sentry_dsn,
+    sentry_settings_from_config,
+)
 from nexus.runtime.agent import Agent
 from nexus.tools.base import ToolKind, ToolRegistry
 
@@ -59,6 +65,62 @@ class FakeSentryClient:
         return True
 
 
+class LegacySpan:
+    def __init__(self, *, op=None, name=None) -> None:
+        self.op = op
+        self.name = name
+        self.data = {}
+        self.tags = {}
+        self.status = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def set_data(self, key, value):
+        self.data[key] = value
+
+    def set_tag(self, key, value):
+        self.tags[key] = value
+
+    def set_status(self, value):
+        self.status = value
+
+
+class LegacySentrySDK:
+    def __init__(self) -> None:
+        self.current_span = None
+        self.transaction_calls = []
+        self.span_calls = []
+        self.update_calls = []
+
+    def start_transaction(self, *, op=None, name=None):
+        self.transaction_calls.append({"op": op, "name": name})
+        span = LegacySpan(op=op, name=name)
+        self.current_span = span
+        return span
+
+    def start_span(self, *, op=None, name=None):
+        self.span_calls.append({"op": op, "name": name})
+        span = LegacySpan(op=op, name=name)
+        self.current_span = span
+        return span
+
+    def update_current_span(self, op=None, name=None):
+        self.update_calls.append({"op": op, "name": name})
+        if self.current_span is None:
+            return
+        if op is not None:
+            self.current_span.op = op
+        if name is not None:
+            self.current_span.name = name
+
+    def get_current_span(self):
+        return self.current_span
+
+
 def _raise_sentry_verification_error(verification_id: str) -> None:
     raise RuntimeError(f"Intentional Sentry verification failure: {verification_id}")
 
@@ -85,6 +147,36 @@ def _emit_live_sentry_verification(monitor: SentryMonitor, verification_id: str)
         return exception_event_id, message_event_id
 
     return None, None
+
+
+def test_sdk_client_backfills_span_updates_for_legacy_sdk():
+    sdk = LegacySentrySDK()
+    client = _SentrySDKClient(sdk)
+
+    transaction = client.start_transaction(
+        op="nexus.turn",
+        name="nexus.turn",
+        attributes={"nexus.session_id": "s1"},
+    )
+    span = client.start_span(
+        op="gen_ai.chat",
+        name="command-a",
+        attributes={"gen_ai.request.model": "command-a"},
+    )
+    client.update_current_span(
+        name="command-a-final",
+        attributes={"gen_ai.usage.total_tokens": 42},
+        status="completed",
+    )
+
+    assert sdk.transaction_calls == [{"op": "nexus.turn", "name": "nexus.turn"}]
+    assert transaction.data["nexus.session_id"] == "s1"
+    assert sdk.span_calls == [{"op": "gen_ai.chat", "name": "command-a"}]
+    assert sdk.update_calls == [{"op": None, "name": "command-a-final"}]
+    assert span.name == "command-a-final"
+    assert span.data["gen_ai.request.model"] == "command-a"
+    assert span.data["gen_ai.usage.total_tokens"] == 42
+    assert span.status == "completed"
 
 
 def test_sentry_settings_read_config_and_env_aliases(tmp_path, monkeypatch):
@@ -221,8 +313,10 @@ async def test_sentry_hook_service_records_redacted_prompt_and_tool_breadcrumbs(
     prompt_breadcrumb = client.breadcrumbs[0]
     tool_breadcrumb = client.breadcrumbs[1]
     assert prompt_breadcrumb["data"]["prompt_chars"] == len("secret prompt text")
+    assert prompt_breadcrumb["data"]["description"] == "User prompt submitted for the next Nexus turn."
     assert "prompt_preview" not in prompt_breadcrumb["data"]
     assert tool_breadcrumb["data"]["output_chars"] == len("api_key=abc123")
+    assert tool_breadcrumb["data"]["description"].startswith("Tool execution completed for bash")
     assert "output_preview" not in tool_breadcrumb["data"]
     assert client.tags["nexus.session_id"] == "s1"
 

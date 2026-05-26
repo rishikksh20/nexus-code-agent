@@ -219,9 +219,11 @@ async def test_otel_hook_service_writes_turn_model_tool_and_log_spans(tmp_path):
 
     root = next(row for row in rows if row["name"] == "nexus.turn")
     assert root["status"]["code"] == "UNSET"
+    assert root["attributes"]["nexus.description"].startswith("Nexus turn trace for session session-1")
     assert any(event["name"] == "turn.output" for event in root["events"])
     output_event = next(event for event in root["events"] if event["name"] == "turn.output")
     assert '"response": "42"' in output_event["attributes"]["nexus.payload.json"]
 
     model = next(row for row in rows if row["name"] == "nexus.model")
+    assert model["attributes"]["nexus.description"].startswith("LLM generation finished")
     assert model["attributes"]["nexus.usage.total_tokens"] == 8

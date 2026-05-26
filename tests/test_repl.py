@@ -350,6 +350,32 @@ async def test_collect_turn_events_honors_auto_confirm_read_only_flag(tmp_path):
     assert confirmation.payload.tool_name == "get_time"
 
 
+@pytest.mark.asyncio
+async def test_collect_turn_events_marks_paused_turn_when_max_turns_is_reached(tmp_path):
+    state = _build_state(tmp_path, max_loop_iterations=1)
+    state.tool_registry.register(GetTimeTool())
+    state.history.append(Message(role="user", content="what time is it?"))
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Checking time."),
+                tool_calls=(ToolCall(call_id="call-1", tool_name="get_time", arguments={}),),
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+    agent = Agent(model_client=model, tool_registry=state.tool_registry)
+
+    events = await collect_turn_events(state, agent, prompt_text="what time is it?")
+
+    assert state.has_paused_turn()
+    assert state.paused_turn_prompt == "what time is it?"
+    assert any(
+        event.kind == AgentEventType.TURN_COMPLETED and event.payload == "max_turns"
+        for event in events
+    )
+
+
 async def _read_only_tool_response(request: RuntimeRequest) -> RuntimeResponse:
     del request
     return RuntimeResponse(

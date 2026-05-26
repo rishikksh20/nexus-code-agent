@@ -50,7 +50,7 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
     if session_resumed:
         ui.print_session_resumed(state.session.session_id, len(state.history))
     if state.has_paused_turn():
-        ui.print_muted("A previous task was paused after hitting the tool-call limit. Type `continue` to resume it, or enter a new prompt to start something else.")
+        ui.print_muted("A previous task was paused after hitting a turn limit. Type `continue` to resume it, or enter a new prompt to start something else.")
     ui.print_help_hint()
     _print_provider_notice_or_warning(state)
     _maybe_prompt_config_upgrade(state)

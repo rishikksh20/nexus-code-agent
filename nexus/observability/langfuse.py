@@ -8,6 +8,13 @@ from types import TracebackType
 from typing import Any, Protocol
 
 from nexus.hooks import HookEvent, HookExecutor
+from nexus.observability.event_descriptions import (
+    describe_model_observation,
+    describe_notification_event,
+    describe_tool_observation,
+    describe_turn_observation,
+    split_notification_payload,
+)
 from nexus.observability.logging import redact_payload
 
 
@@ -107,7 +114,6 @@ class LangfuseMonitor:
         else:
             self._propagate_attributes_factory = lambda **_: _NullPropagationContext()
         self._initialized = True
-        self._install_log_handler()
 
     def enabled(self) -> bool:
         return self._initialized and self._client is not None
@@ -191,6 +197,7 @@ class LangfuseMonitor:
             "message_count": payload.get("message_count"),
             "tool_schema_count": payload.get("tool_schema_count"),
             "active_skills": payload.get("active_skills") or [],
+            "description": describe_model_observation(payload, phase="start"),
         }
         generation = self._start_child_observation(
             root,
@@ -217,6 +224,7 @@ class LangfuseMonitor:
             "finish_reason": payload.get("finish_reason"),
             "tool_call_count": payload.get("tool_call_count"),
             "status": payload.get("status", "completed"),
+            "description": describe_model_observation(payload, phase="end"),
         }
         if payload.get("error"):
             metadata["error"] = payload.get("error")
@@ -244,7 +252,11 @@ class LangfuseMonitor:
             name=f"tool.{payload.get('tool_name', 'unknown')}",
             as_type="span",
             input=_tool_input(payload, self.settings),
-            metadata={**_base_context(payload), **_tool_context(payload)},
+            metadata={
+                **_base_context(payload),
+                **_tool_context(payload),
+                "description": describe_tool_observation(payload),
+            },
         )
         if observation is not None:
             self._tool_observations[(trace_id, call_id)] = observation
@@ -261,6 +273,7 @@ class LangfuseMonitor:
             "duration_ms": payload.get("duration_ms"),
             "is_error": bool(payload.get("is_error")),
             "exception_type": payload.get("exception_type"),
+            "description": describe_tool_observation(payload, phase="end"),
         }
         self._finish_observation(
             observation,
@@ -272,15 +285,24 @@ class LangfuseMonitor:
         root = self._root_for_payload(payload)
         if root is None:
             return
+        event_name = str(payload.get("event", name) or name)
+        input_payload, output_payload = split_notification_payload(payload)
         event = self._start_child_observation(
             root,
             name=name,
             as_type="event",
-            input=_notification_input(payload, self.settings),
-            metadata={**_base_context(payload), "event": payload.get("event", name)},
+            input=_notification_input(input_payload, self.settings),
+            metadata={
+                **_base_context(payload),
+                "event": event_name,
+                "description": describe_notification_event(event_name, payload),
+            },
         )
         if event is not None:
-            self._finish_observation(event)
+            finish_kwargs: dict[str, Any] = {}
+            if output_payload is not None:
+                finish_kwargs["output"] = _event_io_payload(output_payload, enabled=self.settings.trace_content)
+            self._finish_observation(event, **finish_kwargs)
 
     def capture_log_record(self, record: logging.LogRecord) -> None:
         if not self.enabled() or record.levelno < logging.WARNING:
@@ -350,6 +372,7 @@ class LangfuseMonitor:
         kwargs: dict[str, Any] = {
             "name": "nexus.turn",
             "as_type": "span",
+            "session_id": str(payload.get("session_id", "") or "") or None,
             "input": _turn_input(prompt_payload, payload, self.settings),
             "metadata": {
                 **_base_context(payload),
@@ -358,6 +381,8 @@ class LangfuseMonitor:
                 "mode": payload.get("mode"),
                 "agent_mode": payload.get("agent_mode"),
                 "status": payload.get("status"),
+                "session_scope": "nexus.session_id",
+                "description": describe_turn_observation(payload),
             },
         }
         trace_id = str(payload.get("trace_id", "") or "")
@@ -380,7 +405,8 @@ class LangfuseMonitor:
             return factory(**kwargs)
         except TypeError:
             fallback = dict(kwargs)
-            fallback.pop("trace_context", None)
+            for key in ("trace_context", "session_id", "user_id", "tags", "version"):
+                fallback.pop(key, None)
             if fallback.get("as_type") == "event":
                 fallback["as_type"] = "span"
             try:
@@ -420,10 +446,6 @@ class LangfuseHookService:
         hooks.register(HookEvent.USER_PROMPT_SUBMIT, self.on_user_prompt)
         hooks.register(HookEvent.TURN_START, self.on_turn_start)
         hooks.register(HookEvent.TURN_END, self.on_turn_end)
-        hooks.register(HookEvent.PRE_TOOL_USE, self.on_pre_tool)
-        hooks.register(HookEvent.POST_TOOL_USE, self.on_post_tool)
-        hooks.register(HookEvent.NOTIFICATION, self.on_notification)
-        hooks.register(HookEvent.CONTEXT_COMPACTION, self.on_context_compaction)
         hooks.register(HookEvent.STOP, self.on_stop)
 
     async def on_user_prompt(self, payload: dict[str, Any]) -> None:
@@ -539,10 +561,20 @@ def _turn_input(prompt_payload: dict[str, Any] | None, turn_payload: dict[str, A
 def _turn_output(payload: dict[str, Any], settings: LangfuseSettings) -> Any:
     response = payload.get("response")
     if response not in (None, ""):
-        return _event_io_payload({"response": response, "status": payload.get("status")}, enabled=settings.trace_content)
+        return _event_io_payload(
+            {
+                "response": response,
+                "status": payload.get("status"),
+                "tool_calls": payload.get("tool_calls"),
+                "turn_steps": payload.get("turn_steps") or [],
+                "duration_ms": payload.get("duration_ms"),
+            },
+            enabled=settings.trace_content,
+        )
     return {
         "status": payload.get("status"),
         "tool_calls": payload.get("tool_calls"),
+        "turn_steps": payload.get("turn_steps") or [],
         "duration_ms": payload.get("duration_ms"),
     }
 
@@ -557,6 +589,8 @@ def _turn_end_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         "agent_mode": payload.get("agent_mode"),
         "tool_calls": payload.get("tool_calls"),
         "duration_ms": payload.get("duration_ms"),
+        "session_scope": "nexus.session_id",
+        "description": describe_turn_observation(payload),
     }
     if payload.get("usage"):
         metadata["usage"] = payload.get("usage")
