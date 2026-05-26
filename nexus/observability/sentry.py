@@ -4,6 +4,7 @@ import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.observability.logging import redact_payload
@@ -150,12 +151,12 @@ class SentryMonitor:
     def enabled(self) -> bool:
         return self._initialized and self._client is not None
 
-    def capture_exception(self, exc: BaseException, *, context: dict[str, Any] | None = None) -> None:
+    def capture_exception(self, exc: BaseException, *, context: dict[str, Any] | None = None) -> str | None:
         if not self.enabled():
-            return
+            return None
         if context:
             self.set_runtime_context(context)
-        self._client.capture_exception(exc)
+        return self._client.capture_exception(exc)
 
     def capture_message(
         self,
@@ -163,12 +164,12 @@ class SentryMonitor:
         *,
         level: str = "info",
         context: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> str | None:
         if not self.enabled():
-            return
+            return None
         if context:
             self.set_runtime_context(context)
-        self._client.capture_message(message, level=level)
+        return self._client.capture_message(message, level=level)
 
     def breadcrumb(
         self,
@@ -193,7 +194,18 @@ class SentryMonitor:
         scrubbed = _scrub_value(payload, self.settings)
         if not isinstance(scrubbed, dict):
             return
-        for key in ("session_id", "turn_id", "trace_id", "provider", "model", "mode", "agent_mode"):
+        for key in (
+            "session_id",
+            "turn_id",
+            "trace_id",
+            "provider",
+            "model",
+            "mode",
+            "agent_mode",
+            "verification_id",
+            "event_type",
+            "verification_kind",
+        ):
             value = scrubbed.get(key)
             if value not in (None, ""):
                 self._client.set_tag(f"nexus.{key}", value)
@@ -421,6 +433,14 @@ def capture_exception_from_hooks(
         monitor.capture_exception(exc, context=context)
 
 
+def describe_sentry_dsn(dsn: str) -> str:
+    parsed = urlparse(dsn.strip())
+    host = parsed.hostname or "unknown-host"
+    path_parts = [part for part in parsed.path.split("/") if part]
+    project_id = path_parts[-1] if path_parts else "unknown-project"
+    return f"host={host} project={project_id}"
+
+
 def _base_context(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         key: payload.get(key)
@@ -473,6 +493,7 @@ __all__ = [
     "SentryMonitor",
     "SentrySettings",
     "capture_exception_from_hooks",
+    "describe_sentry_dsn",
     "sentry_monitor_from_hooks",
     "sentry_settings_from_config",
     "setup_sentry_monitor",

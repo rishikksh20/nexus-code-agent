@@ -1116,6 +1116,8 @@ SENTRY_DSN=https://public@example.ingest.sentry.io/123
 SENTRY_ENVIRONMENT=production
 ```
 
+Use the project DSN from Sentry web: Project Settings -> Client Keys (DSN) -> DSN. You do not need a Sentry auth token for event ingestion. `SENTRY_ENVIRONMENT` is optional but useful for filtering, and `SENTRY_RELEASE` is optional if you want release tagging.
+
 Sentry events include session, turn, trace, provider/model, tool name/source, approval, MCP, usage, and duration fields. Raw prompts and tool outputs are not sent unless `sentry_include_prompts` or `sentry_include_tool_outputs` is explicitly enabled.
 
 ---

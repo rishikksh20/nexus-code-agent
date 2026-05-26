@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import os
+from pathlib import Path
 
 import pytest
 
@@ -8,7 +10,7 @@ from nexus.config import load_config
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import Message, RuntimeResponse, ToolCall, ToolExecutionContext
-from nexus.observability.sentry import SentryHookService, SentryMonitor, sentry_settings_from_config
+from nexus.observability.sentry import SentryHookService, SentryMonitor, describe_sentry_dsn, sentry_settings_from_config
 from nexus.runtime.agent import Agent
 from nexus.tools.base import ToolKind, ToolRegistry
 
@@ -57,6 +59,34 @@ class FakeSentryClient:
         return True
 
 
+def _raise_sentry_verification_error(verification_id: str) -> None:
+    raise RuntimeError(f"Intentional Sentry verification failure: {verification_id}")
+
+
+def _emit_live_sentry_verification(monitor: SentryMonitor, verification_id: str) -> tuple[str | None, str | None]:
+    context = {
+        "session_id": "pytest-sentry-live-verify",
+        "turn_id": verification_id,
+        "trace_id": verification_id,
+        "mode": "pytest",
+        "verification_id": verification_id,
+        "verification_kind": "live_sentry_test",
+    }
+
+    try:
+        _raise_sentry_verification_error(verification_id)
+    except RuntimeError as exc:
+        exception_event_id = monitor.capture_exception(exc, context=context)
+        message_event_id = monitor.capture_message(
+            f"Nexus live Sentry verification error: {verification_id}",
+            level="error",
+            context={**context, "event_type": "verification_error_message"},
+        )
+        return exception_event_id, message_event_id
+
+    return None, None
+
+
 def test_sentry_settings_read_config_and_env_aliases(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SENTRY_ENABLED", "true")
     monkeypatch.setenv("SENTRY_DSN", "https://public@example.ingest.sentry.io/123")
@@ -80,6 +110,71 @@ def test_sentry_config_rejects_invalid_sample_rate(tmp_path):
 
     with pytest.raises(ValueError, match="sentry_traces_sample_rate"):
         load_config(tmp_path, global_root=tmp_path / "global")
+
+
+def test_live_sentry_verification_emits_exception_and_error_message(tmp_path):
+    config = load_config(
+        tmp_path,
+        global_root=tmp_path / "global",
+        cli_overrides={
+            "sentry_enabled": True,
+            "sentry_dsn": "https://public@example.ingest.sentry.io/123",
+        },
+    )
+    client = FakeSentryClient()
+    monitor = SentryMonitor(sentry_settings_from_config(config), client=client)
+    monitor.initialize()
+
+    verification_id = "pytest-live-sentry-verify"
+    exception_event_id, message_event_id = _emit_live_sentry_verification(monitor, verification_id)
+
+    assert len(client.exceptions) == 1
+    assert str(client.exceptions[0]) == f"Intentional Sentry verification failure: {verification_id}"
+    assert client.messages == [(f"Nexus live Sentry verification error: {verification_id}", "error")]
+    assert exception_event_id == "exception-id"
+    assert message_event_id == "message-id"
+    assert client.contexts["nexus"]["verification_id"] == verification_id
+    assert client.contexts["nexus"]["event_type"] == "verification_error_message"
+    assert client.tags["nexus.verification_id"] == verification_id
+    assert client.tags["nexus.verification_kind"] == "live_sentry_test"
+    assert client.tags["nexus.event_type"] == "verification_error_message"
+
+
+def test_sentry_live_verify_with_dotenv_credentials():
+    if os.getenv("NEXUS_RUN_LIVE_SENTRY_TEST") != "1":
+        pytest.skip("Set NEXUS_RUN_LIVE_SENTRY_TEST=1 to send live Sentry exception and error verification events.")
+
+    workspace_root = Path(__file__).resolve().parents[1]
+    config = load_config(
+        workspace_root,
+        global_root=workspace_root / ".pytest-global",
+        cli_overrides={"sentry_enabled": True},
+    )
+    settings = sentry_settings_from_config(config)
+
+    if not settings.dsn:
+        pytest.fail(
+            "No live Sentry DSN was loaded. Set SENTRY_DSN or AGENT_SENTRY_DSN in the workspace .env or environment before running this verification test."
+        )
+
+    monitor = SentryMonitor(settings)
+    monitor.initialize()
+
+    assert monitor.enabled() is True
+
+    verification_id = os.getenv("NEXUS_SENTRY_VERIFICATION_ID", "pytest-live-sentry-verify")
+    try:
+        exception_event_id, message_event_id = _emit_live_sentry_verification(monitor, verification_id)
+        print(
+            "Sentry verification sent:",
+            f"target={describe_sentry_dsn(settings.dsn)}",
+            f"environment={settings.environment}",
+            f"verification_id={verification_id}",
+            f"exception_event_id={exception_event_id}",
+            f"message_event_id={message_event_id}",
+        )
+    finally:
+        monitor.flush()
 
 
 @pytest.mark.asyncio
