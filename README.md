@@ -2,7 +2,7 @@
 
 **Nexus** is a CLI-first AI coding agent and terminal-based pair programmer. It runs in an interactive REPL or headless one-shot mode, executes tools, manages sessions, and keeps context across long conversations through compaction and carry-over summaries.
 
-> **Status**: active scaffold — core runtime, streaming model clients, safety, skills, MCP, delegation, sandboxing, and JSON observability are implemented. OpenTelemetry export is not yet available.
+> **Status**: active scaffold — core runtime, streaming model clients, safety, skills, MCP, delegation, sandboxing, JSON observability, and optional OpenTelemetry tracing are implemented.
 
 ---
 
@@ -777,6 +777,8 @@ api_base_url = "https://api.mistral.ai/v1"
 default_mode = "default"         # plan | default | auto
 max_loop_iterations = 8
 auto_confirm_read_only = true
+parallel_tools = true             # run eligible non-mutating tools in parallel within a single turn
+parallel_tool_window = 4          # max parallel non-mutating tool calls per window (1-8)
 
 # Context and compaction
 compaction_soft_limit = 85197    # auto-tuned to 65% of model context window
@@ -817,6 +819,13 @@ project_description = ""
 # Filesystem MCP (npm package — do NOT use uvx):
 #   Install: npm install -g @modelcontextprotocol/server-filesystem
 #   Command: ["mcp-server-filesystem", "/absolute/path/to/workspace"]
+
+#### Parallel Tool Execution
+
+- `parallel_tools = true` enables per-turn parallel execution for eligible non-mutating tools.
+- `parallel_tool_window = 4` sets the batch size for each parallel window. Valid values are `1` through `8`.
+- The scheduler still runs mutating tools sequentially. When a turn mixes reads and writes, Nexus drains the read-only parallel windows first and then executes the remaining sequential tools.
+- This applies to both the supervisor agent and sub-agents. Nested `subagent_*` tool calls themselves are still kept out of the parallel lane.
 #
 # Git MCP (Python package — use uvx or pip install mcp-server-git):
 #   Command: ["uvx", "mcp-server-git", "--repository", "/absolute/git/repo/root"]
@@ -1097,7 +1106,9 @@ When `log_format = "json"`, Nexus writes structured logs to `~/.nexus/logs/`:
 | `metrics.json` | Aggregated counters — prompt submissions, tool calls, token usage, cost by session |
 | `.nexus/audit-trail.jsonl` | Durable record of every mutating action with state (`requested` / `executed`) and rollback notes |
 
-Each hook payload includes `session_id`, `turn_id`, `trace_id`, and `tool_call_id` correlation fields.
+Each hook payload includes `session_id`, `turn_id`, `trace_id`, and `tool_call_id` correlation fields. `runtime.jsonl` now also records turn start/end, model start/end, and context-compaction events.
+
+When tracing is enabled, Nexus also writes span records to `~/.nexus/logs/traces.jsonl`. Those spans cover one root `nexus.turn` span per turn, one `nexus.model` span per model call, one span per tool call, and event spans for compaction, warnings, and errors.
 
 ```bash
 # Enable JSON observability in local config
@@ -1119,6 +1130,56 @@ SENTRY_ENVIRONMENT=production
 Use the project DSN from Sentry web: Project Settings -> Client Keys (DSN) -> DSN. You do not need a Sentry auth token for event ingestion. `SENTRY_ENVIRONMENT` is optional but useful for filtering, and `SENTRY_RELEASE` is optional if you want release tagging.
 
 Sentry events include session, turn, trace, provider/model, tool name/source, approval, MCP, usage, and duration fields. Raw prompts and tool outputs are not sent unless `sentry_include_prompts` or `sentry_include_tool_outputs` is explicitly enabled.
+
+OpenTelemetry tracing is optional and is the primary remote tracing path. Nexus writes local JSONL spans directly and can export the same spans over OTLP to Langfuse or any other OTLP-compatible backend.
+
+Install the optional tracing stack and either configure OTLP directly or use Langfuse compatibility keys:
+
+```bash
+uv sync --extra observability
+
+AGENT_OTEL_ENABLED=true
+OTEL_SERVICE_NAME=nexus
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer your-token
+
+# Or let Nexus derive Langfuse OTLP auth and endpoint
+AGENT_LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com
+LANGFUSE_ENVIRONMENT=production
+LANGFUSE_RELEASE=nexus@local
+```
+
+Recommended local config:
+
+```toml
+log_format = "json"
+
+otel_enabled = true
+otel_endpoint = ""
+otel_headers = ""
+otel_service_name = "nexus"
+otel_environment = "development"
+otel_release = ""
+otel_trace_content = true
+otel_trace_tool_outputs = true
+otel_prompt_name = "nexus-system-prompt"
+otel_prompt_version = ""
+otel_jsonl_enabled = true
+
+# Optional Langfuse compatibility if you want Langfuse as the OTLP backend.
+langfuse_enabled = true
+langfuse_public_key = ""
+langfuse_secret_key = ""
+langfuse_base_url = "https://cloud.langfuse.com"
+
+sentry_enabled = true
+sentry_dsn = ""
+```
+
+Nexus does not import prompts from Langfuse. Local Nexus prompts remain the source of truth; the tracing layer only emits prompt metadata and optional prompt content from the local runtime. Use Langfuse when you want OTLP-backed session replay and trace visualization. Keep using Sentry for exceptions, crashes, breadcrumbs, provider/tool failures, and operational alerting. See `docs/llm-observability-langfuse-sentry.md` for the event map and setup checklist.
 
 ---
 

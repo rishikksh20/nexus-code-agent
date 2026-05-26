@@ -20,6 +20,13 @@ dependencies = [
   "sentry-sdk>=2.60.0",
 ]
 
+[project.optional-dependencies]
+observability = [
+  "opentelemetry-api>=1.42.1",
+  "opentelemetry-exporter-otlp-proto-http>=1.42.1",
+  "opentelemetry-sdk>=1.42.1",
+]
+
 [project.scripts]
 nexus = "nexus.app:main"
 

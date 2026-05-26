@@ -118,6 +118,11 @@ async def run_agent_turn(
                 prepared_turn.context.metadata["supervisor_cognitive_tools_only"] = (
                     str(getattr(state.config, "agent_mode", "basic")).strip().lower() == "advanced"
                 )
+                compaction_payload = prepared_turn.context.metadata.get("context_compaction")
+                if state.hooks is not None and isinstance(compaction_payload, dict) and (
+                    compaction_payload.get("compacted") or compaction_payload.get("pruned_tool_results")
+                ):
+                    await state.hooks.emit(HookEvent.CONTEXT_COMPACTION, compaction_payload)
 
                 batch = await _run_model_batch(
                     state,
@@ -308,6 +313,8 @@ async def _run_model_batch(
             max_output_tokens=state.config.max_output_tokens,
             max_turns=state.config.max_loop_iterations,
             max_tool_calls_per_turn=state.config.max_tool_calls_per_turn,
+            parallel_tools=state.config.parallel_tools,
+            parallel_tool_window=state.config.parallel_tool_window,
         ):
             _render_event(ui, state, event)
             batch.append(event)
@@ -399,6 +406,8 @@ async def _resume_approved_tool_calls(
         working_history,
         context,
         approval_manager=state.approval_manager,
+        parallel_tools=state.config.parallel_tools,
+        parallel_tool_window=state.config.parallel_tool_window,
         resume_tool_calls=tuple(tool_calls),
     ):
         _render_event(ui, state, event)
@@ -646,6 +655,7 @@ def _turn_lifecycle_payload(
     error: str | None = None,
 ) -> dict:
     usage, tool_calls = _turn_usage_and_tool_calls(events or [])
+    response = _turn_response_text(events or [])
     payload = {
         "session_id": state.session.session_id,
         "turn_id": turn_id,
@@ -657,6 +667,7 @@ def _turn_lifecycle_payload(
         "status": status,
         "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
         "tool_calls": tool_calls,
+        "response": response,
     }
     if usage is not None:
         payload["usage"] = {
@@ -681,6 +692,16 @@ def _turn_usage_and_tool_calls(events: list[AgentEvent]):
         elif event.kind == "tool_call_requested":
             tool_calls += 1
     return usage, tool_calls
+
+
+def _turn_response_text(events: list[AgentEvent]) -> str:
+    for event in reversed(events):
+        if event.kind != AgentEventType.MODEL_RESPONSE:
+            continue
+        payload = cast(RuntimeResponse, event.payload)
+        if payload.message.content:
+            return payload.message.content
+    return ""
 
 
 def _record_turn_telemetry(

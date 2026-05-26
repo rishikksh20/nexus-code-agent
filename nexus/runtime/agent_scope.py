@@ -120,6 +120,10 @@ def supervisor_tool_names(config: Any, registry: ToolRegistry) -> set[str]:
         allowed |= all_mcp_tool_names(registry) if all_configured_mcp else mcp_tool_names_for_servers(registry, configured_mcp)
     elif str(getattr(config, "agent_mode", "basic")).strip().lower() == "advanced":
         allowed = set()
+    elif subagent_names:
+        # When delegation tools exist, default supervisor scope to those tools
+        # so task work routes through sub-agents unless explicitly overridden.
+        allowed = set(subagent_names)
     else:
         allowed = set(all_names)
     if str(getattr(config, "agent_mode", "basic")).strip().lower() == "advanced":

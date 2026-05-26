@@ -253,12 +253,14 @@ class AgentEvent:
         *,
         preview: dict[str, Any] | None = None,
         actor: str | None = None,
+        display: dict[str, Any] | None = None,
     ) -> AgentEvent:
         payload = {
             "call_id": call_id,
             "name": name,
             "arguments": arguments,
             "preview": preview or {},
+            "display": dict(display or {}),
         }
         if actor:
             payload["actor"] = actor

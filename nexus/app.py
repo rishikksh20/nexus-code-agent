@@ -43,7 +43,7 @@ from nexus.integrations.openai_compatible import (
     resolve_provider_api_key,
 )
 from nexus.runtime.agent import Agent
-from nexus.observability import sentry_monitor_from_hooks
+from nexus.observability import otel_monitor_from_hooks, sentry_monitor_from_hooks
 from nexus.runtime.post_session import run_post_session_updates
 from nexus.runtime.repl import run_repl
 from nexus.runtime.runtime_session import RuntimeSession, resolve_runtime_session
@@ -509,6 +509,9 @@ async def _run_app(config, console: TerminalUI, params: dict) -> int:
         return await app.run_interactive(params)
     finally:
         await app.close()
+        otel_monitor = otel_monitor_from_hooks(app._hooks)
+        if otel_monitor is not None:
+            otel_monitor.close()
         monitor = sentry_monitor_from_hooks(app._hooks)
         if monitor is not None:
             monitor.flush()
@@ -538,6 +541,9 @@ async def _run_doctor(config, console: TerminalUI, *, output_format: str) -> int
         report = build_doctor_report(config, app._registry, app._resources)
     finally:
         await app.close()
+        otel_monitor = otel_monitor_from_hooks(app._hooks)
+        if otel_monitor is not None:
+            otel_monitor.close()
         monitor = sentry_monitor_from_hooks(app._hooks)
         if monitor is not None:
             monitor.flush()

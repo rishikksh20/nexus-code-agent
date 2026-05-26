@@ -46,6 +46,56 @@ def register_default_runtime_hooks(
     *,
     metrics_collector: RuntimeMetricsCollector | None = None,
 ) -> None:
+    async def _log_turn_start(payload: dict[str, Any]) -> None:
+        await logger.log(
+            HookEvent.TURN_START.value,
+            {
+                "session_id": payload.get("session_id"),
+                "turn_id": payload.get("turn_id"),
+                "trace_id": payload.get("trace_id"),
+                "provider": payload.get("provider"),
+                "model": payload.get("model"),
+                "mode": payload.get("mode"),
+                "agent_mode": payload.get("agent_mode"),
+                "status": payload.get("status"),
+            },
+        )
+
+    async def _log_turn_end(payload: dict[str, Any]) -> None:
+        await logger.log(
+            HookEvent.TURN_END.value,
+            {
+                "session_id": payload.get("session_id"),
+                "turn_id": payload.get("turn_id"),
+                "trace_id": payload.get("trace_id"),
+                "provider": payload.get("provider"),
+                "model": payload.get("model"),
+                "status": payload.get("status"),
+                "duration_ms": payload.get("duration_ms"),
+                "tool_calls": payload.get("tool_calls"),
+                "response_chars": len(str(payload.get("response", ""))),
+                "error": payload.get("error"),
+            },
+        )
+
+    async def _log_context_compaction(payload: dict[str, Any]) -> None:
+        await logger.log(
+            HookEvent.CONTEXT_COMPACTION.value,
+            {
+                "session_id": payload.get("session_id"),
+                "turn_id": payload.get("turn_id"),
+                "trace_id": payload.get("trace_id"),
+                "messages_before_prune": payload.get("messages_before_prune"),
+                "messages_before_compaction": payload.get("messages_before_compaction"),
+                "messages_after": payload.get("messages_after"),
+                "pruned_tool_results": payload.get("pruned_tool_results"),
+                "compacted": payload.get("compacted"),
+                "carry_over_entries": payload.get("carry_over_entries"),
+            },
+        )
+        if metrics_collector is not None:
+            await metrics_collector.record_context_compaction(payload)
+
     async def _log_user_prompt(payload: dict[str, Any]) -> None:
         prompt = str(payload.get("prompt", ""))
         await logger.log(
@@ -140,6 +190,35 @@ def register_default_runtime_hooks(
                 "field": payload.get("field"),
                 "call_id": payload.get("call_id"),
             }
+        elif event_name == "model_start":
+            essentials = {
+                "event": event_name,
+                "session_id": payload.get("session_id"),
+                "turn_id": payload.get("turn_id"),
+                "trace_id": payload.get("trace_id"),
+                "model_call_id": payload.get("model_call_id"),
+                "provider": payload.get("provider"),
+                "model": payload.get("model"),
+                "turn_index": payload.get("turn_index"),
+                "actor": payload.get("actor"),
+                "message_count": payload.get("message_count"),
+                "tool_schema_count": payload.get("tool_schema_count"),
+                "system_prompt_chars": payload.get("system_prompt_chars"),
+            }
+        elif event_name == "model_end":
+            output = str(payload.get("output", ""))
+            essentials = {
+                "event": event_name,
+                "session_id": payload.get("session_id"),
+                "turn_id": payload.get("turn_id"),
+                "trace_id": payload.get("trace_id"),
+                "model_call_id": payload.get("model_call_id"),
+                "provider": payload.get("provider"),
+                "model": payload.get("model"),
+                "finish_reason": payload.get("finish_reason"),
+                "tool_call_count": payload.get("tool_call_count"),
+                "output_chars": len(output),
+            }
         else:
             # Unknown notification — log event name + session context only.
             essentials = {
@@ -151,6 +230,9 @@ def register_default_runtime_hooks(
         if metrics_collector is not None:
             await metrics_collector.record_notification(payload)
 
+    hooks.register(HookEvent.TURN_START, _log_turn_start)
+    hooks.register(HookEvent.TURN_END, _log_turn_end)
+    hooks.register(HookEvent.CONTEXT_COMPACTION, _log_context_compaction)
     hooks.register(HookEvent.USER_PROMPT_SUBMIT, _log_user_prompt)
     hooks.register(HookEvent.PRE_TOOL_USE, _log_pre_tool)
     hooks.register(HookEvent.POST_TOOL_USE, _log_post_tool)

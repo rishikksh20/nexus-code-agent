@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 from nexus.cli.init import init_workspace
 from nexus.config import load_config
 from nexus.config.loader import ConfigError
@@ -67,6 +69,8 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
     assert config.prompt_history_max_entries == 200
     assert config.tool_output_max_chars == 102400
     assert config.shell_inherit_environment is False
+    assert config.parallel_tools is True
+    assert config.parallel_tool_window == 4
     assert config.agent_allowed_tools == []
     assert config.agent_allowed_skills == []
     assert config.agent_allowed_mcp_servers == []
@@ -97,6 +101,17 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
     ]
     assert execution_profile["allowed_mcp_servers"] == []
     assert execution_profile["allowed_skills"] == []
+
+
+def test_config_rejects_parallel_tool_window_above_eight(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text("parallel_tool_window = 9\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="parallel_tool_window"):
+        load_config(workspace, global_root=global_root)
 
 
 def test_config_accepts_agent_scope_fields(tmp_path):

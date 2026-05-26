@@ -282,6 +282,8 @@ class SubAgentTool:
                         temperature=float(getattr(self._config, "temperature", 0.0)),
                         max_output_tokens=getattr(self._config, "max_output_tokens", None),
                         max_turns=1,
+                        parallel_tools=bool(getattr(self._config, "parallel_tools", True)),
+                        parallel_tool_window=int(getattr(self._config, "parallel_tool_window", 4) or 4),
                     ),
                     outer_context,
                     deadline=deadline,
@@ -345,6 +347,8 @@ class SubAgentTool:
                                 temperature=float(getattr(self._config, "temperature", 0.0)),
                                 max_output_tokens=getattr(self._config, "max_output_tokens", None),
                                 max_turns=1,
+                                parallel_tools=bool(getattr(self._config, "parallel_tools", True)),
+                                parallel_tool_window=int(getattr(self._config, "parallel_tool_window", 4) or 4),
                                 resume_tool_calls=(resume_call,),
                             ),
                             outer_context,
@@ -372,6 +376,9 @@ class SubAgentTool:
                             if event.payload.is_error:
                                 status = "failed"
                                 failed_tool_outputs.append(_failed_tool_output(event.payload))
+                            else:
+                                status = "completed"
+                                failed_tool_outputs.clear()
                             modified_files.extend(_modified_files_from_result(event.payload))
                             history.append(
                                 Message(
@@ -385,6 +392,12 @@ class SubAgentTool:
                         elif event.kind == AgentEventType.AGENT_ERROR:
                             status = "failed"
                             error = str(event.payload)
+                    continue
+                if confirmation.payload.kind is ConfirmationKind.CLARIFICATION and decision:
+                    field_name = str(confirmation.payload.payload.get("field", "value"))
+                    clarification_text = f"Clarification for {confirmation.payload.tool_name} ({field_name}): {decision}"
+                    history.append(Message(role="user", content=clarification_text))
+                    final_response = clarification_text
                     continue
                 if decision == "denied":
                     continue
@@ -403,6 +416,9 @@ class SubAgentTool:
                     if event.payload.is_error:
                         status = "failed"
                         failed_tool_outputs.append(_failed_tool_output(event.payload))
+                    else:
+                        status = "completed"
+                        failed_tool_outputs.clear()
                     modified_files.extend(_modified_files_from_result(event.payload))
                     history.append(
                         Message(
@@ -595,6 +611,8 @@ async def _handle_inner_confirmation(request, outer_context: ToolExecutionContex
                     arguments=request.arguments,
                 )
             return "denied"
+    if request.kind is ConfirmationKind.CLARIFICATION and response.clarification:
+        return response.clarification.strip()
     return ""
 
 

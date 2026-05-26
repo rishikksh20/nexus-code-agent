@@ -138,16 +138,28 @@ def _interactive_approval_callback(ui: TerminalUI) -> ConfirmationCallback:
         try:
             if request.kind is ConfirmationKind.CLARIFICATION:
                 field = request.payload.get("field", "value")
-                answer = ui.input(f"  [bold]Value for [cyan]{field!r}[/cyan]:[/bold] ").strip()
-                return ConfirmationResponse(clarification=answer) if answer else ConfirmationResponse()
+                while True:
+                    answer = ui.input(f"  [bold]Value for [cyan]{field!r}[/cyan]:[/bold] ").strip()
+                    if answer:
+                        return ConfirmationResponse(clarification=answer)
+                    ui.print_muted("A value is required. Provide input or press Ctrl+C to cancel.")
+
             policy = approval_policy_for_request(request)
-            answer = ui.input(f"[bold yellow]  Allow? {approval_prompt_label(policy)}[/bold yellow] ").strip().lower()
+            while True:
+                answer = ui.input(f"[bold yellow]  Allow? {approval_prompt_label(policy)}[/bold yellow] ").strip().lower()
+                response = approval_response_from_answer(answer, policy)
+                if response.approved or _is_explicit_denial_answer(answer):
+                    return response
+                ui.print_muted("Please answer with yes/y (or t/turn when offered), or no/n.")
         except (EOFError, KeyboardInterrupt):
             return ConfirmationResponse()
 
-        return approval_response_from_answer(answer, approval_policy_for_request(request))
-
     return ask_for_approval
+
+
+def _is_explicit_denial_answer(answer: str) -> bool:
+    normalized = " ".join(answer.strip().lower().replace("(", " ").replace(")", " ").replace("-", " ").replace("_", " ").split())
+    return normalized in {"n", "no"}
 
 
 def _print_provider_notice_or_warning(state: ReplState) -> None:

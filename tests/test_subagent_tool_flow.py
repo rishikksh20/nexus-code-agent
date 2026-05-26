@@ -87,6 +87,29 @@ class _SlowReadTool(_StartAwareReadTool):
         return ToolResult(call_id=call_id, tool_name=self.name, output="too late")
 
 
+class _NamedDelayReadTool(Tool):
+    kind = ToolKind.READ
+    is_mutating = False
+    input_schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+
+    def __init__(self, name: str, timings: dict[str, float], *, delay: float = 0.05) -> None:
+        self.name = name
+        self.description = f"Delay read tool {name}."
+        self._timings = timings
+        self._delay = delay
+
+    async def execute(self, call_id, arguments, context):
+        del call_id, arguments, context
+        self._timings[f"{self.name}_start"] = asyncio.get_running_loop().time()
+        await asyncio.sleep(self._delay)
+        self._timings[f"{self.name}_end"] = asyncio.get_running_loop().time()
+        return ToolResult(call_id=self.name, tool_name=self.name, output=f"done:{self.name}")
+
+
 @pytest.mark.asyncio
 async def test_advanced_supervisor_cannot_execute_normal_write_tool_directly(tmp_path):
     registry = ToolRegistry()
@@ -223,6 +246,59 @@ async def test_execution_subagent_can_execute_allowed_write_tool(tmp_path):
     assert result.is_error is False
     assert payload["status"] == "completed"
     assert (tmp_path / "subagent.txt").read_text(encoding="utf-8") == "done"
+
+
+@pytest.mark.asyncio
+async def test_execution_subagent_runs_non_mutating_tools_in_parallel_when_enabled(tmp_path):
+    timings: dict[str, float] = {}
+    registry = ToolRegistry()
+    registry.register(_NamedDelayReadTool("read_alpha", timings), source="core", origin="builtin")
+    registry.register(_NamedDelayReadTool("read_beta", timings), source="core", origin="builtin")
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Read both files."),
+                tool_calls=(
+                    ToolCall(call_id="alpha", tool_name="read_alpha", arguments={}),
+                    ToolCall(call_id="beta", tool_name="read_beta", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content='{"status": "completed", "summary": "Read both files."}')),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Implement focused work.",
+            goal_prompt="Use normal tools to implement the assigned change.",
+            allowed_tools=["read_alpha", "read_beta"],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(
+            model_name="fake",
+            temperature=0.0,
+            max_output_tokens=4096,
+            parallel_tools=True,
+            parallel_tool_window=2,
+        ),
+    )
+    context = ToolExecutionContext(
+        session_id="test-session",
+        working_directory=tmp_path,
+        metadata={"auto_confirm": True, "execution_mode": "auto"},
+    )
+
+    result = await tool.execute(
+        "sub-call",
+        {"title": "Read files", "instructions": "Read both files before summarizing."},
+        context,
+    )
+
+    assert result.is_error is False
+    assert abs(timings["read_alpha_start"] - timings["read_beta_start"]) < 0.03
+    assert max(timings["read_alpha_end"], timings["read_beta_end"]) - min(timings["read_alpha_start"], timings["read_beta_start"]) < 0.11
 
 
 @pytest.mark.asyncio

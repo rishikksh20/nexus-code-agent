@@ -3,7 +3,13 @@ from __future__ import annotations
 from nexus.models import Message
 from nexus.context import CarryOverState, ContextCompactor, TokenEstimator, compact_messages, prune_tool_outputs
 from nexus.memory.store import MemoryEntry
-from nexus.runtime.repl_state import _load_all_memory
+from nexus.config import load_config
+from nexus.memory.store import MemoryStore
+from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.repl_state import ReplState, _load_all_memory
+from nexus.runtime.sessions import SessionStore, new_snapshot
+from nexus.tools.base import ToolRegistry
+from rich.console import Console
 from nexus.runtime.context_state import (
     AgentSessionState,
     TaskContext,
@@ -77,6 +83,28 @@ def test_prune_tool_outputs_replaces_frozen_messages_in_place():
 
     assert pruned == 1
     assert messages[2].content.startswith("[Tool output cleared")
+
+
+def test_prepare_turn_compaction_metadata_counts_carry_over_entries_without_len_error(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("carry-over-count"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True, width=120),
+        carry_over=CarryOverState(
+            pinned_facts=["fact"],
+            summarized_history=["summary-1", "summary-2"],
+            active_constraints=["constraint"],
+        ),
+    )
+
+    prepared = state.prepare_turn("continue", turn_id="turn-1", trace_id="trace-1")
+
+    assert prepared.context.metadata["context_compaction"]["carry_over_entries"] == 4
 
 
 def test_load_all_memory_uses_single_store_read_path():

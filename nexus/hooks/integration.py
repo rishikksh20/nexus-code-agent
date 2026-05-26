@@ -51,16 +51,20 @@ def setup_hooks(config: "AgentConfig") -> HookExecutor:
     from nexus.observability import (
         JsonlAuditTrail,
         JsonlRuntimeLogger,
+        OtelHookService,
         RuntimeMetricsCollector,
         SentryHookService,
         register_audit_hooks,
         register_default_runtime_hooks,
+        setup_otel_monitor,
         setup_sentry_monitor,
     )
 
     hooks = HookExecutor()
     monitor = setup_sentry_monitor(config)
     hooks.sentry_monitor = monitor
+    otel_monitor = setup_otel_monitor(config)
+    hooks.otel_monitor = otel_monitor
 
     # Audit trail — always active.
     register_audit_hooks(
@@ -80,5 +84,7 @@ def setup_hooks(config: "AgentConfig") -> HookExecutor:
 
     if monitor.enabled():
         SentryHookService(monitor, monitor.settings).register(hooks)
+    if otel_monitor.enabled():
+        OtelHookService(otel_monitor, otel_monitor.settings).register(hooks)
 
     return hooks

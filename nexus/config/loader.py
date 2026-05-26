@@ -370,6 +370,15 @@ def _read_environment(defaults: AgentConfig) -> dict[str, Any]:
         ("SENTRY_DSN", "sentry_dsn"),
         ("SENTRY_ENVIRONMENT", "sentry_environment"),
         ("SENTRY_RELEASE", "sentry_release"),
+        ("OTEL_SERVICE_NAME", "otel_service_name"),
+        ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "otel_endpoint"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "otel_endpoint"),
+        ("OTEL_EXPORTER_OTLP_HEADERS", "otel_headers"),
+        ("LANGFUSE_PUBLIC_KEY", "langfuse_public_key"),
+        ("LANGFUSE_SECRET_KEY", "langfuse_secret_key"),
+        ("LANGFUSE_BASE_URL", "langfuse_base_url"),
+        ("LANGFUSE_ENVIRONMENT", "langfuse_environment"),
+        ("LANGFUSE_RELEASE", "langfuse_release"),
     ]
     for env_key, field_name in _generic_aliases:
         if field_name not in overrides:
@@ -485,6 +494,7 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         "compaction_keep_recent",
         "max_loop_iterations",
         "max_tool_calls_per_turn",
+        "parallel_tool_window",
         "textual_transcript_max_lines",
         "prompt_history_max_entries",
         "tool_output_max_chars",
@@ -496,6 +506,8 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     for field_name in integer_fields:
         if values[field_name] < 1:
             raise ConfigError(f"{field_name} must be greater than 0.")
+    if int(values["parallel_tool_window"]) > 8:
+        raise ConfigError("parallel_tool_window must be less than or equal to 8.")
 
     if values["compaction_hard_limit"] < values["compaction_soft_limit"]:
         raise ConfigError("compaction_hard_limit must be greater than or equal to compaction_soft_limit.")
@@ -517,6 +529,14 @@ def _validate_config_values(values: dict[str, Any]) -> None:
             raise ConfigError(f"{field_name} must be greater than 0.")
     if float(values["sentry_flush_timeout_seconds"]) <= 0:
         raise ConfigError("sentry_flush_timeout_seconds must be greater than 0.")
+    if float(values["langfuse_flush_timeout_seconds"]) <= 0:
+        raise ConfigError("langfuse_flush_timeout_seconds must be greater than 0.")
+    if float(values["otel_flush_timeout_seconds"]) <= 0:
+        raise ConfigError("otel_flush_timeout_seconds must be greater than 0.")
+    if bool(values["langfuse_enabled"]):
+        for field_name in ("langfuse_public_key", "langfuse_secret_key"):
+            if not str(values[field_name]).strip():
+                raise ConfigError(f"{field_name} must be set when langfuse_enabled is true.")
 
     mcp_servers = values["mcp_servers"]
     if not isinstance(mcp_servers, list):

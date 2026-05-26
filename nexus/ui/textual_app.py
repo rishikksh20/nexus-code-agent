@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import re
 import sys
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from rich import box
+from rich.console import Console
 from rich.console import Group
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -35,6 +37,7 @@ from nexus.runtime.turn_runner import (
     approval_prompt_label,
     approval_response_from_answer,
 )
+from nexus.security.policy import ApprovalPolicy
 from nexus.ui.terminal import NEXUS_THEME, TerminalUI, _solid_ascii_banner
 
 if TYPE_CHECKING:
@@ -81,6 +84,8 @@ async def run_textual_repl(
         session_resumed=session_resumed,
     )
     try:
+        # Leave terminal mouse reporting disabled so users can use their terminal's
+        # native select-and-copy behavior in the transcript pane.
         await app.run_async(mouse=False)
     finally:
         await app.finalize_session()
@@ -284,26 +289,14 @@ class TextualTerminalUI(TerminalUI):
             call_id = str(payload.get("call_id", ""))
             tool_name = str(payload.get("name", "tool"))
             actor = str(payload.get("actor", "") or "").strip()
-            display_name = self._tool_display_name(tool_name, actor)
             arguments = payload.get("arguments", {}) if isinstance(payload.get("arguments", {}), dict) else {}
             preview = payload.get("preview", {}) if isinstance(payload.get("preview", {}), dict) else {}
-            self._tool_args_by_call_id[call_id] = dict(arguments)
-            self._tool_preview_by_call_id[call_id] = dict(preview)
-            if actor:
-                self._tool_actor_by_call_id[call_id] = actor
+            display = payload.get("display", {}) if isinstance(payload.get("display", {}), dict) else {}
+            self._store_tool_call_state(call_id, arguments, preview, actor, display)
             self._write(
-                Panel(
-                    self._render_tool_panel_body(display_name, arguments, preview=preview),
-                    title=Text(f"{display_name}  #{call_id[:8] or 'pending'}", style="bold magenta"),
-                    title_align="left",
-                    subtitle=Text("running", style="dim"),
-                    subtitle_align="right",
-                    border_style=self._tool_border_style(tool_name),
-                    box=box.ROUNDED,
-                    padding=(1, 2),
-                )
+                self._render_tool_start_renderable(call_id, tool_name, actor, arguments, preview, display)
             )
-            self.start_tool_wait(f"{display_name} running")
+            self.start_tool_wait(f"{self._tool_display_name(tool_name, actor)} running")
             return
 
         if event.kind == AgentEventType.TOOL_CALL_COMPLETE and show_tool_calls:
@@ -313,22 +306,16 @@ class TextualTerminalUI(TerminalUI):
                 return
             preview = self._tool_preview_by_call_id.get(result.call_id, {})
             actor = str(result.metadata.get("actor") or self._tool_actor_by_call_id.get(result.call_id, "")).strip()
-            display_name = self._tool_display_name(result.tool_name, actor)
-            self._write(
-                Panel(
-                    self._render_tool_result_body(result, preview=preview),
-                    title=Text(f"{display_name}  #{result.call_id[:8]}", style="bold magenta"),
-                    title_align="left",
-                    subtitle=Text("failed" if result.is_error else "done", style="red" if result.is_error else "green"),
-                    subtitle_align="right",
-                    border_style=self._tool_border_style(result.tool_name),
-                    box=box.ROUNDED,
-                    padding=(1, 2),
-                )
+            display = self._tool_display_by_call_id.get(result.call_id, {})
+            renderable = self._render_tool_completion_renderable(
+                result,
+                preview=preview,
+                actor=actor,
+                display=display,
             )
-            self._tool_args_by_call_id.pop(result.call_id, None)
-            self._tool_preview_by_call_id.pop(result.call_id, None)
-            self._tool_actor_by_call_id.pop(result.call_id, None)
+            if renderable is not None:
+                self._write(renderable)
+            self._clear_tool_call_state(result.call_id)
             self._app._streaming_tool_outputs.discard(result.call_id)
             self._app._streaming_tool_output_chars.pop(result.call_id, None)
             self._app._streaming_tool_output_capped.discard(result.call_id)
@@ -357,11 +344,14 @@ class TextualTerminalUI(TerminalUI):
             self.end_assistant()
             req = cast("ConfirmationRequest", event.payload)
             if req.kind is ConfirmationKind.APPROVAL:
-                self._tool_args_by_call_id[req.call_id] = {str(key): value for key, value in req.arguments.items()}
-                self._tool_preview_by_call_id[req.call_id] = {str(key): value for key, value in req.preview.items()}
                 actor = str(req.payload.get("actor", "") or "").strip()
-                if actor:
-                    self._tool_actor_by_call_id[req.call_id] = actor
+                self._store_tool_call_state(
+                    req.call_id,
+                    {str(key): value for key, value in req.arguments.items()},
+                    {str(key): value for key, value in req.preview.items()},
+                    actor,
+                    {"is_mutating": True},
+                )
                 display_name = self._tool_display_name(req.tool_name, actor)
                 self._write(
                     Panel(
@@ -450,6 +440,49 @@ class PromptInput(Input):
     def action_history_next(self) -> None:
         cast("NexusTextualApp", self.app).action_prompt_history_next()
 
+    def key_tab(self, event: events.Key) -> None:
+        event.stop()
+        cursor = int(getattr(self, "cursor_position", len(self.value)))
+        current = str(self.value or "")
+        self.value = current[:cursor] + "\t" + current[cursor:]
+        self.cursor_position = cursor + 1
+
+
+class TranscriptLog(RichLog):
+    """Focusable transcript view with keyboard scrolling."""
+
+    can_focus = True
+    BINDINGS = [
+        ("up", "scroll_line_up", "Scroll up"),
+        ("down", "scroll_line_down", "Scroll down"),
+        ("pageup", "scroll_page_up", "Scroll page up"),
+        ("pagedown", "scroll_page_down", "Scroll page down"),
+        ("home", "scroll_home_key", "Scroll home"),
+        ("end", "scroll_end_key", "Scroll end"),
+    ]
+
+    def on_click(self, event: events.Click) -> None:
+        del event
+        self.focus()
+
+    def action_scroll_line_up(self) -> None:
+        self.scroll_up(animate=False)
+
+    def action_scroll_line_down(self) -> None:
+        self.scroll_down(animate=False)
+
+    def action_scroll_page_up(self) -> None:
+        self.scroll_page_up(animate=False)
+
+    def action_scroll_page_down(self) -> None:
+        self.scroll_page_down(animate=False)
+
+    def action_scroll_home_key(self) -> None:
+        self.scroll_home(animate=False)
+
+    def action_scroll_end_key(self) -> None:
+        self.scroll_end(animate=False)
+
 
 class NexusTextualApp(App[None]):
     CSS = """
@@ -460,9 +493,15 @@ class NexusTextualApp(App[None]):
     #transcript {
         height: 1fr;
         width: 100%;
+        margin: 1 1 0 1;
         padding: 1 2;
+        border: round transparent;
         background: transparent;
         scrollbar-size: 1 1;
+    }
+
+    #transcript:focus {
+        border: round #1e3a8a;
     }
 
     #status {
@@ -491,6 +530,7 @@ class NexusTextualApp(App[None]):
         ("ctrl+c", "copy_or_quit", "Copy selected text or quit"),
         ("ctrl+d", "quit", "Quit"),
         ("ctrl+q", "quit", "Quit"),
+        ("shift+tab", "focus_cycle", "Cycle focus"),
         ("pageup", "scroll_transcript_page_up", "Scroll up"),
         ("pagedown", "scroll_transcript_page_down", "Scroll down"),
         ("home", "scroll_transcript_home", "Scroll home"),
@@ -523,6 +563,7 @@ class NexusTextualApp(App[None]):
         self._streaming_tool_outputs: set[str] = set()
         self._streaming_tool_output_chars: dict[str, int] = {}
         self._streaming_tool_output_capped: set[str] = set()
+        self._transcript_plain_parts: list[str] = []
         self._transcript: Any = None
         self._status: Any = None
         self._input: Any = None
@@ -538,12 +579,12 @@ class NexusTextualApp(App[None]):
 
     def compose(self) -> ComposeResult:
         max_lines = max(1, int(getattr(self.state.config, "textual_transcript_max_lines", 5000)))
-        yield RichLog(id="transcript", wrap=True, highlight=False, markup=False, max_lines=max_lines)
+        yield TranscriptLog(id="transcript", wrap=True, highlight=False, markup=False, max_lines=max_lines)
         yield Static("", id="status")
         yield PromptInput(placeholder="Message Nexus or type /help", id="prompt")
 
     def on_mount(self) -> None:
-        self._transcript = self.query_one("#transcript", RichLog)
+        self._transcript = self.query_one("#transcript", TranscriptLog)
         self._status = self.query_one("#status", Static)
         self._input = self.query_one("#prompt", Input)
         self.console.push_theme(NEXUS_THEME)
@@ -558,6 +599,40 @@ class NexusTextualApp(App[None]):
         if self._transcript is None:
             return
         self._transcript.write(renderable)
+        plain_text = self._render_transcript_plain_text(renderable)
+        if plain_text:
+            self._transcript_plain_parts.append(plain_text)
+
+    def _render_transcript_plain_text(self, renderable: RenderableType) -> str:
+        width = 100
+        if self._transcript is not None:
+            try:
+                width = max(width, int(self._transcript.scrollable_content_region.width or 0))
+            except Exception:  # noqa: BLE001
+                pass
+        buffer = io.StringIO()
+        console = Console(
+            file=buffer,
+            theme=NEXUS_THEME,
+            no_color=True,
+            force_terminal=False,
+            highlight=False,
+            width=width,
+        )
+        console.print(renderable)
+        return buffer.getvalue()
+
+    def _transcript_text(self) -> str:
+        return "".join(self._transcript_plain_parts).strip()
+
+    def _transcript_is_focused(self) -> bool:
+        if self._transcript is None:
+            return False
+        if self.focused is self._transcript:
+            return True
+        if getattr(self.screen, "focused", None) is self._transcript:
+            return True
+        return bool(getattr(self._transcript, "has_focus", False))
 
     def set_status(self, message: str) -> None:
         self._status_text = message
@@ -596,6 +671,12 @@ class NexusTextualApp(App[None]):
         if self._status is not None:
             self._status.update(message)
         self.set_timer(seconds, lambda: self.clear_status(expected=""))
+
+    def _echo_input_prompt(self, prompt: str) -> None:
+        label = prompt.strip()
+        if not label:
+            return
+        self.write(Text(f"Input required: {label}", style="warning"))
 
     def append_assistant_delta(self, content: str) -> None:
         if not self.has_open_assistant_stream:
@@ -684,6 +765,7 @@ class NexusTextualApp(App[None]):
             self._transcript.scroll_up(animate=False)
 
     async def ask(self, prompt: str) -> str:
+        self._echo_input_prompt(prompt)
         self.set_status(prompt)
         self._input.placeholder = prompt
         self._input.focus()
@@ -706,7 +788,20 @@ class NexusTextualApp(App[None]):
             self.copy_to_clipboard(selected_text)
             self._flash_status("Copied selection")
             return
+        transcript_text = self._transcript_text()
+        if transcript_text:
+            self.copy_to_clipboard(transcript_text)
+            self._flash_status("Copied transcript")
+            return
         await self.action_quit()
+
+    def action_focus_cycle(self) -> None:
+        if self._input is None or self._transcript is None:
+            return
+        if self.focused is self._input:
+            self._transcript.focus()
+            return
+        self._input.focus()
 
     def action_scroll_transcript_page_up(self) -> None:
         if self._transcript is not None:
@@ -902,11 +997,25 @@ class NexusTextualApp(App[None]):
         async def ask_for_approval(request: ConfirmationRequest) -> ConfirmationResponse:
             if request.kind is ConfirmationKind.CLARIFICATION:
                 field = request.payload.get("field", "value")
-                answer = (await self.ask(f"Value for {field!r}:")).strip()
-                return ConfirmationResponse(clarification=answer) if answer else ConfirmationResponse()
-            policy = approval_policy_for_request(request)
-            answer = (await self.ask(f"Allow? {approval_prompt_label(policy)}")).strip().lower()
-            return approval_response_from_answer(answer, policy)
+                while True:
+                    answer = await self.ask(f"Value for {field!r}:")
+                    clarified = answer.strip()
+                    if clarified:
+                        return ConfirmationResponse(clarification=clarified)
+                    self.ui.print_muted("A value is required. Provide input or cancel with Ctrl+C.")
+
+            try:
+                policy = approval_policy_for_request(request)
+            except Exception:
+                # Tolerate malformed approval payloads and keep prompting.
+                policy = ApprovalPolicy.ON_REQUEST
+
+            while True:
+                answer = (await self.ask(f"Allow? {approval_prompt_label(policy)}")).strip().lower()
+                response = approval_response_from_answer(answer, policy)
+                if response.approved or _is_explicit_denial_answer(answer):
+                    return response
+                self.ui.print_muted("Please answer with yes/y (or t/turn when offered), or no/n.")
 
         return ask_for_approval
 
@@ -946,6 +1055,13 @@ class NexusTextualApp(App[None]):
                 "message_count": len(self.state.history),
             },
         )
+
+
+def _is_explicit_denial_answer(answer: str) -> bool:
+    normalized = " ".join(
+        answer.strip().lower().replace("(", " ").replace(")", " ").replace("-", " ").replace("_", " ").split()
+    )
+    return normalized in {"n", "no"}
 
 
 def _thinking_label(event: Any) -> str:

@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 
 import pytest
 
 from nexus.integrations.fake_model import FakeModelClient
-from nexus.models import ConfirmationKind, Message, RuntimeResponse, StreamEvent, StreamEventType, ToolCall
+from nexus.models import ConfirmationKind, Message, RuntimeResponse, StreamEvent, StreamEventType, ToolCall, ToolResult
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.security import ApprovalManager, PermissionDecision
-from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool, ShellTool, WriteFileTool
+from nexus.tools.base import Tool, ToolRegistry
+from nexus.tools.builtin import GetTimeTool, ReadFileTool, ShellTool, WriteFileTool
 
 
 class RecordingModelClient(FakeModelClient):
@@ -22,6 +24,48 @@ class RecordingModelClient(FakeModelClient):
     async def chat_completion(self, request, *, stream: bool = True):
         self.requests.append(request)
         yield StreamEvent(type=StreamEventType.MESSAGE_COMPLETE)
+
+
+class RecordingFakeModelClient(FakeModelClient):
+    def __init__(self, scripted=None) -> None:
+        super().__init__(scripted=scripted)
+        self.requests = []
+
+    async def chat_completion(self, request, *, stream: bool = True):
+        self.requests.append(request)
+        async for event in super().chat_completion(request, stream=stream):
+            yield event
+
+
+class DelayReadTool(Tool):
+    input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+    is_mutating = False
+
+    def __init__(self, name: str, timings: dict[str, float], *, delay: float = 0.05) -> None:
+        self.name = name
+        self.description = f"Delay read tool {name}"
+        self._timings = timings
+        self._delay = delay
+
+    async def execute(self, call_id, arguments, context):
+        self._timings[f"{self.name}_start"] = time.perf_counter()
+        await asyncio.sleep(self._delay)
+        self._timings[f"{self.name}_end"] = time.perf_counter()
+        return ToolResult(call_id=call_id, tool_name=self.name, output=f"done:{self.name}")
+
+
+class OrderedWriteTool(Tool):
+    name = "ordered_write"
+    description = "Record when the sequential write starts."
+    input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+    is_mutating = True
+
+    def __init__(self, timings: dict[str, float]) -> None:
+        self._timings = timings
+
+    async def execute(self, call_id, arguments, context):
+        self._timings["ordered_write_start"] = time.perf_counter()
+        return ToolResult(call_id=call_id, tool_name=self.name, output="write-done")
 
 
 @pytest.mark.asyncio
@@ -92,6 +136,93 @@ async def test_agent_executes_read_only_tool(tool_context):
     # AGENT_STOP is the final event; turn_completed precedes it
     assert events[-1].kind == "AGENT_STOP"
     assert any(event.kind == "turn_completed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_agent_runs_parallel_read_only_tools_before_sequential_mutations(tool_context):
+    timings: dict[str, float] = {}
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Inspect then write."),
+                tool_calls=(
+                    ToolCall(call_id="read-1", tool_name="parallel_read_one", arguments={}),
+                    ToolCall(call_id="read-2", tool_name="parallel_read_two", arguments={}),
+                    ToolCall(call_id="write-1", tool_name="ordered_write", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Done.")),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(DelayReadTool("parallel_read_one", timings))
+    registry.register(DelayReadTool("parallel_read_two", timings))
+    registry.register(OrderedWriteTool(timings))
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event async for event in agent.run(
+            [Message(role="user", content="inspect and write")],
+            tool_context,
+            auto_confirm=True,
+            parallel_tools=True,
+            parallel_tool_window=2,
+        )
+    ]
+
+    parallel_starts = [
+        event.payload
+        for event in events
+        if event.kind == "TOOL_CALL_START" and str((event.payload or {}).get("name", "")).startswith("parallel_read_")
+    ]
+
+    assert abs(timings["parallel_read_one_start"] - timings["parallel_read_two_start"]) < 0.03
+    assert timings["ordered_write_start"] >= max(timings["parallel_read_one_end"], timings["parallel_read_two_end"])
+    assert len(parallel_starts) == 2
+    assert {payload["display"]["parallel_index"] for payload in parallel_starts} == {0, 1}
+    assert {payload["display"]["parallel_group_size"] for payload in parallel_starts} == {2}
+    assert all(payload["display"]["is_mutating"] is False for payload in parallel_starts)
+
+
+@pytest.mark.asyncio
+async def test_agent_batches_parallel_invalid_read_only_tool_results_into_next_model_turn(tool_context):
+    model = RecordingFakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Read both sources."),
+                tool_calls=(
+                    ToolCall(call_id="bad-read", tool_name="read_file", arguments={}),
+                    ToolCall(call_id="time-1", tool_name="get_time", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Recovered after tool feedback.")),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())
+    registry.register(ReadFileTool())
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event async for event in agent.run(
+            [Message(role="user", content="inspect the workspace")],
+            tool_context,
+            parallel_tools=True,
+            parallel_tool_window=2,
+        )
+    ]
+
+    assert not any(event.kind == "confirmation_requested" for event in events)
+    tool_results = [event.payload for event in events if event.kind == "tool_result"]
+    assert {result.tool_name for result in tool_results} == {"read_file", "get_time"}
+    assert any(result.is_error for result in tool_results if result.tool_name == "read_file")
+
+    second_request = model.requests[1]
+    tool_messages = [message for message in second_request.messages if message.role == "tool"]
+    assert [message.name for message in tool_messages] == ["read_file", "get_time"]
+    assert "Missing required argument(s) for tool 'read_file'" in tool_messages[0].content
 
 
 @pytest.mark.asyncio

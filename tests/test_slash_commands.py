@@ -453,6 +453,31 @@ async def test_advanced_supervisor_defaults_to_subagent_tools_only(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_basic_supervisor_defaults_to_subagent_tools_when_available(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "basic"
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Execute focused work.",
+                goal_prompt="Do the task.",
+                allowed_tools=["read_file"],
+            ),
+            base_tool_registry=registry,
+            config=config,
+        ),
+        source="agent",
+        origin="execution",
+    )
+
+    assert supervisor_tool_names(config, registry) == {"subagent_execution"}
+
+
+@pytest.mark.asyncio
 async def test_advanced_supervisor_prompt_uses_scoped_agent_resources(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     config.agent_mode = "advanced"
