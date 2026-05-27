@@ -711,14 +711,15 @@ def _advanced_mode_required_tool_names() -> tuple[str, ...]:
         "git_diff",
         "run_tests",
         "run_python_check",
+        "run_formatter",
         "bash",
     )
 
 
 def _builtin_cognitive_tool_names() -> tuple[str, ...]:
     return (
-        "subagent_planning_analysis",
-        "subagent_execution",
-        "subagent_review",
-        "subagent_verification",
+        "subagent_explorer",
+        "subagent_coding",
+        "subagent_code_reviewer",
+        "subagent_impact_analyzer",
     )

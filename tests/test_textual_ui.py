@@ -22,7 +22,7 @@ from nexus.ui.textual_app import NexusTextualApp, TranscriptLog, _strip_mouse_es
 
 
 @pytest.mark.asyncio
-async def test_textual_repl_disables_mouse_to_preserve_terminal_selection(monkeypatch):
+async def test_textual_repl_enables_mouse_for_scroll_support(monkeypatch):
     from nexus.ui import textual_app
 
     calls: list[dict[str, object]] = []
@@ -41,7 +41,7 @@ async def test_textual_repl_disables_mouse_to_preserve_terminal_selection(monkey
 
     await textual_app.run_textual_repl(None, None, None)  # type: ignore[arg-type]
 
-    assert calls[0]["mouse"] is False
+    assert calls[0]["mouse"] is True
     assert calls[1]["finalized"] is True
 
 
@@ -160,7 +160,7 @@ async def test_textual_shift_tab_cycles_focus_between_prompt_and_transcript(tmp_
 
 
 @pytest.mark.asyncio
-async def test_textual_plain_tab_stays_in_prompt_input(tmp_path):
+async def test_textual_tab_cycles_focus_between_panels(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
     state = ReplState(
@@ -180,13 +180,17 @@ async def test_textual_plain_tab_stays_in_prompt_input(tmp_path):
         prompt = app.query_one("#prompt")
         transcript = app.query_one("#transcript")
 
+        # Starts with input focused.
         assert app.focused is prompt
 
+        # Tab moves focus to the transcript pane.
         await pilot.press("tab")
+        assert app.focused is transcript
+        assert prompt.value == ""  # no tab character inserted
 
+        # Tab again cycles back to input.
+        await pilot.press("tab")
         assert app.focused is prompt
-        assert prompt.value == "\t"
-        assert app.focused is not transcript
 
 
 @pytest.mark.asyncio

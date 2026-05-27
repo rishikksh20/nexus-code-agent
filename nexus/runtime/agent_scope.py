@@ -21,10 +21,10 @@ SUBAGENT_PROFILE_FIELDS: tuple[str, ...] = (
 
 BUILTIN_SUBAGENT_NAMES: frozenset[str] = frozenset(
     {
-        "planning_analysis",
-        "execution",
-        "review",
-        "verification",
+        "explorer",
+        "coding",
+        "code_reviewer",
+        "impact_analyzer",
     }
 )
 

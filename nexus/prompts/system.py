@@ -18,6 +18,8 @@ import platform
 import sys
 from typing import TYPE_CHECKING
 
+from nexus.runtime.supervisor_routing import supervisor_routing_guidance_lines
+
 if TYPE_CHECKING:
     from nexus.config.defaults import AgentConfig
     from nexus.tools.base import ToolRegistry
@@ -185,11 +187,20 @@ def _subagent_guidance_lines(records) -> list[str]:
         "",
         "## Cognitive Sub-Agent Contract",
         "",
-        "- Default to delegation: when a task needs repo inspection, code edits, tests, shell commands, MCP calls, or skill-specific work, call the appropriate `subagent_*` tool instead of doing the work directly as supervisor.",
-        "- Direct normal tool use is only for tiny supervisor-local checks, slash/config/status work, one-off lookups, or recovery after a sub-agent cannot proceed.",
-        "- If both a normal tool and a sub-agent could handle the same substantive work, choose the sub-agent first and integrate its structured result.",
-        "- Routing: use `subagent_planning_analysis` for exploration/planning; `subagent_execution` for edits or implementation; `subagent_verification` for tests/lint/typecheck/runtime validation; `subagent_review` for bug/regression review.",
-        "- For implementation requests, prefer `subagent_planning_analysis` first when context is unclear, then `subagent_execution`; use `subagent_verification` and `subagent_review` after changes when available.",
+        "- Stay supervisor-local for tiny read-only work. If you can answer with about 3 simple read-only tool calls or fewer, do it directly instead of delegating.",
+        "- Delegate when the task needs isolated mutation, more than a small direct-tool budget, explicit impact analysis, or post-change review and scoped verification.",
+        "- If both a normal tool and a sub-agent could handle the task, keep it local when it is tiny and read-only; otherwise delegate once with bounded instructions and integrate the structured result.",
+        "- Routing: use `subagent_explorer` for bounded read-only exploration and summaries; `subagent_coding` for code edits and cheap local validation; `subagent_impact_analyzer` when blast radius or verification scope is unclear; `subagent_code_reviewer` for post-change review and scoped automated verification.",
+        "- For implementation requests, do brief supervisor planning first. Call `subagent_explorer` or `subagent_impact_analyzer` only when the controlling code path or blast radius is unclear, then route edits to `subagent_coding`. After non-trivial changes, prefer `subagent_impact_analyzer` followed by `subagent_code_reviewer`.",
+        "",
+        "Supervisor routing policy:",
+        *supervisor_routing_guidance_lines(),
+        "",
+        "Delegation packet requirements:",
+        "- Include objective, exact files/symbols if known, constraints, expected JSON fields, stop condition, and tool budget.",
+        "- For impact analysis, request changed_files, affected_modules, public_interfaces_changed, risk_level, validation_category, candidate_review_targets, candidate_tests, verification_policy, and failure_attribution_hints.",
+        "- For review/verification, provide impact-analysis packet ids when available and require focused checks unless broad regression is explicitly justified.",
+        "- Require manual-validation notes for UI/UX, accessibility feel, animations, responsiveness, external services, and business correctness that cannot be fully auto-validated.",
         "- If active skill metadata is relevant, mention the skill name and expected workflow in the sub-agent instructions; do not expand hidden skill bodies yourself.",
         "- You are the only agent that talks to the user; sub-agents return findings, blockers, and clarification requests to you.",
         "- Treat sub-agent local conversation and tool history as isolated private context.",

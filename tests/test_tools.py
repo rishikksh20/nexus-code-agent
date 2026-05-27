@@ -183,12 +183,14 @@ async def test_register_subagent_tools_registers_default_and_specialist_tools():
     assert specialist.source == "agent"
     assert specialist.origin == "explore"
     assert specialist.tool.is_mutating is False
-    assert registry.record("subagent_planning_analysis").origin == "planning_analysis"
-    assert registry.record("subagent_execution").origin == "execution"
-    assert registry.record("subagent_review").origin == "review"
-    assert registry.record("subagent_verification").origin == "verification"
-    verification_tools = registry.record("subagent_verification").tool._definition.allowed_tools
-    assert "bash" in verification_tools
+    assert registry.record("subagent_explorer").origin == "explorer"
+    assert registry.record("subagent_coding").origin == "coding"
+    assert registry.record("subagent_code_reviewer").origin == "code_reviewer"
+    assert registry.record("subagent_impact_analyzer").origin == "impact_analyzer"
+    coding_tools = registry.record("subagent_coding").tool._definition.allowed_tools
+    reviewer_tools = registry.record("subagent_code_reviewer").tool._definition.allowed_tools
+    assert "run_formatter" in coding_tools
+    assert "run_tests" in reviewer_tools
 
 
 def test_yaml_subagents_are_discovered_with_local_precedence(tmp_path):
@@ -705,10 +707,10 @@ async def test_register_subagent_tools_advanced_mode_does_not_require_delegation
 
     assert count == 4
     assert {record.name for record in registry.records()} == {
-        "subagent_planning_analysis",
-        "subagent_execution",
-        "subagent_review",
-        "subagent_verification",
+        "subagent_explorer",
+        "subagent_coding",
+        "subagent_code_reviewer",
+        "subagent_impact_analyzer",
     }
 
 
@@ -730,15 +732,15 @@ def test_register_subagent_tools_loads_configured_subagents_in_basic_mode():
         allowed_tools=[],
         denied_tools=[],
         subagent_profiles=[
-            {"name": "execution", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
-            {"name": "review", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
+            {"name": "coding", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
+            {"name": "code_reviewer", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
         ],
     )
 
     count = register_subagent_tools(registry, config)
 
     assert count == 2
-    assert {record.name for record in registry.records()} == {"subagent_execution", "subagent_review"}
+    assert {record.name for record in registry.records()} == {"subagent_coding", "subagent_code_reviewer"}
 
 
 def test_load_subagent_definitions_builds_definition_objects():

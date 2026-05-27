@@ -1285,7 +1285,7 @@ async def test_config_upgrade_updates_allowed_tools_and_live_registry(tmp_path):
     assert '"write_file"' in content
     assert "write_file" in state.config.allowed_tools
     assert state.tool_registry.record("write_file").source == "core"
-    assert state.tool_registry.record("subagent_planning_analysis").source == "agent"
+    assert state.tool_registry.record("subagent_explorer").source == "agent"
     assert "allowed_tools: write_file" in console.export_text()
 
 

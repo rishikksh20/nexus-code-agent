@@ -370,8 +370,8 @@ def test_builtin_subagent_allowlists_ingest_registered_mcp_tools():
     )
 
     assert count == 5
-    assert "fs_echo" in registry.record("subagent_execution").tool._definition.allowed_tools
-    assert "fs_echo" in registry.record("subagent_planning_analysis").tool._definition.allowed_tools
+    assert "fs_echo" in registry.record("subagent_coding").tool._definition.allowed_tools
+    assert "fs_echo" in registry.record("subagent_explorer").tool._definition.allowed_tools
     assert registry.record("subagent_custom").tool._definition.allowed_tools == ["get_time"]
 
 

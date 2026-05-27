@@ -84,9 +84,10 @@ async def run_textual_repl(
         session_resumed=session_resumed,
     )
     try:
-        # Leave terminal mouse reporting disabled so users can use their terminal's
-        # native select-and-copy behavior in the transcript pane.
-        await app.run_async(mouse=False)
+        # Enable Textual mouse support so the transcript pane scrolls with the
+        # mouse wheel and click-to-focus works. Text can be copied with Ctrl+C
+        # (copies selected text via Textual's selection system, or full transcript).
+        await app.run_async(mouse=True)
     finally:
         await app.finalize_session()
 
@@ -441,11 +442,9 @@ class PromptInput(Input):
         cast("NexusTextualApp", self.app).action_prompt_history_next()
 
     def key_tab(self, event: events.Key) -> None:
-        event.stop()
-        cursor = int(getattr(self, "cursor_position", len(self.value)))
-        current = str(self.value or "")
-        self.value = current[:cursor] + "\t" + current[cursor:]
-        self.cursor_position = cursor + 1
+        # Let Tab bubble up to cycle focus to the transcript pane instead of
+        # inserting a literal tab character into the prompt.
+        event.prevent_default()
 
 
 class TranscriptLog(RichLog):
@@ -501,7 +500,7 @@ class NexusTextualApp(App[None]):
     }
 
     #transcript:focus {
-        border: round #1e3a8a;
+        border: round $accent;
     }
 
     #status {
@@ -530,7 +529,8 @@ class NexusTextualApp(App[None]):
         ("ctrl+c", "copy_or_quit", "Copy selected text or quit"),
         ("ctrl+d", "quit", "Quit"),
         ("ctrl+q", "quit", "Quit"),
-        ("shift+tab", "focus_cycle", "Cycle focus"),
+        ("tab", "focus_cycle", "Switch panel focus"),
+        ("shift+tab", "focus_cycle", "Switch panel focus"),
         ("pageup", "scroll_transcript_page_up", "Scroll up"),
         ("pagedown", "scroll_transcript_page_down", "Scroll down"),
         ("home", "scroll_transcript_home", "Scroll home"),

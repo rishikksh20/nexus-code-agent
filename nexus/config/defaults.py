@@ -19,7 +19,7 @@ class AgentConfig:
     compaction_keep_recent: int = 12
     default_mode: str = "default"
     auto_confirm_read_only: bool = True
-    max_loop_iterations: int = 8
+    max_loop_iterations: int = 50
     max_tool_calls_per_turn: int = 30
     parallel_tools: bool = True
     parallel_tool_window: int = 4

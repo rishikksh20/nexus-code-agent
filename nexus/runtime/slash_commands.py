@@ -287,12 +287,12 @@ async def handle_sub_agent(state: ReplState, args: list[str]) -> None:
             state, "sub-agent", "Inspect and scope cognitive sub-agent resources.",
             (
                 ("list", "List registered cognitive sub-agent tools.", "/sub-agent list"),
-                ("show <name>", "Show one sub-agent description and effective resources.", "/sub-agent show execution"),
-                ("tools <name>", "List effective tools for one sub-agent.", "/sub-agent tools execution"),
-                ("skills <name>", "List allowed skill metadata for one sub-agent.", "/sub-agent skills execution"),
-                ("mcp <name>", "List active MCP servers and sub-agent scoped state.", "/sub-agent mcp execution"),
-                ("allow <name> tool|skill|mcp <id>", "Add a resource to a sub-agent allowlist.", "/sub-agent allow execution tool read_file"),
-                ("disallow <name> tool|skill|mcp <id>", "Remove a resource from a sub-agent allowlist.", "/sub-agent disallow execution mcp filesystem"),
+                ("show <name>", "Show one sub-agent description and effective resources.", "/sub-agent show coding"),
+                ("tools <name>", "List effective tools for one sub-agent.", "/sub-agent tools coding"),
+                ("skills <name>", "List allowed skill metadata for one sub-agent.", "/sub-agent skills coding"),
+                ("mcp <name>", "List active MCP servers and sub-agent scoped state.", "/sub-agent mcp coding"),
+                ("allow <name> tool|skill|mcp <id>", "Add a resource to a sub-agent allowlist.", "/sub-agent allow coding tool read_file"),
+                ("disallow <name> tool|skill|mcp <id>", "Remove a resource from a sub-agent allowlist.", "/sub-agent disallow coding mcp filesystem"),
                 ("agents list", "List YAML sub-agents in local and global agent directories.", "/sub-agent agents list"),
                 ("agents new <name> [local|global]", "Scaffold a new YAML sub-agent file.", "/sub-agent agents new explore"),
                 ("agents promote <name>", "Move a local YAML sub-agent to the global directory.", "/sub-agent agents promote explore"),
@@ -1865,8 +1865,9 @@ def _print_mcp_refresh_reports(state: ReplState, reports: list[MCPRefreshReport]
 async def _handle_config_upgrade(state: ReplState, scope: str) -> None:
     """Merge any new template keys into the existing local or global config file.
 
-    Existing values are **never** modified — only keys that are absent from the
-    on-disk file are appended.  Memory, sessions, and storage are untouched.
+    Existing user values are preserved except for mechanical migrations such as
+    deprecated key removal and legacy built-in sub-agent name normalization.
+    Memory, sessions, and storage are untouched.
     """
     if scope == "global":
         path = state.config.global_config_file
@@ -1907,6 +1908,8 @@ async def _handle_config_upgrade(state: ReplState, scope: str) -> None:
         state.console.print("  [bold]~[/bold] migrated agent scope to [agents]")
     if report.subagent_scope_migrated:
         state.console.print("  [bold]~[/bold] migrated sub-agent scope to [[sub-agents]]")
+    if report.legacy_subagent_names_migrated:
+        state.console.print("  [bold]~[/bold] normalized legacy sub-agent names to the four-agent model")
     for tool_name in report.allowed_tool_additions:
         state.console.print(f"  [bold]+[/bold] allowed_tools: {tool_name}")
 

@@ -106,6 +106,46 @@ async def test_agent_logs_empty_provider_response_diagnostics(tool_context, capl
     assert "last_role=user" in caplog.text
 
 
+class MaxTokensModelClient(FakeModelClient):
+    """Yields an empty response with finish_reason=max_tokens once, then a real reply."""
+
+    def __init__(self, final_response: RuntimeResponse) -> None:
+        super().__init__(scripted=[final_response])
+        self._first_call = True
+
+    async def chat_completion(self, request, *, stream: bool = True):
+        if self._first_call:
+            self._first_call = False
+            yield StreamEvent(type=StreamEventType.MESSAGE_COMPLETE, finish_reason="max_tokens")
+            return
+        async for event in super().chat_completion(request, stream=stream):
+            yield event
+
+
+@pytest.mark.asyncio
+async def test_agent_retries_on_max_tokens_empty_response(tool_context, caplog):
+    final = RuntimeResponse(message=Message(role="assistant", content="Done after pruning."))
+    model = MaxTokensModelClient(final_response=final)
+    registry = ToolRegistry()
+    agent = Agent(model_client=model, tool_registry=registry)
+    caplog.set_level(logging.WARNING, logger="nexus.runtime.agent")
+
+    events = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="hello")],
+            tool_context,
+            max_turns=3,
+        )
+    ]
+
+    errors = [event for event in events if event.kind == "AGENT_ERROR"]
+    assert not errors, "agent should not error on max_tokens — it should retry"
+    text_events = [event for event in events if event.kind == "TEXT_COMPLETE"]
+    assert any("Done after pruning" in str(e.payload) for e in text_events)
+    assert "max_tokens" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_agent_executes_read_only_tool(tool_context):
     model = FakeModelClient(

@@ -5,6 +5,7 @@ from pathlib import Path
 from nexus.config import load_config
 from nexus.prompts import build_context_sections
 from nexus.context import CarryOverState
+from nexus.runtime.supervisor_routing import SupervisorRoute, classify_supervisor_route
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.skills import load_skill_registry
 from nexus.tools.base import ToolRegistry
@@ -37,26 +38,38 @@ def test_build_context_describes_cognitive_subagent_contract(tmp_path):
     registry.register(
         SubAgentTool(
             definition=SubagentDefinition(
-                name="planning_analysis",
-                description="Analyze the repo and plan.",
+                name="explorer",
+                description="Explore the repo and summarize it.",
                 goal_prompt="Read only.",
                 allowed_tools=["read_file", "grep"],
             ),
         ),
         source="agent",
-        origin="planning_analysis",
+        origin="explorer",
     )
 
     sections = build_context_sections(config, registry, task_input="plan this")
 
     assert "Cognitive Sub-Agent Contract" in sections.base_instruction
-    assert "`subagent_planning_analysis`" in sections.base_instruction
+    assert "`subagent_explorer`" in sections.base_instruction
     assert '"input_packet_ids"' in sections.base_instruction
     assert "status: needs_clarification" in sections.base_instruction
     assert "local conversation and tool history as isolated private context" in sections.base_instruction
-    assert "Default to delegation" in sections.base_instruction
-    assert "If both a normal tool and a sub-agent could handle the same substantive work" in sections.base_instruction
-    assert "Routing: use `subagent_planning_analysis`" in sections.base_instruction
+    assert "Stay supervisor-local for tiny read-only work" in sections.base_instruction
+    assert "If both a normal tool and a sub-agent could handle the task" in sections.base_instruction
+    assert "Routing: use `subagent_explorer`" in sections.base_instruction
+    assert "Delegation packet requirements" in sections.base_instruction
+    assert "validation_category" in sections.base_instruction
+    assert "manual-validation notes" in sections.base_instruction
+    assert "`subagent_coding`" in sections.base_instruction
+
+
+def test_supervisor_routing_helper_classifies_default_task_shapes():
+    assert classify_supervisor_route("read README", estimated_tool_calls=1).route is SupervisorRoute.DIRECT_READ_ONLY
+    assert classify_supervisor_route("summarize the runtime package", estimated_tool_calls=8).route is SupervisorRoute.EXPLORER
+    assert classify_supervisor_route("implement the routing helper").route is SupervisorRoute.CODING
+    assert classify_supervisor_route("do impact analysis for this diff").route is SupervisorRoute.IMPACT_ANALYZER
+    assert classify_supervisor_route("review this change").route is SupervisorRoute.CODE_REVIEWER
 
 
 def test_build_context_includes_current_time_and_working_directory(tmp_path, monkeypatch):

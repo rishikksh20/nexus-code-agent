@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from uuid import uuid4
@@ -42,6 +43,20 @@ logger = logging.getLogger(__name__)
 TOOL_CALL_LIMIT_FINISH_REASON = "tool_call_limit"
 MAX_TURNS_FINISH_REASON = "max_turns"
 INVALID_TOOL_CALL_RETRY_LIMIT = 2
+_READ_RESULT_CACHE_METADATA_KEY = "nexus_read_result_cache"
+_CACHEABLE_READ_TOOL_NAMES = frozenset(
+    {
+        "read_file",
+        "list_dir",
+        "grep",
+        "glob",
+        "lsp",
+        "git_status",
+        "git_diff",
+        "code_index",
+        "semantic_search",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -304,6 +319,12 @@ class Agent:
         )
         yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
 
+        cached_result = _cached_read_result(record, tool, tool_call, context)
+        if cached_result is not None:
+            yield AgentEvent.tool_call_complete(cached_result)
+            yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=cached_result)
+            return
+
         await self.hooks.emit(
             HookEvent.PRE_TOOL_USE,
             {
@@ -365,11 +386,14 @@ class Agent:
             result.metadata = {**result.metadata, "actor": actor}
         result.metadata = {**result.metadata, "is_mutating": tool.is_mutating}
         if tool.is_mutating:
+            _clear_read_result_cache(context)
             result = _with_post_mutation_refresh(
                 result,
                 affected_paths or set(),
                 context,
             )
+        else:
+            _store_read_result(record, tool, tool_call, context, result)
         if approval_manager is not None:
             approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
 
@@ -544,6 +568,20 @@ class Agent:
                         return
 
             if not response_text and not stream_tool_calls:
+                # When the provider hits its output-token limit it returns an
+                # empty response instead of an error.  Aggressively prune tool
+                # outputs from history to free context space and retry the turn
+                # rather than surfacing an opaque error to the user.
+                if str(stream_finish_reason or "").strip().lower() in {"max_tokens", "length"}:
+                    logger.warning(
+                        "agent.model_batch.max_tokens session_id=%s actor=%s turn_index=%s — pruning history and retrying",
+                        context.session_id,
+                        _tool_actor(context) or "supervisor",
+                        turn_index + 1,
+                    )
+                    prune_tool_outputs(history, protect_tokens=500, minimum_tokens=200)
+                    continue
+
                 empty_response_error = _empty_provider_response_message(stream_finish_reason)
                 await self.hooks.emit(
                     HookEvent.NOTIFICATION,
@@ -1059,6 +1097,10 @@ class Agent:
         approval_manager: ApprovalManager | None,
         affected_paths: set[str] | None = None,
     ) -> ToolResult:
+        cached_result = _cached_read_result(record, tool, tool_call, context)
+        if cached_result is not None:
+            return cached_result
+
         await self.hooks.emit(
             HookEvent.PRE_TOOL_USE,
             {
@@ -1121,11 +1163,14 @@ class Agent:
         if actor:
             result.metadata = {**result.metadata, "actor": actor}
         if tool.is_mutating:
+            _clear_read_result_cache(context)
             result = _with_post_mutation_refresh(
                 result,
                 affected_paths or set(),
                 context,
             )
+        else:
+            _store_read_result(record, tool, tool_call, context, result)
         if approval_manager is not None:
             approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
 
@@ -1422,7 +1467,11 @@ class Agent:
 
         missing_fields = _missing_required_fields(record.tool.input_schema, tool_call.arguments)
         if missing_fields:
-            if not _missing_fields_should_be_repaired_by_model(missing_fields):
+            read_without_clarification_callback = (
+                getattr(record.tool, "kind", None) is ToolKind.READ
+                and context.metadata.get("approval_callback") is None
+            )
+            if not _missing_fields_should_be_repaired_by_model(missing_fields) and not read_without_clarification_callback:
                 missing_field = missing_fields[0]
                 prepared.confirmation_request = ConfirmationRequest(
                     kind=ConfirmationKind.CLARIFICATION,
@@ -1654,6 +1703,77 @@ def _tool_result_message(result: ToolResult) -> Message:
         name=result.tool_name,
         tool_call_id=result.call_id,
     )
+
+
+def _cached_read_result(
+    record: Any,
+    tool: Any,
+    tool_call: ToolCall,
+    context: ToolExecutionContext,
+) -> ToolResult | None:
+    key = _read_result_cache_key(record, tool, tool_call)
+    if key is None:
+        return None
+    cache = context.metadata.get(_READ_RESULT_CACHE_METADATA_KEY)
+    if not isinstance(cache, dict):
+        return None
+    cached = cache.get(key)
+    if not isinstance(cached, ToolResult):
+        return None
+    metadata = {
+        **cached.metadata,
+        "read_cache_hit": True,
+        "cached_from_call_id": cached.call_id,
+    }
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=cached.tool_name,
+        output=cached.output,
+        is_error=cached.is_error,
+        metadata=metadata,
+    )
+
+
+def _store_read_result(
+    record: Any,
+    tool: Any,
+    tool_call: ToolCall,
+    context: ToolExecutionContext,
+    result: ToolResult,
+) -> None:
+    key = _read_result_cache_key(record, tool, tool_call)
+    if key is None:
+        return
+    cache = context.metadata.setdefault(_READ_RESULT_CACHE_METADATA_KEY, {})
+    if isinstance(cache, dict):
+        cache[key] = ToolResult(
+            call_id=result.call_id,
+            tool_name=result.tool_name,
+            output=result.output,
+            is_error=result.is_error,
+            metadata={**result.metadata, "read_cache_hit": False},
+        )
+
+
+def _clear_read_result_cache(context: ToolExecutionContext) -> None:
+    cache = context.metadata.get(_READ_RESULT_CACHE_METADATA_KEY)
+    if isinstance(cache, dict):
+        cache.clear()
+
+
+def _read_result_cache_key(record: Any, tool: Any, tool_call: ToolCall) -> str | None:
+    if getattr(tool, "is_mutating", False):
+        return None
+    if getattr(tool, "kind", None) is not ToolKind.READ:
+        return None
+    name = str(getattr(record, "name", "") or getattr(tool, "name", ""))
+    if name not in _CACHEABLE_READ_TOOL_NAMES:
+        return None
+    try:
+        arguments = json.dumps(tool_call.arguments, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        arguments = repr(sorted(tool_call.arguments.items()))
+    return f"{name}:{arguments}"
 
 
 def _tool_name_text(tool_name: Any) -> str:
@@ -1928,10 +2048,10 @@ def _supervisor_preferred_tool_records(records: list[Any]) -> list[Any]:
 def _supervisor_tool_priority(record: Any) -> tuple[int, int, str]:
     name = str(getattr(record, "name", ""))
     subagent_order = {
-        "subagent_planning_analysis": 0,
-        "subagent_execution": 1,
-        "subagent_verification": 2,
-        "subagent_review": 3,
+        "subagent_explorer": 0,
+        "subagent_coding": 1,
+        "subagent_impact_analyzer": 2,
+        "subagent_code_reviewer": 3,
     }
     if name.startswith("subagent_"):
         return (0, subagent_order.get(name, 50), name)
@@ -1950,19 +2070,19 @@ def _supervisor_tool_schema(record: Any, records: list[Any]) -> dict[str, Any]:
         function["description"] = _subagent_preference_description(name, description)
     elif has_subagents:
         function["description"] = (
-            f"{description} Supervisor direct-use escape hatch: for substantial repo inspection, "
-            "edits, tests, shell work, MCP-backed work, or skill-specific work, prefer delegating "
-            "through the appropriate subagent_* tool first."
+            f"{description} Supervisor direct-use path: use this directly for tiny read-only checks, "
+            "one-off recovery steps, or slash/config/status work. Delegate when the task exceeds the "
+            "supervisor's small local budget or needs isolated mutation, impact analysis, or post-change review."
         ).strip()
     return schema
 
 
 def _subagent_preference_description(name: str, description: str) -> str:
     routing = {
-        "subagent_planning_analysis": "Preferred for codebase exploration, impact analysis, and implementation planning.",
-        "subagent_execution": "Preferred for file edits, implementation, refactors, and normal workspace tool use.",
-        "subagent_verification": "Preferred for tests, lint, typecheck, runtime checks, and validation summaries.",
-        "subagent_review": "Preferred for bug/regression review, diffs, and maintainability risk checks.",
+        "subagent_explorer": "Preferred for bounded read-only exploration, directory summaries, and codebase scans.",
+        "subagent_coding": "Preferred for file edits, implementation, and cheap local validation tied to those edits.",
+        "subagent_impact_analyzer": "Preferred when blast radius, affected interfaces, or scoped verification targets are unclear.",
+        "subagent_code_reviewer": "Preferred for post-change review, scoped automated verification, and failure attribution.",
     }
     prefix = routing.get(name, "Preferred delegation route for focused cognitive work.")
     return f"{prefix} {description}".strip()

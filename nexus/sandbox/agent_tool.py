@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from nexus.models import AgentEventType, ConfirmationKind, Message, ToolCall, ToolExecutionContext, ToolResult
+from nexus.runtime.context_state import append_context_packet, make_context_packet
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.agent_scope import render_skill_metadata, subagent_skill_names, subagent_tool_names
 from nexus.security.manager import ApprovalScope
@@ -464,6 +465,15 @@ class SubAgentTool:
             input_packet_ids=input_packet_ids,
             context_snapshot=context_snapshot,
         )
+        output_packet_ids = _persist_subagent_context_packet(
+            outer_context,
+            tool_name=self.name,
+            definition=self._definition,
+            task_id=task_id,
+            output=output,
+        )
+        if output_packet_ids:
+            output = _with_output_packet_ids(output, output_packet_ids)
         if len(output) > self._MAX_OUTPUT_BYTES:
             output = output[: self._MAX_OUTPUT_BYTES] + "\n\u2026[truncated]"
 
@@ -495,6 +505,7 @@ class SubAgentTool:
                 "agent": self.name,
                 "role": self._definition.name if self._definition else "delegate",
                 "input_packet_ids": list(input_packet_ids),
+                "output_packet_ids": list(output_packet_ids),
                 "context_snapshot": context_snapshot,
             },
         )
@@ -588,8 +599,13 @@ def _direct_subagent_system_prompt(
         f"Allowed skill metadata:\n{skills_text}\n\n"
         "If the task requires reading, editing, testing, or shell inspection, use the allowed normal tools before your final answer. "
         "Do not claim files were changed, tests were run, or code was inspected unless you actually used the relevant tools.\n\n"
-        "Return only a JSON object with keys: status, summary, findings, changed_files, "
-        "related_files, tests_run, risks, clarifications_needed, recommended_next_action."
+        "Return only a JSON object. Common keys: status, summary, findings, changed_files, "
+        "related_files, tests_run, risks, clarifications_needed, recommended_next_action. "
+        "Impact-analysis keys when relevant: affected_modules, public_interfaces_changed, "
+        "risk_level, validation_category, candidate_review_targets, candidate_tests, "
+        "verification_policy, failure_attribution_hints. Review/failure keys when relevant: "
+        "failure_analysis with related_to_task, confidence, reasoning_summary, suspected_causes, "
+        "likely_preexisting, and recommended_next_action."
     )
 
 
@@ -698,6 +714,15 @@ def _subagent_result_envelope(
         "changed_files": _list_field_from_result(structured_result, "changed_files") or _list_field_from_snapshot(context_snapshot, "modified_files"),
         "related_files": _list_field_from_result(structured_result, "related_files") or _list_field_from_snapshot(context_snapshot, "related_files"),
         "tests_run": _list_field_from_result(structured_result, "tests_run") or _list_field_from_snapshot(context_snapshot, "tests_run"),
+        "affected_modules": _list_field_from_result(structured_result, "affected_modules"),
+        "public_interfaces_changed": _list_field_from_result(structured_result, "public_interfaces_changed"),
+        "risk_level": _string_field(structured_result, "risk_level"),
+        "validation_category": _string_field(structured_result, "validation_category"),
+        "candidate_review_targets": _list_field_from_result(structured_result, "candidate_review_targets"),
+        "candidate_tests": _list_field_from_result(structured_result, "candidate_tests"),
+        "verification_policy": _dict_field_from_result(structured_result, "verification_policy"),
+        "failure_attribution_hints": _list_field_from_result(structured_result, "failure_attribution_hints"),
+        "failure_analysis": _dict_field_from_result(structured_result, "failure_analysis"),
         "context": context,
         "recommended_next_action": (
             _string_field(structured_result, "recommended_next_action")
@@ -705,6 +730,147 @@ def _subagent_result_envelope(
         ),
         "runtime_status": status,
     }
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _persist_subagent_context_packet(
+    context: ToolExecutionContext,
+    *,
+    tool_name: str,
+    definition: SubagentDefinition | None,
+    task_id: str,
+    output: str,
+) -> tuple[str, ...]:
+    payload = _parse_structured_result(output)
+    if not payload:
+        return ()
+    if not _packet_worthy_payload(payload):
+        return ()
+
+    role = definition.name if definition else "delegate"
+    packet_type = _packet_type_for_subagent(role, payload)
+    failure_summary = _failure_summary_from_payload(payload)
+    artifacts = _packet_artifacts_from_payload(packet_type, payload)
+    packet = make_context_packet(
+        metadata=context.metadata,
+        source_agent=tool_name,
+        target_agent="supervisor",
+        packet_type=packet_type,
+        task_id=task_id,
+        summary=str(payload.get("summary") or "").strip() or _summary_line(str(payload.get("raw_result") or "")),
+        related_files=_string_tuple(payload.get("related_files") or payload.get("candidate_review_targets")),
+        modified_files=_string_tuple(payload.get("changed_files")),
+        behavior_changes=_string_tuple(payload.get("findings") or payload.get("affected_modules")),
+        recommended_tests=_string_tuple(payload.get("candidate_tests") or payload.get("tests_run")),
+        failure_summary=failure_summary,
+        confidence=_confidence_from_payload(payload),
+        artifacts=artifacts,
+    )
+    append_context_packet(context.metadata, packet)
+    return (packet.packet_id,)
+
+
+def _packet_type_for_subagent(role: str, payload: dict[str, Any]) -> str:
+    status = str(payload.get("status") or "").lower()
+    if status == "failed" or payload.get("failure_analysis"):
+        return "failure_analysis"
+    if role == "explorer":
+        return "exploration_summary"
+    if role == "coding":
+        return "coding_summary"
+    if role == "impact_analyzer":
+        return "impact_analysis"
+    if role == "code_reviewer":
+        if payload.get("tests_run") or payload.get("candidate_tests"):
+            return "verification_result"
+        return "review_findings"
+    return "handoff"
+
+
+def _packet_worthy_payload(payload: dict[str, Any]) -> bool:
+    for key in (
+        "changed_files",
+        "related_files",
+        "tests_run",
+        "candidate_tests",
+        "candidate_review_targets",
+        "findings",
+        "risks",
+        "failure_analysis",
+        "verification_policy",
+    ):
+        value = payload.get(key)
+        if value:
+            return True
+    return False
+
+
+def _packet_artifacts_from_payload(packet_type: str, payload: dict[str, Any]) -> tuple[str, ...]:
+    if packet_type not in {"impact_analysis", "failure_analysis", "verification_result", "review_findings"}:
+        return ()
+    compact = {
+        key: payload.get(key)
+        for key in (
+            "affected_modules",
+            "public_interfaces_changed",
+            "risk_level",
+            "validation_category",
+            "verification_policy",
+            "failure_attribution_hints",
+            "failure_analysis",
+            "recommended_next_action",
+        )
+        if payload.get(key)
+    }
+    if not compact:
+        return ()
+    return (json.dumps(compact, sort_keys=True)[:4000],)
+
+
+def _failure_summary_from_payload(payload: dict[str, Any]) -> str | None:
+    failure_analysis = payload.get("failure_analysis")
+    if isinstance(failure_analysis, dict):
+        summary = failure_analysis.get("reasoning_summary") or failure_analysis.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return summary.strip()
+    if str(payload.get("status") or "").lower() == "failed":
+        return str(payload.get("summary") or payload.get("raw_result") or "").strip()[:500] or None
+    return None
+
+
+def _confidence_from_payload(payload: dict[str, Any]) -> float | None:
+    failure_analysis = payload.get("failure_analysis")
+    if isinstance(failure_analysis, dict):
+        value = failure_analysis.get("confidence")
+        if isinstance(value, int | float):
+            return max(0.0, min(1.0, float(value)))
+    return None
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    result: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            text = item.strip()
+        elif isinstance(item, dict):
+            text = json.dumps(item, sort_keys=True)
+        else:
+            text = str(item).strip()
+        if text:
+            result.append(text)
+    return tuple(dict.fromkeys(result))
+
+
+def _with_output_packet_ids(output: str, packet_ids: tuple[str, ...]) -> str:
+    payload = _parse_structured_result(output)
+    if not payload:
+        return output
+    payload["output_packet_ids"] = list(packet_ids)
+    context = payload.get("context")
+    if isinstance(context, dict):
+        context["output_packet_ids"] = list(packet_ids)
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
@@ -808,3 +974,8 @@ def _list_field_from_result(payload: dict[str, Any], key: str) -> list[Any]:
             if text:
                 normalized.append(item)
     return normalized
+
+
+def _dict_field_from_result(payload: dict[str, Any], key: str) -> dict[str, Any]:
+    value = payload.get(key)
+    return dict(value) if isinstance(value, dict) else {}
