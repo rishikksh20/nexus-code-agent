@@ -18,6 +18,8 @@ import platform
 import sys
 from typing import TYPE_CHECKING
 
+from nexus.runtime.supervisor_routing import supervisor_routing_guidance_lines
+
 if TYPE_CHECKING:
     from nexus.config.defaults import AgentConfig
     from nexus.tools.base import ToolRegistry
@@ -133,6 +135,7 @@ def _get_tool_guidelines_section(tool_registry: "ToolRegistry") -> str:
         "",
         "- Prefer read-only inspection before edits or commands that change state.",
         "- For repo review, explanation, or scanning requests, stay read-only unless the user asks for changes.",
+        "- Do not call the same read-only tool with identical arguments more than once in a turn; use the previous tool result already in context.",
         "- Read before editing; prefer focused edits or patches over full rewrites.",
         "- Explain commands that modify filesystem or system state before running them.",
         "- Use task tracking for multi-step work and update progress as steps complete.",
@@ -185,11 +188,23 @@ def _subagent_guidance_lines(records) -> list[str]:
         "",
         "## Cognitive Sub-Agent Contract",
         "",
-        "- Default to delegation: when a task needs repo inspection, code edits, tests, shell commands, MCP calls, or skill-specific work, call the appropriate `subagent_*` tool instead of doing the work directly as supervisor.",
-        "- Direct normal tool use is only for tiny supervisor-local checks, slash/config/status work, one-off lookups, or recovery after a sub-agent cannot proceed.",
-        "- If both a normal tool and a sub-agent could handle the same substantive work, choose the sub-agent first and integrate its structured result.",
-        "- Routing: use `subagent_planning_analysis` for exploration/planning; `subagent_execution` for edits or implementation; `subagent_verification` for tests/lint/typecheck/runtime validation; `subagent_review` for bug/regression review.",
-        "- For implementation requests, prefer `subagent_planning_analysis` first when context is unclear, then `subagent_execution`; use `subagent_verification` and `subagent_review` after changes when available.",
+        "- Pick one active route for the user request before calling tools: direct read-only, explorer, coding, impact, or review. Every tool call must move that route toward the final user-visible answer.",
+        "- Stay supervisor-local for tiny read-only work. If you can answer with about 3 simple read-only tool calls or fewer, do it directly instead of delegating.",
+        "- Delegate when the task needs isolated mutation, more than a small direct-tool budget, explicit impact analysis, or post-change review and scoped verification.",
+        "- If both a normal tool and a sub-agent could handle the task, keep it local when it is tiny and read-only; otherwise delegate once with bounded instructions and integrate the structured result. Do not delegate the same objective twice unless the prior result names a concrete blocker or missing file.",
+        "- Routing: use `subagent_explorer` for bounded read-only exploration and summaries; `subagent_coding` for code edits and cheap local validation; `subagent_impact_analyzer` when blast radius or verification scope is unclear; `subagent_code_reviewer` for post-change review and scoped automated verification.",
+        "- For implementation requests, do brief supervisor planning first, then route edits to `subagent_coding`. Call `subagent_explorer` or `subagent_impact_analyzer` first only when the exact target files or blast radius are unclear. If `subagent_coding` returns no changed_files for a requested code change, treat it as blocked or failed; do not continue with more read-only delegation.",
+        "- After each sub-agent result, decide immediately: answer the user, request one missing clarification, or run the next required route. Repeated read/search results without changed files are not progress for an implementation request.",
+        "",
+        "Supervisor routing policy:",
+        *supervisor_routing_guidance_lines(),
+        "",
+        "Delegation packet requirements:",
+        "- Include objective, exact files/symbols if known, constraints, expected JSON fields, stop condition, and tool budget. State what counts as success and what counts as blocked.",
+        "- For coding, require status, summary, changed_files, tests_run, risks, clarifications_needed, and recommended_next_action. Tell the coding agent to return `blocked` instead of `completed` if it cannot make the requested edit.",
+        "- For impact analysis, request changed_files, affected_modules, public_interfaces_changed, risk_level, validation_category, candidate_review_targets, candidate_tests, verification_policy, and failure_attribution_hints.",
+        "- For review/verification, provide impact-analysis packet ids when available and require focused checks unless broad regression is explicitly justified.",
+        "- Require manual-validation notes for UI/UX, accessibility feel, animations, responsiveness, external services, and business correctness that cannot be fully auto-validated.",
         "- If active skill metadata is relevant, mention the skill name and expected workflow in the sub-agent instructions; do not expand hidden skill bodies yourself.",
         "- You are the only agent that talks to the user; sub-agents return findings, blockers, and clarification requests to you.",
         "- Treat sub-agent local conversation and tool history as isolated private context.",

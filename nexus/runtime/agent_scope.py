@@ -21,10 +21,10 @@ SUBAGENT_PROFILE_FIELDS: tuple[str, ...] = (
 
 BUILTIN_SUBAGENT_NAMES: frozenset[str] = frozenset(
     {
-        "planning_analysis",
-        "execution",
-        "review",
-        "verification",
+        "explorer",
+        "coding",
+        "code_reviewer",
+        "impact_analyzer",
     }
 )
 
@@ -117,7 +117,11 @@ def supervisor_tool_names(config: Any, registry: ToolRegistry) -> set[str]:
 
     if configured_tools or configured_mcp or all_configured_tools or all_configured_mcp:
         allowed = set(direct_normal_names) if all_configured_tools else configured_tools & direct_normal_names
-        allowed |= all_mcp_tool_names(registry) if all_configured_mcp else mcp_tool_names_for_servers(registry, configured_mcp)
+        # When no MCP scope is explicitly restricted, include all active MCP tools by default.
+        if all_configured_mcp or not configured_mcp:
+            allowed |= all_mcp_tool_names(registry)
+        else:
+            allowed |= mcp_tool_names_for_servers(registry, configured_mcp)
     elif str(getattr(config, "agent_mode", "basic")).strip().lower() == "advanced":
         allowed = set()
     elif subagent_names:
@@ -126,8 +130,9 @@ def supervisor_tool_names(config: Any, registry: ToolRegistry) -> set[str]:
         allowed = set(subagent_names)
     else:
         allowed = set(all_names)
-    if str(getattr(config, "agent_mode", "basic")).strip().lower() == "advanced":
-        allowed |= subagent_names
+    # Always ensure delegation tools are reachable regardless of mode or explicit scope;
+    # configuring direct tools like bash should not silently remove sub-agent access.
+    allowed |= subagent_names
     return allowed
 
 

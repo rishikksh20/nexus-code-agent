@@ -14,12 +14,14 @@ class AgentConfig:
     api_key: str = ""       # Set via API_KEY in .env or api_key in config.toml
     max_output_tokens: int = 4096
     temperature: float = 0.0
+    llm_thinking_mode: str = "auto"
+    llm_reasoning_effort: str = "high"
     compaction_soft_limit: int = 10_000
     compaction_hard_limit: int = 14_000
     compaction_keep_recent: int = 12
     default_mode: str = "default"
     auto_confirm_read_only: bool = True
-    max_loop_iterations: int = 8
+    max_loop_iterations: int = 50
     max_tool_calls_per_turn: int = 30
     parallel_tools: bool = True
     parallel_tool_window: int = 4

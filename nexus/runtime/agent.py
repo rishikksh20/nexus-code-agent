@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from uuid import uuid4
@@ -42,6 +43,20 @@ logger = logging.getLogger(__name__)
 TOOL_CALL_LIMIT_FINISH_REASON = "tool_call_limit"
 MAX_TURNS_FINISH_REASON = "max_turns"
 INVALID_TOOL_CALL_RETRY_LIMIT = 2
+_READ_RESULT_CACHE_METADATA_KEY = "nexus_read_result_cache"
+_CACHEABLE_READ_TOOL_NAMES = frozenset(
+    {
+        "read_file",
+        "list_dir",
+        "grep",
+        "glob",
+        "lsp",
+        "git_status",
+        "git_diff",
+        "code_index",
+        "semantic_search",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -196,13 +211,8 @@ class Agent:
                 continue
             if not _tool_available_in_context(record, context):
                 result = _tool_not_available_result(tool_call, self.tool_registry, context)
-                yield AgentEvent.tool_call_start(
-                    tool_call.call_id,
-                    str(tool_call.tool_name),
-                    tool_call.arguments,
-                    actor=_tool_actor(context),
-                    display=_tool_display_metadata(),
-                )
+                # Do not emit TOOL_CALL_START for tools unavailable in this context;
+                # the error result is still fed back to the model without UI noise.
                 yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
                 yield AgentEvent.tool_call_complete(result)
                 yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
@@ -304,6 +314,12 @@ class Agent:
         )
         yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
 
+        cached_result = _cached_read_result(record, tool, tool_call, context)
+        if cached_result is not None:
+            yield AgentEvent.tool_call_complete(cached_result)
+            yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=cached_result)
+            return
+
         await self.hooks.emit(
             HookEvent.PRE_TOOL_USE,
             {
@@ -363,13 +379,20 @@ class Agent:
             raise
         if actor:
             result.metadata = {**result.metadata, "actor": actor}
-        result.metadata = {**result.metadata, "is_mutating": tool.is_mutating}
+        result.metadata = {
+            **result.metadata,
+            "is_mutating": tool.is_mutating,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        }
         if tool.is_mutating:
+            _clear_read_result_cache(context)
             result = _with_post_mutation_refresh(
                 result,
                 affected_paths or set(),
                 context,
             )
+        else:
+            _store_read_result(record, tool, tool_call, context, result)
         if approval_manager is not None:
             approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
 
@@ -449,6 +472,7 @@ class Agent:
             stream_tool_calls: list[ToolCall] = []
             usage: UsageSnapshot | None = None
             stream_finish_reason: str | None = None
+            stream_reasoning_content = ""
             model_call_id = uuid4().hex[:12]
 
             await self.hooks.emit(
@@ -509,6 +533,8 @@ class Agent:
                     elif stream_event.type == StreamEventType.MESSAGE_COMPLETE:
                         usage = stream_event.usage
                         stream_finish_reason = stream_event.finish_reason or stream_finish_reason
+                        if stream_event.reasoning_content:
+                            stream_reasoning_content += stream_event.reasoning_content
                         if monitor is not None and usage is not None:
                             monitor.update_current_span(
                                 attributes={
@@ -544,6 +570,20 @@ class Agent:
                         return
 
             if not response_text and not stream_tool_calls:
+                # When the provider hits its output-token limit it returns an
+                # empty response instead of an error.  Aggressively prune tool
+                # outputs from history to free context space and retry the turn
+                # rather than surfacing an opaque error to the user.
+                if str(stream_finish_reason or "").strip().lower() in {"max_tokens", "length"}:
+                    logger.warning(
+                        "agent.model_batch.max_tokens session_id=%s actor=%s turn_index=%s — pruning history and retrying",
+                        context.session_id,
+                        _tool_actor(context) or "supervisor",
+                        turn_index + 1,
+                    )
+                    prune_tool_outputs(history, protect_tokens=500, minimum_tokens=200)
+                    continue
+
                 empty_response_error = _empty_provider_response_message(stream_finish_reason)
                 await self.hooks.emit(
                     HookEvent.NOTIFICATION,
@@ -580,6 +620,7 @@ class Agent:
             message = Message(
                 role="assistant",
                 content=response_text or "",
+                reasoning_content=stream_reasoning_content,
                 tool_calls=tool_calls,
             )
             should_record_message = bool(message.content or message.tool_calls)
@@ -702,6 +743,7 @@ class Agent:
 
             tool_result_messages: list[Message] = []
             mutating_paths_this_batch: set[str] = set()
+            read_keys_this_batch: dict[str, str] = {}
             for tool_call in tool_calls:
                 if tool_calls_executed >= max_tool_calls_per_turn:
                     pause_message = _tool_call_limit_pause_message(max_tool_calls_per_turn)
@@ -797,6 +839,30 @@ class Agent:
                     continue
 
                 tool = record.tool
+                read_cache_key = _read_result_cache_key(record, tool, tool_call)
+                if read_cache_key is not None:
+                    first_call_id = read_keys_this_batch.get(read_cache_key)
+                    if first_call_id is not None:
+                        duplicate_result = _duplicate_read_result(
+                            tool_call,
+                            tool_name=tool.name,
+                            first_call_id=first_call_id,
+                        )
+                        tool_calls_executed += 1
+                        tool_result_messages.append(_tool_result_message(duplicate_result))
+                        yield AgentEvent.tool_call_start(
+                            tool_call.call_id,
+                            tool.name,
+                            tool_call.arguments,
+                            actor=_tool_actor(context),
+                            display=_tool_display_metadata(is_mutating=False),
+                        )
+                        yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                        yield AgentEvent.tool_call_complete(duplicate_result)
+                        yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=duplicate_result)
+                        loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="duplicate_read")
+                        continue
+                    read_keys_this_batch[read_cache_key] = tool_call.call_id
                 missing_fields = _missing_required_fields(tool.input_schema, tool_call.arguments)
                 if missing_fields:
                     if _missing_fields_should_be_repaired_by_model(missing_fields):
@@ -1059,6 +1125,10 @@ class Agent:
         approval_manager: ApprovalManager | None,
         affected_paths: set[str] | None = None,
     ) -> ToolResult:
+        cached_result = _cached_read_result(record, tool, tool_call, context)
+        if cached_result is not None:
+            return cached_result
+
         await self.hooks.emit(
             HookEvent.PRE_TOOL_USE,
             {
@@ -1120,12 +1190,20 @@ class Agent:
         actor = _tool_actor(context)
         if actor:
             result.metadata = {**result.metadata, "actor": actor}
+        result.metadata = {
+            **result.metadata,
+            "is_mutating": tool.is_mutating,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        }
         if tool.is_mutating:
+            _clear_read_result_cache(context)
             result = _with_post_mutation_refresh(
                 result,
                 affected_paths or set(),
                 context,
             )
+        else:
+            _store_read_result(record, tool, tool_call, context, result)
         if approval_manager is not None:
             approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
 
@@ -1185,6 +1263,7 @@ class Agent:
         parallel_items: list[_PreparedToolCall] = []
         sequential_items: list[_PreparedToolCall] = []
         mutating_paths_this_batch: set[str] = set()
+        read_keys_this_batch: dict[str, str] = {}
 
         for tool_call in limited_tool_calls:
             prepared = await self._prepare_parallel_first_tool_call(
@@ -1199,6 +1278,19 @@ class Agent:
                 invalid_argument_retries=invalid_argument_retries,
                 mutating_paths_this_batch=mutating_paths_this_batch,
             )
+            duplicate_read_key = _prepared_read_result_cache_key(prepared)
+            if duplicate_read_key is not None:
+                first_call_id = read_keys_this_batch.get(duplicate_read_key)
+                if first_call_id is not None:
+                    prepared.immediate_result = _duplicate_read_result(
+                        prepared.tool_call,
+                        tool_name=str(getattr(prepared.tool, "name", prepared.tool_call.tool_name)),
+                        first_call_id=first_call_id,
+                    )
+                    prepared.emit_start_event = True
+                    prepared.loop_result = "duplicate_read"
+                else:
+                    read_keys_this_batch[duplicate_read_key] = prepared.tool_call.call_id
             target_list = parallel_items if _prepared_tool_prefers_parallel(prepared, context) else sequential_items
             target_list.append(prepared)
             if prepared.tool is not None and prepared.tool.is_mutating:
@@ -1422,7 +1514,11 @@ class Agent:
 
         missing_fields = _missing_required_fields(record.tool.input_schema, tool_call.arguments)
         if missing_fields:
-            if not _missing_fields_should_be_repaired_by_model(missing_fields):
+            read_without_clarification_callback = (
+                getattr(record.tool, "kind", None) is ToolKind.READ
+                and context.metadata.get("approval_callback") is None
+            )
+            if not _missing_fields_should_be_repaired_by_model(missing_fields) and not read_without_clarification_callback:
                 missing_field = missing_fields[0]
                 prepared.confirmation_request = ConfirmationRequest(
                     kind=ConfirmationKind.CLARIFICATION,
@@ -1547,7 +1643,8 @@ class Agent:
         result = prepared.immediate_result
         if result is None:
             return
-        if prepared.emit_start_event:
+        _is_unavailable = isinstance(result.metadata, dict) and result.metadata.get("tool_unavailable")
+        if prepared.emit_start_event and not _is_unavailable:
             yield AgentEvent.tool_call_start(
                 prepared.tool_call.call_id,
                 _tool_name_text(prepared.tool_call.tool_name),
@@ -1619,6 +1716,17 @@ def _prepared_tool_prefers_parallel(prepared: _PreparedToolCall, context: ToolEx
     return _tool_call_can_run_in_parallel(prepared.record, context)
 
 
+def _prepared_read_result_cache_key(prepared: _PreparedToolCall) -> str | None:
+    if (
+        prepared.record is None
+        or prepared.tool is None
+        or prepared.immediate_result is not None
+        or prepared.confirmation_request is not None
+    ):
+        return None
+    return _read_result_cache_key(prepared.record, prepared.tool, prepared.tool_call)
+
+
 def _tool_call_can_run_in_parallel(record: Any, context: ToolExecutionContext) -> bool:
     if not _parallel_tool_execution_enabled(context):
         return False
@@ -1654,6 +1762,77 @@ def _tool_result_message(result: ToolResult) -> Message:
         name=result.tool_name,
         tool_call_id=result.call_id,
     )
+
+
+def _cached_read_result(
+    record: Any,
+    tool: Any,
+    tool_call: ToolCall,
+    context: ToolExecutionContext,
+) -> ToolResult | None:
+    key = _read_result_cache_key(record, tool, tool_call)
+    if key is None:
+        return None
+    cache = context.metadata.get(_READ_RESULT_CACHE_METADATA_KEY)
+    if not isinstance(cache, dict):
+        return None
+    cached = cache.get(key)
+    if not isinstance(cached, ToolResult):
+        return None
+    metadata = {
+        **cached.metadata,
+        "read_cache_hit": True,
+        "cached_from_call_id": cached.call_id,
+    }
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=cached.tool_name,
+        output=cached.output,
+        is_error=cached.is_error,
+        metadata=metadata,
+    )
+
+
+def _store_read_result(
+    record: Any,
+    tool: Any,
+    tool_call: ToolCall,
+    context: ToolExecutionContext,
+    result: ToolResult,
+) -> None:
+    key = _read_result_cache_key(record, tool, tool_call)
+    if key is None:
+        return
+    cache = context.metadata.setdefault(_READ_RESULT_CACHE_METADATA_KEY, {})
+    if isinstance(cache, dict):
+        cache[key] = ToolResult(
+            call_id=result.call_id,
+            tool_name=result.tool_name,
+            output=result.output,
+            is_error=result.is_error,
+            metadata={**result.metadata, "read_cache_hit": False},
+        )
+
+
+def _clear_read_result_cache(context: ToolExecutionContext) -> None:
+    cache = context.metadata.get(_READ_RESULT_CACHE_METADATA_KEY)
+    if isinstance(cache, dict):
+        cache.clear()
+
+
+def _read_result_cache_key(record: Any, tool: Any, tool_call: ToolCall) -> str | None:
+    if getattr(tool, "is_mutating", False):
+        return None
+    if getattr(tool, "kind", None) is not ToolKind.READ:
+        return None
+    name = str(getattr(record, "name", "") or getattr(tool, "name", ""))
+    if name not in _CACHEABLE_READ_TOOL_NAMES:
+        return None
+    try:
+        arguments = json.dumps(tool_call.arguments, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        arguments = repr(sorted(tool_call.arguments.items()))
+    return f"{name}:{arguments}"
 
 
 def _tool_name_text(tool_name: Any) -> str:
@@ -1739,6 +1918,26 @@ def _tool_not_available_result(
             "retry_count": retry_count,
             "retry_limit": retry_limit,
             "available_tools": available_names,
+        },
+    )
+
+
+def _duplicate_read_result(
+    tool_call: ToolCall,
+    *,
+    tool_name: str,
+    first_call_id: str,
+) -> ToolResult:
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=tool_name,
+        output=(
+            "Duplicate read-only tool call skipped. The same tool with the same arguments "
+            f"already ran earlier in this batch as call_id={first_call_id}; use that prior tool result instead."
+        ),
+        metadata={
+            "duplicate_read_skipped": True,
+            "cached_from_call_id": first_call_id,
         },
     )
 
@@ -1864,6 +2063,8 @@ def _serialize_message_for_observability(message: Message) -> dict[str, Any]:
         "role": message.role,
         "content": message.content,
     }
+    if message.reasoning_content:
+        payload["reasoning_content_chars"] = len(message.reasoning_content)
     if message.name:
         payload["name"] = message.name
     if message.tool_call_id:
@@ -1928,10 +2129,10 @@ def _supervisor_preferred_tool_records(records: list[Any]) -> list[Any]:
 def _supervisor_tool_priority(record: Any) -> tuple[int, int, str]:
     name = str(getattr(record, "name", ""))
     subagent_order = {
-        "subagent_planning_analysis": 0,
-        "subagent_execution": 1,
-        "subagent_verification": 2,
-        "subagent_review": 3,
+        "subagent_explorer": 0,
+        "subagent_coding": 1,
+        "subagent_impact_analyzer": 2,
+        "subagent_code_reviewer": 3,
     }
     if name.startswith("subagent_"):
         return (0, subagent_order.get(name, 50), name)
@@ -1950,19 +2151,19 @@ def _supervisor_tool_schema(record: Any, records: list[Any]) -> dict[str, Any]:
         function["description"] = _subagent_preference_description(name, description)
     elif has_subagents:
         function["description"] = (
-            f"{description} Supervisor direct-use escape hatch: for substantial repo inspection, "
-            "edits, tests, shell work, MCP-backed work, or skill-specific work, prefer delegating "
-            "through the appropriate subagent_* tool first."
+            f"{description} Supervisor direct-use path: use this directly for tiny read-only checks, "
+            "one-off recovery steps, or slash/config/status work. Delegate when the task exceeds the "
+            "supervisor's small local budget or needs isolated mutation, impact analysis, or post-change review."
         ).strip()
     return schema
 
 
 def _subagent_preference_description(name: str, description: str) -> str:
     routing = {
-        "subagent_planning_analysis": "Preferred for codebase exploration, impact analysis, and implementation planning.",
-        "subagent_execution": "Preferred for file edits, implementation, refactors, and normal workspace tool use.",
-        "subagent_verification": "Preferred for tests, lint, typecheck, runtime checks, and validation summaries.",
-        "subagent_review": "Preferred for bug/regression review, diffs, and maintainability risk checks.",
+        "subagent_explorer": "Preferred for bounded read-only exploration, directory summaries, and codebase scans.",
+        "subagent_coding": "Preferred for file edits, implementation, and cheap local validation tied to those edits.",
+        "subagent_impact_analyzer": "Preferred when blast radius, affected interfaces, or scoped verification targets are unclear.",
+        "subagent_code_reviewer": "Preferred for post-change review, scoped automated verification, and failure attribution.",
     }
     prefix = routing.get(name, "Preferred delegation route for focused cognitive work.")
     return f"{prefix} {description}".strip()

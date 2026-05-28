@@ -8,6 +8,7 @@ from typing import Any
 
 
 CURRENT_CONFIG_VERSION = 2
+UPGRADE_MARKER = "# Added by Nexus config upgrade"
 DEPRECATED_CONFIG_KEYS: dict[str, str] = {
     "multi_agent_mode": "Use agent_mode = \"basic\" or agent_mode = \"advanced\" instead.",
     "delegation_enabled": "Cognitive sub-agents are controlled by agent_mode = \"advanced\".",
@@ -21,8 +22,20 @@ DEPRECATED_CONFIG_KEYS: dict[str, str] = {
 }
 LEGACY_TOOL_NAME_ALIASES: dict[str, tuple[str, ...]] = {
     "delegate_task": (),
-    "subagent_research": ("subagent_planning_analysis",),
-    "subagent_test": ("subagent_verification",),
+    "subagent_research": ("subagent_explorer",),
+    "subagent_test": ("subagent_code_reviewer",),
+    "subagent_planning_analysis": ("subagent_explorer",),
+    "subagent_execution": ("subagent_coding",),
+    "subagent_review": ("subagent_code_reviewer",),
+    "subagent_verification": ("subagent_code_reviewer",),
+}
+LEGACY_SUBAGENT_NAME_ALIASES: dict[str, str] = {
+    "research": "explorer",
+    "test": "code_reviewer",
+    "planning_analysis": "explorer",
+    "execution": "coding",
+    "review": "code_reviewer",
+    "verification": "code_reviewer",
 }
 LEGACY_AGENT_SCOPE_KEYS: dict[str, str] = {
     "agent_allowed_tools": "allowed_tools",
@@ -50,6 +63,7 @@ class ConfigUpgradeReport:
     allowed_tools_updated: bool = False
     agent_scope_migrated: bool = False
     subagent_scope_migrated: bool = False
+    legacy_subagent_names_migrated: bool = False
     current_version: int | None = None
     target_version: int = CURRENT_CONFIG_VERSION
 
@@ -62,6 +76,7 @@ class ConfigUpgradeReport:
             or self.allowed_tools_updated
             or self.agent_scope_migrated
             or self.subagent_scope_migrated
+            or self.legacy_subagent_names_migrated
             or self.current_version != self.target_version
         )
 
@@ -75,6 +90,7 @@ def inspect_config_upgrade(path: Path, template_str: str) -> ConfigUpgradeReport
     allowed_tool_additions = _allowed_tool_additions(existing, template)
     agent_scope_migrated = _needs_agent_scope_migration(existing)
     subagent_scope_migrated = _needs_subagent_scope_migration(existing)
+    legacy_subagent_names_migrated = _needs_legacy_subagent_name_migration(existing)
     version = _optional_int(existing.get("config_version"))
     return ConfigUpgradeReport(
         path=path,
@@ -84,6 +100,7 @@ def inspect_config_upgrade(path: Path, template_str: str) -> ConfigUpgradeReport
         allowed_tools_updated=upgraded_allowed_tools is not None,
         agent_scope_migrated=agent_scope_migrated,
         subagent_scope_migrated=subagent_scope_migrated,
+        legacy_subagent_names_migrated=legacy_subagent_names_migrated,
         current_version=version,
     )
 
@@ -103,8 +120,7 @@ def upgrade_config_file(path: Path, template_str: str) -> ConfigUpgradeReport:
         lines = _remove_table(lines, "agents")
     if _needs_subagent_scope_migration(existing):
         lines = _remove_top_level_assignments(lines, {"subagent_profiles"})
-        if "sub-agents" not in existing:
-            lines = _remove_array_table(lines, "sub-agents")
+        lines = _remove_array_table(lines, "sub-agents")
     upgraded_allowed_tools = _upgraded_allowed_tools(existing, template)
     if upgraded_allowed_tools is not None:
         lines = _replace_top_level_assignment(
@@ -112,11 +128,16 @@ def upgrade_config_file(path: Path, template_str: str) -> ConfigUpgradeReport:
             "allowed_tools",
             _render_toml_value(upgraded_allowed_tools),
         )
+    upgraded_delegation_subagents = _upgraded_delegation_subagents(existing)
+    if upgraded_delegation_subagents is not None:
+        lines = _replace_top_level_assignment(
+            lines,
+            "delegation_subagents",
+            _render_toml_value(upgraded_delegation_subagents),
+        )
 
     additions: list[str] = []
-    if lines and lines[-1].strip():
-        additions.append("")
-    additions.append("# Added by Nexus config upgrade")
+    additions.append(UPGRADE_MARKER)
     additions.append(f"config_version = {CURRENT_CONFIG_VERSION}")
     migrated_subagents = _migrated_subagent_profiles(existing)
     for key in template:
@@ -134,7 +155,7 @@ def upgrade_config_file(path: Path, template_str: str) -> ConfigUpgradeReport:
         additions.extend(_render_toml_assignment("sub-agents", migrated_subagents))
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join((*lines, *additions)).rstrip() + "\n", encoding="utf-8")
+    path.write_text("\n".join(_insert_before_first_table(lines, additions)).rstrip() + "\n", encoding="utf-8")
     return before
 
 
@@ -147,9 +168,10 @@ def normalize_legacy_config_values(values: dict[str, Any]) -> dict[str, Any]:
             normalized["agent_mode"] = "advanced"
         elif mode == "off":
             normalized["agent_mode"] = "basic"
-    allowed_tools = normalized.get("allowed_tools")
-    if isinstance(allowed_tools, list):
-        normalized["allowed_tools"] = _normalize_legacy_tool_names(allowed_tools)
+    for key in ("allowed_tools", "denied_tools", "agent_allowed_tools"):
+        tool_names = normalized.get(key)
+        if isinstance(tool_names, list):
+            normalized[key] = _normalize_legacy_tool_names(tool_names)
     return normalized
 
 
@@ -167,9 +189,37 @@ def _normalize_legacy_tool_names(tool_names: list[Any]) -> list[str]:
         for candidate in candidates:
             if candidate not in normalized:
                 normalized.append(candidate)
-    if "subagent_planning_analysis" in normalized and "subagent_execution" not in normalized:
-        normalized.append("subagent_execution")
+    if "subagent_explorer" in normalized and "subagent_coding" not in normalized:
+        normalized.append("subagent_coding")
     return normalized
+
+
+def normalize_legacy_subagent_name(name: Any) -> str:
+    text = str(name).strip()
+    if text.startswith("subagent_"):
+        text = text[len("subagent_") :]
+    if text.startswith("subagent-"):
+        text = text[len("subagent-") :]
+    normalized = text.replace("-", "_")
+    return LEGACY_SUBAGENT_NAME_ALIASES.get(normalized, normalized)
+
+
+def _normalize_legacy_subagent_profile(entry: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(entry)
+    if "name" in migrated:
+        migrated["name"] = normalize_legacy_subagent_name(migrated["name"])
+    allowed_tools = migrated.get("allowed_tools")
+    if isinstance(allowed_tools, list):
+        migrated["allowed_tools"] = _normalize_legacy_tool_names(allowed_tools)
+    return migrated
+
+
+def _normalize_legacy_delegation_subagent(entry: dict[str, Any]) -> dict[str, Any]:
+    migrated = _normalize_legacy_subagent_profile(entry)
+    allowed_mcps = migrated.get("allowed_mcp_servers")
+    if allowed_mcps is not None and "allowed_mcps" not in migrated:
+        migrated["allowed_mcps"] = allowed_mcps
+    return migrated
 
 
 def _allowed_tool_additions(existing: dict[str, Any], template: dict[str, Any]) -> tuple[str, ...]:
@@ -263,11 +313,28 @@ def _needs_agent_scope_migration(existing: dict[str, Any]) -> bool:
     if (set(LEGACY_AGENT_SCOPE_KEYS) | set(OBSOLETE_SCOPE_KEYS)) & set(existing):
         return True
     agents = existing.get("agents")
-    return isinstance(agents, dict) and bool(set(agents) & {key.removeprefix("agent_") for key in OBSOLETE_SCOPE_KEYS})
+    if not isinstance(agents, dict):
+        return False
+    if set(agents) & {key.removeprefix("agent_") for key in OBSOLETE_SCOPE_KEYS}:
+        return True
+    allowed_tools = agents.get("allowed_tools")
+    return isinstance(allowed_tools, list) and _normalize_legacy_tool_names(allowed_tools) != _string_list(allowed_tools)
 
 
 def _needs_subagent_scope_migration(existing: dict[str, Any]) -> bool:
-    return "subagent_profiles" in existing
+    if "subagent_profiles" in existing:
+        return True
+    return _subagent_profiles_need_name_migration(_subagent_profiles_from_existing(existing))
+
+
+def _needs_legacy_subagent_name_migration(existing: dict[str, Any]) -> bool:
+    if _needs_agent_scope_migration(existing) or _needs_subagent_scope_migration(existing):
+        return True
+    allowed_tools = existing.get("allowed_tools")
+    if isinstance(allowed_tools, list) and _normalize_legacy_tool_names(allowed_tools) != _string_list(allowed_tools):
+        return True
+    delegation_subagents = existing.get("delegation_subagents")
+    return isinstance(delegation_subagents, list) and _upgraded_delegation_subagents(existing) is not None
 
 
 def _migrated_agent_scope(existing: dict[str, Any], template_agents: Any) -> dict[str, Any]:
@@ -279,32 +346,31 @@ def _migrated_agent_scope(existing: dict[str, Any], template_agents: Any) -> dic
     if isinstance(current, dict):
         migrated.update(
             {
-                key: value
+                key: _normalize_legacy_tool_names(value) if key == "allowed_tools" and isinstance(value, list) else value
                 for key, value in current.items()
                 if key in {"allowed_tools", "allowed_skills", "allowed_mcp_servers", "allowed_mcps"}
             }
         )
+    existing_agents = existing.get("agents") if isinstance(existing.get("agents"), dict) else {}
     for old_key, new_key in LEGACY_AGENT_SCOPE_KEYS.items():
         value = existing.get(old_key)
         if old_key not in existing:
             continue
-        if _is_non_empty_scope_value(migrated.get(new_key)):
+        # Only skip if the existing [agents] table explicitly had this key;
+        # template defaults should not block legacy-value migration.
+        if new_key in existing_agents:
             continue
-        migrated[new_key] = value
+        migrated[new_key] = _normalize_legacy_tool_names(value) if new_key == "allowed_tools" and isinstance(value, list) else value
     return migrated
 
 
 def _migrated_subagent_profiles(existing: dict[str, Any]) -> list[dict[str, Any]]:
-    if "sub-agents" in existing:
-        return []
-    profiles = existing.get("subagent_profiles")
-    if not isinstance(profiles, list):
-        return []
+    profiles = _subagent_profiles_from_existing(existing)
     return [_subagent_profile_for_new_layout(dict(entry)) for entry in profiles if isinstance(entry, dict)]
 
 
 def _subagent_profile_for_new_layout(entry: dict[str, Any]) -> dict[str, Any]:
-    migrated = dict(entry)
+    migrated = _normalize_legacy_subagent_profile(dict(entry))
     if "allowed_mcp_servers" in migrated and "allowed_mcps" not in migrated:
         migrated["allowed_mcps"] = migrated.pop("allowed_mcp_servers")
     for obsolete in (
@@ -321,6 +387,55 @@ def _subagent_profile_for_new_layout(entry: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _subagent_profiles_from_existing(existing: dict[str, Any]) -> list[dict[str, Any]]:
+    profiles: list[dict[str, Any]] = []
+    legacy_profiles = existing.get("subagent_profiles")
+    if isinstance(legacy_profiles, list):
+        profiles.extend(dict(entry) for entry in legacy_profiles if isinstance(entry, dict))
+    raw_new_profiles = existing.get("sub-agents")
+    if isinstance(raw_new_profiles, list):
+        profiles.extend(dict(entry) for entry in raw_new_profiles if isinstance(entry, dict))
+    elif isinstance(raw_new_profiles, dict):
+        if "name" in raw_new_profiles:
+            profiles.append(dict(raw_new_profiles))
+        for name, value in raw_new_profiles.items():
+            if not isinstance(value, dict):
+                continue
+            entry = dict(value)
+            entry.setdefault("name", str(name))
+            profiles.append(entry)
+    return profiles
+
+
+def _subagent_profiles_need_name_migration(profiles: list[dict[str, Any]]) -> bool:
+    for profile in profiles:
+        name = str(profile.get("name", "")).strip()
+        if name and normalize_legacy_subagent_name(name) != name.replace("-", "_"):
+            return True
+        allowed_tools = profile.get("allowed_tools")
+        if isinstance(allowed_tools, list) and _normalize_legacy_tool_names(allowed_tools) != _string_list(allowed_tools):
+            return True
+        if "allowed_mcp_servers" in profile:
+            return True
+    return False
+
+
+def _upgraded_delegation_subagents(existing: dict[str, Any]) -> list[dict[str, Any]] | None:
+    delegation_subagents = existing.get("delegation_subagents")
+    if not isinstance(delegation_subagents, list):
+        return None
+    migrated = [
+        _normalize_legacy_delegation_subagent(dict(entry))
+        for entry in delegation_subagents
+        if isinstance(entry, dict)
+    ]
+    return migrated if migrated != [dict(entry) for entry in delegation_subagents if isinstance(entry, dict)] else None
+
+
+def _string_list(values: list[Any]) -> list[str]:
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
 def _is_non_empty_scope_value(value: Any) -> bool:
     if isinstance(value, list):
         return bool(value)
@@ -332,12 +447,40 @@ def _remove_deprecated_and_version_lines(lines: list[str]) -> list[str]:
     kept: list[str] = []
     for line in lines:
         stripped = line.strip()
+        if stripped == UPGRADE_MARKER:
+            continue
         if any(stripped.startswith(f"{key} ") or stripped.startswith(f"{key}=") for key in remove_keys):
             continue
         kept.append(line)
     while kept and not kept[-1].strip():
         kept.pop()
     return kept
+
+
+def _insert_before_first_table(lines: list[str], additions: list[str]) -> list[str]:
+    if not additions:
+        return lines
+
+    insertion_index = next(
+        (index for index, line in enumerate(lines) if _is_table_header(line.strip())),
+        len(lines),
+    )
+    before = list(lines[:insertion_index])
+    after = list(lines[insertion_index:])
+
+    merged = before
+    if merged and merged[-1].strip():
+        merged.append("")
+    merged.extend(additions)
+    if after:
+        if merged and merged[-1].strip():
+            merged.append("")
+        merged.extend(after)
+    return merged
+
+
+def _is_table_header(line: str) -> bool:
+    return line.startswith("[") and line.endswith("]")
 
 
 def _remove_top_level_assignments(lines: list[str], keys: set[str] | dict[str, Any]) -> list[str]:
@@ -444,6 +587,11 @@ def _render_toml_value(value: Any) -> str:
         return str(value)
     if isinstance(value, list):
         return "[" + ", ".join(_render_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(
+            f"{key} = {_render_toml_value(item)}"
+            for key, item in value.items()
+        ) + " }"
     return json.dumps(value)
 
 

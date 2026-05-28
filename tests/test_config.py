@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tomllib
 
 import pytest
 
@@ -8,7 +9,7 @@ from nexus.cli.init import init_workspace
 from nexus.config import load_config
 from nexus.config.loader import ConfigError
 from nexus.config.model_limits import get_model_context_limit
-from nexus.config.upgrade import upgrade_config_file
+from nexus.config.upgrade import inspect_config_upgrade, upgrade_config_file
 
 
 def test_config_merges_local_overrides(tmp_path, monkeypatch):
@@ -71,19 +72,19 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
     assert config.shell_inherit_environment is False
     assert config.parallel_tools is True
     assert config.parallel_tool_window == 4
-    assert config.agent_allowed_tools == []
+    assert config.agent_allowed_tools == ["bash"]
     assert config.agent_allowed_skills == []
     assert config.agent_allowed_mcp_servers == []
     assert not hasattr(config, "agent_attached_tools")
     assert not hasattr(config, "agent_detached_tools")
     assert [entry["name"] for entry in config.subagent_profiles] == [
-        "planning_analysis",
-        "execution",
-        "review",
-        "verification",
+        "explorer",
+        "coding",
+        "code_reviewer",
+        "impact_analyzer",
     ]
-    execution_profile = next(entry for entry in config.subagent_profiles if entry["name"] == "execution")
-    assert execution_profile["allowed_tools"] == [
+    coding_profile = next(entry for entry in config.subagent_profiles if entry["name"] == "coding")
+    assert coding_profile["allowed_tools"] == [
         "read_file",
         "write_file",
         "edit",
@@ -95,12 +96,11 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
         "lsp",
         "git_status",
         "git_diff",
-        "run_tests",
         "run_python_check",
-        "bash",
+        "run_formatter",
     ]
-    assert execution_profile["allowed_mcp_servers"] == []
-    assert execution_profile["allowed_skills"] == []
+    assert coding_profile["allowed_mcp_servers"] == []
+    assert coding_profile["allowed_skills"] == []
 
 
 def test_config_rejects_parallel_tool_window_above_eight(tmp_path):
@@ -135,7 +135,7 @@ def test_config_accepts_agent_scope_fields(tmp_path):
 
     config = load_config(workspace, global_root=global_root)
 
-    assert config.agent_allowed_tools == ["subagent_execution"]
+    assert config.agent_allowed_tools == ["subagent_coding"]
     assert config.agent_allowed_skills == ["nexus-agent"]
     assert config.agent_allowed_mcp_servers == ["search"]
     assert not hasattr(config, "agent_attached_tools")
@@ -173,7 +173,7 @@ def test_config_accepts_agents_and_sub_agents_sections(tmp_path):
 
     config = load_config(workspace, global_root=global_root)
 
-    assert config.agent_allowed_tools == ["subagent_execution"]
+    assert config.agent_allowed_tools == ["subagent_coding"]
     assert config.agent_allowed_skills == ["nexus-agent"]
     assert config.agent_allowed_mcp_servers == ["search"]
     assert config.subagent_profiles[0]["name"] == "execution"
@@ -256,15 +256,15 @@ def test_config_upgrade_migrates_legacy_agent_scope_to_new_tables(tmp_path):
     assert report.agent_scope_migrated is True
     assert report.subagent_scope_migrated is True
     assert "[agents]" in content
-    assert 'allowed_tools = ["subagent_execution"]' in content
+    assert 'allowed_tools = ["subagent_coding"]' in content
     assert 'attached_tools = ["read_file"]' not in content
     assert 'detached_mcp_servers = ["git"]' not in content
     assert "[[sub-agents]]" in content
-    assert 'name = "execution"' in content
+    assert 'name = "coding"' in content
     assert 'allowed_mcps = ["filesystem"]' in content
     assert "agent_allowed_tools" not in content
     assert "subagent_profiles" not in content
-    assert config.agent_allowed_tools == ["subagent_execution"]
+    assert config.agent_allowed_tools == ["subagent_coding"]
     assert config.subagent_profiles[0]["allowed_tools"] == ["grep"]
     assert config.subagent_profiles[0]["allowed_mcp_servers"] == ["filesystem"]
     assert "attached_tools" not in config.subagent_profiles[0]
@@ -298,8 +298,94 @@ def test_config_upgrade_merges_legacy_agent_scope_into_existing_agents_table(tmp
     assert report.agent_scope_migrated is True
     assert content.count("[agents]") == 1
     assert "agent_attached_tools" not in content
-    assert config.agent_allowed_tools == ["subagent_execution"]
+    assert config.agent_allowed_tools == ["subagent_coding"]
     assert not hasattr(config, "agent_attached_tools")
+
+
+def test_config_upgrade_normalizes_existing_sub_agents_and_delegation_names(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    local_config.write_text(
+        'project_name = "workspace"\n'
+        'delegation_subagents = [{ name = "verification", description = "Verify.", goal_prompt = "Run checks.", allowed_tools = ["subagent_review"] }]\n'
+        "\n"
+        "[agents]\n"
+        'allowed_tools = ["subagent_execution"]\n'
+        "\n"
+        "[[sub-agents]]\n"
+        'name = "execution"\n'
+        'allowed_tools = ["grep"]\n'
+        'allowed_mcp_servers = ["filesystem"]\n',
+        encoding="utf-8",
+    )
+
+    report = upgrade_config_file(
+        local_config,
+        __import__("nexus.cli.init", fromlist=["_local_config_toml"])._local_config_toml(
+            workspace_root=workspace,
+            project_name="workspace",
+            project_description="",
+        ),
+    )
+    content = local_config.read_text(encoding="utf-8")
+    config = load_config(workspace, global_root=global_root)
+
+    assert report.legacy_subagent_names_migrated is True
+    assert 'allowed_tools = ["subagent_coding"]' in content
+    assert 'name = "coding"' in content
+    assert 'allowed_mcps = ["filesystem"]' in content
+    assert 'name = "code_reviewer"' in content
+    assert 'subagent_code_reviewer' in content
+    assert config.agent_allowed_tools == ["subagent_coding"]
+    assert config.subagent_profiles[0]["name"] == "coding"
+    assert config.delegation_subagents[0]["name"] == "code_reviewer"
+    assert config.delegation_subagents[0]["allowed_tools"] == ["subagent_code_reviewer"]
+
+
+def test_config_upgrade_rehomes_config_version_before_existing_tables(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    template = __import__("nexus.cli.init", fromlist=["_local_config_toml"])._local_config_toml(
+        workspace_root=workspace,
+        project_name="workspace",
+        project_description="",
+    )
+    lines = template.splitlines()
+    version_line = next(line for line in lines if line.startswith("config_version = "))
+    lines = [line for line in lines if line != version_line]
+    first_subagent_index = lines.index("[[sub-agents]]")
+    broken_content = "\n".join(
+        [
+            *lines[:first_subagent_index],
+            "# Added by Nexus config upgrade",
+            version_line,
+            "",
+            *lines[first_subagent_index:],
+        ]
+    )
+    local_config.write_text(broken_content + "\n", encoding="utf-8")
+
+    before = inspect_config_upgrade(local_config, template)
+
+    assert before.missing_keys == ("config_version",)
+    assert before.subagent_scope_migrated is False
+
+    upgrade_config_file(local_config, template)
+
+    content = local_config.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    after = inspect_config_upgrade(local_config, template)
+
+    assert content.count("# Added by Nexus config upgrade") == 1
+    assert parsed["config_version"] == 2
+    assert "config_version" not in parsed["agents"]
+    assert after.needs_upgrade is False
 
 
 def test_config_non_strict_uses_defaults_and_warning_when_toml_is_corrupt(tmp_path):
@@ -421,13 +507,15 @@ def test_config_normalizes_legacy_subagent_tool_names(tmp_path):
     config = load_config(workspace, global_root=global_root)
 
     assert "subagent_research" not in config.allowed_tools
+    assert "subagent_review" not in config.allowed_tools
     assert "subagent_test" not in config.allowed_tools
-    assert "subagent_planning_analysis" in config.allowed_tools
-    assert "subagent_execution" in config.allowed_tools
-    assert "subagent_review" in config.allowed_tools
-    assert "subagent_verification" in config.allowed_tools
+    assert "subagent_explorer" in config.allowed_tools
+    assert "subagent_coding" in config.allowed_tools
+    assert "subagent_code_reviewer" in config.allowed_tools
+    assert "subagent_impact_analyzer" in config.allowed_tools
     assert "run_tests" in config.allowed_tools
     assert "run_python_check" in config.allowed_tools
+    assert "run_formatter" in config.allowed_tools
     assert "git_status" in config.allowed_tools
     assert "bash" in config.allowed_tools
 
@@ -459,10 +547,10 @@ def test_config_agent_mode_advanced_adds_cognitive_tools_to_legacy_allowlist(tmp
 
     assert "get_time" in config.allowed_tools
     assert "read_file" in config.allowed_tools
-    assert "subagent_planning_analysis" in config.allowed_tools
-    assert "subagent_execution" in config.allowed_tools
-    assert "subagent_review" in config.allowed_tools
-    assert "subagent_verification" in config.allowed_tools
+    assert "subagent_explorer" in config.allowed_tools
+    assert "subagent_coding" in config.allowed_tools
+    assert "subagent_code_reviewer" in config.allowed_tools
+    assert "subagent_impact_analyzer" in config.allowed_tools
 
 
 def test_config_agent_mode_basic_keeps_single_agent_profile(tmp_path):
@@ -506,6 +594,37 @@ def test_config_rejects_invalid_provider(tmp_path):
         assert "Invalid provider" in str(exc)
     else:
         raise AssertionError("Expected ConfigError for invalid provider")
+
+
+def test_config_accepts_llm_thinking_controls(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'llm_thinking_mode = "enabled"\nllm_reasoning_effort = "max"\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.llm_thinking_mode == "enabled"
+    assert config.llm_reasoning_effort == "max"
+
+
+def test_config_rejects_invalid_llm_thinking_mode(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text('llm_thinking_mode = "maybe"\n', encoding="utf-8")
+
+    try:
+        load_config(workspace, global_root=global_root)
+    except ConfigError as exc:
+        assert "Invalid llm_thinking_mode" in str(exc)
+    else:
+        raise AssertionError("Expected ConfigError for invalid llm_thinking_mode")
 
 
 def test_config_requires_api_base_url_for_live_compatible_provider(tmp_path):

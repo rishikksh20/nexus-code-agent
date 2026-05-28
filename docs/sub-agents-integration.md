@@ -91,7 +91,7 @@ agent_mode = "advanced"
 
 Definitions are merged in this order — later entries win on name collision:
 
-1. **Built-in cognitive personas** (`planning_analysis`, `execution`, `review`, `verification`)
+1. **Built-in cognitive personas** (`explorer`, `coding`, `code_reviewer`, `impact_analyzer`)
 2. **`delegation_subagents`** entries from `config.toml`
 3. **Global YAML** files (`~/.nexus/agents/*.yml`)
 4. **Local YAML** files (`.nexus/agents/*.yml`) — highest priority
@@ -291,4 +291,4 @@ An agent with the same name already exists at the destination. Rename or remove 
 
 **YAML agent overrides a built-in**
 
-If your agent uses the same name as a built-in (`planning_analysis`, `execution`, `review`, `verification`), the YAML definition wins. Choose a different name or intentionally override the built-in's goal prompt this way.
+If your agent uses the same name as a built-in (`explorer`, `coding`, `code_reviewer`, `impact_analyzer`), the YAML definition wins. Choose a different name or intentionally override the built-in's goal prompt this way.

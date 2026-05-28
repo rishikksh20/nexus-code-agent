@@ -589,6 +589,7 @@ def _model_response_for_pending_tool_calls(
             role=source_message.role,
             content=source_message.content,
             name=source_message.name,
+            reasoning_content=source_message.reasoning_content,
             tool_calls=tuple(tool_calls),
             tool_call_id=source_message.tool_call_id,
         )
@@ -843,6 +844,7 @@ def _history_safe_completed_events(events: list[AgentEvent]) -> list[AgentEvent]
                             role=message.role,
                             content=message.content,
                             name=message.name,
+                            reasoning_content=message.reasoning_content,
                             tool_calls=completed_calls,
                             tool_call_id=message.tool_call_id,
                         ),

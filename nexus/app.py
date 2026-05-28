@@ -313,6 +313,8 @@ class NexusApp:
                 api_base_url=self.config.api_base_url,
                 api_key=resolve_provider_api_key(self.config.provider, explicit_key),
                 provider_name=self.config.provider,
+                thinking_mode=self.config.llm_thinking_mode,
+                reasoning_effort=self.config.llm_reasoning_effort,
             )
         raise ValueError(f"Unsupported provider: {self.config.provider}")
 

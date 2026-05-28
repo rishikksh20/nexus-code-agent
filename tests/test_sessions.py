@@ -53,6 +53,25 @@ def test_session_round_trip_preserves_tool_call_metadata(tmp_path):
     assert loaded.messages[1].tool_call_id == "call-1"
 
 
+def test_session_round_trip_preserves_reasoning_content(tmp_path):
+    store = SessionStore(tmp_path)
+    snapshot = new_snapshot("reasoning")
+    snapshot.messages.append(
+        Message(
+            role="assistant",
+            content="Calling a tool.",
+            reasoning_content="Need a filesystem read before answering.",
+            tool_calls=(ToolCall("call-1", "read_file", {"path": "README.md"}),),
+        )
+    )
+    snapshot.messages.append(Message(role="tool", content="done", name="read_file", tool_call_id="call-1"))
+
+    store.save(snapshot)
+    loaded = store.load("reasoning")
+
+    assert loaded.messages[0].reasoning_content == "Need a filesystem read before answering."
+
+
 def test_sanitize_session_messages_drops_invalid_legacy_entries():
     messages = [
         Message(role="user", content="write a file"),
@@ -154,4 +173,3 @@ def test_resolve_runtime_session_resumes_latest_when_opted_in(tmp_path):
     assert resumed is True
     assert resolved.session_id == "latest"
     assert resolved.messages[0].content == "previous task"
-
