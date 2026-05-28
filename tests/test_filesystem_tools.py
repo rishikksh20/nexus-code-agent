@@ -6,6 +6,7 @@ import pytest
 from nexus.models import ToolExecutionContext
 from nexus.runtime.execution import ExecutionMode
 from nexus.security import PermissionChecker, PermissionDecision
+from nexus.tools.builtin.edit_file import EditTool
 from nexus.tools.filesystem import (
     ShellTool,
     GlobTool,
@@ -210,6 +211,93 @@ class TestWriteFileTool:
         )
         assert result.is_error
         assert ".nexus" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# EditTool
+# ---------------------------------------------------------------------------
+
+class TestEditTool:
+    @pytest.mark.asyncio
+    async def test_recovers_from_indentation_drift(self, tool_context):
+        target = tool_context.working_directory / "nested.py"
+        target.write_text(
+            "def outer():\n"
+            "    if True:\n"
+            '        print("before")\n'
+            "        return 1\n\n"
+            'print("done")\n',
+            encoding="utf-8",
+        )
+
+        result = await EditTool().execute(
+            "edit-1",
+            {
+                "path": "nested.py",
+                "old_string": 'if True:\n    print("before")\n    return 1\n',
+                "new_string": 'if True:\n    print("after")\n    return 2\n',
+            },
+            tool_context,
+        )
+
+        assert not result.is_error
+        assert "matching" in result.output
+        assert target.read_text(encoding="utf-8") == (
+            "def outer():\n"
+            "    if True:\n"
+            '        print("after")\n'
+            "        return 2\n\n"
+            'print("done")\n'
+        )
+
+    @pytest.mark.asyncio
+    async def test_recovers_from_escaped_newlines(self, tool_context):
+        target = tool_context.working_directory / "escaped.txt"
+        target.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+        result = await EditTool().execute(
+            "edit-2",
+            {
+                "path": "escaped.txt",
+                "old_string": "beta\\ngamma\\n",
+                "new_string": "beta\\ndelta\\n",
+            },
+            tool_context,
+        )
+
+        assert not result.is_error
+        assert target.read_text(encoding="utf-8") == "alpha\nbeta\ndelta\n"
+
+    @pytest.mark.asyncio
+    async def test_rejects_fuzzy_replace_all_without_more_context(self, tool_context):
+        target = tool_context.working_directory / "ambiguous.py"
+        target.write_text(
+            "def one():\n"
+            "    total = old_value\n\n"
+            "def two():\n"
+            "    total = old_value\n",
+            encoding="utf-8",
+        )
+
+        result = await EditTool().execute(
+            "edit-3",
+            {
+                "path": "ambiguous.py",
+                "old_string": "total=old_value",
+                "new_string": "total=new_value",
+                "replace_all": True,
+            },
+            tool_context,
+        )
+
+        assert result.is_error
+        assert "Provide more surrounding context" in result.output
+        assert target.read_text(encoding="utf-8") == (
+            "def one():\n"
+            "    total = old_value\n\n"
+            "def two():\n"
+            "    total = old_value\n"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -62,29 +62,41 @@ def test_terminal_ui_renders_inline_approval_inside_tool_panel():
     assert "Approval: [y]es once" in output
     assert "yes [t]urn" in output
     assert "Approval required — write_file" not in output
-    assert "diff" in output
-    assert "+print('new')" in output
+    assert "params:" in output
+    assert "path=calculator.py" in output
+    assert "diff" not in output
 
 
-def test_terminal_ui_diff_preview_is_limited_to_150_characters():
+def test_terminal_ui_parameter_summary_is_limited_to_100_characters():
     ui = _build_ui()
-    long_line = "+" + ("abcdefghijklmnopqrstuvwxyz" * 8)
+    summary = ui._render_tool_argument_summary(  # type: ignore[attr-defined]
+        "bash",
+        {"command": "echo " + ("abcdefghijklmnopqrstuvwxyz" * 8)},
+    )
+    text = str(summary)
 
-    preview = ui._compact_diff_preview(  # type: ignore[attr-defined]
+    assert len(text) <= 108
+    assert text.endswith("…")
+
+
+def test_terminal_ui_treats_edit_as_write_tool():
+    ui = _build_ui()
+
+    summary = ui._render_tool_argument_summary(  # type: ignore[attr-defined]
+        "edit",
         {
-            "diff": {
-                "unified_diff": f"--- a/file.py\n+++ b/file.py\n@@ -1 +1 @@\n-{long_line}\n+{long_line}\n",
-                "old_content": long_line,
-                "new_content": long_line,
-            }
-        }
+            "new_string": "print('new')\n",
+            "path": "calculator.py",
+            "old_string": "print('old')\n",
+            "replace_all": False,
+        },
     )
 
-    assert len(preview) <= 150
-    assert preview.endswith("…")
+    assert str(summary).startswith("params: path=calculator.py")
+    assert ui._tool_border_style("edit") == "tool.write"  # type: ignore[attr-defined]
 
 
-def test_terminal_ui_tool_result_reuses_stored_preview_diff():
+def test_terminal_ui_tool_result_shows_compact_args_without_preview_diff():
     ui = _build_ui()
     start_event = AgentEvent.tool_call_start(
         "call-1",
@@ -113,8 +125,9 @@ def test_terminal_ui_tool_result_reuses_stored_preview_diff():
     ui.render_event(complete_event, stream_output=False, show_tool_calls=True)
     output = ui.console.export_text()
 
-    assert output.count("diff") >= 2
-    assert "+print('new')" in output
+    assert "params:" in output
+    assert "path=calculator.py" in output
+    assert "diff" not in output
     assert "done" in output
 
 
@@ -139,7 +152,38 @@ def test_terminal_ui_prefixes_nested_subagent_tool_calls():
     ui.render_event(complete_event, stream_output=False, show_tool_calls=True)
     output = ui.console.export_text()
 
-    assert "subagent_planning_analysis - read_file  #call-1" in output
+    assert "|-> read_file path=calculator/main.py  #call-1" in output
+    assert "subagent_planning_analysis - read_file" not in output
+
+
+def test_terminal_ui_indents_parallel_tool_calls_inline():
+    ui = _build_ui()
+
+    ui.render_event(
+        AgentEvent.tool_call_start(
+            "call-1",
+            "read_file",
+            {"path": "calculator/main.py"},
+            display={"parallel_group_size": 2, "parallel_index": 0},
+        ),
+        stream_output=False,
+        show_tool_calls=True,
+    )
+    ui.render_event(
+        AgentEvent.tool_call_start(
+            "call-2",
+            "grep",
+            {"pattern": "tool", "path": "nexus/ui"},
+            display={"parallel_group_size": 2, "parallel_index": 1},
+        ),
+        stream_output=False,
+        show_tool_calls=True,
+    )
+
+    output = ui.console.export_text()
+
+    assert "> -|-> read_file path=calculator/main.py  #call-1" in output
+    assert "> -|-> grep pattern=tool, path=nexus/ui  #call-2" in output
 
 
 def test_terminal_ui_uses_subagent_name_for_thinking_status():

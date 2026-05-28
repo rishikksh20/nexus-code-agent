@@ -6,7 +6,7 @@ from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import Message, RuntimeResponse, ToolCall
 from nexus.runtime.agent import Agent
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import WriteFileTool
+from nexus.tools.builtin import EditTool, WriteFileTool
 
 
 class RecordingModelClient(FakeModelClient):
@@ -111,6 +111,74 @@ async def test_agent_asks_model_to_repair_missing_content_instead_of_user(tool_c
     assert "Missing required argument(s) for tool 'write_file': 'content'" in repair_result.output
     assert "You supplied 'text'; use 'content'" in repair_result.output
     assert (tool_context.working_directory / "hello.txt").read_text(encoding="utf-8") == "Hello, World!"
+
+
+@pytest.mark.asyncio
+async def test_agent_asks_model_to_repair_edit_argument_names_instead_of_user(tool_context):
+    target = tool_context.working_directory / "hello.txt"
+    target.write_text("Hello, World!\n", encoding="utf-8")
+
+    model = RecordingModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Editing with legacy argument names."),
+                tool_calls=(
+                    ToolCall(
+                        call_id="bad-edit",
+                        tool_name="edit",
+                        arguments={
+                            "path": "hello.txt",
+                            "old_text": "Hello",
+                            "new_text": "Hi",
+                        },
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(
+                message=Message(role="assistant", content="Editing with the right keys."),
+                tool_calls=(
+                    ToolCall(
+                        call_id="fixed-edit",
+                        tool_name="edit",
+                        arguments={
+                            "path": "hello.txt",
+                            "old_string": "Hello",
+                            "new_string": "Hi",
+                        },
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Done.")),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(EditTool())
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="replace Hello with Hi in hello.txt")],
+            tool_context,
+            auto_confirm=True,
+            max_turns=4,
+        )
+    ]
+
+    assert not any(event.kind == "confirmation_requested" for event in events)
+    repair_result = next(
+        event.payload
+        for event in events
+        if event.kind == "tool_result" and event.payload.call_id == "bad-edit"
+    )
+    assert repair_result.is_error is True
+    assert "Missing required argument(s) for tool 'edit': 'old_string', 'new_string'" in repair_result.output
+    assert "You supplied 'old_text'; use 'old_string'" in repair_result.output
+    assert "You supplied 'new_text'; use 'new_string'" in repair_result.output
+    assert "The edit tool requires 'path', 'old_string', and 'new_string'" in repair_result.output
+    assert target.read_text(encoding="utf-8") == "Hi, World!\n"
 
 
 @pytest.mark.asyncio

@@ -21,9 +21,12 @@ class RuntimeMetricsCollector:
                 "tool_calls_started": 0,
                 "tool_calls_completed": 0,
                 "tool_errors": 0,
+                "model_calls_started": 0,
+                "model_calls_completed": 0,
                 "confirmation_requests": 0,
                 "clarification_requests": 0,
                 "tool_denials": 0,
+                "context_compactions": 0,
                 "stop_events": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
@@ -84,6 +87,14 @@ class RuntimeMetricsCollector:
                     session["estimated_cost_usd"] + float(payload.get("estimated_cost_usd", 0.0)),
                     6,
                 )
+        elif event_name == "model_start":
+            self._metrics["totals"]["model_calls_started"] += 1
+            if session is not None:
+                session["model_calls_started"] += 1
+        elif event_name == "model_end":
+            self._metrics["totals"]["model_calls_completed"] += 1
+            if session is not None:
+                session["model_calls_completed"] += 1
         elif event_name == "confirmation_requested":
             self._metrics["totals"]["confirmation_requests"] += 1
             self._tool(payload.get("tool_name"))["confirmations"] += 1
@@ -95,6 +106,13 @@ class RuntimeMetricsCollector:
             self._tool(payload.get("tool_name"))["denials"] += 1
         if session is not None:
             session["last_event_at"] = datetime.now(UTC).isoformat()
+        await self._flush()
+
+    async def record_context_compaction(self, payload: dict[str, Any]) -> None:
+        self._metrics["totals"]["context_compactions"] += 1
+        session = self._session(payload.get("session_id"))
+        session["context_compactions"] += 1
+        session["last_event_at"] = datetime.now(UTC).isoformat()
         await self._flush()
 
     async def record_stop(self, payload: dict[str, Any]) -> None:
@@ -122,6 +140,9 @@ class RuntimeMetricsCollector:
                 "tool_calls_started": 0,
                 "tool_calls_completed": 0,
                 "tool_errors": 0,
+                "model_calls_started": 0,
+                "model_calls_completed": 0,
+                "context_compactions": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,

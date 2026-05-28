@@ -9,6 +9,7 @@ from nexus.memory.store import MemoryStore
 from nexus.models import AgentEvent, Message, ToolExecutionContext
 from nexus.prompts import build_context_sections
 from nexus.context import CarryOverState, ContextBuilder, ContextCompactor, TokenEstimator, prune_tool_outputs
+from nexus.hooks import HookEvent
 from nexus.runtime.context_state import load_multi_agent_state, multi_agent_carry_over_lines, render_context_packet
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.agent_scope import skill_metadata_catalog, supervisor_skill_names, supervisor_tool_names
@@ -146,18 +147,24 @@ class ReplState:
         )
         source_history = self.history if history is None else history
         model_messages = prepare_messages_for_model(list(source_history))
+        messages_before_prune = len(model_messages)
         if self.config.context_prune_enabled:
-            prune_outputs(
+            pruned_tool_results = prune_outputs(
                 model_messages,
                 protect_tokens=self.config.context_prune_protect_tokens,
                 minimum_tokens=self.config.context_prune_minimum_tokens,
             )
+        else:
+            pruned_tool_results = 0
+        messages_before_compaction = len(model_messages)
+        compacted = False
         if compactor.should_compact(model_messages):
             model_messages, self.carry_over = compactor.compact(
                 model_messages,
                 self.carry_over,
                 keep_recent=self.config.compaction_keep_recent,
             )
+            compacted = True
         context = ToolExecutionContext(
             session_id=self.session.session_id,
             working_directory=self.config.workspace_root,
@@ -174,6 +181,17 @@ class ReplState:
                 "multi_agent_packet_summaries": {
                     packet.packet_id: render_context_packet(packet)
                     for packet in load_multi_agent_state(self.session.metadata).packets
+                },
+                "context_compaction": {
+                    "session_id": self.session.session_id,
+                    "turn_id": turn_id,
+                    "trace_id": trace_id,
+                    "messages_before_prune": messages_before_prune,
+                    "messages_before_compaction": messages_before_compaction,
+                    "messages_after": len(model_messages),
+                    "pruned_tool_results": pruned_tool_results,
+                    "compacted": compacted,
+                    "carry_over_entries": _carry_over_entry_count(self.carry_over),
                 },
             },
         )
@@ -208,6 +226,14 @@ def _supervisor_prompt_tool_registry(config: AgentConfig, registry: ToolRegistry
         if record.name in available:
             scoped.register(record.tool, source=record.source, origin=record.origin)
     return scoped
+
+
+def _carry_over_entry_count(carry_over: CarryOverState) -> int:
+    return (
+        len(carry_over.pinned_facts)
+        + len(carry_over.summarized_history)
+        + len(carry_over.active_constraints)
+    )
 
 
 def apply_events_to_messages(history: list[Message], events: list[AgentEvent]) -> list:
@@ -299,6 +325,7 @@ def _bound_durable_tool_outputs(
                     f"{suffix}"
                 ),
                 name=message.name,
+                reasoning_content=message.reasoning_content,
                 tool_calls=message.tool_calls,
                 tool_call_id=message.tool_call_id,
             )

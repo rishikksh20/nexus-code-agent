@@ -6,14 +6,14 @@ from types import SimpleNamespace
 import pytest
 
 from nexus.integrations.fake_model import FakeModelClient
-from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message, RuntimeResponse, ToolCall, ToolResult
+from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message, RuntimeResponse, ToolCall, ToolExecutionContext, ToolResult
 from nexus.security import ApprovalManager, ApprovalPolicy, ApprovalScope, PermissionChecker, PermissionDecision
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.agent_scope import subagent_skill_names, subagent_tool_names
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition, _record_inner_approval, _subagent_result_envelope
 from nexus.skills import Skill, SkillRegistry
 from nexus.tools.base import Tool, ToolKind, ToolRegistry
-from nexus.tools.builtin import GetTimeTool, MemoryTool, PythonLspTool, WriteFileTool
+from nexus.tools.builtin import GetTimeTool, MemoryTool, PythonLspTool, ReadFileTool, WriteFileTool
 from nexus.tools.registry import get_core_tools
 from nexus.tools.subagents import (
     load_subagent_definitions,
@@ -41,6 +41,23 @@ class FailingRunTestsTool(Tool):
         )
 
 
+class FailingProbeTool(Tool):
+    name = "probe_read"
+    description = "Failing read probe for recovery coverage."
+    kind = ToolKind.READ
+    is_mutating = False
+    input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+    async def execute(self, call_id, arguments, context):
+        del arguments, context
+        return ToolResult(
+            call_id=call_id,
+            tool_name=self.name,
+            output="probe failed",
+            is_error=True,
+        )
+
+
 class RecordingFakeModelClient(FakeModelClient):
     def __init__(self, scripted=None) -> None:
         super().__init__(scripted=scripted)
@@ -55,7 +72,9 @@ class RecordingFakeModelClient(FakeModelClient):
 def test_core_tools_register_canonical_tool_surface(tmp_path):
     config = SimpleNamespace(memory_dir=tmp_path / "memory")
 
-    tool_names = [tool.name for tool in get_core_tools(config)]
+    tools = get_core_tools(config)
+    tool_names = [tool.name for tool in tools]
+    edit_tool = next(tool for tool in tools if tool.name == "edit")
 
     assert "write_file" in tool_names
     assert "edit" in tool_names
@@ -64,6 +83,8 @@ def test_core_tools_register_canonical_tool_surface(tmp_path):
     assert "lsp" in tool_names
     assert "run_python_check" in tool_names
     assert "modify_file" not in tool_names
+    assert edit_tool.is_mutating is True
+    assert edit_tool.kind is ToolKind.WRITE
     assert len(tool_names) == len(set(tool_names))
 
 
@@ -162,12 +183,14 @@ async def test_register_subagent_tools_registers_default_and_specialist_tools():
     assert specialist.source == "agent"
     assert specialist.origin == "explore"
     assert specialist.tool.is_mutating is False
-    assert registry.record("subagent_planning_analysis").origin == "planning_analysis"
-    assert registry.record("subagent_execution").origin == "execution"
-    assert registry.record("subagent_review").origin == "review"
-    assert registry.record("subagent_verification").origin == "verification"
-    verification_tools = registry.record("subagent_verification").tool._definition.allowed_tools
-    assert "bash" in verification_tools
+    assert registry.record("subagent_explorer").origin == "explorer"
+    assert registry.record("subagent_coding").origin == "coding"
+    assert registry.record("subagent_code_reviewer").origin == "code_reviewer"
+    assert registry.record("subagent_impact_analyzer").origin == "impact_analyzer"
+    coding_tools = registry.record("subagent_coding").tool._definition.allowed_tools
+    reviewer_tools = registry.record("subagent_code_reviewer").tool._definition.allowed_tools
+    assert "run_formatter" in coding_tools
+    assert "run_tests" in reviewer_tools
 
 
 def test_yaml_subagents_are_discovered_with_local_precedence(tmp_path):
@@ -501,8 +524,131 @@ async def test_subagent_tool_marks_unresolved_clarification_as_error(tool_contex
     assert result.metadata["status"] == "needs_clarification"
     assert payload["status"] == "needs_clarification"
     assert payload["runtime_status"] == "needs_clarification"
-    assert payload["recommended_next_action"] == "ask_user"
-    assert "Provide a value for 'path'" in payload["raw_result"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_continues_after_clarification_and_completes_write(tmp_path):
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(WriteFileTool(), source="core", origin="builtin")
+    model = RecordingFakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="I need to inspect a file first."),
+                tool_calls=(
+                    ToolCall(call_id="missing-path", tool_name="read_file", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(
+                message=Message(role="assistant", content="Now I can write the requested file."),
+                tool_calls=(
+                    ToolCall(call_id="write-1", tool_name="write_file", arguments={"path": "subagent.txt", "content": "done"}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content='{"status": "completed", "summary": "Wrote file."}')),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Implement focused work.",
+            goal_prompt="Inspect context and write the requested file.",
+            allowed_tools=["read_file", "write_file"],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+
+    async def approval_callback(request):
+        if request.kind is ConfirmationKind.CLARIFICATION:
+            return ConfirmationResponse(clarification="calculator.py")
+        return ConfirmationResponse(approved=True)
+
+    context = ToolExecutionContext(
+        session_id="test-session",
+        working_directory=tmp_path,
+        metadata={
+            "approval_callback": approval_callback,
+            "auto_confirm": True,
+            "execution_mode": "auto",
+        },
+    )
+
+    result = await tool.execute(
+        "sub-call",
+        {"title": "Write file", "instructions": "Create subagent.txt with the requested content."},
+        context,
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["status"] == "completed"
+    assert payload["runtime_status"] == "completed"
+    assert (tmp_path / "subagent.txt").read_text(encoding="utf-8") == "done"
+    clarification_request = model.requests[1]
+    assert any(
+        message.role == "user" and "Clarification for read_file (path): calculator.py" in message.content
+        for message in clarification_request.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_recovers_status_after_later_successful_write(tmp_path):
+    registry = ToolRegistry()
+    registry.register(FailingProbeTool(), source="core", origin="test")
+    registry.register(WriteFileTool(), source="core", origin="builtin")
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Probe first."),
+                tool_calls=(
+                    ToolCall(call_id="probe-1", tool_name="probe_read", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(
+                message=Message(role="assistant", content="Write the requested file anyway."),
+                tool_calls=(
+                    ToolCall(call_id="write-1", tool_name="write_file", arguments={"path": "subagent.txt", "content": "done"}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content='{"status": "completed", "summary": "Recovered and wrote the file."}')),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Implement focused work.",
+            goal_prompt="Recover from read errors when possible and keep going.",
+            allowed_tools=["probe_read", "write_file"],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+    context = ToolExecutionContext(
+        session_id="test-session",
+        working_directory=tmp_path,
+        metadata={"auto_confirm": True, "execution_mode": "auto"},
+    )
+
+    result = await tool.execute(
+        "sub-call",
+        {"title": "Write file", "instructions": "Create subagent.txt with the requested content."},
+        context,
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["status"] == "completed"
+    assert payload["runtime_status"] == "completed"
+    assert "[Failed tool:" not in payload["raw_result"]
+    assert (tmp_path / "subagent.txt").read_text(encoding="utf-8") == "done"
+    assert payload["recommended_next_action"] == "continue"
 
 
 @pytest.mark.asyncio
@@ -561,10 +707,10 @@ async def test_register_subagent_tools_advanced_mode_does_not_require_delegation
 
     assert count == 4
     assert {record.name for record in registry.records()} == {
-        "subagent_planning_analysis",
-        "subagent_execution",
-        "subagent_review",
-        "subagent_verification",
+        "subagent_explorer",
+        "subagent_coding",
+        "subagent_code_reviewer",
+        "subagent_impact_analyzer",
     }
 
 
@@ -586,15 +732,15 @@ def test_register_subagent_tools_loads_configured_subagents_in_basic_mode():
         allowed_tools=[],
         denied_tools=[],
         subagent_profiles=[
-            {"name": "execution", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
-            {"name": "review", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
+            {"name": "coding", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
+            {"name": "code_reviewer", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
         ],
     )
 
     count = register_subagent_tools(registry, config)
 
     assert count == 2
-    assert {record.name for record in registry.records()} == {"subagent_execution", "subagent_review"}
+    assert {record.name for record in registry.records()} == {"subagent_coding", "subagent_code_reviewer"}
 
 
 def test_load_subagent_definitions_builds_definition_objects():

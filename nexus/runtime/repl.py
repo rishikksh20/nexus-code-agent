@@ -50,7 +50,7 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
     if session_resumed:
         ui.print_session_resumed(state.session.session_id, len(state.history))
     if state.has_paused_turn():
-        ui.print_muted("A previous task was paused after hitting the tool-call limit. Type `continue` to resume it, or enter a new prompt to start something else.")
+        ui.print_muted("A previous task was paused after hitting a turn limit. Type `continue` to resume it, or enter a new prompt to start something else.")
     ui.print_help_hint()
     _print_provider_notice_or_warning(state)
     _maybe_prompt_config_upgrade(state)
@@ -138,16 +138,28 @@ def _interactive_approval_callback(ui: TerminalUI) -> ConfirmationCallback:
         try:
             if request.kind is ConfirmationKind.CLARIFICATION:
                 field = request.payload.get("field", "value")
-                answer = ui.input(f"  [bold]Value for [cyan]{field!r}[/cyan]:[/bold] ").strip()
-                return ConfirmationResponse(clarification=answer) if answer else ConfirmationResponse()
+                while True:
+                    answer = ui.input(f"  [bold]Value for [cyan]{field!r}[/cyan]:[/bold] ").strip()
+                    if answer:
+                        return ConfirmationResponse(clarification=answer)
+                    ui.print_muted("A value is required. Provide input or press Ctrl+C to cancel.")
+
             policy = approval_policy_for_request(request)
-            answer = ui.input(f"[bold yellow]  Allow? {approval_prompt_label(policy)}[/bold yellow] ").strip().lower()
+            while True:
+                answer = ui.input(f"[bold yellow]  Allow? {approval_prompt_label(policy)}[/bold yellow] ").strip().lower()
+                response = approval_response_from_answer(answer, policy)
+                if response.approved or _is_explicit_denial_answer(answer):
+                    return response
+                ui.print_muted("Please answer with yes/y (or t/turn when offered), or no/n.")
         except (EOFError, KeyboardInterrupt):
             return ConfirmationResponse()
 
-        return approval_response_from_answer(answer, approval_policy_for_request(request))
-
     return ask_for_approval
+
+
+def _is_explicit_denial_answer(answer: str) -> bool:
+    normalized = " ".join(answer.strip().lower().replace("(", " ").replace(")", " ").replace("-", " ").replace("_", " ").split())
+    return normalized in {"n", "no"}
 
 
 def _print_provider_notice_or_warning(state: ReplState) -> None:

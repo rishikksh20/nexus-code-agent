@@ -43,7 +43,12 @@ from nexus.integrations.openai_compatible import (
     resolve_provider_api_key,
 )
 from nexus.runtime.agent import Agent
-from nexus.observability import sentry_monitor_from_hooks
+from nexus.observability import (
+    configure_root_text_logging,
+    langfuse_monitor_from_hooks,
+    otel_monitor_from_hooks,
+    sentry_monitor_from_hooks,
+)
 from nexus.runtime.post_session import run_post_session_updates
 from nexus.runtime.repl import run_repl
 from nexus.runtime.runtime_session import RuntimeSession, resolve_runtime_session
@@ -308,6 +313,8 @@ class NexusApp:
                 api_base_url=self.config.api_base_url,
                 api_key=resolve_provider_api_key(self.config.provider, explicit_key),
                 provider_name=self.config.provider,
+                thinking_mode=self.config.llm_thinking_mode,
+                reasoning_effort=self.config.llm_reasoning_effort,
             )
         raise ValueError(f"Unsupported provider: {self.config.provider}")
 
@@ -478,7 +485,10 @@ def _dispatch_runtime(params: dict) -> int:
         console.print_config_error(exc)
         return 1
 
-    logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
+    configure_root_text_logging(
+        level=getattr(logging, config.log_level.upper(), logging.INFO),
+        log_dir=config.log_dir,
+    )
     console = TerminalUI(color=config.color_output)
     _print_config_warnings(console, config)
     return asyncio.run(_run_app(config, console, params))
@@ -509,6 +519,12 @@ async def _run_app(config, console: TerminalUI, params: dict) -> int:
         return await app.run_interactive(params)
     finally:
         await app.close()
+        langfuse_monitor = langfuse_monitor_from_hooks(app._hooks)
+        if langfuse_monitor is not None:
+            langfuse_monitor.close()
+        otel_monitor = otel_monitor_from_hooks(app._hooks)
+        if otel_monitor is not None:
+            otel_monitor.close()
         monitor = sentry_monitor_from_hooks(app._hooks)
         if monitor is not None:
             monitor.flush()
@@ -524,7 +540,10 @@ def _dispatch_doctor(output_format: str) -> int:
         console.print_config_error(exc)
         return 1
 
-    logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
+    configure_root_text_logging(
+        level=getattr(logging, config.log_level.upper(), logging.INFO),
+        log_dir=config.log_dir,
+    )
     _print_config_warnings(console, config)
     return asyncio.run(_run_doctor(config, console, output_format=output_format))
 
@@ -538,6 +557,12 @@ async def _run_doctor(config, console: TerminalUI, *, output_format: str) -> int
         report = build_doctor_report(config, app._registry, app._resources)
     finally:
         await app.close()
+        langfuse_monitor = langfuse_monitor_from_hooks(app._hooks)
+        if langfuse_monitor is not None:
+            langfuse_monitor.close()
+        otel_monitor = otel_monitor_from_hooks(app._hooks)
+        if otel_monitor is not None:
+            otel_monitor.close()
         monitor = sentry_monitor_from_hooks(app._hooks)
         if monitor is not None:
             monitor.flush()
@@ -555,7 +580,10 @@ def _dispatch_init(force: bool) -> None:
         console.print_config_error(exc)
         return
 
-    logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
+    configure_root_text_logging(
+        level=getattr(logging, config.log_level.upper(), logging.INFO),
+        log_dir=config.log_dir,
+    )
     console = TerminalUI(color=config.color_output)
     _print_config_warnings(console, config)
     ensure_config_dirs(config)

@@ -36,9 +36,13 @@ class OpenAICompatibleAdapter:
         *,
         provider_name: str = "openai-compatible",
         cohere_compatibility: bool = False,
+        thinking_mode: str = "auto",
+        reasoning_effort: str = "high",
     ) -> None:
         self.provider_name = provider_name
         self.cohere_compatibility = cohere_compatibility
+        self.thinking_mode = thinking_mode
+        self.reasoning_effort = reasoning_effort
 
     def to_wire_request(self, request: RuntimeRequest) -> dict[str, Any]:
         tools = list(request.tool_schemas)
@@ -72,6 +76,8 @@ class OpenAICompatibleAdapter:
                         for tc in message.tool_calls
                     ],
                 }
+                if self.thinking_mode != "disabled":
+                    item["reasoning_content"] = message.reasoning_content or ""
             elif message.role == "tool":
                 if not message.tool_call_id:
                     continue
@@ -87,6 +93,8 @@ class OpenAICompatibleAdapter:
                 item = {"role": message.role, "content": message.content}
                 if message.name:
                     item["name"] = message.name
+                if self.thinking_mode != "disabled" and message.reasoning_content:
+                    item["reasoning_content"] = message.reasoning_content
             else:
                 item = {"role": message.role, "content": message.content}
                 if message.name:
@@ -101,6 +109,10 @@ class OpenAICompatibleAdapter:
         }
         if request.max_output_tokens is not None:
             payload["max_tokens"] = request.max_output_tokens
+        if self.thinking_mode in {"enabled", "disabled"}:
+            payload["thinking"] = {"type": self.thinking_mode}
+            if self.thinking_mode == "enabled" and self.reasoning_effort:
+                payload["reasoning_effort"] = self.reasoning_effort
         return payload
 
     def from_wire_response(self, payload: dict[str, Any]) -> RuntimeResponse:
@@ -113,6 +125,7 @@ class OpenAICompatibleAdapter:
         message = Message(
             role="assistant",
             content=message_payload.get("content") or "",
+            reasoning_content=_extract_reasoning_text(message_payload),
             tool_calls=tool_calls,
         )
 
@@ -164,6 +177,8 @@ class OpenAICompatibleModelClient:
         retries: int = 3,
         base_delay: float = 0.5,
         jitter: float = 0.2,
+        thinking_mode: str = "auto",
+        reasoning_effort: str = "high",
     ) -> None:
         normalized_base = resolve_provider_api_base_url(provider_name, api_base_url)
         if not normalized_base:
@@ -175,9 +190,13 @@ class OpenAICompatibleModelClient:
         self.retries = retries
         self.base_delay = base_delay
         self.jitter = jitter
+        self.thinking_mode = thinking_mode
+        self.reasoning_effort = reasoning_effort
         self.adapter = OpenAICompatibleAdapter(
             provider_name=provider_name,
             cohere_compatibility=_is_cohere_compatibility_base_url(normalized_base),
+            thinking_mode=thinking_mode,
+            reasoning_effort=reasoning_effort,
         )
 
     async def complete(self, request: RuntimeRequest) -> RuntimeResponse:
@@ -275,6 +294,7 @@ class OpenAICompatibleModelClient:
             type=StreamEventType.MESSAGE_COMPLETE,
             finish_reason=runtime_response.finish_reason,
             usage=runtime_response.usage,
+            reasoning_content=runtime_response.message.reasoning_content or None,
         )
 
     async def _stream_sse(self, payload: dict[str, Any]) -> AsyncGenerator[StreamEvent, None]:
@@ -339,6 +359,7 @@ class OpenAICompatibleModelClient:
         tool_calls_acc: dict[int, dict[str, Any]] = {}
         usage: UsageSnapshot | None = None
         finish_reason: str | None = None
+        reasoning_content = ""
 
         while True:
             item = await queue.get()
@@ -382,6 +403,8 @@ class OpenAICompatibleModelClient:
                     type=StreamEventType.TEXT_DELTA,
                     text_delta=TextDelta(content=message["content"]),
                 )
+            reasoning_content += _extract_reasoning_text(delta)
+            reasoning_content += _extract_reasoning_text(message)
 
             # Accumulate tool-call argument fragments.
             for tc_delta in delta.get("tool_calls") or []:
@@ -429,6 +452,7 @@ class OpenAICompatibleModelClient:
             type=StreamEventType.MESSAGE_COMPLETE,
             finish_reason=finish_reason,
             usage=usage,
+            reasoning_content=reasoning_content or None,
         )
 
     def _send_request(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -472,7 +496,10 @@ _RETRYABLE_ERROR_MARKERS = (
 
 
 def _request_headers(api_key: str | None) -> dict[str, str]:
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Nexus/0.1 (OpenAI-compatible client)",
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
@@ -485,6 +512,15 @@ def _stream_events_have_assistant_output(events: list[StreamEvent]) -> bool:
         if event.type == StreamEventType.TOOL_CALL_COMPLETE and event.tool_call:
             return True
     return False
+
+
+def _extract_reasoning_text(payload: dict[str, Any]) -> str:
+    """Return provider reasoning text from common OpenAI-compatible shapes."""
+    for key in ("reasoning_content", "reasoning", "thinking_content"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def _cohere_compatible_strict_tool_schema(tool: dict[str, Any]) -> dict[str, Any]:

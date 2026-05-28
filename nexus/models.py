@@ -78,6 +78,9 @@ class Message:
     role: Role
     content: str
     name: str | None = None
+    # Provider-specific hidden reasoning that must round-trip for some
+    # thinking-mode APIs when an assistant turn includes tool calls.
+    reasoning_content: str = ""
     # Populated on assistant messages that called tools; required for Mistral/OpenAI
     # multi-turn history so the provider can correlate assistant → tool results.
     tool_calls: tuple[ToolCall, ...] = ()
@@ -133,6 +136,7 @@ class StreamEvent:
     # Uses the nexus ToolCall type (arguments already parsed from JSON).
     tool_call: ToolCall | None = None
     usage: UsageSnapshot | None = None
+    reasoning_content: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -253,12 +257,14 @@ class AgentEvent:
         *,
         preview: dict[str, Any] | None = None,
         actor: str | None = None,
+        display: dict[str, Any] | None = None,
     ) -> AgentEvent:
         payload = {
             "call_id": call_id,
             "name": name,
             "arguments": arguments,
             "preview": preview or {},
+            "display": dict(display or {}),
         }
         if actor:
             payload["actor"] = actor

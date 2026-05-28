@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -98,7 +99,10 @@ class RunPythonCheckTool(_CommandTool):
     default_timeout = 180
 
     def _build_command(self, cwd: Path, raw_args: list[str]) -> tuple[tuple[str, ...], str | None]:
-        return _compileall_command(self.command, cwd, raw_args)
+        # Use the running interpreter so the tool works on systems where
+        # "python" is not on PATH (e.g. Linux distros that only ship python3).
+        cmd = (sys.executable, "-m", "compileall", "-q")
+        return _compileall_command(cmd, cwd, raw_args)
 
 
 class RunFormatterTool(_CommandTool):
@@ -252,7 +256,9 @@ def _compileall_command(base_command: tuple[str, ...], cwd: Path, raw_args: list
 def _explicit_compile_targets(args: list[str]) -> list[str]:
     targets: list[str] = []
     skip_next = False
-    options_with_values = {"-d", "-s", "-p", "-j", "-x"}
+    # -c takes a value in the Python CLI; include it so that `python -c <code>` patterns
+    # don't leak the code string into the compile targets list.
+    options_with_values = {"-c", "-d", "-s", "-p", "-j", "-x"}
     for arg in args:
         if skip_next:
             skip_next = False
@@ -268,7 +274,12 @@ def _explicit_compile_targets(args: list[str]) -> list[str]:
 
 def _target_inside_cwd(cwd: Path, target: str) -> bool:
     candidate = Path(target)
-    resolved = candidate.resolve() if candidate.is_absolute() else (cwd / candidate).resolve()
+    try:
+        resolved = candidate.resolve() if candidate.is_absolute() else (cwd / candidate).resolve()
+    except OSError:
+        # Path construction can raise OSError (e.g. ENAMETOOLONG) for strings that
+        # are not valid filesystem paths, such as inline Python code snippets.
+        return False
     try:
         resolved.relative_to(cwd.resolve())
     except ValueError:

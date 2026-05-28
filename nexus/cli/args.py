@@ -37,7 +37,7 @@ _CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], max_content_width=1
 @click.option("--stream", "stream", is_flag=True, help="Enable streamed output (overrides config).")
 @click.option("--no-stream", "no_stream", is_flag=True, help="Disable streamed output.")
 @click.option("--quiet", "-q", is_flag=True, help="Suppress tool call and progress output.")
-@click.option("--verbose", "-v", is_flag=True, help="Enable debug-level logging.")
+@click.option("--verbose", "--debug", "-v", "verbose", is_flag=True, help="Enable debug-level logging.")
 @click.option("--no-tui", "no_tui", is_flag=True, help="Use the classic line-oriented terminal UI.")
 @click.option("--auto-confirm", "auto_confirm", is_flag=True, help="Automatically confirm all mutating tool calls.")
 @click.option("--deny-mutating", "deny_mutating", is_flag=True, help="Deny all mutating tools (implies plan mode).")

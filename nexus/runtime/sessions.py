@@ -15,6 +15,7 @@ def message_to_dict(message: Message) -> dict[str, object]:
         "role": message.role,
         "content": message.content,
         "name": message.name,
+        "reasoning_content": message.reasoning_content,
         "tool_calls": [
             {
                 "call_id": tool_call.call_id,
@@ -42,6 +43,7 @@ def message_from_dict(payload: dict[str, object]) -> Message:
         role=cast("Any", str(payload["role"])),
         content=str(payload.get("content", "")),
         name=str(payload["name"]) if payload.get("name") is not None else None,
+        reasoning_content=str(payload.get("reasoning_content", "")),
         tool_calls=tool_calls,
         tool_call_id=(
             str(payload["tool_call_id"])

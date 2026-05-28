@@ -392,18 +392,19 @@ class CohereModelClient:
             event_type = str(event.get("type", ""))
             delta = event.get("delta") or {}
             message = delta.get("message") or {}
-            logger.debug(
-                "cohere.sse.event type=%s index=%s finish_reason=%s error_present=%s",
-                event_type or "(missing)",
-                event.get("index"),
-                delta.get("finish_reason"),
-                bool(delta.get("error")),
-            )
+            if not _is_streaming_delta_event_type(event_type):
+                logger.debug(
+                    "cohere.sse.event type=%s index=%s finish_reason=%s error_present=%s",
+                    event_type or "(missing)",
+                    event.get("index"),
+                    delta.get("finish_reason"),
+                    bool(delta.get("error")),
+                )
 
             if event_type in {"content-start", "content-delta"}:
                 text = _content_delta_text(message.get("content"))
                 if text:
-                    logger.debug("cohere.sse.text_delta type=%s chars=%s", event_type, len(text))
+                    logger.info("cohere.sse.text_delta type=%s chars=%s", event_type, len(text))
                     yield StreamEvent(type=StreamEventType.TEXT_DELTA, text_delta=TextDelta(content=text))
             elif event_type == "tool-call-start":
                 idx = int(event.get("index", 0) or 0)
@@ -425,7 +426,7 @@ class CohereModelClient:
                     tool_calls_acc[idx]["name"] += str(fn["name"])
                 if fn.get("arguments"):
                     tool_calls_acc[idx]["arguments"] += str(fn["arguments"])
-                logger.debug(
+                logger.info(
                     "cohere.sse.tool_call_delta index=%s call_id=%s name=%s argument_chars=%s",
                     idx,
                     tool_calls_acc[idx].get("id"),
@@ -598,6 +599,10 @@ def _retry_after_seconds(headers: Any) -> float | None:
     except ValueError:
         return None
     return seconds if seconds > 0 else None
+
+
+def _is_streaming_delta_event_type(event_type: str) -> bool:
+    return event_type in {"content-start", "content-delta", "tool-call-delta"}
 
 
 def _is_retryable_cohere_error(exc: Exception) -> bool:

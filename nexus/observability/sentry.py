@@ -7,6 +7,11 @@ from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from nexus.hooks import HookEvent, HookExecutor
+from nexus.observability.event_descriptions import (
+    describe_notification_event,
+    describe_tool_observation,
+    describe_turn_observation,
+)
 from nexus.observability.logging import redact_payload
 
 
@@ -94,15 +99,23 @@ class _SentrySDKClient:
         self._sdk.set_context(key, value)
 
     def start_transaction(self, **kwargs: Any) -> Any:
-        return self._sdk.start_transaction(**kwargs)
+        sdk_kwargs, span_updates = _split_span_kwargs(kwargs)
+        transaction = self._sdk.start_transaction(**sdk_kwargs)
+        _apply_span_updates(transaction, span_updates)
+        return transaction
 
     def start_span(self, **kwargs: Any) -> Any:
-        return self._sdk.start_span(**kwargs)
+        sdk_kwargs, span_updates = _split_span_kwargs(kwargs)
+        span = self._sdk.start_span(**sdk_kwargs)
+        _apply_span_updates(span, span_updates)
+        return span
 
     def update_current_span(self, **kwargs: Any) -> None:
+        sdk_kwargs, span_updates = _split_span_kwargs(kwargs)
         update = getattr(self._sdk, "update_current_span", None)
         if update is not None:
-            update(**kwargs)
+            update(**sdk_kwargs)
+        _apply_span_updates(_get_current_span(self._sdk), span_updates)
 
     def flush(self, timeout: float | None = None) -> bool:
         return bool(self._sdk.flush(timeout=timeout))
@@ -245,16 +258,39 @@ class SentryMonitor:
         self._client.flush(timeout=self.settings.flush_timeout_seconds)
 
     def _before_send(self, event: dict[str, Any], hint: dict[str, Any] | None = None) -> dict[str, Any]:
-        scrubbed = _scrub_value(event, self.settings)
-        return scrubbed if isinstance(scrubbed, dict) else {}
+        # Scrub only user-controlled fields.  Do NOT touch Sentry protocol
+        # fields (event_id, exception, stacktrace, abs_path, level, platform,
+        # timestamp, sdk …) — the base64 regex in redact_payload corrupts them
+        # and Sentry then drops or misroutes the event.
+
+        # Free-form extra data attached by application code.
+        if isinstance(event.get("extra"), dict):
+            event["extra"] = _scrub_value(event["extra"], self.settings)
+
+        # The "nexus" context block we populate via set_runtime_context().
+        contexts = event.get("contexts")
+        if isinstance(contexts, dict) and isinstance(contexts.get("nexus"), dict):
+            contexts["nexus"] = _scrub_value(contexts["nexus"], self.settings)
+
+        # Breadcrumb data payloads (the structured `data` dict on each crumb).
+        breadcrumbs = event.get("breadcrumbs")
+        if isinstance(breadcrumbs, dict):
+            for crumb in breadcrumbs.get("values") or []:
+                if isinstance(crumb, dict) and isinstance(crumb.get("data"), dict):
+                    crumb["data"] = _scrub_value(crumb["data"], self.settings)
+
+        return event
 
     def _before_breadcrumb(
         self,
         breadcrumb: dict[str, Any],
         hint: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        scrubbed = _scrub_value(breadcrumb, self.settings)
-        return scrubbed if isinstance(scrubbed, dict) else None
+        # Only scrub the structured data payload; leave type/category/message/
+        # level/timestamp intact so Sentry can parse and display the crumb.
+        if isinstance(breadcrumb.get("data"), dict):
+            breadcrumb["data"] = _scrub_value(breadcrumb["data"], self.settings)
+        return breadcrumb
 
 
 class SentryHookService:
@@ -274,7 +310,13 @@ class SentryHookService:
     async def on_user_prompt(self, payload: dict[str, Any]) -> None:
         prompt = str(payload.get("prompt", ""))
         context = _base_context(payload)
-        context.update({"mode": payload.get("mode"), "headless": payload.get("headless")})
+        context.update(
+            {
+                "mode": payload.get("mode"),
+                "headless": payload.get("headless"),
+                "description": "User prompt submitted for the next Nexus turn.",
+            }
+        )
         self.monitor.set_runtime_context(context)
         data = {**context, "prompt_chars": len(prompt)}
         if self.settings.include_prompts:
@@ -284,6 +326,7 @@ class SentryHookService:
     async def on_pre_tool(self, payload: dict[str, Any]) -> None:
         context = _base_context(payload)
         context.update(_tool_context(payload))
+        context["description"] = describe_tool_observation(payload)
         self.monitor.set_runtime_context(context)
         self.monitor.breadcrumb("nexus.tool", "tool started", data=context)
 
@@ -297,6 +340,7 @@ class SentryHookService:
                 "duration_ms": payload.get("duration_ms"),
                 "output_chars": len(output),
                 "exception_type": payload.get("exception_type"),
+                "description": describe_tool_observation(payload, phase="end"),
             }
         )
         if self.settings.include_tool_outputs:
@@ -310,6 +354,7 @@ class SentryHookService:
     async def on_notification(self, payload: dict[str, Any]) -> None:
         event_name = str(payload.get("event", "")).strip()
         context = _base_context(payload)
+        description = describe_notification_event(event_name, payload)
         if event_name == "model_usage":
             context.update(
                 {
@@ -319,6 +364,7 @@ class SentryHookService:
                     "completion_tokens": payload.get("completion_tokens"),
                     "total_tokens": payload.get("total_tokens"),
                     "estimated_cost_usd": payload.get("estimated_cost_usd"),
+                    "description": description,
                 }
             )
             self.monitor.set_runtime_context(context)
@@ -332,6 +378,7 @@ class SentryHookService:
                     "reason": payload.get("reason"),
                     "field": payload.get("field"),
                     "risk_level": payload.get("risk_level"),
+                    "description": description,
                 }
             )
             level = "warning" if event_name == "tool_denied" else "info"
@@ -347,6 +394,7 @@ class SentryHookService:
                     "turn_index": payload.get("turn_index"),
                     "actor": payload.get("actor"),
                     "error": payload.get("error"),
+                    "description": description,
                 }
             )
             self.monitor.breadcrumb("nexus.model", "model error", data=context, level="error")
@@ -360,13 +408,18 @@ class SentryHookService:
                     "transport": payload.get("transport"),
                     "command_name": payload.get("command_name"),
                     "error": payload.get("error"),
+                    "description": description,
                 }
             )
             self.monitor.breadcrumb("nexus.mcp", "mcp server error", data=context, level="warning")
             if self.settings.capture_mcp_errors:
                 self.monitor.capture_message("Nexus MCP server error", level="warning", context=context)
             return
-        self.monitor.breadcrumb("nexus.notification", event_name or "notification", data={**context, "event": event_name})
+        self.monitor.breadcrumb(
+            "nexus.notification",
+            event_name or "notification",
+            data={**context, "event": event_name, "description": description},
+        )
 
     async def on_stop(self, payload: dict[str, Any]) -> None:
         self.monitor.breadcrumb("nexus.stop", "runtime stopped", data=payload)
@@ -374,13 +427,15 @@ class SentryHookService:
             self.monitor.flush()
 
     async def on_turn_start(self, payload: dict[str, Any]) -> None:
-        self.monitor.set_runtime_context(payload)
-        self.monitor.breadcrumb("nexus.turn", "turn started", data=payload)
+        enriched = {**payload, "description": describe_turn_observation(payload)}
+        self.monitor.set_runtime_context(enriched)
+        self.monitor.breadcrumb("nexus.turn", "turn started", data=enriched)
 
     async def on_turn_end(self, payload: dict[str, Any]) -> None:
-        self.monitor.set_runtime_context(payload)
+        enriched = {**payload, "description": describe_turn_observation(payload)}
+        self.monitor.set_runtime_context(enriched)
         level = "error" if payload.get("status") == "failed" else "info"
-        self.monitor.breadcrumb("nexus.turn", "turn ended", data=payload, level=level)
+        self.monitor.breadcrumb("nexus.turn", "turn ended", data=enriched, level=level)
         status = str(payload.get("status", ""))
         if status:
             self.monitor.update_current_span(status=status)
@@ -461,6 +516,99 @@ def _tool_context(payload: dict[str, Any]) -> dict[str, Any]:
         )
         if payload.get(key) not in (None, "")
     }
+
+
+def _split_span_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    sdk_kwargs = dict(kwargs)
+    span_updates: dict[str, Any] = {}
+
+    for key in ("op", "name"):
+        value = sdk_kwargs.get(key)
+        if value not in (None, ""):
+            span_updates[key] = value
+
+    merged_attributes: dict[str, Any] = {}
+    for key in ("attributes", "data"):
+        value = sdk_kwargs.pop(key, None)
+        if isinstance(value, dict):
+            merged_attributes.update(value)
+    if merged_attributes:
+        span_updates["attributes"] = merged_attributes
+
+    status = sdk_kwargs.pop("status", None)
+    if status not in (None, ""):
+        span_updates["status"] = status
+
+    return sdk_kwargs, span_updates
+
+
+def _get_current_span(sdk: Any) -> Any | None:
+    getter = getattr(sdk, "get_current_span", None)
+    if callable(getter):
+        try:
+            return getter()
+        except Exception:  # noqa: BLE001
+            return None
+
+    get_current_scope = getattr(sdk, "get_current_scope", None)
+    if callable(get_current_scope):
+        try:
+            scope = get_current_scope()
+        except Exception:  # noqa: BLE001
+            return None
+        for attr in ("span", "transaction"):
+            current = getattr(scope, attr, None)
+            if current is not None:
+                return current
+    return None
+
+
+def _apply_span_updates(span: Any, updates: dict[str, Any]) -> None:
+    if span is None:
+        return
+
+    op = updates.get("op")
+    if op not in (None, ""):
+        try:
+            setattr(span, "op", op)
+        except Exception:  # noqa: BLE001
+            pass
+
+    name = updates.get("name")
+    if name not in (None, ""):
+        for attr in ("name", "description"):
+            try:
+                setattr(span, attr, name)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+
+    attributes = updates.get("attributes")
+    if isinstance(attributes, dict):
+        for key, value in attributes.items():
+            _set_span_attribute(span, key, value)
+
+    status = updates.get("status")
+    if status not in (None, ""):
+        set_status = getattr(span, "set_status", None)
+        if callable(set_status):
+            try:
+                set_status(status)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        _set_span_attribute(span, "nexus.status", status)
+
+
+def _set_span_attribute(span: Any, key: str, value: Any) -> None:
+    for method_name in ("set_attribute", "set_data", "set_tag"):
+        method = getattr(span, method_name, None)
+        if callable(method):
+            try:
+                method(key, value)
+                return
+            except Exception:  # noqa: BLE001
+                continue
 
 
 def _scrub_value(value: Any, settings: SentrySettings) -> Any:

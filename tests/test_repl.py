@@ -22,6 +22,7 @@ from nexus.models import (
 )
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.repl import _interactive_approval_callback
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import EphemeralSessionStore, new_snapshot
 from nexus.runtime.turn_runner import collect_turn_events, prompt_for_confirmation
@@ -349,6 +350,32 @@ async def test_collect_turn_events_honors_auto_confirm_read_only_flag(tmp_path):
     assert confirmation.payload.tool_name == "get_time"
 
 
+@pytest.mark.asyncio
+async def test_collect_turn_events_marks_paused_turn_when_max_turns_is_reached(tmp_path):
+    state = _build_state(tmp_path, max_loop_iterations=1)
+    state.tool_registry.register(GetTimeTool())
+    state.history.append(Message(role="user", content="what time is it?"))
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Checking time."),
+                tool_calls=(ToolCall(call_id="call-1", tool_name="get_time", arguments={}),),
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+    agent = Agent(model_client=model, tool_registry=state.tool_registry)
+
+    events = await collect_turn_events(state, agent, prompt_text="what time is it?")
+
+    assert state.has_paused_turn()
+    assert state.paused_turn_prompt == "what time is it?"
+    assert any(
+        event.kind == AgentEventType.TURN_COMPLETED and event.payload == "max_turns"
+        for event in events
+    )
+
+
 async def _read_only_tool_response(request: RuntimeRequest) -> RuntimeResponse:
     del request
     return RuntimeResponse(
@@ -463,6 +490,63 @@ def test_prompt_for_confirmation_accepts_yes_turn_aliases():
 
         assert response.approved is True
         assert response.scope == "turn"
+
+
+@pytest.mark.asyncio
+async def test_interactive_approval_callback_reprompts_until_valid_approval_answer():
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow write_file?",
+        reason="Mutating tool requires confirmation.",
+        payload={"approval_policy": "on-request"},
+    )
+
+    class _StubUI:
+        def __init__(self) -> None:
+            self._answers = iter(["", "maybe", "t"])
+            self.muted: list[str] = []
+
+        def input(self, _prompt: str = "") -> str:
+            return next(self._answers)
+
+        def print_muted(self, msg: str) -> None:
+            self.muted.append(msg)
+
+    callback = _interactive_approval_callback(_StubUI())
+    response = await callback(request)
+
+    assert response.approved is True
+    assert response.scope == "turn"
+
+
+@pytest.mark.asyncio
+async def test_interactive_approval_callback_reprompts_for_clarification_value():
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.CLARIFICATION,
+        tool_name="write_file",
+        prompt="Need content",
+        reason="Missing required field.",
+        payload={"field": "content"},
+    )
+
+    class _StubUI:
+        def __init__(self) -> None:
+            self._answers = iter(["", "filled"])
+            self.muted: list[str] = []
+
+        def input(self, _prompt: str = "") -> str:
+            return next(self._answers)
+
+        def print_muted(self, msg: str) -> None:
+            self.muted.append(msg)
+
+    ui = _StubUI()
+    callback = _interactive_approval_callback(ui)
+    response = await callback(request)
+
+    assert response.clarification == "filled"
+    assert ui.muted
 
 
 @pytest.mark.asyncio

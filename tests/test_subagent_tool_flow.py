@@ -9,6 +9,7 @@ import pytest
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import AgentEventType, Message, RuntimeResponse, ToolCall, ToolExecutionContext, ToolResult
 from nexus.runtime.agent import Agent
+from nexus.runtime.context_state import load_multi_agent_state
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.tools.base import Tool, ToolKind, ToolRegistry
 from nexus.tools.builtin import WriteFileTool
@@ -80,11 +81,43 @@ class _PlainReadTool(Tool):
         return ToolResult(call_id=call_id, tool_name=self.name, output="read ok")
 
 
+class _CountingReadTool(_PlainReadTool):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def execute(self, call_id, arguments, context):
+        self.calls += 1
+        return await super().execute(call_id, arguments, context)
+
+
 class _SlowReadTool(_StartAwareReadTool):
     async def execute(self, call_id, arguments, context):
         del arguments, context
         await asyncio.sleep(1)
         return ToolResult(call_id=call_id, tool_name=self.name, output="too late")
+
+
+class _NamedDelayReadTool(Tool):
+    kind = ToolKind.READ
+    is_mutating = False
+    input_schema = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+
+    def __init__(self, name: str, timings: dict[str, float], *, delay: float = 0.05) -> None:
+        self.name = name
+        self.description = f"Delay read tool {name}."
+        self._timings = timings
+        self._delay = delay
+
+    async def execute(self, call_id, arguments, context):
+        del call_id, arguments, context
+        self._timings[f"{self.name}_start"] = asyncio.get_running_loop().time()
+        await asyncio.sleep(self._delay)
+        self._timings[f"{self.name}_end"] = asyncio.get_running_loop().time()
+        return ToolResult(call_id=self.name, tool_name=self.name, output=f"done:{self.name}")
 
 
 @pytest.mark.asyncio
@@ -143,7 +176,7 @@ async def test_supervisor_tool_schemas_prefer_subagents_when_direct_tools_are_av
     registry.register(
         SubAgentTool(
             SubagentDefinition(
-                name="execution",
+                name="coding",
                 description="Implement focused work.",
                 goal_prompt="Use normal tools to implement the assigned change.",
                 allowed_tools=["write_file"],
@@ -151,13 +184,13 @@ async def test_supervisor_tool_schemas_prefer_subagents_when_direct_tools_are_av
             base_tool_registry=registry,
         ),
         source="agent",
-        origin="execution",
+        origin="coding",
     )
     model = _RecordingModel()
     context = ToolExecutionContext(
         session_id="test-session",
         working_directory=tmp_path,
-        metadata={"supervisor_available_tools": ["write_file", "subagent_execution"]},
+        metadata={"supervisor_available_tools": ["write_file", "subagent_coding"]},
     )
     agent = Agent(model_client=model, tool_registry=registry)
 
@@ -165,15 +198,15 @@ async def test_supervisor_tool_schemas_prefer_subagents_when_direct_tools_are_av
 
     assert model.requests
     schemas = list(model.requests[0].tool_schemas)
-    assert schemas[0]["function"]["name"] == "subagent_execution"
+    assert schemas[0]["function"]["name"] == "subagent_coding"
     subagent_description = schemas[0]["function"]["description"]
     direct_description = next(
         schema["function"]["description"]
         for schema in schemas
         if schema["function"]["name"] == "write_file"
     )
-    assert "Preferred for file edits" in subagent_description
-    assert "Supervisor direct-use escape hatch" in direct_description
+    assert "Preferred for file edits, implementation, and cheap local validation" in subagent_description
+    assert "Supervisor direct-use path" in direct_description
 
 
 @pytest.mark.asyncio
@@ -223,6 +256,91 @@ async def test_execution_subagent_can_execute_allowed_write_tool(tmp_path):
     assert result.is_error is False
     assert payload["status"] == "completed"
     assert (tmp_path / "subagent.txt").read_text(encoding="utf-8") == "done"
+
+
+@pytest.mark.asyncio
+async def test_execution_subagent_runs_non_mutating_tools_in_parallel_when_enabled(tmp_path):
+    timings: dict[str, float] = {}
+    registry = ToolRegistry()
+    registry.register(_NamedDelayReadTool("read_alpha", timings), source="core", origin="builtin")
+    registry.register(_NamedDelayReadTool("read_beta", timings), source="core", origin="builtin")
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Read both files."),
+                tool_calls=(
+                    ToolCall(call_id="alpha", tool_name="read_alpha", arguments={}),
+                    ToolCall(call_id="beta", tool_name="read_beta", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content='{"status": "completed", "summary": "Read both files."}')),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Implement focused work.",
+            goal_prompt="Use normal tools to implement the assigned change.",
+            allowed_tools=["read_alpha", "read_beta"],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(
+            model_name="fake",
+            temperature=0.0,
+            max_output_tokens=4096,
+            parallel_tools=True,
+            parallel_tool_window=2,
+        ),
+    )
+    context = ToolExecutionContext(
+        session_id="test-session",
+        working_directory=tmp_path,
+        metadata={"auto_confirm": True, "execution_mode": "auto"},
+    )
+
+    result = await tool.execute(
+        "sub-call",
+        {"title": "Read files", "instructions": "Read both files before summarizing."},
+        context,
+    )
+
+    assert result.is_error is False
+    assert abs(timings["read_alpha_start"] - timings["read_beta_start"]) < 0.03
+    assert max(timings["read_alpha_end"], timings["read_beta_end"]) - min(timings["read_alpha_start"], timings["read_beta_start"]) < 0.11
+
+
+@pytest.mark.asyncio
+async def test_same_turn_duplicate_read_tool_call_reuses_cached_result(tmp_path):
+    registry = ToolRegistry()
+    read_tool = _CountingReadTool()
+    registry.register(read_tool, source="core", origin="test")
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Reading once."),
+                tool_calls=(ToolCall(call_id="read-1", tool_name="read_file", arguments={"path": "README.md"}),),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(
+                message=Message(role="assistant", content="Reading again."),
+                tool_calls=(ToolCall(call_id="read-2", tool_name="read_file", arguments={"path": "README.md"}),),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Done.")),
+        ]
+    )
+    context = ToolExecutionContext(session_id="test-session", working_directory=tmp_path)
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [event async for event in agent.run([Message(role="user", content="read twice")], context, max_turns=3)]
+
+    results = [event.payload for event in events if event.kind == AgentEventType.TOOL_RESULT]
+    assert read_tool.calls == 1
+    assert [result.call_id for result in results] == ["read-1", "read-2"]
+    assert results[1].metadata["read_cache_hit"] is True
+    assert results[1].metadata["cached_from_call_id"] == "read-1"
 
 
 @pytest.mark.asyncio
@@ -277,6 +395,104 @@ async def test_execution_subagent_uses_own_tools_not_supervisor_scope(tmp_path):
     assert result.is_error is False
     assert payload["context"]["allowed_tools"] == ["read_file", "write_file"]
     assert (tmp_path / "subagent-owned.txt").read_text(encoding="utf-8") == "owned"
+
+
+@pytest.mark.asyncio
+async def test_impact_analyzer_subagent_persists_structured_handoff_packet(tmp_path):
+    registry = ToolRegistry()
+    impact_payload = {
+        "status": "completed",
+        "summary": "Scoped runtime agent impact.",
+        "changed_files": ["nexus/runtime/agent.py"],
+        "affected_modules": ["nexus.runtime"],
+        "public_interfaces_changed": [],
+        "risk_level": "medium",
+        "validation_category": "auto_validatable",
+        "candidate_review_targets": ["nexus/runtime/agent.py"],
+        "candidate_tests": ["tests/test_subagent_tool_flow.py"],
+        "verification_policy": {
+            "syntax_check": True,
+            "formatter_check": False,
+            "unit_tests": ["tests/test_subagent_tool_flow.py"],
+            "integration_tests": [],
+            "e2e_tests": [],
+            "manual_validation": [],
+        },
+        "failure_attribution_hints": ["Read-cache failures should relate to agent tool execution."],
+    }
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(message=Message(role="assistant", content=json.dumps(impact_payload))),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="impact_analyzer",
+            description="Analyze impact.",
+            goal_prompt="Return impact JSON.",
+            allowed_tools=[],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+    context = ToolExecutionContext(session_id="test-session", working_directory=tmp_path, metadata={})
+
+    result = await tool.execute("impact-call", {"title": "Impact", "instructions": "Analyze the diff."}, context)
+
+    payload = json.loads(result.output)
+    state = load_multi_agent_state(context.metadata)
+    assert result.is_error is False
+    assert payload["output_packet_ids"] == ["packet-0001"]
+    assert result.metadata["output_packet_ids"] == ["packet-0001"]
+    assert state.packets[0].packet_type == "impact_analysis"
+    assert state.packets[0].modified_files == ("nexus/runtime/agent.py",)
+    assert state.packets[0].recommended_tests == ("tests/test_subagent_tool_flow.py",)
+    assert state.packets[0].artifacts
+
+
+@pytest.mark.asyncio
+async def test_code_reviewer_subagent_persists_failure_analysis_packet(tmp_path):
+    registry = ToolRegistry()
+    review_payload = {
+        "status": "failed",
+        "summary": "Focused test failed.",
+        "related_files": ["tests/test_runtime.py"],
+        "tests_run": ["uv run pytest tests/test_runtime.py"],
+        "failure_analysis": {
+            "related_to_task": False,
+            "confidence": 0.82,
+            "reasoning_summary": "Failure is in an unrelated migration fixture.",
+            "suspected_causes": ["pre-existing fixture issue"],
+            "likely_preexisting": True,
+            "recommended_next_action": "report_without_fixing",
+        },
+    }
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(message=Message(role="assistant", content=json.dumps(review_payload))),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="code_reviewer",
+            description="Review and verify.",
+            goal_prompt="Classify failures.",
+            allowed_tools=[],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+    context = ToolExecutionContext(session_id="test-session", working_directory=tmp_path, metadata={})
+
+    result = await tool.execute("review-call", {"title": "Review", "instructions": "Review the diff."}, context)
+
+    state = load_multi_agent_state(context.metadata)
+    assert result.is_error is False
+    assert state.packets[0].packet_type == "failure_analysis"
+    assert state.packets[0].confidence == 0.82
+    assert state.packets[0].failure_summary == "Failure is in an unrelated migration fixture."
 
 
 @pytest.mark.asyncio

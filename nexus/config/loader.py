@@ -370,6 +370,15 @@ def _read_environment(defaults: AgentConfig) -> dict[str, Any]:
         ("SENTRY_DSN", "sentry_dsn"),
         ("SENTRY_ENVIRONMENT", "sentry_environment"),
         ("SENTRY_RELEASE", "sentry_release"),
+        ("OTEL_SERVICE_NAME", "otel_service_name"),
+        ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "otel_endpoint"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "otel_endpoint"),
+        ("OTEL_EXPORTER_OTLP_HEADERS", "otel_headers"),
+        ("LANGFUSE_PUBLIC_KEY", "langfuse_public_key"),
+        ("LANGFUSE_SECRET_KEY", "langfuse_secret_key"),
+        ("LANGFUSE_BASE_URL", "langfuse_base_url"),
+        ("LANGFUSE_ENVIRONMENT", "langfuse_environment"),
+        ("LANGFUSE_RELEASE", "langfuse_release"),
     ]
     for env_key, field_name in _generic_aliases:
         if field_name not in overrides:
@@ -438,6 +447,8 @@ def _parse_scalar(raw_value: str, template: Any) -> Any:
 def _validate_config_values(values: dict[str, Any]) -> None:
     valid_modes = {"plan", "default", "auto"}
     valid_agent_modes = {"basic", "advanced"}
+    valid_llm_thinking_modes = {"auto", "enabled", "disabled"}
+    valid_llm_reasoning_efforts = {"", "low", "medium", "high", "xhigh", "max"}
     valid_log_formats = {"text", "json"}
     valid_providers = {"anthropic", "cohere", "fake", "gemini", "mistral", "openai", "openai-compatible", "ollama"}
     valid_approval_policies = {
@@ -458,6 +469,22 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         raise ConfigError(
             f"Invalid default_mode '{default_mode}'. Expected one of: {', '.join(sorted(valid_modes))}."
         )
+
+    llm_thinking_mode = str(values.get("llm_thinking_mode", "auto")).strip().lower()
+    if llm_thinking_mode not in valid_llm_thinking_modes:
+        raise ConfigError(
+            "Invalid llm_thinking_mode "
+            f"'{values.get('llm_thinking_mode')}'. Expected one of: {', '.join(sorted(valid_llm_thinking_modes))}."
+        )
+    values["llm_thinking_mode"] = llm_thinking_mode
+
+    llm_reasoning_effort = str(values.get("llm_reasoning_effort", "high")).strip().lower()
+    if llm_reasoning_effort not in valid_llm_reasoning_efforts:
+        raise ConfigError(
+            "Invalid llm_reasoning_effort "
+            f"'{values.get('llm_reasoning_effort')}'. Expected one of: {', '.join(sorted(valid_llm_reasoning_efforts))}."
+        )
+    values["llm_reasoning_effort"] = llm_reasoning_effort
 
     agent_mode = values["agent_mode"]
     if agent_mode not in valid_agent_modes:
@@ -485,6 +512,7 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         "compaction_keep_recent",
         "max_loop_iterations",
         "max_tool_calls_per_turn",
+        "parallel_tool_window",
         "textual_transcript_max_lines",
         "prompt_history_max_entries",
         "tool_output_max_chars",
@@ -496,6 +524,8 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     for field_name in integer_fields:
         if values[field_name] < 1:
             raise ConfigError(f"{field_name} must be greater than 0.")
+    if int(values["parallel_tool_window"]) > 8:
+        raise ConfigError("parallel_tool_window must be less than or equal to 8.")
 
     if values["compaction_hard_limit"] < values["compaction_soft_limit"]:
         raise ConfigError("compaction_hard_limit must be greater than or equal to compaction_soft_limit.")
@@ -517,6 +547,14 @@ def _validate_config_values(values: dict[str, Any]) -> None:
             raise ConfigError(f"{field_name} must be greater than 0.")
     if float(values["sentry_flush_timeout_seconds"]) <= 0:
         raise ConfigError("sentry_flush_timeout_seconds must be greater than 0.")
+    if float(values["langfuse_flush_timeout_seconds"]) <= 0:
+        raise ConfigError("langfuse_flush_timeout_seconds must be greater than 0.")
+    if float(values["otel_flush_timeout_seconds"]) <= 0:
+        raise ConfigError("otel_flush_timeout_seconds must be greater than 0.")
+    if bool(values["langfuse_enabled"]):
+        for field_name in ("langfuse_public_key", "langfuse_secret_key"):
+            if not str(values[field_name]).strip():
+                raise ConfigError(f"{field_name} must be set when langfuse_enabled is true.")
 
     mcp_servers = values["mcp_servers"]
     if not isinstance(mcp_servers, list):
@@ -691,14 +729,15 @@ def _advanced_mode_required_tool_names() -> tuple[str, ...]:
         "git_diff",
         "run_tests",
         "run_python_check",
+        "run_formatter",
         "bash",
     )
 
 
 def _builtin_cognitive_tool_names() -> tuple[str, ...]:
     return (
-        "subagent_planning_analysis",
-        "subagent_execution",
-        "subagent_review",
-        "subagent_verification",
+        "subagent_explorer",
+        "subagent_coding",
+        "subagent_code_reviewer",
+        "subagent_impact_analyzer",
     )

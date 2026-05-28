@@ -55,6 +55,7 @@ NEXUS_THEME = Theme(
 )
 
 _MAX_PREVIEW_CHARS = 150
+_MAX_TOOL_PARAM_SUMMARY_CHARS = 100
 _NEXUS_ASCII_BANNER = r"""
 ███    ██ ███████ ██   ██ ██   ██ ███████      █████  ██
 ████   ██ ██       ██ ██  ██   ██ ██          ██   ██ ██
@@ -102,6 +103,7 @@ class TerminalUI:
         self._tool_args_by_call_id: dict[str, dict[str, Any]] = {}
         self._tool_preview_by_call_id: dict[str, dict[str, Any]] = {}
         self._tool_actor_by_call_id: dict[str, str] = {}
+        self._tool_display_by_call_id: dict[str, dict[str, Any]] = {}
         self._workspace_root: Path | None = None
 
     @property
@@ -339,6 +341,7 @@ class TerminalUI:
         preferred = {
             "read_file": ["path", "offset", "limit"],
             "write_file": ["path", "content"],
+            "edit": ["path", "old_string", "new_string", "replace_all"],
             "insert_edit_into_file": ["path", "code"],
             "apply_patch": ["patch", "strip"],
             "bash": ["command", "timeout", "cwd"],
@@ -359,9 +362,7 @@ class TerminalUI:
             if key in {"content", "old_string", "new_string", "old_text", "new_text", "replacement", "new_content", "code", "input"}:
                 line_count = len(value.splitlines()) or 0
                 byte_count = len(value.encode("utf-8", errors="replace"))
-                preview = self._truncate_preview(value.splitlines()[0] if value.strip() else "")
-                suffix = f" — {preview}" if preview else ""
-                return f"<{line_count} lines • {byte_count} bytes>{suffix}"
+                return f"<{line_count} lines • {byte_count} bytes>"
             if key in {"path", "cwd"}:
                 return self._relative_path(value)
             return self._truncate_preview(value)
@@ -422,8 +423,9 @@ class TerminalUI:
             diff_path = diff.get("path")
             if isinstance(diff_path, str) and not affected_paths:
                 table.add_row("target", self._relative_path(diff_path))
-            blocks.append(Text("diff", style="muted"))
-            blocks.append(self._render_diff_block(str(diff.get("unified_diff", "") or self._compact_diff_preview(preview))))
+            compact_diff = self._compact_diff_preview(preview)
+            if compact_diff:
+                table.add_row("change", compact_diff)
         if tool_name == "apply_patch" and diff is None:
             patch_text = str(args.get("patch", "") or "").strip()
             if patch_text:
@@ -448,13 +450,10 @@ class TerminalUI:
         clarification_prompt: str | None = None,
     ) -> Group:
         blocks: list[Any] = []
-        if args:
-            blocks.append(self._render_args_table(tool_name, args))
-        else:
-            blocks.append(Text("(no arguments)", style="muted"))
-        preview_block = self._render_tool_preview(tool_name, args, preview or {})
-        if preview_block is not None:
-            blocks.append(preview_block)
+        blocks.append(self._render_tool_argument_summary(tool_name, args))
+        preview_renderable = self._render_tool_preview(tool_name, args, preview or {})
+        if preview_renderable is not None:
+            blocks.append(preview_renderable)
         if clarification_prompt:
             blocks.append(Text(clarification_prompt, style="info"))
         if reason:
@@ -462,6 +461,19 @@ class TerminalUI:
         if approval_policy is not None:
             blocks.append(Text(self._approval_choices(approval_policy), style="muted"))
         return Group(*blocks)
+
+    def _render_tool_argument_summary(self, tool_name: str, args: dict[str, Any]) -> Text:
+        if not args:
+            return Text("params: (none)", style="muted")
+        parts = [
+            f"{key}={self._compact_value(key, value)}"
+            for key, value in self._ordered_args(tool_name, args)
+        ]
+        summary = self._truncate_preview(
+            ", ".join(parts),
+            limit=_MAX_TOOL_PARAM_SUMMARY_CHARS,
+        )
+        return Text(f"params: {summary}", style="tool.args")
 
     def _render_args_table(self, tool_name: str, args: dict[str, Any]) -> Table:
         table = Table.grid(padding=(0, 1))
@@ -474,7 +486,7 @@ class TerminalUI:
     def _tool_border_style(self, tool_name: str) -> str:
         if tool_name in {"read_file", "glob", "grep", "ls", "get_time"}:
             return "tool.read"
-        if tool_name in {"write_file", "insert_edit_into_file", "apply_patch"}:
+        if tool_name in {"write_file", "edit", "insert_edit_into_file", "apply_patch"}:
             return "tool.write"
         if tool_name == "bash":
             return "tool.shell"
@@ -492,6 +504,163 @@ class TerminalUI:
             return tool_name
         return f"{actor} - {tool_name}"
 
+    def _store_tool_call_state(
+        self,
+        call_id: str,
+        arguments: dict[str, Any],
+        preview: dict[str, Any],
+        actor: str,
+        display: dict[str, Any],
+    ) -> None:
+        self._tool_args_by_call_id[call_id] = dict(arguments)
+        self._tool_preview_by_call_id[call_id] = dict(preview)
+        self._tool_display_by_call_id[call_id] = dict(display)
+        if actor:
+            self._tool_actor_by_call_id[call_id] = actor
+
+    def _clear_tool_call_state(self, call_id: str) -> None:
+        self._tool_args_by_call_id.pop(call_id, None)
+        self._tool_preview_by_call_id.pop(call_id, None)
+        self._tool_actor_by_call_id.pop(call_id, None)
+        self._tool_display_by_call_id.pop(call_id, None)
+
+    def _tool_is_mutating(self, tool_name: str, display: dict[str, Any] | None = None) -> bool:
+        info = display or {}
+        if "is_mutating" in info:
+            return bool(info.get("is_mutating"))
+        return tool_name in {
+            "apply_patch",
+            "create_directory",
+            "create_file",
+            "delete_file",
+            "edit",
+            "insert_edit_into_file",
+            "modify_file",
+            "move_file",
+            "rename_file",
+            "smart_edit",
+            "write_file",
+        }
+
+    def _should_render_compact_tool(self, tool_name: str, display: dict[str, Any] | None = None) -> bool:
+        return not self._tool_is_mutating(tool_name, display)
+
+    def _pretty_subagent_name(self, name: str) -> str:
+        value = name.strip()
+        if value.startswith("subagent_"):
+            value = value[len("subagent_") :]
+        elif value.startswith("subagent-"):
+            value = value[len("subagent-") :]
+        return value.replace("_", " ").replace("-", " ").strip() or name
+
+    def _compact_tool_label(self, tool_name: str) -> str:
+        if tool_name.startswith("subagent_") or tool_name.startswith("subagent-"):
+            return f"Subagent {self._pretty_subagent_name(tool_name)}"
+        if tool_name.startswith("delegate"):
+            return "Subagent"
+        return tool_name
+
+    def _compact_tool_detail(self, tool_name: str, args: dict[str, Any]) -> str:
+        if tool_name.startswith("subagent_") or tool_name.startswith("subagent-") or tool_name.startswith("delegate"):
+            task = str(args.get("title") or args.get("task") or args.get("instructions") or "").strip()
+            return f"task={self._truncate_preview(task, limit=90)}" if task else ""
+        parts: list[str] = []
+        for key, value in self._ordered_args(tool_name, args):
+            if key in {"content", "code", "input", "new_content", "new_text", "old_text", "patch", "replacement"} and parts:
+                continue
+            parts.append(f"{key}={self._compact_value(key, value)}")
+            joined = ", ".join(parts)
+            if len(parts) >= 2 or len(joined) >= 90:
+                return self._truncate_preview(joined, limit=100)
+        return self._truncate_preview(", ".join(parts), limit=100)
+
+    def _compact_tool_prefix(self, *, actor: str, display: dict[str, Any]) -> str:
+        parallel = int(display.get("parallel_group_size", 0) or 0) > 1
+        if actor:
+            return f"    {'-|-> ' if parallel else '|-> '}"
+        return f"> {'-|-> ' if parallel else ''}"
+
+    def _render_compact_tool_start(
+        self,
+        call_id: str,
+        tool_name: str,
+        actor: str,
+        args: dict[str, Any],
+        display: dict[str, Any],
+    ) -> Text:
+        line = Text(self._compact_tool_prefix(actor=actor, display=display), style="muted")
+        line.append(self._compact_tool_label(tool_name), style=self._tool_border_style(tool_name))
+        detail = self._compact_tool_detail(tool_name, args)
+        if detail:
+            line.append(f" {detail}", style="tool.args")
+        line.append(f"  #{call_id[:8] or 'pending'}", style="muted")
+        return line
+
+    def _render_compact_tool_error(
+        self,
+        result: ToolResult,
+        *,
+        actor: str,
+        display: dict[str, Any],
+    ) -> Text:
+        del display
+        prefix = "    x " if actor else "> x "
+        line = Text(prefix, style="muted")
+        line.append(self._compact_tool_label(result.tool_name), style="error")
+        line.append(
+            f" failed: {self._truncate_preview(result.output or 'Tool failed.', limit=120)}",
+            style="error",
+        )
+        line.append(f"  #{result.call_id[:8]}", style="muted")
+        return line
+
+    def _render_tool_start_renderable(
+        self,
+        call_id: str,
+        tool_name: str,
+        actor: str,
+        arguments: dict[str, Any],
+        preview: dict[str, Any],
+        display: dict[str, Any],
+    ) -> Any:
+        display_name = self._tool_display_name(tool_name, actor)
+        if self._should_render_compact_tool(tool_name, display):
+            return self._render_compact_tool_start(call_id, tool_name, actor, arguments, display)
+        return Panel(
+            self._render_tool_panel_body(tool_name, arguments, preview=preview),
+            title=Text(f"{display_name}  #{call_id[:8] or 'pending'}", style="tool"),
+            title_align="left",
+            subtitle=Text("running", style="muted"),
+            subtitle_align="right",
+            border_style=self._tool_border_style(tool_name),
+            box=box.ROUNDED,
+            padding=(1, 2),
+        )
+
+    def _render_tool_completion_renderable(
+        self,
+        result: ToolResult,
+        *,
+        preview: dict[str, Any],
+        actor: str,
+        display: dict[str, Any],
+    ) -> Any | None:
+        display_name = self._tool_display_name(result.tool_name, actor)
+        if self._should_render_compact_tool(result.tool_name, display):
+            if result.is_error:
+                return self._render_compact_tool_error(result, actor=actor, display=display)
+            return None
+        return Panel(
+            self._render_tool_result_body(result, preview=preview),
+            title=Text(f"{display_name}  #{result.call_id[:8]}", style="tool"),
+            title_align="left",
+            subtitle=Text("failed" if result.is_error else "done", style="error" if result.is_error else "success"),
+            subtitle_align="right",
+            border_style=self._tool_border_style(result.tool_name),
+            box=box.ROUNDED,
+            padding=(1, 2),
+        )
+
     def _preview_block(self, text: str, *, path: str | None = None) -> Syntax | Text:
         cleaned = text.rstrip() or "(no tool output)"
         if len(cleaned) > 4000:
@@ -508,6 +677,7 @@ class TerminalUI:
         metadata = result.metadata or {}
         blocks: list[Any] = []
         path = metadata.get("path") if isinstance(metadata.get("path"), str) else None
+        suppress_output_preview = result.tool_name in {"write_file", "edit", "insert_edit_into_file", "apply_patch"}
         summary = Table.grid(padding=(0, 2))
         summary.add_column(style="muted", no_wrap=True)
         summary.add_column(style="tool.result")
@@ -518,11 +688,11 @@ class TerminalUI:
                 summary.add_row(key, str(metadata[key]))
         if summary.row_count:
             blocks.append(summary)
-        preview_block = self._render_tool_preview(result.tool_name, self._tool_args_by_call_id.get(result.call_id, {}), preview or {})
-        if preview_block is not None:
-            blocks.append(preview_block)
+        blocks.append(self._render_tool_argument_summary(result.tool_name, self._tool_args_by_call_id.get(result.call_id, {})))
         if result.is_error:
             blocks.append(Text(result.output or "Tool failed.", style="error"))
+        elif suppress_output_preview:
+            blocks.append(Text("Changes applied.", style="success"))
         else:
             blocks.append(self._preview_block(result.output, path=path))
         return Group(*blocks)
@@ -539,9 +709,7 @@ class TerminalUI:
             Panel(
                 Group(
                     Text(req.prompt),
-                    self._render_args_table(req.tool_name, req.arguments)
-                    if req.arguments
-                    else Text("(no arguments)", style="muted"),
+                    self._render_tool_argument_summary(req.tool_name, req.arguments),
                 ),
                 title=Text(f"Clarification needed — {req.tool_name}", style="clarification.header"),
                 title_align="left",
@@ -594,26 +762,14 @@ class TerminalUI:
             call_id = str(payload.get("call_id", ""))
             tool_name = str(payload.get("name", "tool"))
             actor = str(payload.get("actor", "") or "").strip()
-            display_name = self._tool_display_name(tool_name, actor)
             arguments = payload.get("arguments", {}) if isinstance(payload.get("arguments", {}), dict) else {}
             preview = payload.get("preview", {}) if isinstance(payload.get("preview", {}), dict) else {}
-            self._tool_args_by_call_id[call_id] = dict(arguments)
-            self._tool_preview_by_call_id[call_id] = dict(preview)
-            if actor:
-                self._tool_actor_by_call_id[call_id] = actor
+            display = payload.get("display", {}) if isinstance(payload.get("display", {}), dict) else {}
+            self._store_tool_call_state(call_id, arguments, preview, actor, display)
             self._console.print(
-                Panel(
-                    self._render_tool_panel_body(display_name, arguments, preview=preview),
-                    title=Text(f"{display_name}  #{call_id[:8] or 'pending'}", style="tool"),
-                    title_align="left",
-                    subtitle=Text("running", style="muted"),
-                    subtitle_align="right",
-                    border_style=self._tool_border_style(tool_name),
-                    box=box.ROUNDED,
-                    padding=(1, 2),
-                )
+                self._render_tool_start_renderable(call_id, tool_name, actor, arguments, preview, display)
             )
-            self.start_tool_wait(f"{display_name} running")
+            self.start_tool_wait(f"{self._tool_display_name(tool_name, actor)} running")
             return
 
         if event.kind == AgentEventType.TOOL_CALL_COMPLETE and show_tool_calls:
@@ -622,24 +778,21 @@ class TerminalUI:
             result = cast("ToolResult", event.payload)
             if result is None:
                 return
+            if isinstance(result.metadata, dict) and result.metadata.get("tool_unavailable"):
+                self._clear_tool_call_state(result.call_id)
+                return
             preview = self._tool_preview_by_call_id.get(result.call_id, {})
             actor = str(result.metadata.get("actor") or self._tool_actor_by_call_id.get(result.call_id, "")).strip()
-            display_name = self._tool_display_name(result.tool_name, actor)
-            self._console.print(
-                Panel(
-                    self._render_tool_result_body(result, preview=preview),
-                    title=Text(f"{display_name}  #{result.call_id[:8]}", style="tool"),
-                    title_align="left",
-                    subtitle=Text("failed" if result.is_error else "done", style="error" if result.is_error else "success"),
-                    subtitle_align="right",
-                    border_style=self._tool_border_style(result.tool_name),
-                    box=box.ROUNDED,
-                    padding=(1, 2),
-                )
+            display = self._tool_display_by_call_id.get(result.call_id, {})
+            renderable = self._render_tool_completion_renderable(
+                result,
+                preview=preview,
+                actor=actor,
+                display=display,
             )
-            self._tool_args_by_call_id.pop(result.call_id, None)
-            self._tool_preview_by_call_id.pop(result.call_id, None)
-            self._tool_actor_by_call_id.pop(result.call_id, None)
+            if renderable is not None:
+                self._console.print(renderable)
+            self._clear_tool_call_state(result.call_id)
             return
 
         if event.kind == AgentEventType.TOOL_DENIED:
@@ -663,16 +816,19 @@ class TerminalUI:
             req = cast("ConfirmationRequest", event.payload)
             self._console.print()
             if req.kind is ConfirmationKind.APPROVAL:
-                self._tool_args_by_call_id[req.call_id] = {str(key): value for key, value in req.arguments.items()}
-                self._tool_preview_by_call_id[req.call_id] = {str(key): value for key, value in req.preview.items()}
                 actor = str(req.payload.get("actor", "") or "").strip()
-                if actor:
-                    self._tool_actor_by_call_id[req.call_id] = actor
+                self._store_tool_call_state(
+                    req.call_id,
+                    {str(key): value for key, value in req.arguments.items()},
+                    {str(key): value for key, value in req.preview.items()},
+                    actor,
+                    {"is_mutating": True},
+                )
                 display_name = self._tool_display_name(req.tool_name, actor)
                 self._console.print(
                     Panel(
                         self._render_tool_panel_body(
-                            display_name,
+                            req.tool_name,
                             req.arguments,
                             preview=req.preview,
                             reason=req.reason,
@@ -693,7 +849,7 @@ class TerminalUI:
                 self._console.print(
                     Panel(
                         self._render_tool_panel_body(
-                            display_name,
+                            req.tool_name,
                             req.arguments,
                             preview=req.preview,
                             clarification_prompt=req.prompt,

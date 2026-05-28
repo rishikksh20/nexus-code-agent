@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import logging
 import time
+from uuid import uuid4
 
+from dataclasses import dataclass, field
 from collections.abc import AsyncGenerator
 from contextlib import nullcontext
 from pathlib import Path
@@ -29,14 +34,51 @@ from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
 from nexus.security.manager import ApprovalManager
-from nexus.tools.base import FileDiff, ToolConfirmation, ToolRegistry, tool_to_schema
+from nexus.tools.base import FileDiff, ToolConfirmation, ToolKind, ToolRegistry, tool_to_schema
 
 
 logger = logging.getLogger(__name__)
 
 
 TOOL_CALL_LIMIT_FINISH_REASON = "tool_call_limit"
+MAX_TURNS_FINISH_REASON = "max_turns"
 INVALID_TOOL_CALL_RETRY_LIMIT = 2
+_READ_RESULT_CACHE_METADATA_KEY = "nexus_read_result_cache"
+_CACHEABLE_READ_TOOL_NAMES = frozenset(
+    {
+        "read_file",
+        "list_dir",
+        "grep",
+        "glob",
+        "lsp",
+        "git_status",
+        "git_diff",
+        "code_index",
+        "semantic_search",
+    }
+)
+
+
+@dataclass(slots=True)
+class _PreparedToolCall:
+    tool_call: ToolCall
+    record: Any | None = None
+    tool: Any | None = None
+    confirmation_preview: dict[str, Any] = field(default_factory=dict)
+    affected_paths: set[str] = field(default_factory=set)
+    immediate_result: ToolResult | None = None
+    confirmation_request: ConfirmationRequest | None = None
+    permission_decision: Any | None = None
+    emit_start_event: bool = False
+    loop_result: str | None = None
+    stop_message: str | None = None
+
+
+@dataclass(slots=True)
+class _ToolBatchState:
+    tool_result_messages: list[Message] = field(default_factory=list)
+    executed_count: int = 0
+    stop_reason: str | None = None
 
 
 @runtime_checkable
@@ -87,6 +129,8 @@ class Agent:
         max_output_tokens: int | None = None,
         max_turns: int = 3,
         max_tool_calls_per_turn: int = 30,
+        parallel_tools: bool = False,
+        parallel_tool_window: int = 4,
         resume_tool_calls: tuple[ToolCall, ...] = (),
     ) -> AsyncGenerator[AgentEvent, None]:
         """Run the agentic loop, yielding :class:`AgentEvent` objects.
@@ -127,6 +171,8 @@ class Agent:
             max_output_tokens=max_output_tokens,
             max_turns=max_turns,
             max_tool_calls_per_turn=max_tool_calls_per_turn,
+            parallel_tools=parallel_tools,
+            parallel_tool_window=parallel_tool_window,
         ):
             if event.kind == AgentEventType.TEXT_COMPLETE:
                 final_response = event.payload
@@ -157,6 +203,7 @@ class Agent:
                     str(tool_call.tool_name),
                     tool_call.arguments,
                     actor=_tool_actor(context),
+                    display=_tool_display_metadata(),
                 )
                 yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
                 yield AgentEvent.tool_call_complete(result)
@@ -164,12 +211,8 @@ class Agent:
                 continue
             if not _tool_available_in_context(record, context):
                 result = _tool_not_available_result(tool_call, self.tool_registry, context)
-                yield AgentEvent.tool_call_start(
-                    tool_call.call_id,
-                    str(tool_call.tool_name),
-                    tool_call.arguments,
-                    actor=_tool_actor(context),
-                )
+                # Do not emit TOOL_CALL_START for tools unavailable in this context;
+                # the error result is still fed back to the model without UI noise.
                 yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
                 yield AgentEvent.tool_call_complete(result)
                 yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
@@ -267,8 +310,15 @@ class Agent:
             tool_call.arguments,
             preview=confirmation_preview,
             actor=actor,
+            display=_tool_display_metadata(is_mutating=tool.is_mutating),
         )
         yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+
+        cached_result = _cached_read_result(record, tool, tool_call, context)
+        if cached_result is not None:
+            yield AgentEvent.tool_call_complete(cached_result)
+            yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=cached_result)
+            return
 
         await self.hooks.emit(
             HookEvent.PRE_TOOL_USE,
@@ -329,12 +379,20 @@ class Agent:
             raise
         if actor:
             result.metadata = {**result.metadata, "actor": actor}
+        result.metadata = {
+            **result.metadata,
+            "is_mutating": tool.is_mutating,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        }
         if tool.is_mutating:
+            _clear_read_result_cache(context)
             result = _with_post_mutation_refresh(
                 result,
                 affected_paths or set(),
                 context,
             )
+        else:
+            _store_read_result(record, tool, tool_call, context, result)
         if approval_manager is not None:
             approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
 
@@ -374,6 +432,8 @@ class Agent:
         max_output_tokens: int | None,
         max_turns: int,
         max_tool_calls_per_turn: int,
+        parallel_tools: bool,
+        parallel_tool_window: int,
     ) -> AsyncGenerator[AgentEvent, None]:
         """Core agentic loop — processes stream events and executes tools."""
 
@@ -412,6 +472,33 @@ class Agent:
             stream_tool_calls: list[ToolCall] = []
             usage: UsageSnapshot | None = None
             stream_finish_reason: str | None = None
+            stream_reasoning_content = ""
+            model_call_id = uuid4().hex[:12]
+
+            await self.hooks.emit(
+                HookEvent.NOTIFICATION,
+                {
+                    "event": "model_start",
+                    "session_id": context.session_id,
+                    "model_call_id": model_call_id,
+                    **_correlation_payload(context),
+                    "provider": _provider_name_from_context(context),
+                    "model": model_name,
+                    "turn_index": turn_index + 1,
+                    "actor": _tool_actor(context) or "supervisor",
+                    "system_prompt": system_prompt,
+                    "messages": [_serialize_message_for_observability(message) for message in request.messages],
+                    "message_count": len(request.messages),
+                    "tool_schema_count": len(request.tool_schemas),
+                    "active_skills": list(context.metadata.get("active_skills", [])),
+                    "prompt_name": getattr(context.metadata.get("config"), "langfuse_prompt_name", "nexus-system-prompt"),
+                    "prompt_version": getattr(context.metadata.get("config"), "langfuse_prompt_version", ""),
+                    "system_prompt_hash": _hash_prompt(system_prompt),
+                    "system_prompt_chars": len(system_prompt),
+                    "max_output_tokens": max_output_tokens,
+                    "temperature": temperature,
+                },
+            )
 
             stream = cast(AsyncGenerator[StreamEvent, None], self.model_client.chat_completion(request, stream=True))
             monitor = sentry_monitor_from_hooks(self.hooks)
@@ -446,6 +533,8 @@ class Agent:
                     elif stream_event.type == StreamEventType.MESSAGE_COMPLETE:
                         usage = stream_event.usage
                         stream_finish_reason = stream_event.finish_reason or stream_finish_reason
+                        if stream_event.reasoning_content:
+                            stream_reasoning_content += stream_event.reasoning_content
                         if monitor is not None and usage is not None:
                             monitor.update_current_span(
                                 attributes={
@@ -468,6 +557,7 @@ class Agent:
                             {
                                 "event": "model_error",
                                 "session_id": context.session_id,
+                                "model_call_id": model_call_id,
                                 **_correlation_payload(context),
                                 "provider": _provider_name_from_context(context),
                                 "model": model_name,
@@ -480,6 +570,35 @@ class Agent:
                         return
 
             if not response_text and not stream_tool_calls:
+                # When the provider hits its output-token limit it returns an
+                # empty response instead of an error.  Aggressively prune tool
+                # outputs from history to free context space and retry the turn
+                # rather than surfacing an opaque error to the user.
+                if str(stream_finish_reason or "").strip().lower() in {"max_tokens", "length"}:
+                    logger.warning(
+                        "agent.model_batch.max_tokens session_id=%s actor=%s turn_index=%s — pruning history and retrying",
+                        context.session_id,
+                        _tool_actor(context) or "supervisor",
+                        turn_index + 1,
+                    )
+                    prune_tool_outputs(history, protect_tokens=500, minimum_tokens=200)
+                    continue
+
+                empty_response_error = _empty_provider_response_message(stream_finish_reason)
+                await self.hooks.emit(
+                    HookEvent.NOTIFICATION,
+                    {
+                        "event": "model_error",
+                        "session_id": context.session_id,
+                        "model_call_id": model_call_id,
+                        **_correlation_payload(context),
+                        "provider": _provider_name_from_context(context),
+                        "model": model_name,
+                        "turn_index": turn_index + 1,
+                        "actor": _tool_actor(context) or "supervisor",
+                        "error": empty_response_error,
+                    },
+                )
                 logger.warning(
                     "agent.model_batch.empty_response session_id=%s actor=%s turn_index=%s finish_reason=%s messages=%s last_role=%s",
                     context.session_id,
@@ -489,7 +608,7 @@ class Agent:
                     len(request.messages),
                     request.messages[-1].role if request.messages else "",
                 )
-                yield AgentEvent.agent_error(_empty_provider_response_message(stream_finish_reason))
+                yield AgentEvent.agent_error(empty_response_error)
                 return
 
             if response_text:
@@ -501,6 +620,7 @@ class Agent:
             message = Message(
                 role="assistant",
                 content=response_text or "",
+                reasoning_content=stream_reasoning_content,
                 tool_calls=tool_calls,
             )
             should_record_message = bool(message.content or message.tool_calls)
@@ -522,6 +642,34 @@ class Agent:
                 tool_calls=tool_calls,
                 usage=usage,
                 finish_reason="tool_calls" if tool_calls else (stream_finish_reason or "stop"),
+            )
+
+            await self.hooks.emit(
+                HookEvent.NOTIFICATION,
+                {
+                    "event": "model_end",
+                    "session_id": context.session_id,
+                    "model_call_id": model_call_id,
+                    **_correlation_payload(context),
+                    "provider": _provider_name_from_context(context),
+                    "model": model_name,
+                    "turn_index": turn_index + 1,
+                    "actor": _tool_actor(context) or "supervisor",
+                    "finish_reason": runtime_response.finish_reason,
+                    "tool_call_count": len(tool_calls),
+                    "output": response_text,
+                    "usage": {
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens,
+                        "total_tokens": usage.total_tokens,
+                        "estimated_cost_usd": usage.estimated_cost_usd,
+                        "provider": usage.provider,
+                        "model": usage.model,
+                    }
+                    if usage is not None
+                    else {},
+                    "status": "completed",
+                },
             )
 
             if usage is not None:
@@ -552,8 +700,50 @@ class Agent:
             # ----------------------------------------------------------------
             # Tool execution
             # ----------------------------------------------------------------
+            if parallel_tools and _parallel_tool_execution_enabled(context):
+                batch_state = _ToolBatchState()
+                async for event in self._execute_parallel_first_tool_batch(
+                    tool_calls,
+                    context,
+                    mode=mode,
+                    approved_tools=approved_tools,
+                    approval_manager=approval_manager,
+                    auto_confirm=auto_confirm,
+                    auto_confirm_read_only=auto_confirm_read_only,
+                    max_tool_calls_per_turn=max_tool_calls_per_turn,
+                    tool_calls_executed=tool_calls_executed,
+                    parallel_tool_window=parallel_tool_window,
+                    unknown_tool_retries=unknown_tool_retries,
+                    invalid_argument_retries=invalid_argument_retries,
+                    loop_detector=loop_detector,
+                    batch_state=batch_state,
+                ):
+                    yield event
+                tool_calls_executed += batch_state.executed_count
+                for msg in batch_state.tool_result_messages:
+                    history.append(msg)
+                if batch_state.tool_result_messages:
+                    logger.debug(
+                        "agent.tool_results.appended session_id=%s actor=%s count=%s next_turn_index=%s",
+                        context.session_id,
+                        _tool_actor(context) or "supervisor",
+                        len(batch_state.tool_result_messages),
+                        turn_index + 2,
+                    )
+                prune_tool_outputs(history, protect_tokens=2000, minimum_tokens=500)
+                loop_error = loop_detector.check_for_loop()
+                if loop_error:
+                    history.append(Message(
+                        role="user",
+                        content=f"[Loop detected] {loop_error} Try a different approach.",
+                    ))
+                if batch_state.stop_reason is not None:
+                    return
+                continue
+
             tool_result_messages: list[Message] = []
             mutating_paths_this_batch: set[str] = set()
+            read_keys_this_batch: dict[str, str] = {}
             for tool_call in tool_calls:
                 if tool_calls_executed >= max_tool_calls_per_turn:
                     pause_message = _tool_call_limit_pause_message(max_tool_calls_per_turn)
@@ -587,6 +777,7 @@ class Agent:
                         tool_name,
                         tool_call.arguments,
                         actor=_tool_actor(context),
+                        display=_tool_display_metadata(),
                     )
                     yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
                     yield AgentEvent.tool_call_complete(unknown_result)
@@ -625,6 +816,7 @@ class Agent:
                         tool_name,
                         tool_call.arguments,
                         actor=_tool_actor(context),
+                        display=_tool_display_metadata(),
                     )
                     yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
                     yield AgentEvent.tool_call_complete(unavailable_result)
@@ -647,6 +839,30 @@ class Agent:
                     continue
 
                 tool = record.tool
+                read_cache_key = _read_result_cache_key(record, tool, tool_call)
+                if read_cache_key is not None:
+                    first_call_id = read_keys_this_batch.get(read_cache_key)
+                    if first_call_id is not None:
+                        duplicate_result = _duplicate_read_result(
+                            tool_call,
+                            tool_name=tool.name,
+                            first_call_id=first_call_id,
+                        )
+                        tool_calls_executed += 1
+                        tool_result_messages.append(_tool_result_message(duplicate_result))
+                        yield AgentEvent.tool_call_start(
+                            tool_call.call_id,
+                            tool.name,
+                            tool_call.arguments,
+                            actor=_tool_actor(context),
+                            display=_tool_display_metadata(is_mutating=False),
+                        )
+                        yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                        yield AgentEvent.tool_call_complete(duplicate_result)
+                        yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=duplicate_result)
+                        loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="duplicate_read")
+                        continue
+                    read_keys_this_batch[read_cache_key] = tool_call.call_id
                 missing_fields = _missing_required_fields(tool.input_schema, tool_call.arguments)
                 if missing_fields:
                     if _missing_fields_should_be_repaired_by_model(missing_fields):
@@ -667,6 +883,7 @@ class Agent:
                             tool.name,
                             tool_call.arguments,
                             actor=_tool_actor(context),
+                            display=_tool_display_metadata(is_mutating=tool.is_mutating),
                         )
                         yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
                         yield AgentEvent.tool_call_complete(invalid_result)
@@ -887,7 +1104,639 @@ class Agent:
                     content=f"[Loop detected] {loop_error} Try a different approach.",
                 ))
 
-        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="max_turns")
+        pause_message = _max_turns_pause_message(max_turns)
+        yield AgentEvent.text_complete(pause_message)
+        yield AgentEvent(
+            kind=AgentEventType.MODEL_RESPONSE,
+            payload=RuntimeResponse(
+                message=Message(role="assistant", content=pause_message),
+                finish_reason=MAX_TURNS_FINISH_REASON,
+            ),
+        )
+        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload=MAX_TURNS_FINISH_REASON)
+
+    async def _run_tool_call(
+        self,
+        record: Any,
+        tool: Any,
+        tool_call: ToolCall,
+        context: ToolExecutionContext,
+        *,
+        approval_manager: ApprovalManager | None,
+        affected_paths: set[str] | None = None,
+    ) -> ToolResult:
+        cached_result = _cached_read_result(record, tool, tool_call, context)
+        if cached_result is not None:
+            return cached_result
+
+        await self.hooks.emit(
+            HookEvent.PRE_TOOL_USE,
+            {
+                "tool_name": tool.name,
+                "tool_source": record.source,
+                "tool_origin": record.origin,
+                "arguments": tool_call.arguments,
+                "call_id": tool_call.call_id,
+                "session_id": context.session_id,
+                "is_mutating": tool.is_mutating,
+                **_correlation_payload(context, tool_call_id=tool_call.call_id),
+            },
+        )
+
+        started_at = time.perf_counter()
+        monitor = sentry_monitor_from_hooks(self.hooks)
+        span = (
+            monitor.start_span(
+                op="nexus.tool",
+                name=tool.name,
+                attributes={
+                    "nexus.tool.name": tool.name,
+                    "nexus.tool.source": record.source,
+                    "nexus.tool.origin": record.origin,
+                    "nexus.tool.kind": getattr(getattr(tool, "kind", None), "value", getattr(tool, "kind", "")),
+                    "nexus.tool.is_mutating": tool.is_mutating,
+                    "nexus.tool.call_id": tool_call.call_id,
+                    **_correlation_payload(context, tool_call_id=tool_call.call_id),
+                },
+            )
+            if monitor is not None
+            else None
+        )
+        try:
+            with (span if span is not None else nullcontext()):
+                result = await tool.execute(tool_call.call_id, tool_call.arguments, context)
+        except Exception as exc:
+            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            failed_payload = {
+                "tool_name": tool.name,
+                "tool_source": record.source,
+                "tool_origin": record.origin,
+                "arguments": tool_call.arguments,
+                "call_id": tool_call.call_id,
+                "session_id": context.session_id,
+                "is_mutating": tool.is_mutating,
+                "is_error": True,
+                "duration_ms": duration_ms,
+                "output": str(exc) or exc.__class__.__name__,
+                "exception_type": exc.__class__.__name__,
+                **_correlation_payload(context, tool_call_id=tool_call.call_id),
+            }
+            await self.hooks.emit(HookEvent.POST_TOOL_USE, failed_payload)
+            capture_exception_from_hooks(self.hooks, exc, context=failed_payload)
+            setattr(exc, "_nexus_sentry_captured", True)
+            setattr(exc, "_nexus_error_area", "tool")
+            raise
+
+        actor = _tool_actor(context)
+        if actor:
+            result.metadata = {**result.metadata, "actor": actor}
+        result.metadata = {
+            **result.metadata,
+            "is_mutating": tool.is_mutating,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        }
+        if tool.is_mutating:
+            _clear_read_result_cache(context)
+            result = _with_post_mutation_refresh(
+                result,
+                affected_paths or set(),
+                context,
+            )
+        else:
+            _store_read_result(record, tool, tool_call, context, result)
+        if approval_manager is not None:
+            approval_manager.consume_approval(tool.name, arguments=tool_call.arguments)
+
+        await self.hooks.emit(
+            HookEvent.POST_TOOL_USE,
+            {
+                "tool_name": tool.name,
+                "tool_source": record.source,
+                "tool_origin": record.origin,
+                "arguments": tool_call.arguments,
+                "call_id": tool_call.call_id,
+                "session_id": context.session_id,
+                "is_mutating": tool.is_mutating,
+                "is_error": result.is_error,
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                "output": result.output,
+                **_correlation_payload(context, tool_call_id=tool_call.call_id),
+            },
+        )
+        return result
+
+    async def _execute_parallel_first_tool_batch(
+        self,
+        tool_calls: tuple[ToolCall, ...],
+        context: ToolExecutionContext,
+        *,
+        mode: ExecutionMode,
+        approved_tools: set[str],
+        approval_manager: ApprovalManager | None,
+        auto_confirm: bool,
+        auto_confirm_read_only: bool,
+        max_tool_calls_per_turn: int,
+        tool_calls_executed: int,
+        parallel_tool_window: int,
+        unknown_tool_retries: dict[str, int],
+        invalid_argument_retries: dict[tuple[str, tuple[str, ...]], int],
+        loop_detector: LoopDetector,
+        batch_state: _ToolBatchState,
+    ) -> AsyncGenerator[AgentEvent, None]:
+        remaining_budget = max_tool_calls_per_turn - tool_calls_executed
+        if remaining_budget <= 0:
+            pause_message = _tool_call_limit_pause_message(max_tool_calls_per_turn)
+            yield AgentEvent.text_complete(pause_message)
+            yield AgentEvent(
+                kind=AgentEventType.MODEL_RESPONSE,
+                payload=RuntimeResponse(
+                    message=Message(role="assistant", content=pause_message),
+                    finish_reason=TOOL_CALL_LIMIT_FINISH_REASON,
+                ),
+            )
+            yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload=TOOL_CALL_LIMIT_FINISH_REASON)
+            batch_state.stop_reason = TOOL_CALL_LIMIT_FINISH_REASON
+            return
+
+        limited_tool_calls = tuple(tool_calls[:remaining_budget])
+        hit_limit = len(limited_tool_calls) < len(tool_calls)
+        parallel_items: list[_PreparedToolCall] = []
+        sequential_items: list[_PreparedToolCall] = []
+        mutating_paths_this_batch: set[str] = set()
+        read_keys_this_batch: dict[str, str] = {}
+
+        for tool_call in limited_tool_calls:
+            prepared = await self._prepare_parallel_first_tool_call(
+                tool_call,
+                context,
+                mode=mode,
+                approved_tools=approved_tools,
+                approval_manager=approval_manager,
+                auto_confirm=auto_confirm,
+                auto_confirm_read_only=auto_confirm_read_only,
+                unknown_tool_retries=unknown_tool_retries,
+                invalid_argument_retries=invalid_argument_retries,
+                mutating_paths_this_batch=mutating_paths_this_batch,
+            )
+            duplicate_read_key = _prepared_read_result_cache_key(prepared)
+            if duplicate_read_key is not None:
+                first_call_id = read_keys_this_batch.get(duplicate_read_key)
+                if first_call_id is not None:
+                    prepared.immediate_result = _duplicate_read_result(
+                        prepared.tool_call,
+                        tool_name=str(getattr(prepared.tool, "name", prepared.tool_call.tool_name)),
+                        first_call_id=first_call_id,
+                    )
+                    prepared.emit_start_event = True
+                    prepared.loop_result = "duplicate_read"
+                else:
+                    read_keys_this_batch[duplicate_read_key] = prepared.tool_call.call_id
+            target_list = parallel_items if _prepared_tool_prefers_parallel(prepared, context) else sequential_items
+            target_list.append(prepared)
+            if prepared.tool is not None and prepared.tool.is_mutating:
+                mutating_paths_this_batch.update(prepared.affected_paths)
+
+        window_size = max(1, min(int(parallel_tool_window or 1), 8))
+        for start in range(0, len(parallel_items), window_size):
+            window = parallel_items[start:start + window_size]
+            pending_confirmation: _PreparedToolCall | None = None
+            task_map: dict[str, asyncio.Task[ToolResult]] = {}
+            runnable_parallel = [
+                prepared
+                for prepared in window
+                if prepared.record is not None and prepared.tool is not None and prepared.immediate_result is None
+            ]
+            for parallel_index, prepared in enumerate(runnable_parallel):
+                yield AgentEvent.tool_call_start(
+                    prepared.tool_call.call_id,
+                    prepared.tool_call.tool_name,
+                    prepared.tool_call.arguments,
+                    preview=prepared.confirmation_preview,
+                    actor=_tool_actor(context),
+                    display=_tool_display_metadata(
+                        is_mutating=prepared.tool.is_mutating,
+                        parallel_group_size=len(runnable_parallel),
+                        parallel_index=parallel_index,
+                    ),
+                )
+                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=prepared.tool_call)
+                task_map[prepared.tool_call.call_id] = asyncio.create_task(
+                    self._run_tool_call(
+                        prepared.record,
+                        prepared.tool,
+                        prepared.tool_call,
+                        context,
+                        approval_manager=approval_manager,
+                        affected_paths=prepared.affected_paths,
+                    )
+                )
+
+            if task_map:
+                results = await asyncio.gather(*task_map.values())
+                result_by_call_id = dict(zip(task_map, results, strict=False))
+            else:
+                result_by_call_id = {}
+
+            for prepared in window:
+                if prepared.immediate_result is not None:
+                    async for event in self._emit_prepared_tool_result(prepared, context, loop_detector, batch_state):
+                        yield event
+                    if prepared.stop_message is not None:
+                        yield AgentEvent.text_complete(prepared.stop_message)
+                        yield AgentEvent(
+                            kind=AgentEventType.MODEL_RESPONSE,
+                            payload=RuntimeResponse(
+                                message=Message(role="assistant", content=prepared.stop_message),
+                                finish_reason="invalid_tool_call",
+                            ),
+                        )
+                        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="invalid_tool_call")
+                        batch_state.stop_reason = "invalid_tool_call"
+                        return
+                    continue
+                if prepared.confirmation_request is not None:
+                    pending_confirmation = pending_confirmation or prepared
+                    continue
+                result = result_by_call_id.get(prepared.tool_call.call_id)
+                if result is None:
+                    logger.warning(
+                        "agent.tool_result.missing session_id=%s actor=%s tool_name=%s call_id=%s",
+                        context.session_id,
+                        _tool_actor(context) or "supervisor",
+                        prepared.tool_call.tool_name,
+                        prepared.tool_call.call_id,
+                    )
+                    continue
+                batch_state.executed_count += 1
+                batch_state.tool_result_messages.append(_tool_result_message(result))
+                logger.debug(
+                    "agent.tool_result.recorded session_id=%s actor=%s tool_name=%s call_id=%s is_error=%s output_chars=%s",
+                    context.session_id,
+                    _tool_actor(context) or "supervisor",
+                    result.tool_name,
+                    result.call_id,
+                    result.is_error,
+                    len(result.output),
+                )
+                loop_detector.record_action("tool_call", tool_name=prepared.tool_call.tool_name)
+                yield AgentEvent.tool_call_complete(result)
+                yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
+
+            if pending_confirmation is not None and pending_confirmation.confirmation_request is not None:
+                await self._emit_confirmation_requested_notification(pending_confirmation.confirmation_request, pending_confirmation, context)
+                yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=pending_confirmation.confirmation_request)
+                batch_state.stop_reason = "confirmation_requested"
+                return
+
+        for prepared in sequential_items:
+            if prepared.immediate_result is not None:
+                async for event in self._emit_prepared_tool_result(prepared, context, loop_detector, batch_state):
+                    yield event
+                if prepared.stop_message is not None:
+                    yield AgentEvent.text_complete(prepared.stop_message)
+                    yield AgentEvent(
+                        kind=AgentEventType.MODEL_RESPONSE,
+                        payload=RuntimeResponse(
+                            message=Message(role="assistant", content=prepared.stop_message),
+                            finish_reason="invalid_tool_call",
+                        ),
+                    )
+                    yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="invalid_tool_call")
+                    batch_state.stop_reason = "invalid_tool_call"
+                    return
+                continue
+            if prepared.confirmation_request is not None:
+                await self._emit_confirmation_requested_notification(prepared.confirmation_request, prepared, context)
+                yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=prepared.confirmation_request)
+                batch_state.stop_reason = "confirmation_requested"
+                return
+            if prepared.record is None or prepared.tool is None:
+                continue
+            result: ToolResult | None = None
+            async for event in self._execute_tool_call(
+                prepared.record,
+                prepared.tool,
+                prepared.tool_call,
+                context,
+                approval_manager=approval_manager,
+                confirmation_preview=prepared.confirmation_preview,
+                affected_paths=prepared.affected_paths,
+            ):
+                if event.kind == AgentEventType.TOOL_RESULT:
+                    result = event.payload
+                yield event
+            if result is None:
+                logger.warning(
+                    "agent.tool_result.missing session_id=%s actor=%s tool_name=%s call_id=%s",
+                    context.session_id,
+                    _tool_actor(context) or "supervisor",
+                    prepared.tool_call.tool_name,
+                    prepared.tool_call.call_id,
+                )
+                continue
+            batch_state.executed_count += 1
+            batch_state.tool_result_messages.append(_tool_result_message(result))
+            logger.debug(
+                "agent.tool_result.recorded session_id=%s actor=%s tool_name=%s call_id=%s is_error=%s output_chars=%s",
+                context.session_id,
+                _tool_actor(context) or "supervisor",
+                result.tool_name,
+                result.call_id,
+                result.is_error,
+                len(result.output),
+            )
+            loop_detector.record_action("tool_call", tool_name=prepared.tool_call.tool_name)
+
+        if hit_limit:
+            pause_message = _tool_call_limit_pause_message(max_tool_calls_per_turn)
+            yield AgentEvent.text_complete(pause_message)
+            yield AgentEvent(
+                kind=AgentEventType.MODEL_RESPONSE,
+                payload=RuntimeResponse(
+                    message=Message(role="assistant", content=pause_message),
+                    finish_reason=TOOL_CALL_LIMIT_FINISH_REASON,
+                ),
+            )
+            yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload=TOOL_CALL_LIMIT_FINISH_REASON)
+            batch_state.stop_reason = TOOL_CALL_LIMIT_FINISH_REASON
+
+    async def _prepare_parallel_first_tool_call(
+        self,
+        tool_call: ToolCall,
+        context: ToolExecutionContext,
+        *,
+        mode: ExecutionMode,
+        approved_tools: set[str],
+        approval_manager: ApprovalManager | None,
+        auto_confirm: bool,
+        auto_confirm_read_only: bool,
+        unknown_tool_retries: dict[str, int],
+        invalid_argument_retries: dict[tuple[str, tuple[str, ...]], int],
+        mutating_paths_this_batch: set[str],
+    ) -> _PreparedToolCall:
+        prepared = _PreparedToolCall(tool_call=tool_call)
+        try:
+            record = self.tool_registry.record(tool_call.tool_name)
+        except LookupError:
+            tool_name = _tool_name_text(tool_call.tool_name)
+            retry_count = unknown_tool_retries.get(tool_name, 0) + 1
+            unknown_tool_retries[tool_name] = retry_count
+            prepared.immediate_result = _unknown_tool_result(
+                tool_call,
+                self.tool_registry,
+                retry_count=retry_count,
+                retry_limit=INVALID_TOOL_CALL_RETRY_LIMIT,
+            )
+            prepared.emit_start_event = True
+            prepared.loop_result = "unknown_tool"
+            if retry_count > INVALID_TOOL_CALL_RETRY_LIMIT:
+                prepared.stop_message = _invalid_tool_call_stop_message(tool_name, "unknown tool name")
+            return prepared
+
+        prepared.record = record
+        prepared.tool = record.tool
+        if not _tool_available_in_context(record, context):
+            tool_name = _tool_name_text(tool_call.tool_name)
+            retry_count = unknown_tool_retries.get(tool_name, 0) + 1
+            unknown_tool_retries[tool_name] = retry_count
+            prepared.immediate_result = _tool_not_available_result(
+                tool_call,
+                self.tool_registry,
+                context,
+                retry_count=retry_count,
+                retry_limit=INVALID_TOOL_CALL_RETRY_LIMIT,
+            )
+            prepared.emit_start_event = True
+            prepared.loop_result = "unavailable_tool"
+            if retry_count > INVALID_TOOL_CALL_RETRY_LIMIT:
+                prepared.stop_message = _invalid_tool_call_stop_message(tool_name, "tool unavailable in this context")
+            return prepared
+
+        missing_fields = _missing_required_fields(record.tool.input_schema, tool_call.arguments)
+        if missing_fields:
+            read_without_clarification_callback = (
+                getattr(record.tool, "kind", None) is ToolKind.READ
+                and context.metadata.get("approval_callback") is None
+            )
+            if not _missing_fields_should_be_repaired_by_model(missing_fields) and not read_without_clarification_callback:
+                missing_field = missing_fields[0]
+                prepared.confirmation_request = ConfirmationRequest(
+                    kind=ConfirmationKind.CLARIFICATION,
+                    tool_name=record.tool.name,
+                    prompt=f"Provide a value for '{missing_field}' before running '{record.tool.name}'.",
+                    reason="Required tool argument is missing.",
+                    call_id=tool_call.call_id,
+                    payload={"tool_name": record.tool.name, "field": missing_field, "actor": _tool_actor(context)},
+                    arguments=tool_call.arguments,
+                    preview={},
+                )
+                return prepared
+            retry_key = (record.tool.name, tuple(missing_fields))
+            retry_count = invalid_argument_retries.get(retry_key, 0) + 1
+            invalid_argument_retries[retry_key] = retry_count
+            prepared.immediate_result = _missing_required_argument_result(
+                tool_call,
+                record.tool.name,
+                missing_fields,
+                retry_count=retry_count,
+                retry_limit=INVALID_TOOL_CALL_RETRY_LIMIT,
+            )
+            prepared.emit_start_event = True
+            prepared.loop_result = "missing_argument"
+            if retry_count > INVALID_TOOL_CALL_RETRY_LIMIT:
+                prepared.stop_message = _invalid_tool_call_stop_message(record.tool.name, "missing required arguments")
+            return prepared
+
+        confirmation = await _get_tool_confirmation(record.tool, tool_call.call_id, tool_call.arguments, context)
+        prepared.confirmation_preview = _confirmation_preview(confirmation)
+        prepared.affected_paths = _affected_file_paths(record.tool, tool_call.arguments, confirmation, context)
+
+        decision = self.permission_checker.evaluate(
+            record.tool,
+            tool_call.arguments,
+            mode,
+            context=context,
+            auto_confirm_read_only=auto_confirm_read_only,
+        )
+        risk_level = _risk_level_name(decision.risk_level)
+        prepared.permission_decision = decision
+
+        if decision.decision is PermissionDecision.DENY:
+            denied_result = _denied_tool_result(
+                tool_call.call_id,
+                record.tool.name,
+                decision.reason,
+                risk_level=risk_level,
+            )
+            await self.hooks.emit(
+                HookEvent.NOTIFICATION,
+                {
+                    "event": "tool_denied",
+                    "tool_name": record.tool.name,
+                    "tool_source": record.source,
+                    "tool_origin": record.origin,
+                    "arguments": tool_call.arguments,
+                    "reason": decision.reason,
+                    "session_id": context.session_id,
+                    "call_id": tool_call.call_id,
+                    **_correlation_payload(context, tool_call_id=tool_call.call_id),
+                },
+            )
+            prepared.immediate_result = denied_result
+            prepared.loop_result = "denied"
+            return prepared
+
+        if approval_manager is not None and approval_manager.is_refused(record.tool.name, tool_call.arguments):
+            refused_reason = "User previously denied this tool call in the current turn. Continue without running it."
+            prepared.immediate_result = _denied_tool_result(
+                tool_call.call_id,
+                record.tool.name,
+                refused_reason,
+                risk_level=risk_level,
+            )
+            prepared.loop_result = "refused"
+            return prepared
+
+        duplicate_paths = prepared.affected_paths & mutating_paths_this_batch if record.tool.is_mutating else set()
+        if duplicate_paths:
+            prepared.immediate_result = _same_file_mutation_result(tool_call, duplicate_paths)
+            prepared.loop_result = "same_file_blocked"
+            return prepared
+
+        if (
+            decision.decision is PermissionDecision.CONFIRM
+            and not auto_confirm
+            and not _is_tool_preapproved(
+                record.tool.name,
+                tool_call.arguments,
+                is_mutating=record.tool.is_mutating,
+                risk_level=risk_level,
+                approved_tools=approved_tools,
+                approval_manager=approval_manager,
+            )
+        ):
+            prepared.confirmation_request = ConfirmationRequest(
+                kind=ConfirmationKind.APPROVAL,
+                tool_name=record.tool.name,
+                prompt=f"Allow tool '{record.tool.name}'?",
+                reason=decision.reason,
+                call_id=tool_call.call_id,
+                payload={
+                    "tool_name": record.tool.name,
+                    "reason": decision.reason,
+                    "approval_policy": str(context.metadata.get("approval_policy", "on-request")),
+                    "risk_level": risk_level,
+                    "actor": _tool_actor(context),
+                },
+                arguments=tool_call.arguments,
+                preview=prepared.confirmation_preview,
+            )
+        return prepared
+
+    async def _emit_prepared_tool_result(
+        self,
+        prepared: _PreparedToolCall,
+        context: ToolExecutionContext,
+        loop_detector: LoopDetector,
+        batch_state: _ToolBatchState,
+    ) -> AsyncGenerator[AgentEvent, None]:
+        result = prepared.immediate_result
+        if result is None:
+            return
+        _is_unavailable = isinstance(result.metadata, dict) and result.metadata.get("tool_unavailable")
+        if prepared.emit_start_event and not _is_unavailable:
+            yield AgentEvent.tool_call_start(
+                prepared.tool_call.call_id,
+                _tool_name_text(prepared.tool_call.tool_name),
+                prepared.tool_call.arguments,
+                actor=_tool_actor(context),
+                display=_tool_display_metadata(
+                    is_mutating=bool(getattr(prepared.tool, "is_mutating", False)) if prepared.tool is not None else None,
+                ),
+            )
+            yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=prepared.tool_call)
+        if prepared.loop_result == "denied" and prepared.permission_decision is not None:
+            yield AgentEvent(kind=AgentEventType.TOOL_DENIED, payload=prepared.permission_decision)
+        yield AgentEvent.tool_call_complete(result)
+        yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
+        batch_state.executed_count += 1
+        batch_state.tool_result_messages.append(_tool_result_message(result))
+        loop_detector.record_action(
+            "tool_call",
+            tool_name=_tool_name_text(prepared.tool_call.tool_name),
+            result=prepared.loop_result or "error",
+        )
+
+    async def _emit_confirmation_requested_notification(
+        self,
+        request: ConfirmationRequest,
+        prepared: _PreparedToolCall,
+        context: ToolExecutionContext,
+    ) -> None:
+        await self.hooks.emit(
+            HookEvent.NOTIFICATION,
+            {
+                "event": "confirmation_requested",
+                "tool_name": request.tool_name,
+                "tool_source": prepared.record.source if prepared.record is not None else "unknown",
+                "tool_origin": prepared.record.origin if prepared.record is not None else None,
+                "arguments": request.arguments,
+                "reason": request.reason,
+                "session_id": context.session_id,
+                "call_id": request.call_id,
+                **_correlation_payload(context, tool_call_id=request.call_id),
+            },
+        )
+
+
+def _parallel_tool_execution_enabled(context: ToolExecutionContext) -> bool:
+    del context
+    return True
+
+
+def _tool_display_metadata(
+    *,
+    is_mutating: bool | None = None,
+    parallel_group_size: int | None = None,
+    parallel_index: int | None = None,
+) -> dict[str, Any]:
+    display: dict[str, Any] = {}
+    if is_mutating is not None:
+        display["is_mutating"] = is_mutating
+    if parallel_group_size is not None and parallel_group_size > 1:
+        display["parallel_group_size"] = parallel_group_size
+    if parallel_index is not None and parallel_group_size is not None and parallel_group_size > 1:
+        display["parallel_index"] = parallel_index
+    return display
+
+
+def _prepared_tool_prefers_parallel(prepared: _PreparedToolCall, context: ToolExecutionContext) -> bool:
+    if prepared.record is None:
+        return False
+    return _tool_call_can_run_in_parallel(prepared.record, context)
+
+
+def _prepared_read_result_cache_key(prepared: _PreparedToolCall) -> str | None:
+    if (
+        prepared.record is None
+        or prepared.tool is None
+        or prepared.immediate_result is not None
+        or prepared.confirmation_request is not None
+    ):
+        return None
+    return _read_result_cache_key(prepared.record, prepared.tool, prepared.tool_call)
+
+
+def _tool_call_can_run_in_parallel(record: Any, context: ToolExecutionContext) -> bool:
+    if not _parallel_tool_execution_enabled(context):
+        return False
+    tool = getattr(record, "tool", None)
+    if tool is None or getattr(tool, "is_mutating", False):
+        return False
+    name = str(getattr(record, "name", ""))
+    if name == "delegate_task" or name.startswith("subagent_"):
+        return False
+    return getattr(tool, "kind", None) is not ToolKind.AGENT
 
 
 def _missing_required_fields(schema: dict[str, Any], arguments: dict[str, Any]) -> list[str]:
@@ -913,6 +1762,77 @@ def _tool_result_message(result: ToolResult) -> Message:
         name=result.tool_name,
         tool_call_id=result.call_id,
     )
+
+
+def _cached_read_result(
+    record: Any,
+    tool: Any,
+    tool_call: ToolCall,
+    context: ToolExecutionContext,
+) -> ToolResult | None:
+    key = _read_result_cache_key(record, tool, tool_call)
+    if key is None:
+        return None
+    cache = context.metadata.get(_READ_RESULT_CACHE_METADATA_KEY)
+    if not isinstance(cache, dict):
+        return None
+    cached = cache.get(key)
+    if not isinstance(cached, ToolResult):
+        return None
+    metadata = {
+        **cached.metadata,
+        "read_cache_hit": True,
+        "cached_from_call_id": cached.call_id,
+    }
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=cached.tool_name,
+        output=cached.output,
+        is_error=cached.is_error,
+        metadata=metadata,
+    )
+
+
+def _store_read_result(
+    record: Any,
+    tool: Any,
+    tool_call: ToolCall,
+    context: ToolExecutionContext,
+    result: ToolResult,
+) -> None:
+    key = _read_result_cache_key(record, tool, tool_call)
+    if key is None:
+        return
+    cache = context.metadata.setdefault(_READ_RESULT_CACHE_METADATA_KEY, {})
+    if isinstance(cache, dict):
+        cache[key] = ToolResult(
+            call_id=result.call_id,
+            tool_name=result.tool_name,
+            output=result.output,
+            is_error=result.is_error,
+            metadata={**result.metadata, "read_cache_hit": False},
+        )
+
+
+def _clear_read_result_cache(context: ToolExecutionContext) -> None:
+    cache = context.metadata.get(_READ_RESULT_CACHE_METADATA_KEY)
+    if isinstance(cache, dict):
+        cache.clear()
+
+
+def _read_result_cache_key(record: Any, tool: Any, tool_call: ToolCall) -> str | None:
+    if getattr(tool, "is_mutating", False):
+        return None
+    if getattr(tool, "kind", None) is not ToolKind.READ:
+        return None
+    name = str(getattr(record, "name", "") or getattr(tool, "name", ""))
+    if name not in _CACHEABLE_READ_TOOL_NAMES:
+        return None
+    try:
+        arguments = json.dumps(tool_call.arguments, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        arguments = repr(sorted(tool_call.arguments.items()))
+    return f"{name}:{arguments}"
 
 
 def _tool_name_text(tool_name: Any) -> str:
@@ -1002,6 +1922,26 @@ def _tool_not_available_result(
     )
 
 
+def _duplicate_read_result(
+    tool_call: ToolCall,
+    *,
+    tool_name: str,
+    first_call_id: str,
+) -> ToolResult:
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=tool_name,
+        output=(
+            "Duplicate read-only tool call skipped. The same tool with the same arguments "
+            f"already ran earlier in this batch as call_id={first_call_id}; use that prior tool result instead."
+        ),
+        metadata={
+            "duplicate_read_skipped": True,
+            "cached_from_call_id": first_call_id,
+        },
+    )
+
+
 def _missing_fields_should_be_repaired_by_model(missing_fields: list[str]) -> bool:
     model_owned_fields = {
         "content",
@@ -1025,9 +1965,19 @@ def _missing_required_argument_result(
 ) -> ToolResult:
     fields_text = ", ".join(f"'{field}'" for field in missing_fields)
     supplied_keys = ", ".join(sorted(str(key) for key in tool_call.arguments)) or "(none)"
-    alias_hint = ""
+    alias_hints: list[str] = []
     if "content" in missing_fields and "text" in tool_call.arguments:
-        alias_hint = " You supplied 'text'; use 'content' for the file body instead."
+        alias_hints.append("You supplied 'text'; use 'content' for the file body instead.")
+    if tool_name == "edit":
+        if "old_string" in missing_fields and "old_text" in tool_call.arguments:
+            alias_hints.append("You supplied 'old_text'; use 'old_string' for the exact text to replace.")
+        if "new_string" in missing_fields and "new_text" in tool_call.arguments:
+            alias_hints.append("You supplied 'new_text'; use 'new_string' for the replacement text.")
+        if any(field in missing_fields for field in {"old_string", "new_string"}):
+            alias_hints.append(
+                "The edit tool requires 'path', 'old_string', and 'new_string'. old_string must be the current snippet from disk, preferably with a few surrounding lines so the match is unique. Use write_file only for new files or true full-file rewrites."
+            )
+    alias_hint = f" {' '.join(alias_hints)}" if alias_hints else ""
     if retry_count > retry_limit:
         guidance = (
             f"Retry limit exceeded after {retry_limit} repair attempts. Stop and explain the blocker."
@@ -1085,6 +2035,14 @@ def _tool_call_limit_pause_message(max_tool_calls_per_turn: int) -> str:
     )
 
 
+def _max_turns_pause_message(max_turns: int) -> str:
+    return (
+        "Single-query turn limit reached "
+        f"({max_turns}). Write `continue` to resume the previous task, "
+        "or increase `max_loop_iterations` to allow more turns per query."
+    )
+
+
 def _risk_level_name(value: Any) -> str:
     raw_value = getattr(value, "value", value)
     return str(raw_value).strip().lower().split(".")[-1]
@@ -1094,6 +2052,33 @@ def _provider_name_from_context(context: ToolExecutionContext) -> str:
     config = context.metadata.get("config")
     provider = getattr(config, "provider", "")
     return str(provider or "").strip()
+
+
+def _hash_prompt(system_prompt: str) -> str:
+    return hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+
+
+def _serialize_message_for_observability(message: Message) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "role": message.role,
+        "content": message.content,
+    }
+    if message.reasoning_content:
+        payload["reasoning_content_chars"] = len(message.reasoning_content)
+    if message.name:
+        payload["name"] = message.name
+    if message.tool_call_id:
+        payload["tool_call_id"] = message.tool_call_id
+    if message.tool_calls:
+        payload["tool_calls"] = [
+            {
+                "call_id": tool_call.call_id,
+                "tool_name": tool_call.tool_name,
+                "arguments": tool_call.arguments,
+            }
+            for tool_call in message.tool_calls
+        ]
+    return payload
 
 
 def _correlation_payload(context: ToolExecutionContext, *, tool_call_id: str | None = None) -> dict[str, Any]:
@@ -1144,10 +2129,10 @@ def _supervisor_preferred_tool_records(records: list[Any]) -> list[Any]:
 def _supervisor_tool_priority(record: Any) -> tuple[int, int, str]:
     name = str(getattr(record, "name", ""))
     subagent_order = {
-        "subagent_planning_analysis": 0,
-        "subagent_execution": 1,
-        "subagent_verification": 2,
-        "subagent_review": 3,
+        "subagent_explorer": 0,
+        "subagent_coding": 1,
+        "subagent_impact_analyzer": 2,
+        "subagent_code_reviewer": 3,
     }
     if name.startswith("subagent_"):
         return (0, subagent_order.get(name, 50), name)
@@ -1166,19 +2151,19 @@ def _supervisor_tool_schema(record: Any, records: list[Any]) -> dict[str, Any]:
         function["description"] = _subagent_preference_description(name, description)
     elif has_subagents:
         function["description"] = (
-            f"{description} Supervisor direct-use escape hatch: for substantial repo inspection, "
-            "edits, tests, shell work, MCP-backed work, or skill-specific work, prefer delegating "
-            "through the appropriate subagent_* tool first."
+            f"{description} Supervisor direct-use path: use this directly for tiny read-only checks, "
+            "one-off recovery steps, or slash/config/status work. Delegate when the task exceeds the "
+            "supervisor's small local budget or needs isolated mutation, impact analysis, or post-change review."
         ).strip()
     return schema
 
 
 def _subagent_preference_description(name: str, description: str) -> str:
     routing = {
-        "subagent_planning_analysis": "Preferred for codebase exploration, impact analysis, and implementation planning.",
-        "subagent_execution": "Preferred for file edits, implementation, refactors, and normal workspace tool use.",
-        "subagent_verification": "Preferred for tests, lint, typecheck, runtime checks, and validation summaries.",
-        "subagent_review": "Preferred for bug/regression review, diffs, and maintainability risk checks.",
+        "subagent_explorer": "Preferred for bounded read-only exploration, directory summaries, and codebase scans.",
+        "subagent_coding": "Preferred for file edits, implementation, and cheap local validation tied to those edits.",
+        "subagent_impact_analyzer": "Preferred when blast radius, affected interfaces, or scoped verification targets are unclear.",
+        "subagent_code_reviewer": "Preferred for post-change review, scoped automated verification, and failure attribution.",
     }
     prefix = routing.get(name, "Preferred delegation route for focused cognitive work.")
     return f"{prefix} {description}".strip()
