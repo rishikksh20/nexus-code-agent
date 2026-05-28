@@ -270,6 +270,9 @@ class TextualTerminalUI(TerminalUI):
     def begin_assistant(self) -> None:
         if self._assistant_stream_open:
             return
+        self._app.close_supervisor_group()
+        if self._app._turn_had_tool_calls:
+            self._write(Text(""))
         self._write(_assistant_header())
         self._assistant_stream_open = True
 
@@ -440,6 +443,35 @@ class TextualTerminalUI(TerminalUI):
         else:
             row.append(" · done", style="dim")
         self._append_elapsed(row, self._elapsed_label(call_id, result))
+        return row
+
+    def _render_supervisor_row(
+        self,
+        call_id: str,
+        tool_name: str,
+        args: dict[str, Any],
+        result: ToolResult | None = None,
+    ) -> Text:
+        label = self._semantic_tool_label(
+            tool_name,
+            completed=result is not None,
+            failed=bool(result.is_error) if result is not None else False,
+        )
+        target = self._tool_target(tool_name, args, result)
+        style = "error" if result is not None and result.is_error else self._tool_border_style(tool_name)
+        row = Text("|-> ", style="dim")
+        row.append(label, style=style)
+        if target:
+            row.append(f" {target}", style="dim")
+        if result is None:
+            return row
+        if result.is_error:
+            row.append(" · failed", style="bold red")
+            if result.output:
+                truncated = result.output[:200].strip()
+                row.append(f"\n|   {truncated}", style="dim red")
+        else:
+            self._append_elapsed(row, self._elapsed_label(call_id, result))
         return row
 
     def _render_bash_complete(self, result: ToolResult, args: dict[str, Any]) -> None:
@@ -660,7 +692,7 @@ class TextualTerminalUI(TerminalUI):
                 self.begin_assistant()
                 if _should_collapse_text(content):
                     self._app.write_collapsible(
-                        Text("< Assistant response", style="assistant.header"),
+                        Text("·", style="bold"),
                         Markdown(content),
                         summary=f"{_line_count(content)} lines",
                         initially_expanded=True,
@@ -697,7 +729,20 @@ class TextualTerminalUI(TerminalUI):
                     call_id,
                     self._render_subagent_tool_row(call_id, tool_name, arguments),
                 )
+            elif _is_supervisor_group_tool(tool_name):
+                self._tool_started_at[call_id] = time.perf_counter()
+                self._app._turn_had_tool_calls = True
+                if self._app._supervisor_entry is None:
+                    sup_header = Text()
+                    sup_header.append("● ", style="bold cyan")
+                    sup_header.append("Supervisor Agent", style="bold white")
+                    self._app.begin_supervisor_group(sup_header)
+                self._app.record_supervisor_row(
+                    call_id,
+                    self._render_supervisor_row(call_id, tool_name, arguments),
+                )
             else:
+                self._app._turn_had_tool_calls = True
                 self._write_inline_tool_start(call_id, tool_name, actor, arguments, display)
             self.start_tool_wait(f"{self._tool_display_name(tool_name, actor)} running")
             return
@@ -728,6 +773,11 @@ class TextualTerminalUI(TerminalUI):
                     actor,
                     result.call_id,
                     self._render_subagent_tool_row(result.call_id, result.tool_name, arguments, result),
+                )
+            elif result.call_id in self._app._supervisor_entries_by_call_id:
+                self._app.update_supervisor_row(
+                    result.call_id,
+                    self._render_supervisor_row(result.call_id, result.tool_name, arguments, result),
                 )
             elif result.tool_name == "bash":
                 self._render_bash_complete(result, arguments)
@@ -802,6 +852,7 @@ class TextualTerminalUI(TerminalUI):
         if event.kind in {AgentEventType.TURN_COMPLETED, AgentEventType.AGENT_STOP}:
             self.stop_thinking()
             self.stop_tool_wait()
+            self._app.close_supervisor_group()
             if event.kind == AgentEventType.AGENT_STOP:
                 self._app.write_turn_footer()
             return
@@ -1122,6 +1173,9 @@ class NexusTextualApp(App[None]):
         self._transcript_plain_parts: list[str] = []
         self._subagent_entries_by_actor: dict[str, dict[str, Any]] = {}
         self._subagent_entries_by_call_id: dict[str, dict[str, Any]] = {}
+        self._supervisor_entry: dict[str, Any] | None = None
+        self._supervisor_entries_by_call_id: dict[str, dict[str, Any]] = {}
+        self._turn_had_tool_calls = False
         self._transcript: Any = None
         self._status: Any = None
         self._input: Any = None
@@ -1240,6 +1294,69 @@ class NexusTextualApp(App[None]):
 
     def has_subagent_task(self, actor: str) -> bool:
         return actor in self._subagent_entries_by_actor
+
+    # ------------------------------------------------------------------
+    # Supervisor group – collapsible block for main-agent tool calls
+    # ------------------------------------------------------------------
+
+    def begin_supervisor_group(self, header: "RenderableType") -> None:
+        entry: dict[str, Any] = {
+            "type": "collapsible",
+            "id": uuid4().hex[:8],
+            "header": header,
+            "expanded": Text("| Working...", style="dim"),
+            "preview": Text("| Working...", style="dim"),
+            "summary": "running",
+            "expanded_state": True,
+            "supervisor_tool_order": [],
+            "supervisor_tool_rows": {},
+        }
+        self._supervisor_entry = entry
+        self._transcript_entries.append(entry)
+        self._render_transcript_entry(entry)
+
+    def record_supervisor_row(self, call_id: str, row: "RenderableType") -> None:
+        entry = self._supervisor_entry
+        if entry is None:
+            self.write(row)
+            return
+        order = cast("list[str]", entry.setdefault("supervisor_tool_order", []))
+        rows = cast("dict[str, RenderableType]", entry.setdefault("supervisor_tool_rows", {}))
+        if call_id not in rows:
+            order.append(call_id)
+            self._supervisor_entries_by_call_id[call_id] = entry
+        rows[call_id] = row
+        self._refresh_supervisor_entry(entry)
+        self._rerender_transcript()
+
+    def update_supervisor_row(self, call_id: str, row: "RenderableType") -> None:
+        entry = self._supervisor_entries_by_call_id.get(call_id)
+        if entry is None:
+            return
+        rows = cast("dict[str, RenderableType]", entry.get("supervisor_tool_rows", {}))
+        rows[call_id] = row
+        self._refresh_supervisor_entry(entry)
+        self._rerender_transcript()
+
+    def close_supervisor_group(self) -> None:
+        entry = self._supervisor_entry
+        if entry is None:
+            return
+        order = cast("list[str]", entry.get("supervisor_tool_order", []))
+        count = len(order)
+        entry["summary"] = f"{count} call{'s' if count != 1 else ''}"
+        entry["expanded_state"] = False
+        self._refresh_supervisor_entry(entry)
+        self._supervisor_entry = None
+        self._rerender_transcript()
+
+    def _refresh_supervisor_entry(self, entry: dict[str, Any]) -> None:
+        order = cast("list[str]", entry.get("supervisor_tool_order", []))
+        rows = cast("dict[str, RenderableType]", entry.get("supervisor_tool_rows", {}))
+        body_parts: list[RenderableType] = [rows[cid] for cid in order if cid in rows]
+        entry["expanded"] = Group(*body_parts) if body_parts else Text("| Working...", style="dim")
+        preview_rows: list[RenderableType] = [rows[cid] for cid in order[:5] if cid in rows]
+        entry["preview"] = Group(*preview_rows) if preview_rows else Text("| Working...", style="dim")
 
     def finish_subagent_task(
         self,
@@ -1366,6 +1483,9 @@ class NexusTextualApp(App[None]):
         self._turn_recovery_count = 0
         self._last_tool_failed = False
         self._turn_footer_written = False
+        self._supervisor_entry = None
+        self._supervisor_entries_by_call_id.clear()
+        self._turn_had_tool_calls = False
         self.refresh_footer()
 
     def record_tool_completion(self, result: ToolResult) -> None:
@@ -1538,7 +1658,7 @@ class NexusTextualApp(App[None]):
         content = self._assistant_buffer
         if _should_collapse_text(content):
             self.write_collapsible(
-                Text("< Assistant response", style="assistant.header"),
+                Text("·", style="bold"),
                 Markdown(content),
                 summary=f"{_line_count(content)} lines",
                 initially_expanded=True,
@@ -2011,7 +2131,7 @@ def _assistant_header() -> Text:
     return header
 
 
-def _user_prompt_block(raw_input: str) -> Padding:
+def _user_prompt_block(raw_input: str) -> Table:
     text = Text()
     text.append("You", style="bold green")
     text.append(": ", style="green")
@@ -2020,7 +2140,11 @@ def _user_prompt_block(raw_input: str) -> Padding:
         if index:
             text.append("\n  ", style="dim")
         text.append(line, style="white")
-    return Padding(text, pad=(0, 0), style="on #1d2b3e")
+    grid = Table.grid(expand=True, padding=(1, 1))
+    grid.add_column()
+    grid.add_row(text)
+    grid.style = Style(bgcolor="#1d2b3e")
+    return grid
 
 
 def _input_response_block(prompt: str, raw_input: str) -> Text:
@@ -2039,6 +2163,15 @@ def _is_subagent_tool(tool_name: str) -> bool:
 
 def _is_subagent_actor(actor: str) -> bool:
     return bool(actor) and _is_subagent_tool(actor)
+
+
+def _is_supervisor_group_tool(tool_name: str) -> bool:
+    """Return True for tools that should be grouped in the supervisor collapsible block.
+
+    Bash, file-mutating tools, and sub-agent dispatches are excluded because they
+    need their own rich output or delegation UI.
+    """
+    return not _is_subagent_tool(tool_name) and tool_name != "bash" and tool_name not in _MUTATING_FILE_TOOLS
 
 
 def _subagent_title(args: dict[str, Any]) -> str:
