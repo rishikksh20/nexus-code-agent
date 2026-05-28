@@ -12,7 +12,7 @@ def test_builtin_four_agent_defaults_match_supervisor_first_contract():
     impact_analyzer = definitions["impact_analyzer"]
 
     assert explorer.allowed_tools == ["read_file", "glob", "grep", "list_dir", "lsp"]
-    assert explorer.max_turns == 10
+    assert explorer.max_turns == 20
 
     coding_prompt = coding.goal_prompt.lower()
     assert "implement only the assigned change" in coding_prompt

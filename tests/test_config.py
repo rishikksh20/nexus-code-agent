@@ -72,7 +72,7 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
     assert config.shell_inherit_environment is False
     assert config.parallel_tools is True
     assert config.parallel_tool_window == 4
-    assert config.agent_allowed_tools == []
+    assert config.agent_allowed_tools == ["bash"]
     assert config.agent_allowed_skills == []
     assert config.agent_allowed_mcp_servers == []
     assert not hasattr(config, "agent_attached_tools")

@@ -778,6 +778,9 @@ class TerminalUI:
             result = cast("ToolResult", event.payload)
             if result is None:
                 return
+            if isinstance(result.metadata, dict) and result.metadata.get("tool_unavailable"):
+                self._clear_tool_call_state(result.call_id)
+                return
             preview = self._tool_preview_by_call_id.get(result.call_id, {})
             actor = str(result.metadata.get("actor") or self._tool_actor_by_call_id.get(result.call_id, "")).strip()
             display = self._tool_display_by_call_id.get(result.call_id, {})

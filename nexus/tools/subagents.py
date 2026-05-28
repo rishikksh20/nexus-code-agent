@@ -223,7 +223,7 @@ def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
                 "the instructions ask for one."
             ),
             allowed_tools=["read_file", "glob", "grep", "list_dir", "lsp"],
-            max_turns=10,
+            max_turns=20,
             timeout_seconds=300,
         ),
         SubagentDefinition(

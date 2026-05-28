@@ -211,13 +211,8 @@ class Agent:
                 continue
             if not _tool_available_in_context(record, context):
                 result = _tool_not_available_result(tool_call, self.tool_registry, context)
-                yield AgentEvent.tool_call_start(
-                    tool_call.call_id,
-                    str(tool_call.tool_name),
-                    tool_call.arguments,
-                    actor=_tool_actor(context),
-                    display=_tool_display_metadata(),
-                )
+                # Do not emit TOOL_CALL_START for tools unavailable in this context;
+                # the error result is still fed back to the model without UI noise.
                 yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
                 yield AgentEvent.tool_call_complete(result)
                 yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
@@ -1648,7 +1643,8 @@ class Agent:
         result = prepared.immediate_result
         if result is None:
             return
-        if prepared.emit_start_event:
+        _is_unavailable = isinstance(result.metadata, dict) and result.metadata.get("tool_unavailable")
+        if prepared.emit_start_event and not _is_unavailable:
             yield AgentEvent.tool_call_start(
                 prepared.tool_call.call_id,
                 _tool_name_text(prepared.tool_call.tool_name),

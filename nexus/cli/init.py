@@ -180,7 +180,7 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             '# Set allowed_tools/allowed_skills/allowed_mcp_servers to "all" to inherit',
             '# all normal tools, active skills, or active MCP servers for that scope.',
             '[agents]',
-            'allowed_tools = []',
+            'allowed_tools = ["bash"]',
             'allowed_skills = []',
             'allowed_mcp_servers = []',
             '',

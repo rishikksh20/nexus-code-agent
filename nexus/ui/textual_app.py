@@ -19,6 +19,7 @@ from rich import box
 from rich.console import Console
 from rich.console import Group
 from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.style import Style
@@ -705,6 +706,10 @@ class TextualTerminalUI(TerminalUI):
             self.end_assistant()
             result = cast("ToolResult", event.payload)
             if result is None:
+                return
+            if isinstance(result.metadata, dict) and result.metadata.get("tool_unavailable"):
+                self._clear_tool_call_state(result.call_id)
+                self._tool_started_at.pop(result.call_id, None)
                 return
             preview = self._tool_preview_by_call_id.get(result.call_id, {})
             actor = str(result.metadata.get("actor") or self._tool_actor_by_call_id.get(result.call_id, "")).strip()
@@ -1541,6 +1546,7 @@ class NexusTextualApp(App[None]):
             )
         else:
             self.write(Markdown(content))
+        self.write(Text(""))
         self._assistant_buffer = ""
         self.has_open_assistant_stream = False
 
@@ -1804,7 +1810,9 @@ class NexusTextualApp(App[None]):
         self._busy = True
         user_message_appended = False
         self.set_status("Thinking")
-        self.ui.print(_user_prompt_block(raw_input, alternate=bool(self._prompt_turn_index % 2)))
+        self.ui.print(Text(""))
+        self.ui.print(_user_prompt_block(raw_input))
+        self.ui.print(Text(""))
         self._prompt_turn_index += 1
         try:
             if await self.router.dispatch(self.state, raw_input):
@@ -2003,8 +2011,7 @@ def _assistant_header() -> Text:
     return header
 
 
-def _user_prompt_block(raw_input: str, *, alternate: bool = False) -> Text:
-    prompt_style = "white on #252525" if alternate else "white"
+def _user_prompt_block(raw_input: str) -> Padding:
     text = Text()
     text.append("You", style="bold green")
     text.append(": ", style="green")
@@ -2012,8 +2019,8 @@ def _user_prompt_block(raw_input: str, *, alternate: bool = False) -> Text:
     for index, line in enumerate(lines):
         if index:
             text.append("\n  ", style="dim")
-        text.append(line, style=prompt_style)
-    return text
+        text.append(line, style="white")
+    return Padding(text, pad=(0, 0), style="on #1d2b3e")
 
 
 def _input_response_block(prompt: str, raw_input: str) -> Text:

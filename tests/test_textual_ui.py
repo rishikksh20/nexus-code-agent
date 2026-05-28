@@ -55,7 +55,9 @@ def test_textual_input_strips_leaked_mouse_reports():
 
 
 def test_textual_user_prompt_block_is_inline_label():
-    assert _user_prompt_block("adjust the TUI").plain == "You: adjust the TUI"
+    block = _user_prompt_block("adjust the TUI")
+    # _user_prompt_block now returns a Padding wrapper; unwrap to get the Text
+    assert block.renderable.plain == "You: adjust the TUI"
 
 
 def test_clipboard_commands_use_pbcopy_on_macos(monkeypatch):

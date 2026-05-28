@@ -351,11 +351,14 @@ def _migrated_agent_scope(existing: dict[str, Any], template_agents: Any) -> dic
                 if key in {"allowed_tools", "allowed_skills", "allowed_mcp_servers", "allowed_mcps"}
             }
         )
+    existing_agents = existing.get("agents") if isinstance(existing.get("agents"), dict) else {}
     for old_key, new_key in LEGACY_AGENT_SCOPE_KEYS.items():
         value = existing.get(old_key)
         if old_key not in existing:
             continue
-        if _is_non_empty_scope_value(migrated.get(new_key)):
+        # Only skip if the existing [agents] table explicitly had this key;
+        # template defaults should not block legacy-value migration.
+        if new_key in existing_agents:
             continue
         migrated[new_key] = _normalize_legacy_tool_names(value) if new_key == "allowed_tools" and isinstance(value, list) else value
     return migrated
