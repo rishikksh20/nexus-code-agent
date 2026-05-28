@@ -832,6 +832,66 @@ class PromptInput(Input):
         # inserting a literal tab character into the prompt.
         event.prevent_default()
 
+    def render_line(self, y: int) -> Strip:
+        if y != 0:
+            return Strip.blank(self.size.width, self.rich_style)
+
+        console = self.app.console
+        console_options = self.app.console_options
+        max_content_width = self.scrollable_content_region.width
+        cursor_visible = self._cursor_visible if self.has_focus else True
+
+        if not self.value:
+            placeholder = Text(self.placeholder, justify="left", end="")
+            placeholder.stylize(self.get_component_rich_style("input--placeholder"))
+            if cursor_visible:
+                cursor_style = self.get_component_rich_style("input--cursor")
+                if len(placeholder) == 0:
+                    placeholder = Text(" ", end="")
+                placeholder.stylize(cursor_style, 0, 1)
+
+            strip = Strip(
+                console.render(
+                    placeholder, console_options.update_width(max_content_width + 1)
+                )
+            )
+        else:
+            result = self._value
+            value = self.value
+            value_length = len(value)
+            suggestion = self._suggestion
+            show_suggestion = len(suggestion) > value_length and self.has_focus
+            if show_suggestion:
+                result += Text(
+                    suggestion[value_length:],
+                    self.get_component_rich_style("input--suggestion"),
+                    end="",
+                )
+
+            if self.has_focus and not self.selection.is_empty:
+                start, end = self.selection
+                start, end = sorted((start, end))
+                selection_style = self.get_component_rich_style("input--selection")
+                result.stylize_before(selection_style, start, end)
+
+            if cursor_visible:
+                cursor_style = self.get_component_rich_style("input--cursor")
+                cursor = self.cursor_position
+                if not show_suggestion and self.cursor_at_end:
+                    result.pad_right(1)
+                result.stylize(cursor_style, cursor, cursor + 1)
+
+            segments = list(
+                console.render(result, console_options.update_width(self.content_width))
+            )
+
+            strip = Strip(segments)
+            scroll_x, _ = self.scroll_offset
+            strip = strip.crop(scroll_x, scroll_x + max_content_width + 1)
+            strip = strip.extend_cell_length(max_content_width + 1)
+
+        return strip.apply_style(self.rich_style)
+
 
 class TranscriptLog(RichLog):
     """Focusable transcript view with keyboard scrolling."""
@@ -961,7 +1021,7 @@ class NexusTextualApp(App[None]):
     }
 
     #transcript:focus {
-        border: round $accent;
+        border: round transparent;
     }
 
     #status {
@@ -995,12 +1055,13 @@ class NexusTextualApp(App[None]):
         margin: 0;
         padding: 0 1 0 0;
         border: none;
-        background: #1f1f1f;
+        background: #2e2e2e;
     }
 
     #prompt:focus {
         border: none;
-        background: #242424;
+        background: #2e2e2e;
+        background-tint: transparent;
     }
 
     #footer {
