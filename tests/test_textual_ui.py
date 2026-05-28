@@ -806,6 +806,129 @@ async def test_textual_diff_preview_includes_context_and_line_numbers(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_textual_write_file_new_file_preview_uses_single_added_view(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+    content = "\n".join(
+        [
+            '"""Cosine operation for the calculator."""',
+            "",
+            "import math",
+            "",
+            "",
+            "def cos(value: float) -> float:",
+            "    return math.cos(value)",
+        ]
+    )
+    diff = "\n".join(
+        [
+            "--- /dev/null",
+            "+++ b/calculator/operations/cos.py",
+            "@@ -0,0 +1,7 @@",
+            *[f"+{line}" for line in content.splitlines()],
+        ]
+    )
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow write_file?",
+        reason="write_file creates a file.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-new-file",
+        arguments={"path": "calculator/operations/cos.py", "content": content},
+        preview={
+            "diff": {
+                "path": "calculator/operations/cos.py",
+                "is_new_file": True,
+                "old_content": "",
+                "new_content": content,
+                "unified_diff": diff,
+            }
+        },
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        collapsed = app._transcript_text()
+        assert "New file" in collapsed
+        assert "Before" not in collapsed
+        assert "After" not in collapsed
+        assert '1 | +"""Cosine operation for the calculator."""' in collapsed
+        assert "6 | +def cos(value: float) -> float:" in collapsed
+
+
+@pytest.mark.asyncio
+async def test_textual_bash_approval_uses_command_block_and_structured_details(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="bash",
+        prompt="Allow bash?",
+        reason="Medium-risk bash command requires confirmation.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-bash",
+        arguments={"command": "printf 'hello\\n'", "timeout": 10, "cwd": "calculator"},
+        preview={"command": "printf 'hello\\n'"},
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        collapsed = app._transcript_text()
+        assert "Command" in collapsed
+        assert "printf 'hello\\n'" in collapsed
+        assert "params" in collapsed
+        assert "timeout=10" in collapsed
+        assert "cwd=calculator" in collapsed
+        assert "reason" in collapsed
+        assert "approval" in collapsed
+
+
+@pytest.mark.asyncio
 async def test_textual_diff_preview_stacks_on_narrow_width(tmp_path, monkeypatch):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
@@ -1162,8 +1285,8 @@ async def test_textual_file_change_completion_collapses_side_by_side_diff(tmp_pa
         assert "[+] < Edited calculator.py" in collapsed
         assert "-print('old')" in collapsed
         assert "+print('new')" in collapsed
-        assert "Before" not in collapsed
-        assert "After" not in collapsed
+        assert "Before" in collapsed
+        assert "After" in collapsed
 
         app.toggle_collapsible(app._transcript_entries[-1]["id"])
         expanded = app._transcript_text()

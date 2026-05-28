@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from difflib import unified_diff
+from difflib import SequenceMatcher, unified_diff
 import io
 import json
 import re
@@ -53,7 +53,7 @@ from nexus.runtime.turn_runner import (
     approval_response_from_answer,
 )
 from nexus.security.policy import ApprovalPolicy
-from nexus.ui.terminal import NEXUS_THEME, TerminalUI, _solid_ascii_banner
+from nexus.ui.terminal import NEXUS_THEME, TerminalUI, _MAX_TOOL_PARAM_SUMMARY_CHARS, _solid_ascii_banner
 
 if TYPE_CHECKING:
     from rich.console import RenderableType
@@ -513,22 +513,23 @@ class TextualTerminalUI(TerminalUI):
         args: dict[str, Any],
         preview: dict[str, Any],
     ) -> tuple[RenderableType, RenderableType, str] | None:
-        diff = _diff_from_preview(preview) or _diff_from_arguments(tool_name, args)
+        diff_data = _diff_data_from_preview(preview) or _diff_data_from_arguments(tool_name, args)
+        diff = _diff_text_from_data(diff_data) or _diff_from_arguments(tool_name, args)
         if not diff and tool_name == "apply_patch":
             diff = str(args.get("patch", "") or "")
         if diff:
             target = self._tool_target(tool_name, args)
             return (
-                self._render_diff_editor(diff, path=target),
-                self._render_diff_editor_preview(diff, path=target),
+                self._render_file_diff_preview(tool_name, diff_data, diff, path=target, collapsed=False),
+                self._render_file_diff_preview(tool_name, diff_data, diff, path=target, collapsed=True),
                 _diff_summary(diff),
             )
         if tool_name == "bash":
             command = str(args.get("command", "") or "").strip()
             if command:
                 return (
-                    Syntax(command, "bash", theme="monokai", word_wrap=True),
-                    _preview_text_block(command, style="dim on #1f1f1f"),
+                    _bash_command_block(command),
+                    _bash_command_block(command, collapsed=True),
                     f"{_line_count(command)} line{'s' if _line_count(command) != 1 else ''}",
                 )
         return None
@@ -550,11 +551,7 @@ class TextualTerminalUI(TerminalUI):
             f"{display_name}  #{req.call_id[:8] or 'pending'}",
             style="warning",
         )
-        detail = Group(
-            self._render_tool_argument_summary(req.tool_name, args),
-            Text(req.reason, style="dim"),
-            Text(self._approval_choices(policy), style="dim"),
-        )
+        detail = self._render_approval_detail(req.tool_name, args, req.reason, policy)
         rendered_preview = self._render_confirmation_preview(req.tool_name, args, preview)
         if rendered_preview is None:
             self._write(Group(header, detail))
@@ -599,18 +596,19 @@ class TextualTerminalUI(TerminalUI):
                 self._write(Group(header, body))
             return
 
-        diff = _diff_from_preview(preview)
+        diff_data = _diff_data_from_preview(preview)
+        diff = _diff_text_from_data(diff_data)
         if not diff:
             self._write(header)
             return
 
-        diff_renderable = self._render_diff_editor(diff, path=target)
+        diff_renderable = self._render_file_diff_preview(result.tool_name, diff_data, diff, path=target, collapsed=False)
         self._app.write_collapsible(
             header,
             diff_renderable,
             summary=_diff_summary(diff),
             initially_expanded=False,
-            preview=_diff_preview_block(diff, language=self._guess_language(target)),
+            preview=self._render_file_diff_preview(result.tool_name, diff_data, diff, path=target, collapsed=True),
         )
 
     def _render_diff_editor(self, diff_text: str, *, path: str = "") -> Group | Table:
@@ -621,6 +619,7 @@ class TextualTerminalUI(TerminalUI):
         return self._render_diff_rows(rows, path=path)
 
     def _render_diff_rows(self, rows: list[_DiffRow], *, path: str = "") -> Group | Table:
+        del path
         width = self._app.transcript_width
         if width < _SIDE_BY_SIDE_DIFF_WIDTH:
             return Group(
@@ -638,6 +637,57 @@ class TextualTerminalUI(TerminalUI):
             _diff_side_text(rows, side="after"),
         )
         return table
+
+    def _render_file_diff_preview(
+        self,
+        tool_name: str,
+        diff_data: dict[str, Any],
+        diff_text: str,
+        *,
+        path: str = "",
+        collapsed: bool = False,
+    ) -> Group | Table:
+        old_content = str(diff_data.get("old_content", "") or "")
+        new_content = str(diff_data.get("new_content", "") or "")
+        has_contents = "old_content" in diff_data or "new_content" in diff_data
+        if _should_render_as_new_file(tool_name, diff_data):
+            return _render_new_file_preview(new_content, collapsed=collapsed)
+        if has_contents:
+            rows = _diff_rows_from_contents(old_content, new_content)
+        else:
+            rows = _diff_rows_from_unified_diff(diff_text)
+        if collapsed:
+            rows = _collapsed_diff_rows(rows, limit=_COLLAPSED_PREVIEW_LINES)
+        return self._render_diff_rows(rows, path=path)
+
+    def _render_approval_detail(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        reason: str,
+        policy: str,
+    ) -> Table:
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(style="dim", no_wrap=True, width=9)
+        table.add_column(ratio=1, overflow="fold")
+        visible_args = args
+        if tool_name == "bash":
+            visible_args = {key: value for key, value in args.items() if key != "command"}
+        if visible_args:
+            table.add_row("params", self._approval_params_summary(tool_name, visible_args))
+        table.add_row("reason", Text(reason, style="dim"))
+        table.add_row("approval", Text(self._approval_choices(policy).replace("Approval: ", ""), style="warning"))
+        return table
+
+    def _approval_params_summary(self, tool_name: str, args: dict[str, Any]) -> Text:
+        parts = [
+            f"{key}={self._compact_value(key, value)}"
+            for key, value in self._ordered_args(tool_name, args)
+        ]
+        return Text(
+            self._truncate_preview(", ".join(parts), limit=_MAX_TOOL_PARAM_SUMMARY_CHARS),
+            style="tool.args",
+        )
 
     def _render_generic_complete(self, result: ToolResult, args: dict[str, Any]) -> None:
         elapsed = self._elapsed_label(result.call_id, result)
@@ -2326,8 +2376,37 @@ def _alert_preview(value: str) -> str:
 
 
 def _diff_from_preview(preview: dict[str, Any]) -> str:
+    return _diff_text_from_data(_diff_data_from_preview(preview))
+
+
+def _diff_data_from_preview(preview: dict[str, Any]) -> dict[str, Any]:
     diff = preview.get("diff") if isinstance(preview.get("diff"), dict) else {}
+    return {str(key): value for key, value in diff.items()}
+
+
+def _diff_text_from_data(diff: dict[str, Any]) -> str:
     return str(diff.get("unified_diff", "") or "")
+
+
+def _diff_data_from_arguments(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    if tool_name == "write_file":
+        return {
+            "old_content": "",
+            "new_content": str(args.get("content", "") or ""),
+            "is_new_file": True,
+        }
+    if tool_name == "edit":
+        return {
+            "old_content": str(args.get("old_string", "") or ""),
+            "new_content": str(args.get("new_string", "") or ""),
+        }
+    if tool_name == "insert_edit_into_file":
+        return {
+            "old_content": "",
+            "new_content": str(args.get("code", "") or ""),
+            "is_new_file": True,
+        }
+    return {}
 
 
 def _diff_from_arguments(tool_name: str, args: dict[str, Any]) -> str:
@@ -2407,6 +2486,42 @@ def _diff_preview_block(diff_text: str, *, language: str = "text") -> Text:
     for value, style in preview_lines:
         _append_text_line(text, value, style)
     return text
+
+
+def _diff_rows_from_contents(old_content: str, new_content: str, *, context: int = 3) -> list[_DiffRow]:
+    old_lines = old_content.splitlines()
+    new_lines = new_content.splitlines()
+    matcher = SequenceMatcher(None, old_lines, new_lines)
+    groups = list(matcher.get_grouped_opcodes(context))
+    rows: list[_DiffRow] = []
+    for group_index, group in enumerate(groups):
+        if group_index:
+            rows.append(_DiffRow(None, None, "", "", "ellipsis"))
+        for tag, old_start, old_end, new_start, new_end in group:
+            if tag == "equal":
+                for offset, value in enumerate(old_lines[old_start:old_end]):
+                    line_number = old_start + offset + 1
+                    rows.append(_DiffRow(line_number, new_start + offset + 1, value, value, "context"))
+                continue
+            if tag == "delete":
+                for offset, value in enumerate(old_lines[old_start:old_end]):
+                    rows.append(_DiffRow(old_start + offset + 1, None, value, "", "delete"))
+                continue
+            if tag == "insert":
+                for offset, value in enumerate(new_lines[new_start:new_end]):
+                    rows.append(_DiffRow(None, new_start + offset + 1, "", value, "add"))
+                continue
+            replaced_old = old_lines[old_start:old_end]
+            replaced_new = new_lines[new_start:new_end]
+            max_len = max(len(replaced_old), len(replaced_new))
+            for offset in range(max_len):
+                before = replaced_old[offset] if offset < len(replaced_old) else ""
+                after = replaced_new[offset] if offset < len(replaced_new) else ""
+                before_number = old_start + offset + 1 if offset < len(replaced_old) else None
+                after_number = new_start + offset + 1 if offset < len(replaced_new) else None
+                kind = "change" if before and after else "delete" if before else "add"
+                rows.append(_DiffRow(before_number, after_number, before, after, kind))
+    return rows
 
 
 def _diff_rows_from_unified_diff(diff_text: str) -> list[_DiffRow]:
@@ -2496,6 +2611,44 @@ def _diff_side_text(rows: list[_DiffRow], *, side: str) -> Text:
             continue
         _append_text_line(text, f"{_format_line_number(line_number, width)} | {marker}{value}", style)
     return text
+
+
+def _should_render_as_new_file(tool_name: str, diff_data: dict[str, Any]) -> bool:
+    if tool_name != "write_file":
+        return False
+    if "old_content" not in diff_data and not diff_data.get("is_new_file"):
+        return False
+    old_content = str(diff_data.get("old_content", "") or "")
+    return bool(diff_data.get("is_new_file")) or old_content == ""
+
+
+def _render_new_file_preview(content: str, *, collapsed: bool = False) -> Group:
+    lines = content.splitlines()
+    header = Text("New file", style="dim")
+    if not lines:
+        return Group(header, Text("(empty file)", style="dim"))
+    line_number_width = max(1, len(str(len(lines))))
+    visible_lines = lines
+    truncated = False
+    if collapsed and len(lines) > _COLLAPSED_PREVIEW_LINES:
+        visible_lines = lines[: max(0, _COLLAPSED_PREVIEW_LINES - 1)]
+        truncated = True
+    body = Text()
+    for index, line in enumerate(visible_lines, start=1):
+        _append_text_line(body, f"{index:>{line_number_width}} | +{line}", "green on #162a1a")
+    if truncated:
+        _append_text_line(body, f"{' ' * line_number_width} | ... click [+] to expand", "dim")
+    return Group(header, body)
+
+
+def _bash_command_block(command: str, *, collapsed: bool = False) -> Group:
+    command_text = command.rstrip()
+    if collapsed and _line_count(command_text) > _COLLAPSED_PREVIEW_LINES:
+        command_text = f"{_first_lines(command_text)}\n... click [+] to expand"
+    return Group(
+        Text("Command", style="dim"),
+        Syntax(command_text or "(empty command)", "bash", theme="monokai", word_wrap=True),
+    )
 
 
 def _line_number_width(rows: list[_DiffRow], *, side: str) -> int:
