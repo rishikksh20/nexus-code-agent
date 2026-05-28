@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from difflib import unified_diff
 import io
 import json
@@ -71,9 +72,18 @@ _COLLAPSED_PREVIEW_LINES = 15
 _COLLAPSE_LINE_LIMIT = 18
 _COLLAPSE_CHAR_LIMIT = 2400
 _ALERT_PREVIEW_CHARS = 150
-_SIDE_BY_SIDE_DIFF_WIDTH = 112
+_SIDE_BY_SIDE_DIFF_WIDTH = 104
 _MUTATING_FILE_TOOLS = {"write_file", "edit", "insert_edit_into_file", "apply_patch"}
 _VERIFY_TOOL_NAMES = {"bash", "run_tests", "run_python_check"}
+
+
+@dataclass(frozen=True)
+class _DiffRow:
+    before_number: int | None
+    after_number: int | None
+    before: str
+    after: str
+    kind: str
 
 
 def _strip_mouse_escape_sequences(value: str) -> str:
@@ -604,36 +614,28 @@ class TextualTerminalUI(TerminalUI):
         )
 
     def _render_diff_editor(self, diff_text: str, *, path: str = "") -> Group | Table:
-        before, after = _changed_sides_from_unified_diff(diff_text)
-        return self._render_diff_sides(before, after, path=path)
+        return self._render_diff_rows(_diff_rows_from_unified_diff(diff_text), path=path)
 
     def _render_diff_editor_preview(self, diff_text: str, *, path: str = "") -> Group | Table:
-        before, after = _changed_sides_from_unified_diff(diff_text)
-        truncated = len(before) > _COLLAPSED_PREVIEW_LINES or len(after) > _COLLAPSED_PREVIEW_LINES
-        before = before[:_COLLAPSED_PREVIEW_LINES]
-        after = after[:_COLLAPSED_PREVIEW_LINES]
-        if truncated:
-            before.append("...")
-            after.append("click [+] to expand")
-        return self._render_diff_sides(before, after, path=path)
+        rows = _collapsed_diff_rows(_diff_rows_from_unified_diff(diff_text), limit=_COLLAPSED_PREVIEW_LINES)
+        return self._render_diff_rows(rows, path=path)
 
-    def _render_diff_sides(self, before: list[str], after: list[str], *, path: str = "") -> Group | Table:
+    def _render_diff_rows(self, rows: list[_DiffRow], *, path: str = "") -> Group | Table:
         width = self._app.transcript_width
-        language = self._guess_language(path)
         if width < _SIDE_BY_SIDE_DIFF_WIDTH:
             return Group(
                 Text("Before", style="dim"),
-                Syntax("\n".join(before).rstrip() or "(empty)", language, theme="monokai", word_wrap=True),
+                _diff_side_text(rows, side="before"),
                 Text("After", style="dim"),
-                Syntax("\n".join(after).rstrip() or "(empty)", language, theme="monokai", word_wrap=True),
+                _diff_side_text(rows, side="after"),
             )
-        table = Table.grid(expand=True, padding=(0, 2))
-        table.add_column(ratio=1)
-        table.add_column(ratio=1)
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(ratio=1, min_width=1)
+        table.add_column(ratio=1, min_width=1)
         table.add_row(Text("Before", style="dim"), Text("After", style="dim"))
         table.add_row(
-            Syntax("\n".join(before).rstrip() or "(empty)", language, theme="monokai", word_wrap=True),
-            Syntax("\n".join(after).rstrip() or "(empty)", language, theme="monokai", word_wrap=True),
+            _diff_side_text(rows, side="before"),
+            _diff_side_text(rows, side="after"),
         )
         return table
 
@@ -2376,53 +2378,173 @@ def _diff_summary(diff_text: str) -> str:
     return " ".join(parts) if parts else "diff"
 
 
-def _diff_preview_block(diff_text: str, *, language: str = "text") -> Syntax:
-    lines: list[str] = []
-    for raw_line in diff_text.splitlines():
-        if raw_line.startswith(("+++", "---", "@@")):
-            continue
-        if raw_line.startswith(("+", "-")):
-            lines.append(raw_line)
-        if len(lines) >= _COLLAPSED_PREVIEW_LINES:
+def _diff_preview_block(diff_text: str, *, language: str = "text") -> Text:
+    del language
+    all_rows = _diff_rows_from_unified_diff(diff_text)
+    if not all_rows:
+        return Text("(no changed lines)", style="dim")
+    preview_lines: list[tuple[str, str]] = []
+    truncated = False
+    for row in all_rows:
+        if len(preview_lines) >= _COLLAPSED_PREVIEW_LINES:
+            truncated = True
             break
-    preview = "\n".join(lines) or "(no changed lines)"
-    if _line_count(diff_text) > _COLLAPSED_PREVIEW_LINES:
-        preview = f"{preview}\n... click [+] to expand"
-    return Syntax(preview, language, theme="monokai", word_wrap=True)
+        if row.kind == "context":
+            preview_lines.append((f"  {row.before}", "default"))
+            continue
+        if row.before:
+            preview_lines.append((f"-{row.before}", "red on #2a1717"))
+        if row.after:
+            if len(preview_lines) >= _COLLAPSED_PREVIEW_LINES:
+                truncated = True
+                break
+            preview_lines.append((f"+{row.after}", "green on #162a1a"))
+    if truncated:
+        if len(preview_lines) >= _COLLAPSED_PREVIEW_LINES:
+            preview_lines = preview_lines[: max(0, _COLLAPSED_PREVIEW_LINES - 1)]
+        preview_lines.append(("... click [+] to expand", "dim"))
+    text = Text()
+    for value, style in preview_lines:
+        _append_text_line(text, value, style)
+    return text
 
 
-def _changed_sides_from_unified_diff(diff_text: str) -> tuple[list[str], list[str]]:
-    before: list[str] = []
-    after: list[str] = []
-    pending_removed: list[str] = []
+def _diff_rows_from_unified_diff(diff_text: str) -> list[_DiffRow]:
+    rows: list[_DiffRow] = []
+    pending_removed: list[tuple[int | None, str]] = []
+    before_line: int | None = None
+    after_line: int | None = None
 
     def flush_removed() -> None:
         nonlocal pending_removed
-        if not pending_removed:
-            return
-        before.extend(pending_removed)
-        after.extend([""] * len(pending_removed))
+        for line_number, value in pending_removed:
+            rows.append(_DiffRow(line_number, None, value, "", "delete"))
         pending_removed = []
 
     for raw_line in diff_text.splitlines():
-        if not raw_line or raw_line.startswith(("+++", "---", "@@")):
+        if raw_line.startswith("@@"):
+            flush_removed()
+            before_line, after_line = _parse_unified_hunk_start(raw_line)
+            continue
+        if raw_line.startswith(("+++", "---")) or raw_line.startswith("\\"):
+            continue
+        if raw_line == "":
             continue
         marker = raw_line[0]
         value = raw_line[1:]
         if marker == "-":
-            pending_removed.append(value)
+            pending_removed.append((before_line, value))
+            if before_line is not None:
+                before_line += 1
             continue
         if marker == "+":
             if pending_removed:
-                before.append(pending_removed.pop(0))
-                after.append(value)
+                removed_number, removed_value = pending_removed.pop(0)
+                rows.append(_DiffRow(removed_number, after_line, removed_value, value, "change"))
             else:
-                before.append("")
-                after.append(value)
+                rows.append(_DiffRow(None, after_line, "", value, "add"))
+            if after_line is not None:
+                after_line += 1
             continue
         flush_removed()
+        if marker == " ":
+            rows.append(_DiffRow(before_line, after_line, value, value, "context"))
+            if before_line is not None:
+                before_line += 1
+            if after_line is not None:
+                after_line += 1
+            continue
+        rows.append(_DiffRow(before_line, after_line, raw_line, raw_line, "context"))
+        if before_line is not None:
+            before_line += 1
+        if after_line is not None:
+            after_line += 1
     flush_removed()
-    return before, after
+    return rows
+
+
+def _parse_unified_hunk_start(line: str) -> tuple[int | None, int | None]:
+    match = re.search(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+    if match is None:
+        return None, None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _collapsed_diff_rows(rows: list[_DiffRow], *, limit: int) -> list[_DiffRow]:
+    if len(rows) <= limit:
+        return rows
+    if limit <= 0:
+        return [_DiffRow(None, None, "", "click [+] to expand", "ellipsis")]
+    return [*rows[: max(0, limit - 1)], _DiffRow(None, None, "", "click [+] to expand", "ellipsis")]
+
+
+def _diff_side_text(rows: list[_DiffRow], *, side: str) -> Text:
+    if not rows:
+        return Text("(empty)", style="dim on #1f1f1f")
+    width = _line_number_width(rows, side=side)
+    text = Text()
+    for row in rows:
+        if row.kind == "ellipsis":
+            _append_text_line(text, _diff_ellipsis_line(width), "dim")
+            continue
+        line_number = row.before_number if side == "before" else row.after_number
+        value = row.before if side == "before" else row.after
+        marker = _diff_marker(row, side=side)
+        style = _diff_row_style(row, side=side)
+        if not value and row.kind in {"add", "delete"}:
+            _append_text_line(text, _diff_blank_line(width), "dim")
+            continue
+        _append_text_line(text, f"{_format_line_number(line_number, width)} | {marker}{value}", style)
+    return text
+
+
+def _line_number_width(rows: list[_DiffRow], *, side: str) -> int:
+    numbers = [
+        row.before_number if side == "before" else row.after_number
+        for row in rows
+        if (row.before_number if side == "before" else row.after_number) is not None
+    ]
+    if not numbers:
+        return 1
+    return max(1, len(str(max(numbers))))
+
+
+def _format_line_number(line_number: int | None, width: int) -> str:
+    if line_number is None:
+        return " " * width
+    return f"{line_number:>{width}}"
+
+
+def _diff_marker(row: _DiffRow, *, side: str) -> str:
+    if side == "before" and row.kind in {"change", "delete"}:
+        return "-"
+    if side == "after" and row.kind in {"change", "add"}:
+        return "+"
+    return " "
+
+
+def _diff_row_style(row: _DiffRow, *, side: str) -> str:
+    if row.kind == "change":
+        return "red on #2a1717" if side == "before" else "green on #162a1a"
+    if row.kind == "delete":
+        return "red on #2a1717" if side == "before" else "dim"
+    if row.kind == "add":
+        return "green on #162a1a" if side == "after" else "dim"
+    return "default"
+
+
+def _diff_blank_line(width: int) -> str:
+    return f"{' ' * width} |"
+
+
+def _diff_ellipsis_line(width: int) -> str:
+    return f"{' ' * width} | ... click [+] to expand"
+
+
+def _append_text_line(text: Text, value: str, style: str) -> None:
+    if text.plain:
+        text.append("\n")
+    text.append(value, style=style)
 
 
 def _context_style(percent: float) -> str:

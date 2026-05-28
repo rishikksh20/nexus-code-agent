@@ -745,6 +745,107 @@ async def test_textual_approval_request_shows_collapsible_file_diff_preview(tmp_
 
 
 @pytest.mark.asyncio
+async def test_textual_diff_preview_includes_context_and_line_numbers(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+    diff = "\n".join(
+        [
+            "--- a/app.py",
+            "+++ b/app.py",
+            "@@ -37,7 +37,7 @@",
+            " keep 37",
+            " keep 38",
+            " keep 39",
+            "-old 40",
+            "+new 40",
+            " keep 41",
+            " keep 42",
+            " keep 43",
+        ]
+    )
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="edit",
+        prompt="Allow edit?",
+        reason="edit modifies app.py.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-context",
+        arguments={"path": "app.py", "old_string": "old 40", "new_string": "new 40"},
+        preview={"diff": {"path": "app.py", "unified_diff": diff}},
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        collapsed = app._transcript_text()
+        assert "37 |  keep 37" in collapsed
+        assert "40 | -old 40" in collapsed
+        assert "40 | +new 40" in collapsed
+        assert "43 |  keep 43" in collapsed
+
+
+@pytest.mark.asyncio
+async def test_textual_diff_preview_stacks_on_narrow_width(tmp_path, monkeypatch):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+    monkeypatch.setattr(NexusTextualApp, "transcript_width", property(lambda self: 80))
+    diff = "\n".join(
+        [
+            "--- a/app.py",
+            "+++ b/app.py",
+            "@@ -40,1 +40,1 @@",
+            "-old 40",
+            "+new 40",
+        ]
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.write(app.ui._render_diff_editor_preview(diff, path="app.py"))
+
+        rendered = app._transcript_text()
+        assert rendered.index("After") > rendered.index("40 | -old 40")
+        assert "40 | +new 40" in rendered
+
+
+@pytest.mark.asyncio
 async def test_textual_collapsible_entries_toggle_by_id(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
