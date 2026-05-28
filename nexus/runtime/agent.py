@@ -384,7 +384,11 @@ class Agent:
             raise
         if actor:
             result.metadata = {**result.metadata, "actor": actor}
-        result.metadata = {**result.metadata, "is_mutating": tool.is_mutating}
+        result.metadata = {
+            **result.metadata,
+            "is_mutating": tool.is_mutating,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        }
         if tool.is_mutating:
             _clear_read_result_cache(context)
             result = _with_post_mutation_refresh(
@@ -744,6 +748,7 @@ class Agent:
 
             tool_result_messages: list[Message] = []
             mutating_paths_this_batch: set[str] = set()
+            read_keys_this_batch: dict[str, str] = {}
             for tool_call in tool_calls:
                 if tool_calls_executed >= max_tool_calls_per_turn:
                     pause_message = _tool_call_limit_pause_message(max_tool_calls_per_turn)
@@ -839,6 +844,30 @@ class Agent:
                     continue
 
                 tool = record.tool
+                read_cache_key = _read_result_cache_key(record, tool, tool_call)
+                if read_cache_key is not None:
+                    first_call_id = read_keys_this_batch.get(read_cache_key)
+                    if first_call_id is not None:
+                        duplicate_result = _duplicate_read_result(
+                            tool_call,
+                            tool_name=tool.name,
+                            first_call_id=first_call_id,
+                        )
+                        tool_calls_executed += 1
+                        tool_result_messages.append(_tool_result_message(duplicate_result))
+                        yield AgentEvent.tool_call_start(
+                            tool_call.call_id,
+                            tool.name,
+                            tool_call.arguments,
+                            actor=_tool_actor(context),
+                            display=_tool_display_metadata(is_mutating=False),
+                        )
+                        yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                        yield AgentEvent.tool_call_complete(duplicate_result)
+                        yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=duplicate_result)
+                        loop_detector.record_action("tool_call", tool_name=tool_call.tool_name, result="duplicate_read")
+                        continue
+                    read_keys_this_batch[read_cache_key] = tool_call.call_id
                 missing_fields = _missing_required_fields(tool.input_schema, tool_call.arguments)
                 if missing_fields:
                     if _missing_fields_should_be_repaired_by_model(missing_fields):
@@ -1166,6 +1195,11 @@ class Agent:
         actor = _tool_actor(context)
         if actor:
             result.metadata = {**result.metadata, "actor": actor}
+        result.metadata = {
+            **result.metadata,
+            "is_mutating": tool.is_mutating,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        }
         if tool.is_mutating:
             _clear_read_result_cache(context)
             result = _with_post_mutation_refresh(
@@ -1234,6 +1268,7 @@ class Agent:
         parallel_items: list[_PreparedToolCall] = []
         sequential_items: list[_PreparedToolCall] = []
         mutating_paths_this_batch: set[str] = set()
+        read_keys_this_batch: dict[str, str] = {}
 
         for tool_call in limited_tool_calls:
             prepared = await self._prepare_parallel_first_tool_call(
@@ -1248,6 +1283,19 @@ class Agent:
                 invalid_argument_retries=invalid_argument_retries,
                 mutating_paths_this_batch=mutating_paths_this_batch,
             )
+            duplicate_read_key = _prepared_read_result_cache_key(prepared)
+            if duplicate_read_key is not None:
+                first_call_id = read_keys_this_batch.get(duplicate_read_key)
+                if first_call_id is not None:
+                    prepared.immediate_result = _duplicate_read_result(
+                        prepared.tool_call,
+                        tool_name=str(getattr(prepared.tool, "name", prepared.tool_call.tool_name)),
+                        first_call_id=first_call_id,
+                    )
+                    prepared.emit_start_event = True
+                    prepared.loop_result = "duplicate_read"
+                else:
+                    read_keys_this_batch[duplicate_read_key] = prepared.tool_call.call_id
             target_list = parallel_items if _prepared_tool_prefers_parallel(prepared, context) else sequential_items
             target_list.append(prepared)
             if prepared.tool is not None and prepared.tool.is_mutating:
@@ -1672,6 +1720,17 @@ def _prepared_tool_prefers_parallel(prepared: _PreparedToolCall, context: ToolEx
     return _tool_call_can_run_in_parallel(prepared.record, context)
 
 
+def _prepared_read_result_cache_key(prepared: _PreparedToolCall) -> str | None:
+    if (
+        prepared.record is None
+        or prepared.tool is None
+        or prepared.immediate_result is not None
+        or prepared.confirmation_request is not None
+    ):
+        return None
+    return _read_result_cache_key(prepared.record, prepared.tool, prepared.tool_call)
+
+
 def _tool_call_can_run_in_parallel(record: Any, context: ToolExecutionContext) -> bool:
     if not _parallel_tool_execution_enabled(context):
         return False
@@ -1863,6 +1922,26 @@ def _tool_not_available_result(
             "retry_count": retry_count,
             "retry_limit": retry_limit,
             "available_tools": available_names,
+        },
+    )
+
+
+def _duplicate_read_result(
+    tool_call: ToolCall,
+    *,
+    tool_name: str,
+    first_call_id: str,
+) -> ToolResult:
+    return ToolResult(
+        call_id=tool_call.call_id,
+        tool_name=tool_name,
+        output=(
+            "Duplicate read-only tool call skipped. The same tool with the same arguments "
+            f"already ran earlier in this batch as call_id={first_call_id}; use that prior tool result instead."
+        ),
+        metadata={
+            "duplicate_read_skipped": True,
+            "cached_from_call_id": first_call_id,
         },
     )
 

@@ -135,6 +135,7 @@ def _get_tool_guidelines_section(tool_registry: "ToolRegistry") -> str:
         "",
         "- Prefer read-only inspection before edits or commands that change state.",
         "- For repo review, explanation, or scanning requests, stay read-only unless the user asks for changes.",
+        "- Do not call the same read-only tool with identical arguments more than once in a turn; use the previous tool result already in context.",
         "- Read before editing; prefer focused edits or patches over full rewrites.",
         "- Explain commands that modify filesystem or system state before running them.",
         "- Use task tracking for multi-step work and update progress as steps complete.",

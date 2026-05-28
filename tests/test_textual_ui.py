@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from rich.text import Text
@@ -574,7 +575,7 @@ async def test_textual_transcript_plain_text_handles_theme_styles(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_textual_write_approval_shows_diff_only_in_approval_panel(tmp_path):
+async def test_textual_write_completion_collapses_diff_without_echoing_file_content(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
     state = ReplState(
@@ -621,10 +622,446 @@ async def test_textual_write_approval_shows_diff_only_in_approval_panel(tmp_path
         )
 
         transcript = app._transcript_text()
-        assert "+++ b/calculator/calculator.py" in transcript
+        assert "[+] < Wrote calculator/calculator.py" in transcript
         assert "-OLD" in transcript
         assert "+NEW" in transcript
         assert "NEW FILE CONTENT" not in transcript
+        assert "Before" not in transcript
+        assert "After" not in transcript
+
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        transcript = app._transcript_text()
+        assert "Before" in transcript
+        assert "After" in transcript
+        assert "OLD" in transcript
+        assert "NEW" in transcript
+        assert "NEW FILE CONTENT" not in transcript
+
+
+@pytest.mark.asyncio
+async def test_textual_collapsible_entries_toggle_by_id(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.write_collapsible(Text("< Ran command"), Text("full output"), summary="1 line")
+        collapsed = app._transcript_text()
+        assert "[+] < Ran command" in collapsed
+        assert "full output" not in collapsed
+
+        entry_id = app._transcript_entries[-1]["id"]
+        app.toggle_collapsible(entry_id)
+
+        expanded = app._transcript_text()
+        assert "[-] < Ran command" in expanded
+        assert "full output" in expanded
+
+
+@pytest.mark.asyncio
+async def test_textual_long_assistant_response_is_expanded_by_default(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.text_complete("\n".join(f"assistant line {i}" for i in range(30))),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        transcript_text = app._transcript_text()
+        assert "[-] < Assistant response" in transcript_text
+        assert "assistant line 29" in transcript_text
+        assert app._transcript_entries[-1]["expanded_state"] is True
+
+
+@pytest.mark.asyncio
+async def test_textual_assistant_header_is_green_label_with_colon(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.text_complete("Found the algorithms/ directory."),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        transcript_text = app._transcript_text()
+        assert "Assistant:" in transcript_text
+        assert "Found the algorithms/ directory." in transcript_text
+
+
+@pytest.mark.asyncio
+async def test_textual_bash_output_uses_inline_blocks_and_collapses_long_output(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start("call-1", "bash", {"command": "uv run pytest"}),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(call_id="call-1", tool_name="bash", output="\n".join(f"line {i}" for i in range(30)))
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        transcript_text = app._transcript_text()
+        assert "$ uv run pytest" in transcript_text
+        assert "bash output" not in transcript_text
+        assert "[+] < Ran uv run pytest" in transcript_text
+        assert "line 14" in transcript_text
+        assert "line 16" not in transcript_text
+
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        expanded = app._transcript_text()
+        assert "[-] < Ran uv run pytest" in expanded
+        assert "line 29" in expanded
+
+
+@pytest.mark.asyncio
+async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+    result_payload = {
+        "schema_version": 1,
+        "status": "completed",
+        "agent": "subagent_explorer",
+        "role": "explorer",
+        "task_id": "call-sub",
+        "title": "Summarize the algorithms directory",
+        "summary": "Algorithms contains heap and table examples.",
+        "raw_result": "{\"status\":\"completed\"}",
+        "context": {"tool_call_count": 2},
+        "recommended_next_action": "continue",
+    }
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start(
+                "call-sub",
+                "subagent_explorer",
+                {"title": "Summarize the algorithms directory", "instructions": "Summarize algorithms."},
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_start(
+                "inner-1",
+                "list_dir",
+                {"path": "algorithms"},
+                actor="subagent_explorer",
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(
+                    call_id="inner-1",
+                    tool_name="list_dir",
+                    output="heap.py\nheap_table.py",
+                    metadata={"actor": "subagent_explorer", "duration_ms": 4},
+                )
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_start(
+                "inner-2",
+                "read_file",
+                {"path": "algorithms/README.md"},
+                actor="subagent_explorer",
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(
+                    call_id="inner-2",
+                    tool_name="read_file",
+                    output="# Algorithms",
+                    metadata={"actor": "subagent_explorer", "duration_ms": 8},
+                )
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(
+                    call_id="call-sub",
+                    tool_name="subagent_explorer",
+                    output=json.dumps(result_payload, indent=2),
+                    metadata={"duration_ms": 21000, "title": "Summarize the algorithms directory"},
+                )
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        collapsed = app._transcript_text()
+        assert "[+] | Explore Task - Summarize the algorithms directory" in collapsed
+        assert "completed · 21.0s · 2 tools" in collapsed
+        assert "Algorithms contains heap and table examples." in collapsed
+        assert "> Delegate" not in collapsed
+        assert "< Delegated" not in collapsed
+        assert '"schema_version"' not in collapsed
+        assert "|--> Listed algorithms" not in collapsed
+
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        expanded = app._transcript_text()
+        assert "|--> Listed algorithms" in expanded
+        assert "|--> Read algorithms/README.md" in expanded
+        assert "4ms" in expanded
+        assert "8ms" in expanded
+        assert '"schema_version"' in expanded
+        assert '"summary": "Algorithms contains heap and table examples."' in expanded
+
+
+@pytest.mark.asyncio
+async def test_textual_file_change_completion_collapses_side_by_side_diff(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start("call-1", "edit", {"path": "calculator.py", "old_string": "old", "new_string": "new"}),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui._tool_preview_by_call_id["call-1"] = {
+            "diff": {
+                "unified_diff": "--- a/calculator.py\n+++ b/calculator.py\n@@ -1 +1 @@\n-print('old')\n+print('new')\n"
+            }
+        }
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(ToolResult(call_id="call-1", tool_name="edit", output="Patched 1 region")),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        collapsed = app._transcript_text()
+        assert "[+] < Edited calculator.py" in collapsed
+        assert "-print('old')" in collapsed
+        assert "+print('new')" in collapsed
+        assert "Before" not in collapsed
+        assert "After" not in collapsed
+
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        expanded = app._transcript_text()
+        assert "Before" in expanded
+        assert "After" in expanded
+        assert "print('old')" in expanded
+        assert "print('new')" in expanded
+
+
+@pytest.mark.asyncio
+async def test_textual_turn_footer_summarizes_tools_edits_and_recovery(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(AgentEvent.agent_start("do work"), stream_output=True, show_tool_calls=True)
+        app.record_tool_completion(ToolResult(call_id="a", tool_name="bash", output="failed", is_error=True))
+        app.record_tool_completion(ToolResult(call_id="b", tool_name="edit", output="patched"))
+        app.ui.render_event(AgentEvent.agent_stop("done"), stream_output=True, show_tool_calls=True)
+
+        transcript_text = app._transcript_text()
+        assert "Done" in transcript_text
+        assert "2 tools" in transcript_text
+        assert "1 edit" in transcript_text
+        assert "1 failed" in transcript_text
+        assert "1 recovered" in transcript_text
+
+
+@pytest.mark.asyncio
+async def test_textual_footer_shows_context_and_runtime_metadata(tmp_path):
+    config = load_config(
+        tmp_path,
+        global_root=tmp_path / "global",
+        cli_overrides={"agent_mode": "advanced", "model_name": "mistral-medium-latest"},
+    )
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+        history=[Message(role="user", content="hello nexus")],
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        footer = app.query_one("#footer")
+        footer_text = str(footer.render())
+
+        assert "ctx" in footer_text
+        assert "%" in footer_text
+        assert "mode default" in footer_text
+        assert "agent advanced" in footer_text
+        assert "thinking True" in footer_text
+        assert "budget high" in footer_text
+        assert "model mistral-medium-latest" in footer_text
+        assert "workspace" in footer_text
+
+
+@pytest.mark.asyncio
+async def test_textual_status_uses_braille_thinking_animation(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.set_status("Thinking")
+
+        status = app.query_one("#status")
+        rendered = str(status.render())
+        assert rendered[0] in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        assert "Thinking" in rendered
 
 
 @pytest.mark.asyncio

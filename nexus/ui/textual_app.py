@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
@@ -18,6 +20,8 @@ from rich.console import Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.style import Style
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 from textual import events
@@ -26,6 +30,8 @@ from textual.selection import Selection
 from textual.strip import Strip
 from textual.widgets import Input, RichLog, Static
 
+from nexus.config.model_limits import get_model_context_limit
+from nexus.context import TokenEstimator
 from nexus.hooks import HookEvent
 from nexus.models import (
     AgentEventType,
@@ -33,6 +39,7 @@ from nexus.models import (
     ConfirmationRequest,
     ConfirmationResponse,
     Message,
+    ToolResult,
 )
 from nexus.runtime.orchestration import run_orchestrated_turn
 from nexus.runtime.turn_runner import (
@@ -47,7 +54,7 @@ from nexus.ui.terminal import NEXUS_THEME, TerminalUI, _solid_ascii_banner
 if TYPE_CHECKING:
     from rich.console import RenderableType
 
-    from nexus.models import AgentEvent, ToolResult
+    from nexus.models import AgentEvent
     from nexus.runtime.agent import Agent
     from nexus.runtime.repl_state import ReplState
     from nexus.runtime.slash_commands import SlashCommandRouter
@@ -57,6 +64,12 @@ _MOUSE_ESCAPE_RE = re.compile(
     r"(?:\x1b)?\[(?:<\d{1,4};\d{1,5};\d{1,5}[mM]|M.{3})"
 )
 _RIGHT_MOUSE_BUTTON = 3
+_COLLAPSED_PREVIEW_LINES = 15
+_COLLAPSE_LINE_LIMIT = 18
+_COLLAPSE_CHAR_LIMIT = 2400
+_SIDE_BY_SIDE_DIFF_WIDTH = 112
+_MUTATING_FILE_TOOLS = {"write_file", "edit", "insert_edit_into_file", "apply_patch"}
+_VERIFY_TOOL_NAMES = {"bash", "run_tests", "run_python_check"}
 
 
 def _strip_mouse_escape_sequences(value: str) -> str:
@@ -103,6 +116,7 @@ class TextualTerminalUI(TerminalUI):
     def __init__(self, app: "NexusTextualApp") -> None:
         super().__init__(color=True)
         self._app = app
+        self._tool_started_at: dict[str, float] = {}
 
     def _write(self, renderable: RenderableType) -> None:
         self._app.write(renderable)
@@ -239,7 +253,7 @@ class TextualTerminalUI(TerminalUI):
     def begin_assistant(self) -> None:
         if self._assistant_stream_open:
             return
-        self._write(Rule(Text("Assistant", style="bold white")))
+        self._write(_assistant_header())
         self._assistant_stream_open = True
 
     def end_assistant(self) -> None:
@@ -257,6 +271,248 @@ class TextualTerminalUI(TerminalUI):
     def stop_tool_wait(self) -> None:
         self._app.clear_status()
 
+    def _semantic_tool_label(self, tool_name: str, *, completed: bool = False, failed: bool = False) -> str:
+        if failed:
+            return "Failed"
+        labels = {
+            "bash": "Ran" if completed else "Run",
+            "write_file": "Wrote" if completed else "Write",
+            "edit": "Edited" if completed else "Edit",
+            "insert_edit_into_file": "Edited" if completed else "Edit",
+            "apply_patch": "Patched" if completed else "Patch",
+            "read_file": "Read" if completed else "Read",
+            "list_dir": "Listed" if completed else "List",
+            "grep": "Searched" if completed else "Search",
+            "glob": "Found" if completed else "Find",
+            "run_tests": "Tested" if completed else "Test",
+            "run_python_check": "Checked" if completed else "Check",
+        }
+        if tool_name.startswith("subagent_"):
+            return "Delegated" if completed else "Delegate"
+        return labels.get(tool_name, tool_name)
+
+    def _elapsed_label(self, call_id: str, result: ToolResult | None = None) -> str:
+        duration = None
+        if result is not None:
+            raw_duration = result.metadata.get("duration_ms") if isinstance(result.metadata, dict) else None
+            if isinstance(raw_duration, (int, float)):
+                duration = float(raw_duration) / 1000
+        if duration is None and call_id in self._tool_started_at:
+            duration = max(0.0, time.perf_counter() - self._tool_started_at[call_id])
+        if duration is None:
+            return ""
+        if duration < 1:
+            return f"{duration * 1000:.0f}ms"
+        return f"{duration:.1f}s"
+
+    def _tool_target(self, tool_name: str, args: dict[str, Any], result: ToolResult | None = None) -> str:
+        metadata = result.metadata if result is not None and isinstance(result.metadata, dict) else {}
+        path = metadata.get("path") or args.get("path") or args.get("cwd")
+        if isinstance(path, str) and path.strip():
+            return self._relative_path(path)
+        if tool_name == "bash":
+            command = str(args.get("command", "") or "").strip()
+            return self._truncate_preview(command, limit=100)
+        if tool_name.startswith("subagent_"):
+            return self._compact_tool_detail(tool_name, args)
+        return self._compact_tool_detail(tool_name, args)
+
+    def _block_text(self, *lines: str, style: str = "default") -> Text:
+        text = Text()
+        for index, line in enumerate(lines):
+            if index:
+                text.append("\n")
+            text.append(line, style=style)
+        return text
+
+    def _inline_header(self, prefix: str, title: str, detail: str = "", *, style: str = "tool") -> Text:
+        text = Text(prefix, style="dim")
+        text.append(title, style=style)
+        if detail:
+            text.append(f" {detail}", style="dim")
+        return text
+
+    def _append_elapsed(self, text: Text, elapsed: str) -> None:
+        if not elapsed:
+            return
+        text.append(" · ", style="dim")
+        text.append(elapsed, style="bold bright_cyan")
+
+    def _render_inline_tool_start(
+        self,
+        call_id: str,
+        tool_name: str,
+        actor: str,
+        args: dict[str, Any],
+        display: dict[str, Any],
+    ) -> Text | Group:
+        del actor, display
+        self._tool_started_at[call_id] = time.perf_counter()
+        if _is_subagent_tool(tool_name):
+            return self._render_subagent_header(tool_name, args)
+        label = self._semantic_tool_label(tool_name)
+        if tool_name == "bash":
+            command = str(args.get("command", "") or "").strip()
+            return Group(
+                self._inline_header("> ", f"{label} command", f"#{call_id[:8]}", style="tool.shell"),
+                self._block_text(f"$ {command}", style="dim on #1f1f1f"),
+            )
+        target = self._tool_target(tool_name, args)
+        style = self._tool_border_style(tool_name)
+        return self._inline_header("> ", label, f"{target}  #{call_id[:8]}", style=style)
+
+    def _render_subagent_header(self, tool_name: str, args: dict[str, Any]) -> Text:
+        title = _subagent_title(args)
+        header = Text("| ", style="dim")
+        header.append(_subagent_task_label(tool_name), style="bold magenta")
+        if title:
+            header.append(" - ", style="dim")
+            header.append(title, style="bold white")
+        return header
+
+    def _render_subagent_tool_row(
+        self,
+        call_id: str,
+        tool_name: str,
+        args: dict[str, Any],
+        result: ToolResult | None = None,
+    ) -> Text:
+        label = self._semantic_tool_label(
+            tool_name,
+            completed=result is not None,
+            failed=bool(result.is_error) if result is not None else False,
+        )
+        target = self._tool_target(tool_name, args, result)
+        style = "error" if result is not None and result.is_error else self._tool_border_style(tool_name)
+        row = Text("|--> ", style="dim")
+        row.append(label, style=style)
+        if target:
+            row.append(f" {target}", style="dim")
+        row.append(f"  #{call_id[:8]}", style="dim")
+        if result is None:
+            row.append(" · running", style="dim")
+            return row
+        if result.is_error:
+            row.append(" · failed", style="bold red")
+        else:
+            row.append(" · done", style="dim")
+        self._append_elapsed(row, self._elapsed_label(call_id, result))
+        return row
+
+    def _render_bash_complete(self, result: ToolResult, args: dict[str, Any]) -> None:
+        elapsed = self._elapsed_label(result.call_id, result)
+        status = "failed" if result.is_error else "done"
+        target = self._tool_target(result.tool_name, args, result)
+        header = self._inline_header(
+            "x " if result.is_error else "< ",
+            self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error),
+            " · ".join(part for part in (target, status) if part),
+            style="error" if result.is_error else "tool.shell",
+        )
+        self._append_elapsed(header, elapsed)
+        output = (result.output or "").strip()
+        if not output:
+            self._write(header)
+            return
+        output_style = "red on #1f1f1f" if result.is_error else "dim on #1f1f1f"
+        output_block = self._block_text(output, style=output_style)
+        output_preview = _preview_text_block(output, style=output_style)
+        if _should_collapse_text(output):
+            self._app.write_collapsible(header, output_block, summary=f"{_line_count(output)} lines", preview=output_preview)
+        else:
+            self._write(Group(header, output_block))
+
+    def _render_file_change_complete(
+        self,
+        result: ToolResult,
+        args: dict[str, Any],
+        preview: dict[str, Any],
+    ) -> None:
+        elapsed = self._elapsed_label(result.call_id, result)
+        target = self._tool_target(result.tool_name, args, result)
+        label = self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error)
+        detail = " · ".join(part for part in (target, "failed" if result.is_error else "done") if part)
+        header = self._inline_header(
+            "x " if result.is_error else "< ",
+            label,
+            detail,
+            style="error" if result.is_error else "tool.write",
+        )
+        self._append_elapsed(header, elapsed)
+        if result.is_error:
+            body_text = result.output or "Tool failed."
+            body = self._block_text(body_text, style="red on #1f1f1f")
+            if _should_collapse_text(result.output):
+                self._app.write_collapsible(
+                    header,
+                    body,
+                    summary=f"{_line_count(result.output)} lines",
+                    preview=_preview_text_block(body_text, style="red on #1f1f1f"),
+                )
+            else:
+                self._write(Group(header, body))
+            return
+
+        diff = _diff_from_preview(preview)
+        if not diff:
+            self._write(header)
+            return
+
+        diff_renderable = self._render_diff_editor(diff, path=target)
+        self._app.write_collapsible(
+            header,
+            diff_renderable,
+            summary=_diff_summary(diff),
+            initially_expanded=False,
+            preview=_diff_preview_block(diff, language=self._guess_language(target)),
+        )
+
+    def _render_diff_editor(self, diff_text: str, *, path: str = "") -> Group | Table:
+        before, after = _changed_sides_from_unified_diff(diff_text)
+        width = self._app.transcript_width
+        language = self._guess_language(path)
+        if width < _SIDE_BY_SIDE_DIFF_WIDTH:
+            return Group(
+                Text("Before", style="dim"),
+                Syntax("\n".join(before).rstrip() or "(empty)", language, theme="monokai", word_wrap=True),
+                Text("After", style="dim"),
+                Syntax("\n".join(after).rstrip() or "(empty)", language, theme="monokai", word_wrap=True),
+            )
+        table = Table.grid(expand=True, padding=(0, 2))
+        table.add_column(ratio=1)
+        table.add_column(ratio=1)
+        table.add_row(Text("Before", style="dim"), Text("After", style="dim"))
+        table.add_row(
+            Syntax("\n".join(before).rstrip() or "(empty)", language, theme="monokai", word_wrap=True),
+            Syntax("\n".join(after).rstrip() or "(empty)", language, theme="monokai", word_wrap=True),
+        )
+        return table
+
+    def _render_generic_complete(self, result: ToolResult, args: dict[str, Any]) -> None:
+        elapsed = self._elapsed_label(result.call_id, result)
+        label = self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error)
+        detail = self._tool_target(result.tool_name, args, result)
+        header = self._inline_header(
+            "x " if result.is_error else "< ",
+            label,
+            detail,
+            style="error" if result.is_error else self._tool_border_style(result.tool_name),
+        )
+        self._append_elapsed(header, elapsed)
+        if not result.output or (not result.is_error and result.tool_name in {"read_file", "grep", "glob", "list_dir"}):
+            self._write(header)
+            return
+        body = self._preview_block(result.output, path=str(result.metadata.get("path", "") if isinstance(result.metadata, dict) else ""))
+        if _should_collapse_text(result.output):
+            self._app.write_collapsible(
+                header,
+                body,
+                summary=f"{_line_count(result.output)} lines",
+                preview=_preview_text_block(result.output),
+            )
+        else:
+            self._write(Group(header, body))
+
     def render_event(
         self,
         event: AgentEvent,
@@ -268,6 +524,7 @@ class TextualTerminalUI(TerminalUI):
         del stream_output
 
         if event.kind == AgentEventType.AGENT_START:
+            self._app.begin_turn_transcript()
             return
 
         if event.kind == AgentEventType.THINKING_STARTED and show_thinking_indicator:
@@ -284,7 +541,16 @@ class TextualTerminalUI(TerminalUI):
             content = str(event.payload or "")
             if content and not self._app.has_open_assistant_stream:
                 self.begin_assistant()
-                self._write(Markdown(content))
+                if _should_collapse_text(content):
+                    self._app.write_collapsible(
+                        Text("< Assistant response", style="assistant.header"),
+                        Markdown(content),
+                        summary=f"{_line_count(content)} lines",
+                        initially_expanded=True,
+                        preview=Markdown(_first_lines(content)),
+                    )
+                else:
+                    self._write(Markdown(content))
             self._app.close_assistant_stream()
             self.end_assistant()
             return
@@ -299,9 +565,23 @@ class TextualTerminalUI(TerminalUI):
             preview = payload.get("preview", {}) if isinstance(payload.get("preview", {}), dict) else {}
             display = payload.get("display", {}) if isinstance(payload.get("display", {}), dict) else {}
             self._store_tool_call_state(call_id, arguments, preview, actor, display)
-            self._write(
-                self._render_tool_start_renderable(call_id, tool_name, actor, arguments, preview, display)
-            )
+            if _is_subagent_tool(tool_name):
+                self._tool_started_at[call_id] = time.perf_counter()
+                self._app.begin_subagent_task(
+                    call_id,
+                    tool_name,
+                    arguments,
+                    header=self._render_subagent_header(tool_name, arguments),
+                )
+            elif _is_subagent_actor(actor) and self._app.has_subagent_task(actor):
+                self._tool_started_at[call_id] = time.perf_counter()
+                self._app.record_subagent_tool_row(
+                    actor,
+                    call_id,
+                    self._render_subagent_tool_row(call_id, tool_name, arguments),
+                )
+            else:
+                self._write(self._render_inline_tool_start(call_id, tool_name, actor, arguments, display))
             self.start_tool_wait(f"{self._tool_display_name(tool_name, actor)} running")
             return
 
@@ -313,15 +593,29 @@ class TextualTerminalUI(TerminalUI):
             preview = self._tool_preview_by_call_id.get(result.call_id, {})
             actor = str(result.metadata.get("actor") or self._tool_actor_by_call_id.get(result.call_id, "")).strip()
             display = self._tool_display_by_call_id.get(result.call_id, {})
-            renderable = self._render_tool_completion_renderable(
-                result,
-                preview=preview,
-                actor=actor,
-                display=display,
-            )
-            if renderable is not None:
-                self._write(renderable)
+            del display
+            arguments = self._tool_args_by_call_id.get(result.call_id, {})
+            self._app.record_tool_completion(result)
+            if _is_subagent_tool(result.tool_name):
+                self._app.finish_subagent_task(
+                    result.call_id,
+                    result,
+                    elapsed=self._elapsed_label(result.call_id, result),
+                )
+            elif _is_subagent_actor(actor) and self._app.has_subagent_task(actor):
+                self._app.record_subagent_tool_row(
+                    actor,
+                    result.call_id,
+                    self._render_subagent_tool_row(result.call_id, result.tool_name, arguments, result),
+                )
+            elif result.tool_name == "bash":
+                self._render_bash_complete(result, arguments)
+            elif result.tool_name in _MUTATING_FILE_TOOLS:
+                self._render_file_change_complete(result, arguments, preview)
+            else:
+                self._render_generic_complete(result, arguments)
             self._clear_tool_call_state(result.call_id)
+            self._tool_started_at.pop(result.call_id, None)
             self._app._streaming_tool_outputs.discard(result.call_id)
             self._app._streaming_tool_output_chars.pop(result.call_id, None)
             self._app._streaming_tool_output_capped.discard(result.call_id)
@@ -360,42 +654,22 @@ class TextualTerminalUI(TerminalUI):
                 )
                 display_name = self._tool_display_name(req.tool_name, actor)
                 self._write(
-                    Panel(
-                        self._render_tool_panel_body(
-                            display_name,
-                            req.arguments,
-                            preview=req.preview,
-                            reason=req.reason,
-                            approval_policy=str(req.payload.get("approval_policy", "on-request")),
-                        ),
-                        title=Text(f"{display_name}  #{req.call_id[:8] or 'pending'}", style="bold magenta"),
-                        title_align="left",
-                        subtitle=Text("approval required", style="yellow"),
-                        subtitle_align="right",
-                        border_style=self._tool_border_style(req.tool_name),
-                        box=box.ROUNDED,
-                        padding=(1, 2),
+                    Group(
+                        self._inline_header("? ", "Approval required", f"{display_name}  #{req.call_id[:8] or 'pending'}", style="warning"),
+                        self._render_tool_argument_summary(req.tool_name, req.arguments),
+                        Text(req.reason, style="dim"),
+                        Text(self._approval_choices(str(req.payload.get("approval_policy", "on-request"))), style="dim"),
                     )
                 )
             else:
                 actor = str(req.payload.get("actor", "") or "").strip()
                 display_name = self._tool_display_name(req.tool_name, actor)
                 self._write(
-                    Panel(
-                        self._render_tool_panel_body(
-                            display_name,
-                            req.arguments,
-                            preview=req.preview,
-                            clarification_prompt=req.prompt,
-                            reason=req.reason,
-                        ),
-                        title=Text(f"{display_name}  #{req.call_id[:8] or 'pending'}", style="bold magenta"),
-                        title_align="left",
-                        subtitle=Text("clarification needed", style="cyan"),
-                        subtitle_align="right",
-                        border_style=self._tool_border_style(req.tool_name),
-                        box=box.ROUNDED,
-                        padding=(1, 2),
+                    Group(
+                        self._inline_header("? ", "Clarification needed", f"{display_name}  #{req.call_id[:8] or 'pending'}", style="info"),
+                        self._render_tool_argument_summary(req.tool_name, req.arguments),
+                        Text(req.prompt, style="info"),
+                        Text(req.reason, style="dim"),
                     )
                 )
             return
@@ -418,6 +692,8 @@ class TextualTerminalUI(TerminalUI):
         if event.kind in {AgentEventType.TURN_COMPLETED, AgentEventType.AGENT_STOP}:
             self.stop_thinking()
             self.stop_tool_wait()
+            if event.kind == AgentEventType.AGENT_STOP:
+                self._app.write_turn_footer()
             return
 
     def stream_tool_output(
@@ -469,6 +745,11 @@ class TranscriptLog(RichLog):
 
     def on_click(self, event: events.Click) -> None:
         if event.button == _RIGHT_MOUSE_BUTTON:
+            event.stop()
+            return
+        toggle_id = _toggle_id_from_click(event)
+        if toggle_id:
+            cast("NexusTextualApp", self.app).toggle_collapsible(toggle_id)
             event.stop()
             return
         del event
@@ -588,7 +869,7 @@ class NexusTextualApp(App[None]):
 
     #prompt {
         height: 3;
-        margin: 0 1 1 1;
+        margin: 0 1 0 1;
         padding: 0 1;
         border: solid $primary;
         background: transparent;
@@ -596,6 +877,14 @@ class NexusTextualApp(App[None]):
 
     #prompt:focus {
         border: solid $accent;
+    }
+
+    #footer {
+        height: 1;
+        margin: 0 1 1 1;
+        padding: 0 2;
+        color: $text-muted;
+        background: transparent;
     }
     """
     TITLE = "Nexus"
@@ -638,10 +927,21 @@ class NexusTextualApp(App[None]):
         self._streaming_tool_outputs: set[str] = set()
         self._streaming_tool_output_chars: dict[str, int] = {}
         self._streaming_tool_output_capped: set[str] = set()
+        self._transcript_entries: list[dict[str, Any]] = []
         self._transcript_plain_parts: list[str] = []
+        self._subagent_entries_by_actor: dict[str, dict[str, Any]] = {}
+        self._subagent_entries_by_call_id: dict[str, dict[str, Any]] = {}
         self._transcript: Any = None
         self._status: Any = None
         self._input: Any = None
+        self._footer: Any = None
+        self._turn_started_at = 0.0
+        self._turn_tool_count = 0
+        self._turn_edit_count = 0
+        self._turn_error_count = 0
+        self._turn_recovery_count = 0
+        self._last_tool_failed = False
+        self._turn_footer_written = False
         self._prompt_history = [
             message.content
             for message in state.history
@@ -657,26 +957,291 @@ class NexusTextualApp(App[None]):
         yield TranscriptLog(id="transcript", wrap=True, highlight=False, markup=False, max_lines=max_lines)
         yield Static("", id="status")
         yield PromptInput(placeholder="Message Nexus or type /help", id="prompt")
+        yield Static("", id="footer")
 
     def on_mount(self) -> None:
         self._transcript = self.query_one("#transcript", TranscriptLog)
         self._status = self.query_one("#status", Static)
         self._input = self.query_one("#prompt", Input)
+        self._footer = self.query_one("#footer", Static)
         self.console.push_theme(NEXUS_THEME)
         self.state.console = self.ui
         self._render_startup()
+        self.refresh_footer()
         self._input.focus()
 
     def on_unmount(self) -> None:
         self.state.console = self._original_console
 
     def write(self, renderable: RenderableType) -> None:
+        self._transcript_entries.append({"type": "renderable", "renderable": renderable})
+        self._render_transcript_entry(self._transcript_entries[-1])
+
+    def write_collapsible(
+        self,
+        header: RenderableType,
+        expanded: RenderableType,
+        *,
+        summary: str = "",
+        initially_expanded: bool = False,
+        preview: RenderableType | None = None,
+    ) -> None:
+        entry = {
+            "type": "collapsible",
+            "id": uuid4().hex[:8],
+            "header": header,
+            "expanded": expanded,
+            "preview": preview,
+            "summary": summary,
+            "expanded_state": initially_expanded,
+        }
+        self._transcript_entries.append(entry)
+        self._render_transcript_entry(entry)
+
+    def begin_subagent_task(
+        self,
+        call_id: str,
+        actor: str,
+        args: dict[str, Any],
+        *,
+        header: RenderableType,
+    ) -> None:
+        entry = {
+            "type": "collapsible",
+            "id": uuid4().hex[:8],
+            "header": header,
+            "expanded": Text("| Starting sub-agent...", style="dim"),
+            "preview": Text("| Running...", style="dim"),
+            "summary": "running",
+            "expanded_state": True,
+            "subagent_actor": actor,
+            "subagent_call_id": call_id,
+            "subagent_title": _subagent_title(args),
+            "subagent_tool_order": [],
+            "subagent_tool_rows": {},
+        }
+        self._refresh_subagent_task_entry(entry)
+        self._transcript_entries.append(entry)
+        self._subagent_entries_by_actor[actor] = entry
+        self._subagent_entries_by_call_id[call_id] = entry
+        self._render_transcript_entry(entry)
+
+    def record_subagent_tool_row(
+        self,
+        actor: str,
+        call_id: str,
+        row: RenderableType,
+    ) -> None:
+        entry = self._subagent_entries_by_actor.get(actor)
+        if entry is None:
+            self.write(row)
+            return
+        order = cast("list[str]", entry.setdefault("subagent_tool_order", []))
+        rows = cast("dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {}))
+        if call_id not in rows:
+            order.append(call_id)
+        rows[call_id] = row
+        self._refresh_subagent_task_entry(entry)
+        self._rerender_transcript()
+
+    def has_subagent_task(self, actor: str) -> bool:
+        return actor in self._subagent_entries_by_actor
+
+    def finish_subagent_task(
+        self,
+        call_id: str,
+        result: ToolResult,
+        *,
+        elapsed: str = "",
+    ) -> None:
+        entry = self._subagent_entries_by_call_id.get(call_id) or self._subagent_entries_by_actor.get(result.tool_name)
+        if entry is None:
+            payload = _parse_json_object(result.output)
+            header = _subagent_completion_header(result, payload, elapsed=elapsed)
+            body = _subagent_result_body(result.output, payload)
+            self.write_collapsible(
+                header,
+                body,
+                summary=_subagent_completion_summary(result, payload, elapsed=elapsed, tool_rows=0),
+                preview=_subagent_result_preview(result, payload),
+            )
+            return
+
+        payload = _parse_json_object(result.output)
+        tool_rows = len(cast("list[str]", entry.get("subagent_tool_order", [])))
+        entry["header"] = _subagent_completion_header(result, payload, elapsed=elapsed)
+        entry["summary"] = _subagent_completion_summary(result, payload, elapsed=elapsed, tool_rows=tool_rows)
+        entry["subagent_result_output"] = result.output
+        entry["subagent_result_payload"] = payload
+        entry["subagent_result_status"] = str(payload.get("status") or result.metadata.get("status") or ("failed" if result.is_error else "completed"))
+        entry["subagent_result_is_error"] = result.is_error
+        entry["expanded_state"] = False
+        self._refresh_subagent_task_entry(entry)
+        self._subagent_entries_by_actor.pop(str(entry.get("subagent_actor", "")), None)
+        self._rerender_transcript()
+
+    def _refresh_subagent_task_entry(self, entry: dict[str, Any]) -> None:
+        order = cast("list[str]", entry.get("subagent_tool_order", []))
+        rows = cast("dict[str, RenderableType]", entry.get("subagent_tool_rows", {}))
+        body_parts: list[RenderableType] = []
+        payload = entry.get("subagent_result_payload")
+        if isinstance(payload, dict):
+            body_parts.append(_subagent_result_summary_block(payload, str(entry.get("subagent_result_status", ""))))
+        if order:
+            body_parts.append(Text("| Tool calls", style="dim"))
+            body_parts.extend(rows[call_id] for call_id in order if call_id in rows)
+        if isinstance(entry.get("subagent_result_output"), str):
+            body_parts.append(Text("| Result JSON", style="dim"))
+            body_parts.append(_subagent_result_body(str(entry.get("subagent_result_output") or ""), payload if isinstance(payload, dict) else {}))
+            entry["preview"] = _subagent_result_preview(
+                ToolResult(
+                    call_id=str(entry.get("subagent_call_id", "")),
+                    tool_name=str(entry.get("subagent_actor", "subagent")),
+                    output=str(entry.get("subagent_result_output") or ""),
+                    is_error=bool(entry.get("subagent_result_is_error")),
+                ),
+                payload if isinstance(payload, dict) else {},
+            )
+        elif order:
+            entry["preview"] = Group(Text("| Running tool calls", style="dim"), *[rows[call_id] for call_id in order[:3] if call_id in rows])
+        else:
+            entry["preview"] = Text("| Running...", style="dim")
+        entry["expanded"] = Group(*body_parts) if body_parts else Text("| Starting sub-agent...", style="dim")
+
+    def toggle_collapsible(self, toggle_id: str) -> None:
+        for entry in self._transcript_entries:
+            if entry.get("type") == "collapsible" and entry.get("id") == toggle_id:
+                entry["expanded_state"] = not bool(entry.get("expanded_state"))
+                self._rerender_transcript()
+                return
+
+    @property
+    def transcript_width(self) -> int:
+        if self._transcript is None:
+            return 100
+        try:
+            return max(1, int(self._transcript.scrollable_content_region.width or 0))
+        except Exception:  # noqa: BLE001
+            return 100
+
+    def _render_transcript_entry(self, entry: dict[str, Any]) -> None:
         if self._transcript is None:
             return
+        renderable = self._entry_renderable(entry)
         self._transcript.write(renderable)
         plain_text = self._render_transcript_plain_text(renderable)
         if plain_text:
             self._transcript_plain_parts.append(plain_text)
+
+    def _entry_renderable(self, entry: dict[str, Any]) -> RenderableType:
+        if entry.get("type") != "collapsible":
+            return cast("RenderableType", entry.get("renderable", Text("")))
+        toggle_id = str(entry.get("id", ""))
+        expanded = bool(entry.get("expanded_state"))
+        marker = "[-]" if expanded else "[+]"
+        header_text = _renderable_plain_text(cast("RenderableType", entry.get("header", ""))).strip()
+        summary = str(entry.get("summary", "") or "").strip()
+        line = Text(f"{marker} {header_text}", style="default")
+        if summary:
+            line.append(f" ({summary})", style="dim")
+        line.stylize(Style(color="cyan", meta={"nexus_toggle": toggle_id}), 0, min(3, len(line.plain)))
+        if not expanded:
+            preview = entry.get("preview")
+            if preview is not None:
+                return Group(line, cast("RenderableType", preview))
+            return line
+        return Group(line, cast("RenderableType", entry.get("expanded", Text(""))))
+
+    def _rerender_transcript(self) -> None:
+        if self._transcript is None:
+            return
+        self._transcript.clear()
+        self._transcript_plain_parts.clear()
+        for entry in self._transcript_entries:
+            self._render_transcript_entry(entry)
+
+    def begin_turn_transcript(self) -> None:
+        self._turn_started_at = time.perf_counter()
+        self._turn_tool_count = 0
+        self._turn_edit_count = 0
+        self._turn_error_count = 0
+        self._turn_recovery_count = 0
+        self._last_tool_failed = False
+        self._turn_footer_written = False
+        self.refresh_footer()
+
+    def record_tool_completion(self, result: ToolResult) -> None:
+        self._turn_tool_count += 1
+        if result.tool_name in _MUTATING_FILE_TOOLS:
+            self._turn_edit_count += 1
+        if result.is_error:
+            self._turn_error_count += 1
+            self._last_tool_failed = True
+            return
+        if self._last_tool_failed and (result.tool_name in _MUTATING_FILE_TOOLS or result.tool_name in _VERIFY_TOOL_NAMES):
+            self._turn_recovery_count += 1
+        self._last_tool_failed = False
+
+    def write_turn_footer(self) -> None:
+        if self._turn_footer_written or self._turn_started_at <= 0:
+            return
+        self._turn_footer_written = True
+        elapsed = max(0.0, time.perf_counter() - self._turn_started_at)
+        parts = [
+            "Done",
+            f"{self._turn_tool_count} tool{'s' if self._turn_tool_count != 1 else ''}",
+            f"{self._turn_edit_count} edit{'s' if self._turn_edit_count != 1 else ''}",
+        ]
+        if self._turn_error_count:
+            parts.append(f"{self._turn_error_count} failed")
+        if self._turn_recovery_count:
+            parts.append(f"{self._turn_recovery_count} recovered")
+        footer = Text(" · ".join(parts), style="dim")
+        footer.append(" · ", style="dim")
+        footer.append(f"{elapsed:.1f}s", style="bold bright_cyan")
+        self.write(footer)
+        self.refresh_footer()
+
+    def refresh_footer(self) -> None:
+        if self._footer is None:
+            return
+        estimator = TokenEstimator()
+        history_tokens = sum(estimator.estimate(message.content) for message in self.state.history)
+        system_tokens = estimator.estimate(self.state.current_system_prompt or "")
+        total_tokens = history_tokens + system_tokens
+        context_limit = get_model_context_limit(self.state.config.model_name)
+        pct = min(100.0, round((total_tokens / context_limit * 100), 1)) if context_limit else 0.0
+        thinking_enabled = self.state.config.llm_thinking_mode != "disabled"
+        workspace = _compact_workspace_label(self.state.config.workspace_root)
+
+        text = Text()
+        pie_style = _context_style(pct)
+        text.append(_context_pie_icon(pct), style=f"bold {pie_style}")
+        text.append(" ctx ", style="dim")
+        text.append(f"{pct:.1f}%", style=f"bold {pie_style}")
+        text.append("  ")
+        text.append("mode ", style="dim")
+        text.append(self.state.mode.value, style="bold cyan")
+        text.append("  ")
+        text.append("agent ", style="dim")
+        text.append(str(getattr(self.state.config, "agent_mode", "basic")), style="bold magenta")
+        text.append("  ")
+        text.append("thinking ", style="dim")
+        text.append("True" if thinking_enabled else "False", style="bold green" if thinking_enabled else "bold red")
+        text.append("  ")
+        text.append("budget ", style="dim")
+        text.append(str(self.state.config.llm_reasoning_effort or "none"), style="bold yellow")
+        text.append("  ")
+        text.append("model ", style="dim")
+        text.append(self.state.config.model_name, style="bold white")
+        text.append("  ")
+        text.append("workspace ", style="dim")
+        text.append(workspace, style="white")
+        if self._status_text:
+            text.append("  ")
+            text.append("status ", style="dim")
+            text.append(self._status_text, style="bold bright_cyan")
+        self._footer.update(text)
 
     def _render_transcript_plain_text(self, renderable: RenderableType) -> str:
         width = 100
@@ -723,10 +1288,16 @@ class NexusTextualApp(App[None]):
             if not self._status_text:
                 self._status.update("")
                 return
-            frames = "|/-\\"
+            frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
             frame = frames[self._spinner_frame % len(frames)]
             self._spinner_frame += 1
-            self._status.update(f"{frame} {self._status_text}...")
+            status = Text()
+            status.append(frame, style="bold bright_cyan")
+            status.append(" ")
+            status.append(self._status_text, style="bold")
+            status.append(" ...", style="dim")
+            self._status.update(status)
+        self.refresh_footer()
 
     def clear_status(self, expected: str | None = None) -> None:
         if expected is not None and self._status_text != expected:
@@ -737,6 +1308,7 @@ class NexusTextualApp(App[None]):
         if self._spinner_timer is not None:
             self._spinner_timer.stop()
             self._spinner_timer = None
+        self.refresh_footer()
 
     def _flash_status(self, message: str, *, seconds: float = 1.5) -> None:
         self._status_text = ""
@@ -746,6 +1318,7 @@ class NexusTextualApp(App[None]):
         if self._status is not None:
             self._status.update(message)
         self.set_timer(seconds, lambda: self.clear_status(expected=""))
+        self.refresh_footer()
 
     def _echo_input_prompt(self, prompt: str) -> None:
         label = prompt.strip()
@@ -763,7 +1336,17 @@ class NexusTextualApp(App[None]):
     def close_assistant_stream(self) -> None:
         if not self.has_open_assistant_stream:
             return
-        self.write(Markdown(self._assistant_buffer))
+        content = self._assistant_buffer
+        if _should_collapse_text(content):
+            self.write_collapsible(
+                Text("< Assistant response", style="assistant.header"),
+                Markdown(content),
+                summary=f"{_line_count(content)} lines",
+                initially_expanded=True,
+                preview=Markdown(_first_lines(content)),
+            )
+        else:
+            self.write(Markdown(content))
         self._assistant_buffer = ""
         self.has_open_assistant_stream = False
 
@@ -783,19 +1366,10 @@ class NexusTextualApp(App[None]):
         self._streaming_tool_output_chars[call_id] = current_chars + len(chunk)
         if call_id not in self._streaming_tool_outputs:
             self._streaming_tool_outputs.add(call_id)
-            self.write(
-                Panel(
-                    Text("Live bash output", style="dim"),
-                    title=Text(f"bash output  #{call_id[:8]}", style="bold magenta"),
-                    title_align="left",
-                    border_style="magenta",
-                    box=box.ROUNDED,
-                    padding=(0, 2),
-                )
-            )
+            self.write(Text(f"> bash live output  #{call_id[:8]}", style="dim"))
         style = "red" if stream_name == "stderr" else "default"
         prefix = "[stderr] " if stream_name == "stderr" else ""
-        self.write(Text(prefix + chunk.rstrip("\n"), style=style))
+        self.write(Text(prefix + chunk.rstrip("\n"), style=f"{style} on #1f1f1f"))
         if capped_now and call_id not in self._streaming_tool_output_capped:
             self._streaming_tool_output_capped.add(call_id)
             self.write(Text(f"[live output capped at {max_chars} chars]", style="dim"))
@@ -1088,6 +1662,7 @@ class NexusTextualApp(App[None]):
             self.state.apply_events(events)
             self.state.current_turn_id = ""
             self.state.current_trace_id = ""
+            self.refresh_footer()
         finally:
             self._busy = False
             self.clear_status()
@@ -1196,6 +1771,282 @@ def _clipboard_commands() -> list[list[str]]:
     if shutil.which("xsel"):
         commands.append(["xsel", "--clipboard", "--input"])
     return commands
+
+
+def _toggle_id_from_click(event: events.Click) -> str:
+    style = getattr(event, "style", None)
+    meta = getattr(style, "meta", None)
+    if not isinstance(meta, dict):
+        return ""
+    return str(meta.get("nexus_toggle") or "")
+
+
+def _renderable_plain_text(renderable: RenderableType, *, width: int = 120) -> str:
+    buffer = io.StringIO()
+    console = Console(
+        file=buffer,
+        theme=NEXUS_THEME,
+        no_color=True,
+        force_terminal=False,
+        highlight=False,
+        width=width,
+    )
+    console.print(renderable)
+    return buffer.getvalue()
+
+
+def _assistant_header() -> Text:
+    header = Text()
+    header.append("Assistant", style="bold green")
+    header.append(":", style="green")
+    return header
+
+
+def _is_subagent_tool(tool_name: str) -> bool:
+    return tool_name == "delegate_task" or tool_name.startswith("subagent_")
+
+
+def _is_subagent_actor(actor: str) -> bool:
+    return bool(actor) and _is_subagent_tool(actor)
+
+
+def _subagent_title(args: dict[str, Any]) -> str:
+    title = str(args.get("title") or args.get("task") or args.get("instructions") or "").strip()
+    return _single_line(title, limit=120)
+
+
+def _subagent_task_label(tool_name: str) -> str:
+    role = tool_name
+    if role.startswith("subagent_"):
+        role = role[len("subagent_") :]
+    elif role == "delegate_task":
+        role = "delegate"
+    labels = {
+        "explorer": "Explore Task",
+        "explore": "Explore Task",
+        "planning_analysis": "Planning Task",
+        "execution": "Execution Task",
+        "coding": "Coding Task",
+        "code_reviewer": "Review Task",
+        "review": "Review Task",
+        "impact_analyzer": "Impact Task",
+        "verification": "Verification Task",
+        "delegate": "Sub-agent Task",
+    }
+    if role in labels:
+        return labels[role]
+    pretty = role.replace("_", " ").replace("-", " ").strip().title()
+    return f"{pretty} Task" if pretty else "Sub-agent Task"
+
+
+def _parse_json_object(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _subagent_completion_header(result: ToolResult, payload: dict[str, Any], *, elapsed: str = "") -> Text:
+    del elapsed
+    title = _single_line(str(payload.get("title") or result.metadata.get("title") or result.tool_name), limit=120)
+    header = Text("| ", style="dim")
+    header.append(_subagent_task_label(result.tool_name), style="bold magenta")
+    if title:
+        header.append(" - ", style="dim")
+        header.append(title, style="bold white")
+    return header
+
+
+def _subagent_completion_summary(
+    result: ToolResult,
+    payload: dict[str, Any],
+    *,
+    elapsed: str = "",
+    tool_rows: int = 0,
+) -> str:
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    count = context.get("tool_call_count") if isinstance(context, dict) else None
+    if not isinstance(count, int):
+        count = tool_rows
+    status = str(payload.get("status") or result.metadata.get("status") or ("failed" if result.is_error else "completed"))
+    parts = [status]
+    if elapsed:
+        parts.append(elapsed)
+    parts.append(f"{count} tool{'s' if count != 1 else ''}")
+    return " · ".join(parts)
+
+
+def _subagent_result_preview(result: ToolResult, payload: dict[str, Any]) -> Text:
+    status = str(payload.get("status") or result.metadata.get("status") or ("failed" if result.is_error else "completed"))
+    summary = _single_line(str(payload.get("summary") or payload.get("raw_result") or result.output or ""), limit=160)
+    text = Text("| Status ", style="dim")
+    text.append(status, style=_subagent_status_style(status, is_error=result.is_error))
+    if summary:
+        text.append("\n| Summary - ", style="dim")
+        text.append(summary, style="white")
+    text.append("\n| Expand to view sub-agent tool calls and JSON.", style="dim")
+    return text
+
+
+def _subagent_result_summary_block(payload: dict[str, Any], status: str) -> Text:
+    summary = _single_line(str(payload.get("summary") or payload.get("raw_result") or ""), limit=180)
+    text = Text("| Status ", style="dim")
+    rendered_status = status or str(payload.get("status") or "completed")
+    text.append(rendered_status, style=_subagent_status_style(rendered_status))
+    if summary:
+        text.append("\n| Summary - ", style="dim")
+        text.append(summary, style="white")
+    next_action = _single_line(str(payload.get("recommended_next_action") or ""), limit=100)
+    if next_action:
+        text.append("\n| Next - ", style="dim")
+        text.append(next_action, style="white")
+    return text
+
+
+def _subagent_result_body(output: str, payload: dict[str, Any]) -> RenderableType:
+    if payload:
+        return Syntax(output, "json", theme="monokai", word_wrap=True)
+    return _preview_text_block(output)
+
+
+def _subagent_status_style(status: str, *, is_error: bool = False) -> str:
+    normalized = status.strip().lower()
+    if is_error or normalized in {"failed", "needs_approval", "needs_clarification", "blocked", "failed_verification"}:
+        return "bold red"
+    if normalized in {"issues_found"}:
+        return "bold yellow"
+    return "bold green"
+
+
+def _single_line(value: str, *, limit: int) -> str:
+    compact = " ".join(str(value or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _first_lines(value: str, *, limit: int = _COLLAPSED_PREVIEW_LINES) -> str:
+    lines = str(value or "").splitlines()
+    return "\n".join(lines[:limit])
+
+
+def _preview_text_block(value: str, *, style: str = "dim on #1f1f1f") -> Text:
+    preview = _first_lines(value)
+    if _line_count(value) > _COLLAPSED_PREVIEW_LINES:
+        preview = f"{preview}\n... click [+] to expand"
+    return Text(preview, style=style)
+
+
+def _line_count(value: str) -> int:
+    return len(str(value or "").splitlines()) or 1
+
+
+def _should_collapse_text(value: str) -> bool:
+    text = str(value or "")
+    return len(text) > _COLLAPSE_CHAR_LIMIT or _line_count(text) > _COLLAPSE_LINE_LIMIT
+
+
+def _diff_from_preview(preview: dict[str, Any]) -> str:
+    diff = preview.get("diff") if isinstance(preview.get("diff"), dict) else {}
+    return str(diff.get("unified_diff", "") or "")
+
+
+def _diff_summary(diff_text: str) -> str:
+    added = 0
+    removed = 0
+    for line in diff_text.splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+    parts = []
+    if removed:
+        parts.append(f"-{removed}")
+    if added:
+        parts.append(f"+{added}")
+    return " ".join(parts) if parts else "diff"
+
+
+def _diff_preview_block(diff_text: str, *, language: str = "text") -> Syntax:
+    lines: list[str] = []
+    for raw_line in diff_text.splitlines():
+        if raw_line.startswith(("+++", "---", "@@")):
+            continue
+        if raw_line.startswith(("+", "-")):
+            lines.append(raw_line)
+        if len(lines) >= _COLLAPSED_PREVIEW_LINES:
+            break
+    preview = "\n".join(lines) or "(no changed lines)"
+    if _line_count(diff_text) > _COLLAPSED_PREVIEW_LINES:
+        preview = f"{preview}\n... click [+] to expand"
+    return Syntax(preview, language, theme="monokai", word_wrap=True)
+
+
+def _changed_sides_from_unified_diff(diff_text: str) -> tuple[list[str], list[str]]:
+    before: list[str] = []
+    after: list[str] = []
+    pending_removed: list[str] = []
+
+    def flush_removed() -> None:
+        nonlocal pending_removed
+        if not pending_removed:
+            return
+        before.extend(pending_removed)
+        after.extend([""] * len(pending_removed))
+        pending_removed = []
+
+    for raw_line in diff_text.splitlines():
+        if not raw_line or raw_line.startswith(("+++", "---", "@@")):
+            continue
+        marker = raw_line[0]
+        value = raw_line[1:]
+        if marker == "-":
+            pending_removed.append(value)
+            continue
+        if marker == "+":
+            if pending_removed:
+                before.append(pending_removed.pop(0))
+                after.append(value)
+            else:
+                before.append("")
+                after.append(value)
+            continue
+        flush_removed()
+    flush_removed()
+    return before, after
+
+
+def _context_style(percent: float) -> str:
+    if percent >= 85:
+        return "red"
+    if percent >= 65:
+        return "yellow"
+    return "green"
+
+
+def _context_pie_icon(percent: float) -> str:
+    if percent <= 0:
+        return "○"
+    if percent < 25:
+        return "◔"
+    if percent < 50:
+        return "◑"
+    if percent < 75:
+        return "◕"
+    return "●"
+
+
+def _compact_workspace_label(path: Path) -> str:
+    try:
+        resolved = path.resolve()
+    except Exception:  # noqa: BLE001
+        resolved = path
+    name = resolved.name or str(resolved)
+    parent = resolved.parent.name
+    return f"{parent}/{name}" if parent else name
 
 
 def _thinking_label(event: Any) -> str:

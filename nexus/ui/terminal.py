@@ -423,8 +423,9 @@ class TerminalUI:
             diff_path = diff.get("path")
             if isinstance(diff_path, str) and not affected_paths:
                 table.add_row("target", self._relative_path(diff_path))
-            blocks.append(Text("diff", style="muted"))
-            blocks.append(self._render_diff_block(str(diff.get("unified_diff", "") or self._compact_diff_preview(preview))))
+            compact_diff = self._compact_diff_preview(preview)
+            if compact_diff:
+                table.add_row("change", compact_diff)
         if tool_name == "apply_patch" and diff is None:
             patch_text = str(args.get("patch", "") or "").strip()
             if patch_text:
