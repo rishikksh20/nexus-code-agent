@@ -596,6 +596,37 @@ def test_config_rejects_invalid_provider(tmp_path):
         raise AssertionError("Expected ConfigError for invalid provider")
 
 
+def test_config_accepts_llm_thinking_controls(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text(
+        'llm_thinking_mode = "enabled"\nllm_reasoning_effort = "max"\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.llm_thinking_mode == "enabled"
+    assert config.llm_reasoning_effort == "max"
+
+
+def test_config_rejects_invalid_llm_thinking_mode(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    (workspace / ".nexus" / "config.toml").write_text('llm_thinking_mode = "maybe"\n', encoding="utf-8")
+
+    try:
+        load_config(workspace, global_root=global_root)
+    except ConfigError as exc:
+        assert "Invalid llm_thinking_mode" in str(exc)
+    else:
+        raise AssertionError("Expected ConfigError for invalid llm_thinking_mode")
+
+
 def test_config_requires_api_base_url_for_live_compatible_provider(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

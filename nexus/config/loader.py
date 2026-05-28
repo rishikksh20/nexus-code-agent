@@ -447,6 +447,8 @@ def _parse_scalar(raw_value: str, template: Any) -> Any:
 def _validate_config_values(values: dict[str, Any]) -> None:
     valid_modes = {"plan", "default", "auto"}
     valid_agent_modes = {"basic", "advanced"}
+    valid_llm_thinking_modes = {"auto", "enabled", "disabled"}
+    valid_llm_reasoning_efforts = {"", "low", "medium", "high", "xhigh", "max"}
     valid_log_formats = {"text", "json"}
     valid_providers = {"anthropic", "cohere", "fake", "gemini", "mistral", "openai", "openai-compatible", "ollama"}
     valid_approval_policies = {
@@ -467,6 +469,22 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         raise ConfigError(
             f"Invalid default_mode '{default_mode}'. Expected one of: {', '.join(sorted(valid_modes))}."
         )
+
+    llm_thinking_mode = str(values.get("llm_thinking_mode", "auto")).strip().lower()
+    if llm_thinking_mode not in valid_llm_thinking_modes:
+        raise ConfigError(
+            "Invalid llm_thinking_mode "
+            f"'{values.get('llm_thinking_mode')}'. Expected one of: {', '.join(sorted(valid_llm_thinking_modes))}."
+        )
+    values["llm_thinking_mode"] = llm_thinking_mode
+
+    llm_reasoning_effort = str(values.get("llm_reasoning_effort", "high")).strip().lower()
+    if llm_reasoning_effort not in valid_llm_reasoning_efforts:
+        raise ConfigError(
+            "Invalid llm_reasoning_effort "
+            f"'{values.get('llm_reasoning_effort')}'. Expected one of: {', '.join(sorted(valid_llm_reasoning_efforts))}."
+        )
+    values["llm_reasoning_effort"] = llm_reasoning_effort
 
     agent_mode = values["agent_mode"]
     if agent_mode not in valid_agent_modes:

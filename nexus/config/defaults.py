@@ -14,6 +14,8 @@ class AgentConfig:
     api_key: str = ""       # Set via API_KEY in .env or api_key in config.toml
     max_output_tokens: int = 4096
     temperature: float = 0.0
+    llm_thinking_mode: str = "auto"
+    llm_reasoning_effort: str = "high"
     compaction_soft_limit: int = 10_000
     compaction_hard_limit: int = 14_000
     compaction_keep_recent: int = 12

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import io
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -20,6 +22,8 @@ from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
+from textual.selection import Selection
+from textual.strip import Strip
 from textual.widgets import Input, RichLog, Static
 
 from nexus.hooks import HookEvent
@@ -52,6 +56,7 @@ if TYPE_CHECKING:
 _MOUSE_ESCAPE_RE = re.compile(
     r"(?:\x1b)?\[(?:<\d{1,4};\d{1,5};\d{1,5}[mM]|M.{3})"
 )
+_RIGHT_MOUSE_BUTTON = 3
 
 
 def _strip_mouse_escape_sequences(value: str) -> str:
@@ -451,7 +456,9 @@ class TranscriptLog(RichLog):
     """Focusable transcript view with keyboard scrolling."""
 
     can_focus = True
+    ALLOW_SELECT = True
     BINDINGS = [
+        ("ctrl+a", "select_all", "Select transcript"),
         ("up", "scroll_line_up", "Scroll up"),
         ("down", "scroll_line_down", "Scroll down"),
         ("pageup", "scroll_page_up", "Scroll page up"),
@@ -461,8 +468,19 @@ class TranscriptLog(RichLog):
     ]
 
     def on_click(self, event: events.Click) -> None:
+        if event.button == _RIGHT_MOUSE_BUTTON:
+            event.stop()
+            return
         del event
         self.focus()
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        if event.button != _RIGHT_MOUSE_BUTTON:
+            return
+        event.stop()
+        event.prevent_default()
+        self.focus()
+        cast("NexusTextualApp", self.app).copy_selection_or_transcript()
 
     def action_scroll_line_up(self) -> None:
         self.scroll_up(animate=False)
@@ -482,8 +500,65 @@ class TranscriptLog(RichLog):
     def action_scroll_end_key(self) -> None:
         self.scroll_end(animate=False)
 
+    def action_select_all(self) -> None:
+        self.text_select_all()
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        text = "\n".join(line.text.rstrip() for line in self.lines)
+        return selection.extract(text), "\n"
+
+    def selection_updated(self, selection: Selection | None) -> None:
+        self._line_cache.clear()
+        self.refresh()
+
+    def _render_line(self, y: int, scroll_x: int, width: int) -> Strip:
+        if y >= len(self.lines):
+            return Strip.blank(width, self.rich_style).apply_offsets(scroll_x, y)
+
+        key = (y + self._start_line, scroll_x, width, self._widest_line_width)
+        if key in self._line_cache:
+            line = self._line_cache[key]
+        else:
+            line = self.lines[y].crop_extend(scroll_x, scroll_x + width, self.rich_style)
+            self._line_cache[key] = line
+
+        selection = self.text_selection
+        if selection is not None:
+            line = self._apply_selection_style(line, selection, y, scroll_x, width)
+        return line.apply_offsets(scroll_x, y)
+
+    def _apply_selection_style(
+        self,
+        line: Strip,
+        selection: Selection,
+        y: int,
+        scroll_x: int,
+        width: int,
+    ) -> Strip:
+        span = selection.get_span(y)
+        if span is None:
+            return line
+        start, end = span
+        if end == -1:
+            end = self.lines[y].cell_length
+        visible_start = max(start, scroll_x)
+        visible_end = min(end, scroll_x + width)
+        if visible_end <= visible_start:
+            return line
+        selected_start = visible_start - scroll_x
+        selected_end = visible_end - scroll_x
+        selection_style = self.screen.get_component_rich_style("screen--selection")
+        return Strip.join(
+            [
+                line.crop(0, selected_start),
+                line.crop(selected_start, selected_end).apply_style(selection_style),
+                line.crop(selected_end),
+            ]
+        )
+
 
 class NexusTextualApp(App[None]):
+    ALLOW_SELECT = True
     CSS = """
     Screen {
         background: $surface;
@@ -783,17 +858,42 @@ class NexusTextualApp(App[None]):
         self.exit()
 
     async def action_copy_or_quit(self) -> None:
-        selected_text = self.screen.get_selected_text()
-        if selected_text:
-            self.copy_to_clipboard(selected_text)
-            self._flash_status("Copied selection")
+        input_selected_text = self._focused_input_selected_text()
+        if input_selected_text:
+            self._copy_text_to_clipboard(input_selected_text)
+            self._flash_status("Copied input selection")
             return
-        transcript_text = self._transcript_text()
-        if transcript_text:
-            self.copy_to_clipboard(transcript_text)
-            self._flash_status("Copied transcript")
+        if self.copy_selection_or_transcript():
             return
         await self.action_quit()
+
+    def copy_selection_or_transcript(self) -> bool:
+        selected_text = self.screen.get_selected_text()
+        if selected_text:
+            self._copy_text_to_clipboard(selected_text)
+            self._flash_status("Copied selection")
+            return True
+        transcript_text = self._transcript_text()
+        if transcript_text:
+            self._copy_text_to_clipboard(transcript_text)
+            self._flash_status("Copied transcript")
+            return True
+        return False
+
+    def _copy_text_to_clipboard(self, text: str) -> None:
+        self.copy_to_clipboard(text)
+        _copy_to_system_clipboard(text)
+
+    def _focused_input_selected_text(self) -> str:
+        if self._input is None:
+            return ""
+        if (
+            self.focused is not self._input
+            and getattr(self.screen, "focused", None) is not self._input
+            and not bool(getattr(self._input, "has_focus", False))
+        ):
+            return ""
+        return str(getattr(self._input, "selected_text", "") or "")
 
     def action_focus_cycle(self) -> None:
         if self._input is None or self._transcript is None:
@@ -1062,6 +1162,40 @@ def _is_explicit_denial_answer(answer: str) -> bool:
         answer.strip().lower().replace("(", " ").replace(")", " ").replace("-", " ").replace("_", " ").split()
     )
     return normalized in {"n", "no"}
+
+
+def _copy_to_system_clipboard(text: str) -> bool:
+    for command in _clipboard_commands():
+        try:
+            subprocess.run(
+                command,
+                input=text,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1,
+                check=True,
+            )
+            return True
+        except (FileNotFoundError, subprocess.SubprocessError, OSError):
+            continue
+    return False
+
+
+def _clipboard_commands() -> list[list[str]]:
+    if sys.platform == "darwin":
+        return [["pbcopy"]] if shutil.which("pbcopy") else []
+    if not sys.platform.startswith("linux"):
+        return []
+
+    commands: list[list[str]] = []
+    if shutil.which("wl-copy"):
+        commands.append(["wl-copy"])
+    if shutil.which("xclip"):
+        commands.append(["xclip", "-selection", "clipboard"])
+    if shutil.which("xsel"):
+        commands.append(["xsel", "--clipboard", "--input"])
+    return commands
 
 
 def _thinking_label(event: Any) -> str:

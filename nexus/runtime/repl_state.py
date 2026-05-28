@@ -325,6 +325,7 @@ def _bound_durable_tool_outputs(
                     f"{suffix}"
                 ),
                 name=message.name,
+                reasoning_content=message.reasoning_content,
                 tool_calls=message.tool_calls,
                 tool_call_id=message.tool_call_id,
             )

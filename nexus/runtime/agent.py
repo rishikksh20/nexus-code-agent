@@ -473,6 +473,7 @@ class Agent:
             stream_tool_calls: list[ToolCall] = []
             usage: UsageSnapshot | None = None
             stream_finish_reason: str | None = None
+            stream_reasoning_content = ""
             model_call_id = uuid4().hex[:12]
 
             await self.hooks.emit(
@@ -533,6 +534,8 @@ class Agent:
                     elif stream_event.type == StreamEventType.MESSAGE_COMPLETE:
                         usage = stream_event.usage
                         stream_finish_reason = stream_event.finish_reason or stream_finish_reason
+                        if stream_event.reasoning_content:
+                            stream_reasoning_content += stream_event.reasoning_content
                         if monitor is not None and usage is not None:
                             monitor.update_current_span(
                                 attributes={
@@ -618,6 +621,7 @@ class Agent:
             message = Message(
                 role="assistant",
                 content=response_text or "",
+                reasoning_content=stream_reasoning_content,
                 tool_calls=tool_calls,
             )
             should_record_message = bool(message.content or message.tool_calls)
@@ -1984,6 +1988,8 @@ def _serialize_message_for_observability(message: Message) -> dict[str, Any]:
         "role": message.role,
         "content": message.content,
     }
+    if message.reasoning_content:
+        payload["reasoning_content_chars"] = len(message.reasoning_content)
     if message.name:
         payload["name"] = message.name
     if message.tool_call_id:
