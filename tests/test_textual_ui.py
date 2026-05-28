@@ -21,7 +21,7 @@ from nexus.runtime.sessions import EphemeralSessionStore, new_snapshot
 from nexus.runtime.slash_commands import build_router
 from nexus.tools.base import ToolRegistry
 from nexus.ui import TerminalUI
-from nexus.ui.textual_app import NexusTextualApp, TranscriptLog, _strip_mouse_escape_sequences
+from nexus.ui.textual_app import NexusTextualApp, TranscriptLog, _strip_mouse_escape_sequences, _user_prompt_block
 
 
 @pytest.mark.asyncio
@@ -52,6 +52,10 @@ def test_textual_input_strips_leaked_mouse_reports():
     value = "hello\x1b[<35;12;5M world[<64;10;20M"
 
     assert _strip_mouse_escape_sequences(value) == "hello world"
+
+
+def test_textual_user_prompt_block_is_inline_label():
+    assert _user_prompt_block("adjust the TUI").plain == "You: adjust the TUI"
 
 
 def test_clipboard_commands_use_pbcopy_on_macos(monkeypatch):
@@ -548,6 +552,43 @@ async def test_textual_ask_echoes_input_prompt_to_transcript(tmp_path):
         await pilot.press("enter")
 
         assert await task == "y"
+        assert "Approval response: y" in app._transcript_text()
+
+
+@pytest.mark.asyncio
+async def test_textual_long_error_alert_collapses_to_short_preview(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.print_error("failure detail " * 20)
+
+        collapsed = app._transcript_text()
+        assert "[+] Request failed:" in collapsed
+        assert "failure detail failure detail" in collapsed
+        assert len(collapsed) < 260
+
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        expanded = app._transcript_text()
+        assert "[-] Request failed:" in expanded
+        assert "failure detail failure detail failure detail" in expanded
 
 
 @pytest.mark.asyncio
@@ -626,8 +667,6 @@ async def test_textual_write_completion_collapses_diff_without_echoing_file_cont
         assert "-OLD" in transcript
         assert "+NEW" in transcript
         assert "NEW FILE CONTENT" not in transcript
-        assert "Before" not in transcript
-        assert "After" not in transcript
 
         app.toggle_collapsible(app._transcript_entries[-1]["id"])
         transcript = app._transcript_text()
@@ -636,6 +675,71 @@ async def test_textual_write_completion_collapses_diff_without_echoing_file_cont
         assert "OLD" in transcript
         assert "NEW" in transcript
         assert "NEW FILE CONTENT" not in transcript
+
+
+@pytest.mark.asyncio
+async def test_textual_approval_request_shows_collapsible_file_diff_preview(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+    diff = "\n".join(
+        [
+            "--- a/app.py",
+            "+++ b/app.py",
+            "@@ -1,20 +1,20 @@",
+            *(f"-old {index}\n+new {index}" for index in range(20)),
+        ]
+    )
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow write_file?",
+        reason="write_file replaces the entire file.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-preview",
+        arguments={"path": "app.py", "content": "hidden full content"},
+        preview={"diff": {"path": "app.py", "unified_diff": diff}},
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        collapsed = app._transcript_text()
+        assert "[+] ? Approval required write_file" in collapsed
+        assert "Before" in collapsed
+        assert "After" in collapsed
+        assert "old 0" in collapsed
+        assert "new 6" in collapsed
+        assert "old 7" in collapsed
+        assert "new 19" not in collapsed
+        assert "hidden full content" not in collapsed
+
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        expanded = app._transcript_text()
+        assert "[-] ? Approval required write_file" in expanded
+        assert "Before" in expanded
+        assert "After" in expanded
+        assert "new 19" in expanded
 
 
 @pytest.mark.asyncio

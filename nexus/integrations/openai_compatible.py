@@ -76,10 +76,8 @@ class OpenAICompatibleAdapter:
                         for tc in message.tool_calls
                     ],
                 }
-                if self.thinking_mode != "disabled" and message.reasoning_content:
-                    item["reasoning_content"] = message.reasoning_content
-                elif self.thinking_mode == "enabled":
-                    item["reasoning_content"] = ""
+                if self.thinking_mode != "disabled":
+                    item["reasoning_content"] = message.reasoning_content or ""
             elif message.role == "tool":
                 if not message.tool_call_id:
                     continue
@@ -127,7 +125,7 @@ class OpenAICompatibleAdapter:
         message = Message(
             role="assistant",
             content=message_payload.get("content") or "",
-            reasoning_content=message_payload.get("reasoning_content") or "",
+            reasoning_content=_extract_reasoning_text(message_payload),
             tool_calls=tool_calls,
         )
 
@@ -405,10 +403,8 @@ class OpenAICompatibleModelClient:
                     type=StreamEventType.TEXT_DELTA,
                     text_delta=TextDelta(content=message["content"]),
                 )
-            if delta.get("reasoning_content"):
-                reasoning_content += str(delta["reasoning_content"])
-            if message.get("reasoning_content"):
-                reasoning_content += str(message["reasoning_content"])
+            reasoning_content += _extract_reasoning_text(delta)
+            reasoning_content += _extract_reasoning_text(message)
 
             # Accumulate tool-call argument fragments.
             for tc_delta in delta.get("tool_calls") or []:
@@ -516,6 +512,15 @@ def _stream_events_have_assistant_output(events: list[StreamEvent]) -> bool:
         if event.type == StreamEventType.TOOL_CALL_COMPLETE and event.tool_call:
             return True
     return False
+
+
+def _extract_reasoning_text(payload: dict[str, Any]) -> str:
+    """Return provider reasoning text from common OpenAI-compatible shapes."""
+    for key in ("reasoning_content", "reasoning", "thinking_content"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def _cohere_compatible_strict_tool_schema(tool: dict[str, Any]) -> dict[str, Any]:

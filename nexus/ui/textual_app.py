@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from difflib import unified_diff
 import io
 import json
 import re
@@ -26,6 +27,7 @@ from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
+from textual.containers import Horizontal
 from textual.selection import Selection
 from textual.strip import Strip
 from textual.widgets import Input, RichLog, Static
@@ -67,6 +69,7 @@ _RIGHT_MOUSE_BUTTON = 3
 _COLLAPSED_PREVIEW_LINES = 15
 _COLLAPSE_LINE_LIMIT = 18
 _COLLAPSE_CHAR_LIMIT = 2400
+_ALERT_PREVIEW_CHARS = 150
 _SIDE_BY_SIDE_DIFF_WIDTH = 112
 _MUTATING_FILE_TOOLS = {"write_file", "edit", "insert_edit_into_file", "apply_patch"}
 _VERIFY_TOOL_NAMES = {"bash", "run_tests", "run_python_check"}
@@ -141,19 +144,10 @@ class TextualTerminalUI(TerminalUI):
 
     def print_error(self, msg: str) -> None:
         self.end_assistant()
-        self._write(
-            Panel(
-                Text(msg, style="error"),
-                title=Text("Request failed", style="error"),
-                title_align="left",
-                border_style="red",
-                box=box.ROUNDED,
-                padding=(1, 2),
-            )
-        )
+        self._write_alert("Request failed", msg, title_style="bold red", body_style="red on #2a1717")
 
     def print_warning(self, msg: str) -> None:
-        self._write(Text.from_markup(f"[bold yellow]Warning:[/bold yellow] {msg}"))
+        self._write_alert("Warning", msg, title_style="bold yellow", body_style="yellow on #2b2516")
 
     def print_success(self, msg: str) -> None:
         self._write(Text(msg, style="bold green"))
@@ -163,6 +157,28 @@ class TextualTerminalUI(TerminalUI):
 
     def print_muted(self, msg: str) -> None:
         self._write(Text(msg, style="dim"))
+
+    def _write_alert(
+        self,
+        title: str,
+        msg: str,
+        *,
+        title_style: str,
+        body_style: str,
+    ) -> None:
+        header = Text()
+        header.append(title, style=title_style)
+        header.append(":", style=title_style)
+        body = Text(str(msg or ""), style=body_style)
+        if _should_collapse_alert(msg):
+            self._app.write_collapsible(
+                header,
+                body,
+                summary=f"{len(str(msg or ''))} chars",
+                preview=Text(_alert_preview(msg), style=body_style),
+            )
+            return
+        self._write(Group(header, body))
 
     def print_rule(self, title: str = "", *, style: str = "border") -> None:
         del style
@@ -361,6 +377,32 @@ class TextualTerminalUI(TerminalUI):
         style = self._tool_border_style(tool_name)
         return self._inline_header("> ", label, f"{target}  #{call_id[:8]}", style=style)
 
+    def _write_inline_tool_start(
+        self,
+        call_id: str,
+        tool_name: str,
+        actor: str,
+        args: dict[str, Any],
+        display: dict[str, Any],
+    ) -> None:
+        if tool_name == "bash":
+            self._tool_started_at[call_id] = time.perf_counter()
+            label = self._semantic_tool_label(tool_name)
+            command = str(args.get("command", "") or "").strip()
+            header = self._inline_header("> ", f"{label} command", f"#{call_id[:8]}", style="tool.shell")
+            if _should_collapse_text(command):
+                self._app.write_collapsible(
+                    header,
+                    Syntax(command, "bash", theme="monokai", word_wrap=True),
+                    summary=f"{_line_count(command)} lines",
+                    initially_expanded=False,
+                    preview=_preview_text_block(command, style="dim on #1f1f1f"),
+                )
+                return
+            self._write(Group(header, self._block_text(f"$ {command}", style="dim on #1f1f1f")))
+            return
+        self._write(self._render_inline_tool_start(call_id, tool_name, actor, args, display))
+
     def _render_subagent_header(self, tool_name: str, args: dict[str, Any]) -> Text:
         title = _subagent_title(args)
         header = Text("| ", style="dim")
@@ -422,6 +464,67 @@ class TextualTerminalUI(TerminalUI):
         else:
             self._write(Group(header, output_block))
 
+    def _render_confirmation_preview(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        preview: dict[str, Any],
+    ) -> tuple[RenderableType, RenderableType, str] | None:
+        diff = _diff_from_preview(preview) or _diff_from_arguments(tool_name, args)
+        if not diff and tool_name == "apply_patch":
+            diff = str(args.get("patch", "") or "")
+        if diff:
+            target = self._tool_target(tool_name, args)
+            return (
+                self._render_diff_editor(diff, path=target),
+                self._render_diff_editor_preview(diff, path=target),
+                _diff_summary(diff),
+            )
+        if tool_name == "bash":
+            command = str(args.get("command", "") or "").strip()
+            if command:
+                return (
+                    Syntax(command, "bash", theme="monokai", word_wrap=True),
+                    _preview_text_block(command, style="dim on #1f1f1f"),
+                    f"{_line_count(command)} line{'s' if _line_count(command) != 1 else ''}",
+                )
+        return None
+
+    def _write_confirmation_request(
+        self,
+        req: ConfirmationRequest,
+        *,
+        actor: str,
+        display_name: str,
+        policy: str,
+    ) -> None:
+        del actor
+        args = {str(key): value for key, value in req.arguments.items()}
+        preview = {str(key): value for key, value in req.preview.items()}
+        header = self._inline_header(
+            "? ",
+            "Approval required",
+            f"{display_name}  #{req.call_id[:8] or 'pending'}",
+            style="warning",
+        )
+        detail = Group(
+            self._render_tool_argument_summary(req.tool_name, args),
+            Text(req.reason, style="dim"),
+            Text(self._approval_choices(policy), style="dim"),
+        )
+        rendered_preview = self._render_confirmation_preview(req.tool_name, args, preview)
+        if rendered_preview is None:
+            self._write(Group(header, detail))
+            return
+        expanded, collapsed_preview, summary = rendered_preview
+        self._app.write_collapsible(
+            header,
+            Group(detail, expanded),
+            summary=summary,
+            initially_expanded=False,
+            preview=Group(collapsed_preview, detail),
+        )
+
     def _render_file_change_complete(
         self,
         result: ToolResult,
@@ -469,6 +572,19 @@ class TextualTerminalUI(TerminalUI):
 
     def _render_diff_editor(self, diff_text: str, *, path: str = "") -> Group | Table:
         before, after = _changed_sides_from_unified_diff(diff_text)
+        return self._render_diff_sides(before, after, path=path)
+
+    def _render_diff_editor_preview(self, diff_text: str, *, path: str = "") -> Group | Table:
+        before, after = _changed_sides_from_unified_diff(diff_text)
+        truncated = len(before) > _COLLAPSED_PREVIEW_LINES or len(after) > _COLLAPSED_PREVIEW_LINES
+        before = before[:_COLLAPSED_PREVIEW_LINES]
+        after = after[:_COLLAPSED_PREVIEW_LINES]
+        if truncated:
+            before.append("...")
+            after.append("click [+] to expand")
+        return self._render_diff_sides(before, after, path=path)
+
+    def _render_diff_sides(self, before: list[str], after: list[str], *, path: str = "") -> Group | Table:
         width = self._app.transcript_width
         language = self._guess_language(path)
         if width < _SIDE_BY_SIDE_DIFF_WIDTH:
@@ -581,7 +697,7 @@ class TextualTerminalUI(TerminalUI):
                     self._render_subagent_tool_row(call_id, tool_name, arguments),
                 )
             else:
-                self._write(self._render_inline_tool_start(call_id, tool_name, actor, arguments, display))
+                self._write_inline_tool_start(call_id, tool_name, actor, arguments, display)
             self.start_tool_wait(f"{self._tool_display_name(tool_name, actor)} running")
             return
 
@@ -626,16 +742,7 @@ class TextualTerminalUI(TerminalUI):
             self.stop_tool_wait()
             self.end_assistant()
             reason = getattr(event.payload, "reason", str(event.payload))
-            self._write(
-                Panel(
-                    Text(reason, style="bold red"),
-                    title=Text("Tool denied", style="bold red"),
-                    title_align="left",
-                    border_style="red",
-                    box=box.ROUNDED,
-                    padding=(0, 2),
-                )
-            )
+            self._write_alert("Tool denied", str(reason), title_style="bold red", body_style="red on #2a1717")
             return
 
         if event.kind == AgentEventType.CONFIRMATION_REQUESTED:
@@ -653,13 +760,11 @@ class TextualTerminalUI(TerminalUI):
                     {"is_mutating": True},
                 )
                 display_name = self._tool_display_name(req.tool_name, actor)
-                self._write(
-                    Group(
-                        self._inline_header("? ", "Approval required", f"{display_name}  #{req.call_id[:8] or 'pending'}", style="warning"),
-                        self._render_tool_argument_summary(req.tool_name, req.arguments),
-                        Text(req.reason, style="dim"),
-                        Text(self._approval_choices(str(req.payload.get("approval_policy", "on-request"))), style="dim"),
-                    )
+                self._write_confirmation_request(
+                    req,
+                    actor=actor,
+                    display_name=display_name,
+                    policy=str(req.payload.get("approval_policy", "on-request")),
                 )
             else:
                 actor = str(req.payload.get("actor", "") or "").strip()
@@ -852,7 +957,7 @@ class NexusTextualApp(App[None]):
         padding: 1 2;
         border: round transparent;
         background: transparent;
-        scrollbar-size: 1 1;
+        scrollbar-size: 0 0;
     }
 
     #transcript:focus {
@@ -867,16 +972,35 @@ class NexusTextualApp(App[None]):
         background: transparent;
     }
 
-    #prompt {
+    #input-bar {
         height: 3;
         margin: 0 1 0 1;
-        padding: 0 1;
-        border: solid $primary;
-        background: transparent;
+        padding: 0;
+        border: none;
+        background: #1f1f1f;
+    }
+
+    #prompt-marker {
+        width: 3;
+        height: 3;
+        padding: 0 0 0 1;
+        color: #4ea1ff;
+        text-style: bold;
+        background: #1f1f1f;
+    }
+
+    #prompt {
+        height: 3;
+        width: 1fr;
+        margin: 0;
+        padding: 0 1 0 0;
+        border: none;
+        background: #1f1f1f;
     }
 
     #prompt:focus {
-        border: solid $accent;
+        border: none;
+        background: #242424;
     }
 
     #footer {
@@ -917,6 +1041,7 @@ class NexusTextualApp(App[None]):
         self.ui = TextualTerminalUI(self)
         self._original_console = state.console
         self._pending_input: asyncio.Future[str] | None = None
+        self._pending_input_prompt = ""
         self._busy = False
         self._assistant_buffer = ""
         self.has_open_assistant_stream = False
@@ -942,6 +1067,7 @@ class NexusTextualApp(App[None]):
         self._turn_recovery_count = 0
         self._last_tool_failed = False
         self._turn_footer_written = False
+        self._prompt_turn_index = 0
         self._prompt_history = [
             message.content
             for message in state.history
@@ -956,7 +1082,9 @@ class NexusTextualApp(App[None]):
         max_lines = max(1, int(getattr(self.state.config, "textual_transcript_max_lines", 5000)))
         yield TranscriptLog(id="transcript", wrap=True, highlight=False, markup=False, max_lines=max_lines)
         yield Static("", id="status")
-        yield PromptInput(placeholder="Message Nexus or type /help", id="prompt")
+        with Horizontal(id="input-bar"):
+            yield Static("|\n|\n|", id="prompt-marker")
+            yield PromptInput(placeholder="Message Nexus or type /help", id="prompt")
         yield Static("", id="footer")
 
     def on_mount(self) -> None:
@@ -1139,9 +1267,13 @@ class NexusTextualApp(App[None]):
         toggle_id = str(entry.get("id", ""))
         expanded = bool(entry.get("expanded_state"))
         marker = "[-]" if expanded else "[+]"
-        header_text = _renderable_plain_text(cast("RenderableType", entry.get("header", ""))).strip()
+        header = cast("RenderableType", entry.get("header", ""))
         summary = str(entry.get("summary", "") or "").strip()
-        line = Text(f"{marker} {header_text}", style="default")
+        line = Text(f"{marker} ", style="default")
+        if isinstance(header, Text):
+            line.append(header.copy())
+        else:
+            line.append(_renderable_plain_text(header).strip(), style="default")
         if summary:
             line.append(f" ({summary})", style="dim")
         line.stylize(Style(color="cyan", meta={"nexus_toggle": toggle_id}), 0, min(3, len(line.plain)))
@@ -1200,6 +1332,7 @@ class NexusTextualApp(App[None]):
         footer.append(" · ", style="dim")
         footer.append(f"{elapsed:.1f}s", style="bold bright_cyan")
         self.write(footer)
+        self.write(Text(""))
         self.refresh_footer()
 
     def refresh_footer(self) -> None:
@@ -1383,8 +1516,10 @@ class NexusTextualApp(App[None]):
                 return
         if self._pending_input is not None:
             pending = self._pending_input
+            pending_prompt = self._pending_input_prompt
             self._pending_input = None
             if not pending.done():
+                self.write(_input_response_block(pending_prompt, raw))
                 pending.set_result(raw)
             self.clear_status()
             return
@@ -1419,10 +1554,12 @@ class NexusTextualApp(App[None]):
         self._input.placeholder = prompt
         self._input.focus()
         self._pending_input = asyncio.get_running_loop().create_future()
+        self._pending_input_prompt = prompt
         try:
             return await self._pending_input
         finally:
             self._pending_input = None
+            self._pending_input_prompt = ""
             self._input.placeholder = "Message Nexus or type /help"
             self.clear_status()
 
@@ -1443,6 +1580,17 @@ class NexusTextualApp(App[None]):
 
     def copy_selection_or_transcript(self) -> bool:
         selected_text = self.screen.get_selected_text()
+        # Fallback: directly read selection from TranscriptLog (screen.get_selected_text()
+        # may not pick up the custom RichLog subclass selection on some platforms).
+        if not selected_text and self._transcript is not None:
+            ts = getattr(self._transcript, "text_selection", None)
+            if ts is not None:
+                try:
+                    sel_result = self._transcript.get_selection(ts)
+                    if sel_result:
+                        selected_text = sel_result[0] if isinstance(sel_result, tuple) else sel_result
+                except Exception:  # noqa: BLE001
+                    pass
         if selected_text:
             self._copy_text_to_clipboard(selected_text)
             self._flash_status("Copied selection")
@@ -1595,16 +1743,8 @@ class NexusTextualApp(App[None]):
         self._busy = True
         user_message_appended = False
         self.set_status("Thinking")
-        self.ui.print(
-            Panel(
-                Text(raw_input),
-                title=Text("You", style="bold cyan"),
-                title_align="left",
-                border_style="cyan",
-                box=box.ROUNDED,
-                padding=(0, 2),
-            )
-        )
+        self.ui.print(_user_prompt_block(raw_input, alternate=bool(self._prompt_turn_index % 2)))
+        self._prompt_turn_index += 1
         try:
             if await self.router.dispatch(self.state, raw_input):
                 if self.state.should_exit:
@@ -1802,6 +1942,29 @@ def _assistant_header() -> Text:
     return header
 
 
+def _user_prompt_block(raw_input: str, *, alternate: bool = False) -> Text:
+    prompt_style = "white on #252525" if alternate else "white"
+    text = Text()
+    text.append("You", style="bold green")
+    text.append(": ", style="green")
+    lines = str(raw_input or "").splitlines() or [""]
+    for index, line in enumerate(lines):
+        if index:
+            text.append("\n  ", style="dim")
+        text.append(line, style=prompt_style)
+    return text
+
+
+def _input_response_block(prompt: str, raw_input: str) -> Text:
+    is_approval = prompt.strip().lower().startswith("allow?")
+    title = "Approval response" if is_approval else "Input response"
+    text = Text()
+    text.append(title, style="bold dark_green")
+    text.append(": ", style="bold dark_green")
+    text.append(str(raw_input or ""), style="white on #252525")
+    return text
+
+
 def _is_subagent_tool(tool_name: str) -> bool:
     return tool_name == "delegate_task" or tool_name.startswith("subagent_")
 
@@ -1944,12 +2107,54 @@ def _line_count(value: str) -> int:
 
 def _should_collapse_text(value: str) -> bool:
     text = str(value or "")
-    return len(text) > _COLLAPSE_CHAR_LIMIT or _line_count(text) > _COLLAPSE_LINE_LIMIT
+    return len(text) > _COLLAPSE_CHAR_LIMIT or _line_count(text) > min(_COLLAPSE_LINE_LIMIT, _COLLAPSED_PREVIEW_LINES)
+
+
+def _should_collapse_alert(value: str) -> bool:
+    text = str(value or "")
+    return len(text) > _ALERT_PREVIEW_CHARS or _line_count(text) > 3
+
+
+def _alert_preview(value: str) -> str:
+    compact = " ".join(str(value or "").split())
+    if len(compact) <= _ALERT_PREVIEW_CHARS:
+        return compact
+    return compact[: max(0, _ALERT_PREVIEW_CHARS - 3)].rstrip() + "..."
 
 
 def _diff_from_preview(preview: dict[str, Any]) -> str:
     diff = preview.get("diff") if isinstance(preview.get("diff"), dict) else {}
     return str(diff.get("unified_diff", "") or "")
+
+
+def _diff_from_arguments(tool_name: str, args: dict[str, Any]) -> str:
+    path = str(args.get("path") or "file").strip() or "file"
+    if tool_name == "write_file":
+        return _unified_diff_text("", str(args.get("content", "") or ""), path=path)
+    if tool_name == "edit":
+        return _unified_diff_text(
+            str(args.get("old_string", "") or ""),
+            str(args.get("new_string", "") or ""),
+            path=path,
+        )
+    if tool_name == "insert_edit_into_file":
+        return _unified_diff_text("", str(args.get("code", "") or ""), path=path)
+    return ""
+
+
+def _unified_diff_text(old: str, new: str, *, path: str) -> str:
+    old_lines = str(old or "").splitlines()
+    new_lines = str(new or "").splitlines()
+    if old_lines == new_lines:
+        return ""
+    lines = unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        lineterm="",
+    )
+    return "\n".join(lines)
 
 
 def _diff_summary(diff_text: str) -> str:

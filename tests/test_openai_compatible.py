@@ -420,6 +420,50 @@ async def test_openai_compatible_stream_accumulates_reasoning_content(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_openai_compatible_stream_accepts_reasoning_alias(monkeypatch):
+    lines = [
+        'data: {"model":"deepseek/deepseek-v4-pro","choices":[{"delta":{"reasoning":"Need "}}]}\n',
+        'data: {"model":"deepseek/deepseek-v4-pro","choices":[{"delta":{"reasoning":"a file."}}]}\n',
+        (
+            'data: {"model":"deepseek/deepseek-v4-pro","choices":[{"delta":{"tool_calls":'
+            '[{"index":0,"id":"call-1","function":{"name":"read_file","arguments":"{}"}}]},'
+            '"finish_reason":"tool_calls"}]}\n'
+        ),
+        "data: [DONE]\n",
+    ]
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return _FakeStreamingHTTPResponse(lines)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = OpenAICompatibleModelClient(
+        api_base_url="https://openrouter.ai/api/v1",
+        api_key="secret",
+        provider_name="openai-compatible",
+    )
+
+    events = [
+        event
+        async for event in client.chat_completion(
+            RuntimeRequest(
+                model_name="deepseek/deepseek-v4-pro",
+                system_prompt="system",
+                messages=(Message(role="user", content="read README"),),
+            ),
+            stream=True,
+        )
+    ]
+
+    assert [event.type for event in events] == [
+        StreamEventType.TOOL_CALL_COMPLETE,
+        StreamEventType.MESSAGE_COMPLETE,
+    ]
+    assert events[1].reasoning_content == "Need a file."
+
+
+@pytest.mark.asyncio
 async def test_openai_compatible_stream_falls_back_when_provider_stream_is_empty(monkeypatch):
     requests: list[dict[str, object]] = []
 
@@ -736,6 +780,62 @@ def test_openai_adapter_round_trips_reasoning_content_for_thinking_tool_calls():
                     "message": {
                         "content": "checking",
                         "reasoning_content": "Need a tool.",
+                        "tool_calls": [
+                            {
+                                "id": "call-2",
+                                "type": "function",
+                                "function": {"name": "list_dir", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        }
+    )
+
+    assert response.message.reasoning_content == "Need a tool."
+    assert response.message.tool_calls == (ToolCall("call-2", "list_dir", {}),)
+
+
+def test_openai_adapter_replays_reasoning_content_key_for_auto_thinking_tool_calls():
+    adapter = OpenAICompatibleAdapter(
+        provider_name="openai-compatible",
+        thinking_mode="auto",
+    )
+
+    payload = adapter.to_wire_request(
+        RuntimeRequest(
+            model_name="deepseek-v4-pro",
+            system_prompt="system",
+            messages=(
+                Message(role="user", content="read README"),
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=(ToolCall("call-1", "read_file", {"path": "README.md"}),),
+                ),
+                Message(role="tool", content="README contents", name="read_file", tool_call_id="call-1"),
+            ),
+        )
+    )
+
+    assistant = payload["messages"][2]
+    assert "thinking" not in payload
+    assert assistant["reasoning_content"] == ""
+
+
+def test_openai_adapter_accepts_reasoning_alias_from_wire_response():
+    adapter = OpenAICompatibleAdapter(provider_name="openai-compatible")
+
+    response = adapter.from_wire_response(
+        {
+            "model": "deepseek/deepseek-v4-pro",
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning": "Need a tool.",
                         "tool_calls": [
                             {
                                 "id": "call-2",
