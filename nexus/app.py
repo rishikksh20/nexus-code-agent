@@ -29,7 +29,6 @@ from nexus.cli.init import init_workspace
 from nexus.cli.input import resolve_prompt
 from nexus.config import config_to_plain_dict, ensure_config_dirs, load_config
 from nexus.config.loader import ConfigError
-from nexus.config.model_limits import get_model_context_limit
 from nexus.config.provider_profiles import active_model_profile, active_provider_config
 from nexus.extensions.plugins import get_plugin_roots, load_plugins_from_roots
 from nexus.hooks import HookEvent, HookExecutor, setup_hooks
@@ -303,7 +302,7 @@ class NexusApp:
         ctx_limit = (
             profile.context_length - profile.reserved_output_tokens
             if not getattr(self.config, "active_model_profile_legacy", True)
-            else get_model_context_limit(self.config.model_name)
+            else self.config.context_length
         )
         self.config.compaction_soft_limit = int(ctx_limit * 0.65)
         self.config.compaction_hard_limit = int(ctx_limit * 0.85)

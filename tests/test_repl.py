@@ -19,6 +19,7 @@ from nexus.models import (
     RuntimeResponse,
     ToolCall,
     ToolResult,
+    UsageSnapshot,
 )
 from nexus.runtime.agent import Agent
 from nexus.runtime.execution import ExecutionMode
@@ -665,6 +666,7 @@ async def test_collect_turn_events_yes_turn_skips_later_non_dangerous_mutating_c
             RuntimeResponse(
                 message=Message(role="assistant", content="Creating notes."),
                 tool_calls=(note_one, note_two),
+                usage=UsageSnapshot(prompt_tokens=10, completion_tokens=4, total_tokens=14),
                 finish_reason="tool_calls",
             ),
             RuntimeResponse(message=Message(role="assistant", content="Done.")),
@@ -692,6 +694,80 @@ async def test_collect_turn_events_yes_turn_skips_later_non_dangerous_mutating_c
     assert (tmp_path / "notes" / "one.txt").read_text(encoding="utf-8") == "one"
     assert (tmp_path / "notes" / "two.txt").read_text(encoding="utf-8") == "two"
     assert not any(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events)
+    state.apply_events(events)
+    assert state.session.metadata["usage"]["total_tokens"] == 14
+
+
+@pytest.mark.asyncio
+async def test_collect_turn_events_prompts_for_remaining_same_batch_mutations_without_model_retry(tmp_path):
+    state = _build_state(tmp_path)
+    state.tool_registry.register(WriteFileTool())
+    state.history.append(Message(role="user", content="create two notes"))
+
+    note_one = ToolCall(
+        call_id="note-1",
+        tool_name="write_file",
+        arguments={"path": "notes/one.txt", "content": "one"},
+    )
+    note_two = ToolCall(
+        call_id="note-2",
+        tool_name="write_file",
+        arguments={"path": "notes/two.txt", "content": "two"},
+    )
+    model = _CountingFakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Creating notes."),
+                tool_calls=(note_one, note_two),
+                usage=UsageSnapshot(prompt_tokens=10, completion_tokens=4, total_tokens=14),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Done.")),
+        ]
+    )
+    agent = Agent(model_client=model, tool_registry=state.tool_registry)
+    seen_requests: list[ConfirmationRequest] = []
+    rendered_events: list[AgentEvent] = []
+
+    async def _approve(request):
+        seen_requests.append(request)
+        return ConfirmationResponse(approved=True)
+
+    class _RecordingUI:
+        def render_event(self, event, **_kwargs):
+            rendered_events.append(event)
+
+    events = await collect_turn_events(
+        state,
+        agent,
+        prompt_text="create two notes",
+        ui=_RecordingUI(),
+        approval_callback=_approve,
+    )
+
+    tool_results = [event.payload for event in events if event.kind == AgentEventType.TOOL_RESULT]
+
+    assert model.calls == 2
+    assert [request.arguments["path"] for request in seen_requests] == [
+        "notes/one.txt",
+        "notes/two.txt",
+    ]
+    assert [result.call_id for result in tool_results] == ["note-1", "note-2"]
+    assert [
+        event.payload.call_id
+        for event in rendered_events
+        if event.kind == AgentEventType.CONFIRMATION_REQUESTED
+    ] == ["note-1", "note-2"]
+    assert [
+        event.payload["call_id"]
+        for event in rendered_events
+        if event.kind == AgentEventType.TOOL_CALL_START
+    ] == ["note-1", "note-2"]
+    assert (tmp_path / "notes" / "one.txt").read_text(encoding="utf-8") == "one"
+    assert (tmp_path / "notes" / "two.txt").read_text(encoding="utf-8") == "two"
+    assert not any(event.kind == AgentEventType.CONFIRMATION_REQUESTED for event in events)
+    state.apply_events(events)
+    assert state.session.metadata["usage"]["total_tokens"] == 14
 
 
 @pytest.mark.asyncio

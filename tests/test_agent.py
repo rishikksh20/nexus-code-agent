@@ -707,7 +707,7 @@ async def test_agent_stops_with_continue_message_when_max_turns_is_reached(tool_
 
 
 @pytest.mark.asyncio
-async def test_agent_requests_clarification_for_missing_required_tool_argument(tool_context):
+async def test_agent_asks_model_to_repair_missing_path_instead_of_user(tool_context):
     model = FakeModelClient(
         scripted=[
             RuntimeResponse(
@@ -721,6 +721,18 @@ async def test_agent_requests_clarification_for_missing_required_tool_argument(t
                 ),
                 finish_reason="tool_calls",
             ),
+            RuntimeResponse(
+                message=Message(role="assistant", content="Writing with a destination."),
+                tool_calls=(
+                    ToolCall(
+                        call_id="4",
+                        tool_name="write_file",
+                        arguments={"path": "note.txt", "content": "hello"},
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Done.")),
         ]
     )
     registry = ToolRegistry()
@@ -731,12 +743,19 @@ async def test_agent_requests_clarification_for_missing_required_tool_argument(t
         event async for event in agent.run(
             [Message(role="user", content="write a note")],
             tool_context,
+            auto_confirm=True,
         )
     ]
 
-    clarification = next(event for event in events if event.kind == "confirmation_requested")
-    assert clarification.payload.kind is ConfirmationKind.CLARIFICATION
-    assert clarification.payload.payload["field"] == "path"
+    assert not any(event.kind == "confirmation_requested" for event in events)
+    repair_result = next(
+        event.payload
+        for event in events
+        if event.kind == "tool_result" and event.payload.call_id == "3"
+    )
+    assert repair_result.is_error is True
+    assert "Missing required argument(s) for tool 'write_file': 'path'" in repair_result.output
+    assert (tool_context.working_directory / "note.txt").read_text(encoding="utf-8") == "hello"
 
 
 @pytest.mark.asyncio

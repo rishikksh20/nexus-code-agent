@@ -308,10 +308,10 @@ class TextualTerminalUI(TerminalUI):
             return "Failed"
         labels = {
             "bash": "Ran" if completed else "Run",
-            "write_file": "Wrote" if completed else "Write",
-            "edit": "Edited" if completed else "Edit",
-            "insert_edit_into_file": "Edited" if completed else "Edit",
-            "apply_patch": "Patched" if completed else "Patch",
+            "write_file": "Wrote file" if completed else "Write file",
+            "edit": "Edited file" if completed else "Edit file",
+            "insert_edit_into_file": "Edited file" if completed else "Edit file",
+            "apply_patch": "Patched files" if completed else "Patch files",
             "read_file": "Read" if completed else "Read",
             "list_dir": "Listed" if completed else "List",
             "grep": "Searched" if completed else "Search",
@@ -560,10 +560,13 @@ class TextualTerminalUI(TerminalUI):
         del actor
         args = {str(key): value for key, value in req.arguments.items()}
         preview = {str(key): value for key, value in req.preview.items()}
+        target = self._tool_target(req.tool_name, args)
+        action = self._semantic_tool_label(req.tool_name)
+        request_detail = f"{action} {target}".strip() if req.tool_name in _MUTATING_FILE_TOOLS else display_name
         header = self._inline_header(
             "? ",
             "Approval required",
-            f"{display_name}  #{req.call_id[:8] or 'pending'}",
+            f"{request_detail}  #{req.call_id[:8] or 'pending'}",
             style="warning",
         )
         detail = self._render_approval_detail(req.tool_name, args, req.reason, policy)

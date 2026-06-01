@@ -1766,6 +1766,18 @@ def test_apply_model_context_limits_overrides_defaults(tmp_path):
     assert config.compaction_hard_limit == int(131_072 * 0.85)
 
 
+def test_apply_model_context_limits_uses_explicit_legacy_context_length(tmp_path):
+    from nexus.app import _apply_model_context_limits
+    config = load_config(tmp_path, global_root=tmp_path / "global",
+                         cli_overrides={"model_name": "big-pickle",
+                                        "context_length": 200_000})
+
+    _apply_model_context_limits(config)
+
+    assert config.compaction_soft_limit == 130_000
+    assert config.compaction_hard_limit == 170_000
+
+
 def test_apply_model_context_limits_respects_user_overrides(tmp_path):
     from nexus.app import _apply_model_context_limits
     config = load_config(tmp_path, global_root=tmp_path / "global",

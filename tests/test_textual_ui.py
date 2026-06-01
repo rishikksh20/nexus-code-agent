@@ -692,7 +692,7 @@ async def test_textual_write_completion_collapses_diff_without_echoing_file_cont
         )
 
         transcript = app._transcript_text()
-        assert "[+] ✓ Wrote calculator/calculator.py" in transcript
+        assert "[+] ✓ Wrote file calculator/calculator.py" in transcript
         assert "-OLD" in transcript
         assert "+NEW" in transcript
         assert "NEW FILE CONTENT" not in transcript
@@ -754,7 +754,7 @@ async def test_textual_approval_request_shows_collapsible_file_diff_preview(tmp_
         )
 
         collapsed = app._transcript_text()
-        assert "[+] ? Approval required write_file" in collapsed
+        assert "[+] ? Approval required Write file app.py" in collapsed
         assert "Before" in collapsed
         assert "After" in collapsed
         assert "old 0" in collapsed
@@ -765,7 +765,7 @@ async def test_textual_approval_request_shows_collapsible_file_diff_preview(tmp_
 
         app.toggle_collapsible(app._transcript_entries[-1]["id"])
         expanded = app._transcript_text()
-        assert "[-] ? Approval required write_file" in expanded
+        assert "[-] ? Approval required Write file app.py" in expanded
         assert "Before" in expanded
         assert "After" in expanded
         assert "new 19" in expanded
@@ -1369,7 +1369,7 @@ async def test_textual_file_change_completion_collapses_side_by_side_diff(tmp_pa
         )
 
         collapsed = app._transcript_text()
-        assert "[+] ✓ Edited calculator.py" in collapsed
+        assert "[+] ✓ Edited file calculator.py" in collapsed
         assert "-print('old')" in collapsed
         assert "+print('new')" in collapsed
         assert "Before" in collapsed

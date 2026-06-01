@@ -544,9 +544,50 @@ def test_config_upgrade_rehomes_config_version_before_existing_tables(tmp_path):
     after = inspect_config_upgrade(local_config, template)
 
     assert content.count("# Added by Nexus config upgrade") == 1
+    assert content.splitlines().count("[[sub-agents]]") == 4
     assert parsed["config_version"] == 3
     assert "config_version" not in parsed["agents"]
     assert after.needs_upgrade is False
+
+
+def test_config_upgrade_repairs_exact_duplicate_sub_agent_tables(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    local_config = workspace / ".nexus" / "config.toml"
+    local_config.write_text(
+        'project_name = "workspace"\n'
+        "config_version = 3\n"
+        "\n"
+        "[[sub-agents]]\n"
+        'name = "explorer"\n'
+        'allowed_tools = ["read_file", "grep"]\n'
+        "\n"
+        "[[sub-agents]]\n"
+        'name = "explorer"\n'
+        'allowed_tools = ["read_file", "grep"]\n',
+        encoding="utf-8",
+    )
+    template = __import__("nexus.cli.init", fromlist=["_local_config_toml"])._local_config_toml(
+        workspace_root=workspace,
+        project_name="workspace",
+        project_description="",
+    )
+
+    before = inspect_config_upgrade(local_config, template)
+
+    assert before.subagent_scope_migrated is True
+
+    upgrade_config_file(local_config, template)
+
+    content = local_config.read_text(encoding="utf-8")
+    config = load_config(workspace, global_root=global_root)
+
+    assert content.splitlines().count("[[sub-agents]]") == 1
+    assert config.subagent_profiles == [
+        {"name": "explorer", "allowed_tools": ["read_file", "grep"]}
+    ]
 
 
 def test_config_non_strict_uses_defaults_and_warning_when_toml_is_corrupt(tmp_path):

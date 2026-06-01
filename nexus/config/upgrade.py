@@ -120,7 +120,8 @@ def upgrade_config_file(path: Path, template_str: str) -> ConfigUpgradeReport:
     if _needs_agent_scope_migration(existing):
         lines = _remove_top_level_assignments(lines, {*LEGACY_AGENT_SCOPE_KEYS, *OBSOLETE_SCOPE_KEYS})
         lines = _remove_table(lines, "agents")
-    if _needs_subagent_scope_migration(existing):
+    subagent_scope_migrated = _needs_subagent_scope_migration(existing)
+    if subagent_scope_migrated:
         lines = _remove_top_level_assignments(lines, {"subagent_profiles"})
         lines = _remove_array_table(lines, "sub-agents")
     upgraded_allowed_tools = _upgraded_allowed_tools(existing, template)
@@ -141,7 +142,7 @@ def upgrade_config_file(path: Path, template_str: str) -> ConfigUpgradeReport:
     additions: list[str] = []
     additions.append(UPGRADE_MARKER)
     additions.append(f"config_version = {CURRENT_CONFIG_VERSION}")
-    migrated_subagents = _migrated_subagent_profiles(existing)
+    migrated_subagents = _migrated_subagent_profiles(existing) if subagent_scope_migrated else []
     migrated_profile_values = _migrated_provider_profile_values(existing, template)
     for key in template:
         if key == "config_version" or key in existing:
@@ -375,7 +376,11 @@ def _needs_agent_scope_migration(existing: dict[str, Any]) -> bool:
 def _needs_subagent_scope_migration(existing: dict[str, Any]) -> bool:
     if "subagent_profiles" in existing:
         return True
-    return _subagent_profiles_need_name_migration(_subagent_profiles_from_existing(existing))
+    profiles = _subagent_profiles_from_existing(existing)
+    return (
+        _has_exact_duplicate_subagent_profiles(profiles)
+        or _subagent_profiles_need_name_migration(profiles)
+    )
 
 
 def _needs_legacy_subagent_name_migration(existing: dict[str, Any]) -> bool:
@@ -417,7 +422,12 @@ def _migrated_agent_scope(existing: dict[str, Any], template_agents: Any) -> dic
 
 def _migrated_subagent_profiles(existing: dict[str, Any]) -> list[dict[str, Any]]:
     profiles = _subagent_profiles_from_existing(existing)
-    return [_subagent_profile_for_new_layout(dict(entry)) for entry in profiles if isinstance(entry, dict)]
+    migrated = [
+        _subagent_profile_for_new_layout(dict(entry))
+        for entry in profiles
+        if isinstance(entry, dict)
+    ]
+    return _dedupe_exact_subagent_profiles(migrated)
 
 
 def _subagent_profile_for_new_layout(entry: dict[str, Any]) -> dict[str, Any]:
@@ -469,6 +479,18 @@ def _subagent_profiles_need_name_migration(profiles: list[dict[str, Any]]) -> bo
         if "allowed_mcp_servers" in profile:
             return True
     return False
+
+
+def _has_exact_duplicate_subagent_profiles(profiles: list[dict[str, Any]]) -> bool:
+    return len(_dedupe_exact_subagent_profiles(profiles)) != len(profiles)
+
+
+def _dedupe_exact_subagent_profiles(profiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    for profile in profiles:
+        if profile not in unique:
+            unique.append(profile)
+    return unique
 
 
 def _upgraded_delegation_subagents(existing: dict[str, Any]) -> list[dict[str, Any]] | None:
