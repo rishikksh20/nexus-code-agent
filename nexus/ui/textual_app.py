@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher, unified_diff
 import io
 import json
@@ -74,6 +74,7 @@ _COLLAPSED_PREVIEW_LINES = 15
 _COLLAPSE_LINE_LIMIT = 18
 _COLLAPSE_CHAR_LIMIT = 2400
 _ALERT_PREVIEW_CHARS = 150
+_COMMAND_PREVIEW_CHARS = 1600
 _SIDE_BY_SIDE_DIFF_WIDTH = 104
 _DIFF_EDITOR_BACKGROUND = "#272822"
 _DIFF_DELETE_BACKGROUND = "#3a2020"
@@ -101,6 +102,7 @@ class _ResponsiveDiff:
     path: str = ""
     language: str = "text"
     new_file: bool = False
+    toggle_id: str = ""
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         del console
@@ -110,7 +112,36 @@ class _ResponsiveDiff:
             language=self.language,
             width=max(1, options.max_width),
             new_file=self.new_file,
+            toggle_id=self.toggle_id,
         )
+
+
+@dataclass(frozen=True)
+class _FencedCodeBlock:
+    """Render command text or console output as a Markdown code fence."""
+
+    value: str
+    language: str = "text"
+    label: str = ""
+    collapsed: bool = False
+    toggle_id: str = ""
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        del console, options
+        value = self.value.rstrip() or "(empty)"
+        truncated = False
+        if self.collapsed:
+            value, truncated = _bounded_command_preview(value)
+        blocks: list[RenderableType] = []
+        if self.label:
+            blocks.append(Text(self.label, style="dim"))
+        blocks.append(Markdown(_markdown_code_fence(value, language=self.language)))
+        if truncated:
+            hint = Text("... click [+] to expand", style="dim")
+            if self.toggle_id:
+                hint.stylize(Style(meta={"nexus_toggle": self.toggle_id}))
+            blocks.append(hint)
+        yield Group(*blocks)
 
 
 def _strip_mouse_escape_sequences(value: str) -> str:
@@ -408,11 +439,11 @@ class TextualTerminalUI(TerminalUI):
         if _is_subagent_tool(tool_name):
             return self._render_subagent_header(tool_name, args)
         label = self._semantic_tool_label(tool_name)
-        if tool_name == "bash":
-            command = str(args.get("command", "") or "").strip()
+        command = _command_from_arguments(args)
+        if command:
             return Group(
                 self._inline_header("> ", f"{label} command", f"#{call_id[:8]}", style="tool.shell"),
-                self._block_text(f"$ {command}", style="dim on #1f1f1f"),
+                _bash_command_block(command),
             )
         target = self._tool_target(tool_name, args)
         style = self._tool_border_style(tool_name)
@@ -426,21 +457,21 @@ class TextualTerminalUI(TerminalUI):
         args: dict[str, Any],
         display: dict[str, Any],
     ) -> None:
-        if tool_name == "bash":
+        command = _command_from_arguments(args)
+        if command:
             self._tool_started_at[call_id] = time.perf_counter()
             label = self._semantic_tool_label(tool_name)
-            command = str(args.get("command", "") or "").strip()
             header = self._inline_header("> ", f"{label} command", f"#{call_id[:8]}", style="tool.shell")
             if _should_collapse_text(command):
                 self._app.write_collapsible(
                     header,
-                    Syntax(command, "bash", theme="monokai", word_wrap=True),
+                    _bash_command_block(command),
                     summary=f"{_line_count(command)} lines",
                     initially_expanded=False,
-                    preview=_preview_text_block(command, style="dim on #1f1f1f"),
+                    preview=_bash_command_block(command, collapsed=True),
                 )
                 return
-            self._write(Group(header, self._block_text(f"$ {command}", style="dim on #1f1f1f")))
+            self._write(Group(header, _bash_command_block(command)))
             return
         self._write(self._render_inline_tool_start(call_id, tool_name, actor, args, display))
 
@@ -539,13 +570,12 @@ class TextualTerminalUI(TerminalUI):
         if not output:
             self._write(header)
             return
-        output_style = "red on #1f1f1f" if result.is_error else "dim on #1f1f1f"
-        output_block = self._block_text(output, style=output_style)
-        output_preview = _preview_text_block(output, style=output_style)
-        if _should_collapse_text(output):
-            self._app.write_collapsible(header, output_block, summary=f"{_line_count(output)} lines", preview=output_preview)
-        else:
-            self._write(Group(header, output_block))
+        self._app.write_collapsible(
+            header,
+            _bash_output_block(output),
+            summary=f"{_line_count(output)} lines",
+            preview=_bash_output_block(output, collapsed=True),
+        )
 
     def _render_confirmation_preview(
         self,
@@ -564,14 +594,13 @@ class TextualTerminalUI(TerminalUI):
                 self._render_file_diff_preview(tool_name, diff_data, diff, path=target, collapsed=True),
                 _diff_summary(diff),
             )
-        if tool_name == "bash":
-            command = str(args.get("command", "") or "").strip()
-            if command:
-                return (
-                    _bash_command_block(command),
-                    _bash_command_block(command, collapsed=True),
-                    f"{_line_count(command)} line{'s' if _line_count(command) != 1 else ''}",
-                )
+        command = _command_from_preview_or_arguments(preview, args)
+        if command:
+            return (
+                _bash_command_block(command),
+                _bash_command_block(command, collapsed=True),
+                f"{_line_count(command)} line{'s' if _line_count(command) != 1 else ''}",
+            )
         return None
 
     def _write_confirmation_request(
@@ -816,7 +845,7 @@ class TextualTerminalUI(TerminalUI):
                     call_id,
                     self._render_subagent_tool_row(call_id, tool_name, arguments),
                 )
-            elif _is_supervisor_group_tool(tool_name):
+            elif _is_supervisor_group_tool(tool_name, arguments):
                 self._tool_started_at[call_id] = time.perf_counter()
                 self._app._turn_had_tool_calls = True
                 if self._app._supervisor_entry is None:
@@ -837,6 +866,7 @@ class TextualTerminalUI(TerminalUI):
             if result is None:
                 return
             if isinstance(result.metadata, dict) and result.metadata.get("tool_unavailable"):
+                self._app.finish_tool_output_stream(result.call_id)
                 self._clear_tool_call_state(result.call_id)
                 self._tool_started_at.pop(result.call_id, None)
                 return
@@ -846,6 +876,7 @@ class TextualTerminalUI(TerminalUI):
             del display
             arguments = self._tool_args_by_call_id.get(result.call_id, {})
             self._app.record_tool_completion(result)
+            self._app.finish_tool_output_stream(result.call_id)
             if _is_subagent_tool(result.tool_name):
                 self._app.finish_subagent_task(
                     result.call_id,
@@ -871,9 +902,6 @@ class TextualTerminalUI(TerminalUI):
                 self._render_generic_complete(result, arguments)
             self._clear_tool_call_state(result.call_id)
             self._tool_started_at.pop(result.call_id, None)
-            self._app._streaming_tool_outputs.discard(result.call_id)
-            self._app._streaming_tool_output_chars.pop(result.call_id, None)
-            self._app._streaming_tool_output_capped.discard(result.call_id)
             self.start_thinking()
             return
 
@@ -1259,6 +1287,8 @@ class NexusTextualApp(App[None]):
         self._streaming_tool_outputs: set[str] = set()
         self._streaming_tool_output_chars: dict[str, int] = {}
         self._streaming_tool_output_capped: set[str] = set()
+        self._streaming_tool_output_text: dict[str, str] = {}
+        self._streaming_tool_output_entries: dict[str, dict[str, Any]] = {}
         self._transcript_entries: list[dict[str, Any]] = []
         self._transcript_plain_parts: list[str] = []
         self._subagent_entries_by_actor: dict[str, dict[str, Any]] = {}
@@ -1336,7 +1366,7 @@ class NexusTextualApp(App[None]):
         summary: str = "",
         initially_expanded: bool = False,
         preview: RenderableType | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         entry = {
             "type": "collapsible",
             "id": uuid4().hex[:8],
@@ -1348,6 +1378,7 @@ class NexusTextualApp(App[None]):
         }
         self._transcript_entries.append(entry)
         self._render_transcript_entry(entry)
+        return entry
 
     def begin_subagent_task(
         self,
@@ -1566,7 +1597,7 @@ class NexusTextualApp(App[None]):
         if not expanded:
             preview = entry.get("preview")
             if preview is not None:
-                return Group(line, cast("RenderableType", preview))
+                return Group(line, _with_inline_toggle(cast("RenderableType", preview), toggle_id))
             return line
         return Group(line, cast("RenderableType", entry.get("expanded", Text(""))))
 
@@ -1781,7 +1812,7 @@ class NexusTextualApp(App[None]):
         if current_chars >= max_chars:
             if call_id not in self._streaming_tool_output_capped:
                 self._streaming_tool_output_capped.add(call_id)
-                self.write(Text(f"[live output capped at {max_chars} chars]", style="dim"))
+                self._append_streaming_tool_output(call_id, f"\n[live output capped at {max_chars} chars]")
             return
         remaining = max_chars - current_chars
         capped_now = False
@@ -1791,13 +1822,39 @@ class NexusTextualApp(App[None]):
         self._streaming_tool_output_chars[call_id] = current_chars + len(chunk)
         if call_id not in self._streaming_tool_outputs:
             self._streaming_tool_outputs.add(call_id)
-            self.write(Text(f"> bash live output  #{call_id[:8]}", style="dim"))
-        style = "red" if stream_name == "stderr" else "default"
         prefix = "[stderr] " if stream_name == "stderr" else ""
-        self.write(Text(prefix + chunk.rstrip("\n"), style=f"{style} on #1f1f1f"))
+        self._append_streaming_tool_output(call_id, prefix + chunk)
         if capped_now and call_id not in self._streaming_tool_output_capped:
             self._streaming_tool_output_capped.add(call_id)
-            self.write(Text(f"[live output capped at {max_chars} chars]", style="dim"))
+            self._append_streaming_tool_output(call_id, f"\n[live output capped at {max_chars} chars]")
+
+    def _append_streaming_tool_output(self, call_id: str, chunk: str) -> None:
+        output = self._streaming_tool_output_text.get(call_id, "") + chunk
+        self._streaming_tool_output_text[call_id] = output
+        entry = self._streaming_tool_output_entries.get(call_id)
+        if entry is None:
+            entry = self.write_collapsible(
+                Text(f"> bash live output  #{call_id[:8]}", style="dim"),
+                _bash_output_block(output),
+                summary=f"streaming · {_line_count(output)} lines",
+                preview=_bash_output_block(output, collapsed=True),
+            )
+            self._streaming_tool_output_entries[call_id] = entry
+            return
+        entry["expanded"] = _bash_output_block(output)
+        entry["preview"] = _bash_output_block(output, collapsed=True)
+        entry["summary"] = f"streaming · {_line_count(output)} lines"
+        self._rerender_transcript()
+
+    def finish_tool_output_stream(self, call_id: str) -> None:
+        entry = self._streaming_tool_output_entries.pop(call_id, None)
+        if entry is not None and entry in self._transcript_entries:
+            self._transcript_entries.remove(entry)
+            self._rerender_transcript()
+        self._streaming_tool_outputs.discard(call_id)
+        self._streaming_tool_output_chars.pop(call_id, None)
+        self._streaming_tool_output_capped.discard(call_id)
+        self._streaming_tool_output_text.pop(call_id, None)
 
     async def on_input_submitted(self, event: Any) -> None:
         raw = _strip_mouse_escape_sequences(str(event.value or "")).strip()
@@ -2189,6 +2246,16 @@ def _toggle_id_from_click(event: events.Click) -> str:
     return str(meta.get("nexus_toggle") or "")
 
 
+def _with_inline_toggle(renderable: RenderableType, toggle_id: str) -> RenderableType:
+    if isinstance(renderable, _ResponsiveDiff):
+        return replace(renderable, toggle_id=toggle_id)
+    if isinstance(renderable, _FencedCodeBlock):
+        return replace(renderable, toggle_id=toggle_id)
+    if isinstance(renderable, Group):
+        return Group(*(_with_inline_toggle(item, toggle_id) for item in renderable.renderables), fit=renderable.fit)
+    return renderable
+
+
 def _renderable_plain_text(renderable: RenderableType, *, width: int = 120) -> str:
     buffer = io.StringIO()
     console = Console(
@@ -2244,13 +2311,18 @@ def _is_subagent_actor(actor: str) -> bool:
     return bool(actor) and _is_subagent_tool(actor)
 
 
-def _is_supervisor_group_tool(tool_name: str) -> bool:
+def _is_supervisor_group_tool(tool_name: str, args: dict[str, Any] | None = None) -> bool:
     """Return True for tools that should be grouped in the supervisor collapsible block.
 
     Bash, file-mutating tools, and sub-agent dispatches are excluded because they
     need their own rich output or delegation UI.
     """
-    return not _is_subagent_tool(tool_name) and tool_name != "bash" and tool_name not in _MUTATING_FILE_TOOLS
+    return (
+        not _is_subagent_tool(tool_name)
+        and tool_name != "bash"
+        and tool_name not in _MUTATING_FILE_TOOLS
+        and not _command_from_arguments(args or {})
+    )
 
 
 def _subagent_title(args: dict[str, Any]) -> str:
@@ -2372,6 +2444,16 @@ def _single_line(value: str, *, limit: int) -> str:
 def _first_lines(value: str, *, limit: int = _COLLAPSED_PREVIEW_LINES) -> str:
     lines = str(value or "").splitlines()
     return "\n".join(lines[:limit])
+
+
+def _bounded_command_preview(value: str) -> tuple[str, bool]:
+    lines = str(value or "").splitlines()
+    preview = "\n".join(lines[:_COLLAPSED_PREVIEW_LINES])
+    truncated = len(lines) > _COLLAPSED_PREVIEW_LINES
+    if len(preview) > _COMMAND_PREVIEW_CHARS:
+        preview = preview[:_COMMAND_PREVIEW_CHARS].rstrip()
+        truncated = True
+    return preview, truncated
 
 
 def _preview_text_block(value: str, *, style: str = "dim on #1f1f1f") -> Text:
@@ -2627,18 +2709,19 @@ def _render_diff_layout(
     language: str,
     width: int,
     new_file: bool = False,
+    toggle_id: str = "",
 ) -> Panel | Group | Table:
     if new_file:
-        return _render_diff_side_panel(rows, side="after", title="New file", path=path, language=language)
+        return _render_diff_side_panel(rows, side="after", title="New file", path=path, language=language, toggle_id=toggle_id)
     if width < _SIDE_BY_SIDE_DIFF_WIDTH:
         return Group(
-            _render_diff_side_panel(rows, side="before", title="Before", path=path, language=language),
-            _render_diff_side_panel(rows, side="after", title="After", path=path, language=language),
+            _render_diff_side_panel(rows, side="before", title="Before", path=path, language=language, toggle_id=toggle_id),
+            _render_diff_side_panel(rows, side="after", title="After", path=path, language=language, toggle_id=toggle_id),
         )
-    return _render_side_by_side_diff_table(rows, path=path, language=language)
+    return _render_side_by_side_diff_table(rows, path=path, language=language, toggle_id=toggle_id)
 
 
-def _render_side_by_side_diff_table(rows: list[_DiffRow], *, path: str, language: str) -> Table:
+def _render_side_by_side_diff_table(rows: list[_DiffRow], *, path: str, language: str, toggle_id: str = "") -> Table:
     table = Table(
         box=box.SQUARE,
         border_style="grey35",
@@ -2657,8 +2740,8 @@ def _render_side_by_side_diff_table(rows: list[_DiffRow], *, path: str, language
     highlighter = Syntax("", language, theme="monokai")
     for row in rows:
         table.add_row(
-            _diff_side_line(row, side="before", width=before_width, highlighter=highlighter),
-            _diff_side_line(row, side="after", width=after_width, highlighter=highlighter),
+            _diff_side_line(row, side="before", width=before_width, highlighter=highlighter, toggle_id=toggle_id),
+            _diff_side_line(row, side="after", width=after_width, highlighter=highlighter, toggle_id=toggle_id),
         )
     return table
 
@@ -2670,6 +2753,7 @@ def _render_diff_side_panel(
     title: str,
     path: str,
     language: str,
+    toggle_id: str = "",
 ) -> Panel:
     table = Table.grid(expand=True, padding=0)
     table.add_column(ratio=1, min_width=1, overflow="fold")
@@ -2677,7 +2761,7 @@ def _render_diff_side_panel(
         line_number_width = _line_number_width(rows, side=side)
         highlighter = Syntax("", language, theme="monokai")
         for row in rows:
-            table.add_row(_diff_side_line(row, side=side, width=line_number_width, highlighter=highlighter))
+            table.add_row(_diff_side_line(row, side=side, width=line_number_width, highlighter=highlighter, toggle_id=toggle_id))
     else:
         table.add_row(Text("(empty)", style=f"dim on {_DIFF_EDITOR_BACKGROUND}"))
     return Panel(
@@ -2701,9 +2785,12 @@ def _diff_panel_title(title: str, *, path: str, title_style: str = "bold") -> Te
     return text
 
 
-def _diff_side_line(row: _DiffRow, *, side: str, width: int, highlighter: Syntax) -> Text:
+def _diff_side_line(row: _DiffRow, *, side: str, width: int, highlighter: Syntax, toggle_id: str = "") -> Text:
     if row.kind == "ellipsis":
-        return Text(_diff_ellipsis_line(width), style=f"dim on {_DIFF_EDITOR_BACKGROUND}")
+        text = Text(_diff_ellipsis_line(width), style=f"dim on {_DIFF_EDITOR_BACKGROUND}")
+        if toggle_id:
+            text.stylize(Style(meta={"nexus_toggle": toggle_id}))
+        return text
 
     line_number = row.before_number if side == "before" else row.after_number
     value = row.before if side == "before" else row.after
@@ -2760,13 +2847,39 @@ def _render_new_file_preview(
     return _ResponsiveDiff(rows=tuple(rows), path=path, language=language, new_file=True)
 
 
-def _bash_command_block(command: str, *, collapsed: bool = False) -> Group:
-    command_text = command.rstrip()
-    if collapsed and _line_count(command_text) > _COLLAPSED_PREVIEW_LINES:
-        command_text = f"{_first_lines(command_text)}\n... click [+] to expand"
-    return Group(
-        Text("Command", style="dim"),
-        Syntax(command_text or "(empty command)", "bash", theme="monokai", word_wrap=True),
+def _command_from_arguments(args: dict[str, Any]) -> str:
+    command = args.get("command")
+    return str(command or "").strip() if isinstance(command, str) else ""
+
+
+def _command_from_preview_or_arguments(preview: dict[str, Any], args: dict[str, Any]) -> str:
+    command = preview.get("command")
+    if isinstance(command, str) and command.strip():
+        return command.strip()
+    return _command_from_arguments(args)
+
+
+def _markdown_code_fence(value: str, *, language: str) -> str:
+    longest_run = max((len(match.group(0)) for match in re.finditer(r"`+", value)), default=0)
+    fence = "`" * max(3, longest_run + 1)
+    return f"{fence}{language}\n{value}\n{fence}"
+
+
+def _bash_command_block(command: str, *, collapsed: bool = False) -> _FencedCodeBlock:
+    return _FencedCodeBlock(
+        command,
+        language="bash",
+        label="Command",
+        collapsed=collapsed,
+    )
+
+
+def _bash_output_block(output: str, *, collapsed: bool = False) -> _FencedCodeBlock:
+    return _FencedCodeBlock(
+        output,
+        language="text",
+        label="Console output",
+        collapsed=collapsed,
     )
 
 
