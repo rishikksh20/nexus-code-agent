@@ -18,7 +18,9 @@ from uuid import uuid4
 
 from rich import box
 from rich.console import Console
+from rich.console import ConsoleOptions
 from rich.console import Group
+from rich.console import RenderResult
 from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.panel import Panel
@@ -73,6 +75,9 @@ _COLLAPSE_LINE_LIMIT = 18
 _COLLAPSE_CHAR_LIMIT = 2400
 _ALERT_PREVIEW_CHARS = 150
 _SIDE_BY_SIDE_DIFF_WIDTH = 104
+_DIFF_EDITOR_BACKGROUND = "#272822"
+_DIFF_DELETE_BACKGROUND = "#3a2020"
+_DIFF_ADD_BACKGROUND = "#203a24"
 _MUTATING_FILE_TOOLS = {"write_file", "edit", "insert_edit_into_file", "apply_patch"}
 _VERIFY_TOOL_NAMES = {"bash", "run_tests", "run_python_check"}
 _AGENT_BULLET = "● "
@@ -86,6 +91,26 @@ class _DiffRow:
     before: str
     after: str
     kind: str
+
+
+@dataclass(frozen=True)
+class _ResponsiveDiff:
+    """Render a file diff using the width available at paint time."""
+
+    rows: tuple[_DiffRow, ...]
+    path: str = ""
+    language: str = "text"
+    new_file: bool = False
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        del console
+        yield _render_diff_layout(
+            list(self.rows),
+            path=self.path,
+            language=self.language,
+            width=max(1, options.max_width),
+            new_file=self.new_file,
+        )
 
 
 def _strip_mouse_escape_sequences(value: str) -> str:
@@ -629,32 +654,19 @@ class TextualTerminalUI(TerminalUI):
             preview=self._render_file_diff_preview(result.tool_name, diff_data, diff, path=target, collapsed=True),
         )
 
-    def _render_diff_editor(self, diff_text: str, *, path: str = "") -> Group | Table:
+    def _render_diff_editor(self, diff_text: str, *, path: str = "") -> _ResponsiveDiff:
         return self._render_diff_rows(_diff_rows_from_unified_diff(diff_text), path=path)
 
-    def _render_diff_editor_preview(self, diff_text: str, *, path: str = "") -> Group | Table:
+    def _render_diff_editor_preview(self, diff_text: str, *, path: str = "") -> _ResponsiveDiff:
         rows = _collapsed_diff_rows(_diff_rows_from_unified_diff(diff_text), limit=_COLLAPSED_PREVIEW_LINES)
         return self._render_diff_rows(rows, path=path)
 
-    def _render_diff_rows(self, rows: list[_DiffRow], *, path: str = "") -> Group | Table:
-        del path
-        width = self._app.transcript_width
-        if width < _SIDE_BY_SIDE_DIFF_WIDTH:
-            return Group(
-                Text("Before", style="dim"),
-                _diff_side_text(rows, side="before"),
-                Text("After", style="dim"),
-                _diff_side_text(rows, side="after"),
-            )
-        table = Table.grid(expand=True, padding=(0, 1))
-        table.add_column(ratio=1, min_width=1)
-        table.add_column(ratio=1, min_width=1)
-        table.add_row(Text("Before", style="dim"), Text("After", style="dim"))
-        table.add_row(
-            _diff_side_text(rows, side="before"),
-            _diff_side_text(rows, side="after"),
+    def _render_diff_rows(self, rows: list[_DiffRow], *, path: str = "") -> _ResponsiveDiff:
+        return _ResponsiveDiff(
+            rows=tuple(rows),
+            path=path,
+            language=self._guess_language(path),
         )
-        return table
 
     def _render_file_diff_preview(
         self,
@@ -664,12 +676,17 @@ class TextualTerminalUI(TerminalUI):
         *,
         path: str = "",
         collapsed: bool = False,
-    ) -> Group | Table:
+    ) -> _ResponsiveDiff:
         old_content = str(diff_data.get("old_content", "") or "")
         new_content = str(diff_data.get("new_content", "") or "")
         has_contents = "old_content" in diff_data or "new_content" in diff_data
         if _should_render_as_new_file(tool_name, diff_data):
-            return _render_new_file_preview(new_content, collapsed=collapsed)
+            return _render_new_file_preview(
+                new_content,
+                path=path,
+                language=self._guess_language(path),
+                collapsed=collapsed,
+            )
         if has_contents:
             rows = _diff_rows_from_contents(old_content, new_content)
         else:
@@ -1050,6 +1067,12 @@ class TranscriptLog(RichLog):
         event.prevent_default()
         self.focus()
         cast("NexusTextualApp", self.app).copy_selection_or_transcript()
+
+    def on_resize(self, event: events.Resize) -> None:
+        del event
+        app = cast("NexusTextualApp", self.app)
+        if app._transcript is self:
+            app.call_after_refresh(app._rerender_transcript)
 
     def action_scroll_line_up(self) -> None:
         self.scroll_up(animate=False)
@@ -2597,24 +2620,116 @@ def _collapsed_diff_rows(rows: list[_DiffRow], *, limit: int) -> list[_DiffRow]:
     return [*rows[: max(0, limit - 1)], _DiffRow(None, None, "", "click [+] to expand", "ellipsis")]
 
 
-def _diff_side_text(rows: list[_DiffRow], *, side: str) -> Text:
+def _render_diff_layout(
+    rows: list[_DiffRow],
+    *,
+    path: str,
+    language: str,
+    width: int,
+    new_file: bool = False,
+) -> Panel | Group | Table:
+    if new_file:
+        return _render_diff_side_panel(rows, side="after", title="New file", path=path, language=language)
+    if width < _SIDE_BY_SIDE_DIFF_WIDTH:
+        return Group(
+            _render_diff_side_panel(rows, side="before", title="Before", path=path, language=language),
+            _render_diff_side_panel(rows, side="after", title="After", path=path, language=language),
+        )
+    return _render_side_by_side_diff_table(rows, path=path, language=language)
+
+
+def _render_side_by_side_diff_table(rows: list[_DiffRow], *, path: str, language: str) -> Table:
+    table = Table(
+        box=box.SQUARE,
+        border_style="grey35",
+        collapse_padding=True,
+        expand=True,
+        padding=(0, 0),
+        style=f"on {_DIFF_EDITOR_BACKGROUND}",
+    )
+    table.add_column(_diff_panel_title("Before", path=path, title_style="bold red"), ratio=1, min_width=1, overflow="fold")
+    table.add_column(_diff_panel_title("After", path=path, title_style="bold green"), ratio=1, min_width=1, overflow="fold")
     if not rows:
-        return Text("(empty)", style="dim on #1f1f1f")
-    width = _line_number_width(rows, side=side)
-    text = Text()
+        table.add_row(Text("(empty)", style="dim"), Text("(empty)", style="dim"))
+        return table
+    before_width = _line_number_width(rows, side="before")
+    after_width = _line_number_width(rows, side="after")
+    highlighter = Syntax("", language, theme="monokai")
     for row in rows:
-        if row.kind == "ellipsis":
-            _append_text_line(text, _diff_ellipsis_line(width), "dim")
-            continue
-        line_number = row.before_number if side == "before" else row.after_number
-        value = row.before if side == "before" else row.after
-        marker = _diff_marker(row, side=side)
-        style = _diff_row_style(row, side=side)
-        if not value and row.kind in {"add", "delete"}:
-            _append_text_line(text, _diff_blank_line(width), "dim")
-            continue
-        _append_text_line(text, f"{_format_line_number(line_number, width)} | {marker}{value}", style)
+        table.add_row(
+            _diff_side_line(row, side="before", width=before_width, highlighter=highlighter),
+            _diff_side_line(row, side="after", width=after_width, highlighter=highlighter),
+        )
+    return table
+
+
+def _render_diff_side_panel(
+    rows: list[_DiffRow],
+    *,
+    side: str,
+    title: str,
+    path: str,
+    language: str,
+) -> Panel:
+    table = Table.grid(expand=True, padding=0)
+    table.add_column(ratio=1, min_width=1, overflow="fold")
+    if rows:
+        line_number_width = _line_number_width(rows, side=side)
+        highlighter = Syntax("", language, theme="monokai")
+        for row in rows:
+            table.add_row(_diff_side_line(row, side=side, width=line_number_width, highlighter=highlighter))
+    else:
+        table.add_row(Text("(empty)", style=f"dim on {_DIFF_EDITOR_BACKGROUND}"))
+    return Panel(
+        table,
+        title=_diff_panel_title(title, path=path),
+        title_align="left",
+        border_style="red" if side == "before" else "green",
+        box=box.SQUARE,
+        padding=(0, 0),
+        expand=True,
+        style=f"on {_DIFF_EDITOR_BACKGROUND}",
+    )
+
+
+def _diff_panel_title(title: str, *, path: str, title_style: str = "bold") -> Text:
+    text = Text(title, style=title_style)
+    clean_path = path.replace("\n", " ").strip()
+    if clean_path:
+        text.append(" | ", style="dim")
+        text.append(clean_path, style="dim")
     return text
+
+
+def _diff_side_line(row: _DiffRow, *, side: str, width: int, highlighter: Syntax) -> Text:
+    if row.kind == "ellipsis":
+        return Text(_diff_ellipsis_line(width), style=f"dim on {_DIFF_EDITOR_BACKGROUND}")
+
+    line_number = row.before_number if side == "before" else row.after_number
+    value = row.before if side == "before" else row.after
+    marker = _diff_marker(row, side=side)
+    text = Text(overflow="fold")
+    text.append(f"{_format_line_number(line_number, width)} | ", style="grey62")
+    text.append(marker, style=_diff_marker_style(marker))
+    if value:
+        text.append_text(_syntax_highlight_line(value, highlighter=highlighter))
+    background = _diff_row_background(row, side=side)
+    text.stylize(Style(bgcolor=background))
+    return text
+
+
+def _syntax_highlight_line(value: str, *, highlighter: Syntax) -> Text:
+    highlighted = highlighter.highlight(value)
+    highlighted.rstrip()
+    return highlighted
+
+
+def _diff_marker_style(marker: str) -> str:
+    if marker == "-":
+        return "bold bright_red"
+    if marker == "+":
+        return "bold bright_green"
+    return "default"
 
 
 def _should_render_as_new_file(tool_name: str, diff_data: dict[str, Any]) -> bool:
@@ -2626,23 +2741,23 @@ def _should_render_as_new_file(tool_name: str, diff_data: dict[str, Any]) -> boo
     return bool(diff_data.get("is_new_file")) or old_content == ""
 
 
-def _render_new_file_preview(content: str, *, collapsed: bool = False) -> Group:
+def _render_new_file_preview(
+    content: str,
+    *,
+    path: str = "",
+    language: str = "text",
+    collapsed: bool = False,
+) -> _ResponsiveDiff:
     lines = content.splitlines()
-    header = Text("New file", style="dim")
-    if not lines:
-        return Group(header, Text("(empty file)", style="dim"))
-    line_number_width = max(1, len(str(len(lines))))
     visible_lines = lines
-    truncated = False
     if collapsed and len(lines) > _COLLAPSED_PREVIEW_LINES:
         visible_lines = lines[: max(0, _COLLAPSED_PREVIEW_LINES - 1)]
-        truncated = True
-    body = Text()
+    rows: list[_DiffRow] = []
     for index, line in enumerate(visible_lines, start=1):
-        _append_text_line(body, f"{index:>{line_number_width}} | +{line}", "green on #162a1a")
-    if truncated:
-        _append_text_line(body, f"{' ' * line_number_width} | ... click [+] to expand", "dim")
-    return Group(header, body)
+        rows.append(_DiffRow(None, index, "", line, "add"))
+    if len(visible_lines) < len(lines):
+        rows.append(_DiffRow(None, None, "", "click [+] to expand", "ellipsis"))
+    return _ResponsiveDiff(rows=tuple(rows), path=path, language=language, new_file=True)
 
 
 def _bash_command_block(command: str, *, collapsed: bool = False) -> Group:
@@ -2680,18 +2795,14 @@ def _diff_marker(row: _DiffRow, *, side: str) -> str:
     return " "
 
 
-def _diff_row_style(row: _DiffRow, *, side: str) -> str:
+def _diff_row_background(row: _DiffRow, *, side: str) -> str:
     if row.kind == "change":
-        return "red on #2a1717" if side == "before" else "green on #162a1a"
+        return _DIFF_DELETE_BACKGROUND if side == "before" else _DIFF_ADD_BACKGROUND
     if row.kind == "delete":
-        return "red on #2a1717" if side == "before" else "dim"
+        return _DIFF_DELETE_BACKGROUND if side == "before" else _DIFF_EDITOR_BACKGROUND
     if row.kind == "add":
-        return "green on #162a1a" if side == "after" else "dim"
-    return "default"
-
-
-def _diff_blank_line(width: int) -> str:
-    return f"{' ' * width} |"
+        return _DIFF_ADD_BACKGROUND if side == "after" else _DIFF_EDITOR_BACKGROUND
+    return _DIFF_EDITOR_BACKGROUND
 
 
 def _diff_ellipsis_line(width: int) -> str:

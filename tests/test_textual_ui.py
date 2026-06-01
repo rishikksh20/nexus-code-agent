@@ -956,7 +956,7 @@ async def test_textual_bash_approval_uses_command_block_and_structured_details(t
 
 
 @pytest.mark.asyncio
-async def test_textual_diff_preview_stacks_on_narrow_width(tmp_path, monkeypatch):
+async def test_textual_diff_preview_reflows_when_terminal_width_changes(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
     state = ReplState(
@@ -970,7 +970,6 @@ async def test_textual_diff_preview_stacks_on_narrow_width(tmp_path, monkeypatch
     )
     agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
     app = NexusTextualApp(state, agent, build_router())
-    monkeypatch.setattr(NexusTextualApp, "transcript_width", property(lambda self: 80))
     diff = "\n".join(
         [
             "--- a/app.py",
@@ -981,7 +980,7 @@ async def test_textual_diff_preview_stacks_on_narrow_width(tmp_path, monkeypatch
         ]
     )
 
-    async with app.run_test() as pilot:
+    async with app.run_test(size=(140, 40)) as pilot:
         await pilot.pause()
         transcript = app.query_one("#transcript", TranscriptLog)
         transcript.clear()
@@ -990,9 +989,43 @@ async def test_textual_diff_preview_stacks_on_narrow_width(tmp_path, monkeypatch
 
         app.write(app.ui._render_diff_editor_preview(diff, path="app.py"))
 
-        rendered = app._transcript_text()
-        assert rendered.index("After") > rendered.index("40 | -old 40")
-        assert "40 | +new 40" in rendered
+        wide = app._transcript_text()
+        assert "Before | app.py" in wide
+        assert "After | app.py" in wide
+        assert wide.index("After | app.py") < wide.index("40 | -old 40")
+
+        await pilot.resize_terminal(80, 40)
+        await pilot.pause()
+
+        narrow = app._transcript_text()
+        assert narrow.index("After | app.py") > narrow.index("40 | -old 40")
+        assert "40 | +new 40" in narrow
+
+
+def test_textual_wide_diff_preview_uses_full_width_and_keeps_wrapped_rows_aligned():
+    from nexus.ui.textual_app import _DiffRow, _ResponsiveDiff, _renderable_plain_text
+
+    renderable = _ResponsiveDiff(
+        rows=(
+            _DiffRow(
+                1,
+                1,
+                "short",
+                "this replacement line is intentionally much longer than the available split panel width so it wraps",
+                "change",
+            ),
+            _DiffRow(2, 2, "next()", "next()", "context"),
+        ),
+        path="src/example.py",
+        language="python",
+    )
+
+    rendered = _renderable_plain_text(renderable, width=110)
+    lines = rendered.splitlines()
+
+    assert len(lines[0]) == 110
+    aligned_context_line = next(line for line in lines if "2 |  next()" in line)
+    assert aligned_context_line.count("2 |  next()") == 2
 
 
 @pytest.mark.asyncio
