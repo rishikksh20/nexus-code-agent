@@ -16,6 +16,7 @@ from nexus.integrations.cohere import (
     _with_cohere_strict_reason_argument,
 )
 from nexus.integrations.retry import call_with_backoff, retry_delay
+from nexus.config.provider_profiles import ThinkingConfig
 from nexus.models import (
     Message,
     RuntimeRequest,
@@ -38,11 +39,13 @@ class OpenAICompatibleAdapter:
         cohere_compatibility: bool = False,
         thinking_mode: str = "auto",
         reasoning_effort: str = "high",
+        thinking: ThinkingConfig | None = None,
     ) -> None:
         self.provider_name = provider_name
         self.cohere_compatibility = cohere_compatibility
         self.thinking_mode = thinking_mode
         self.reasoning_effort = reasoning_effort
+        self.thinking = thinking or ThinkingConfig()
 
     def to_wire_request(self, request: RuntimeRequest) -> dict[str, Any]:
         tools = list(request.tool_schemas)
@@ -107,10 +110,15 @@ class OpenAICompatibleAdapter:
             "tools": tools,
             "temperature": request.temperature,
         }
+        if request.top_p != 1.0:
+            payload["top_p"] = request.top_p
         if request.max_output_tokens is not None:
-            payload["max_tokens"] = request.max_output_tokens
+            token_key = "max_completion_tokens" if self.provider_name == "openai" and self.thinking.enabled else "max_tokens"
+            payload[token_key] = request.max_output_tokens
         if self.thinking_mode in {"enabled", "disabled"}:
             payload["thinking"] = {"type": self.thinking_mode}
+            if self.thinking_mode == "enabled" and self.thinking.budget_tokens is not None:
+                payload["thinking"]["budget_tokens"] = self.thinking.budget_tokens
             if self.thinking_mode == "enabled" and self.reasoning_effort:
                 payload["reasoning_effort"] = self.reasoning_effort
         return payload
@@ -179,6 +187,7 @@ class OpenAICompatibleModelClient:
         jitter: float = 0.2,
         thinking_mode: str = "auto",
         reasoning_effort: str = "high",
+        thinking: ThinkingConfig | None = None,
     ) -> None:
         normalized_base = resolve_provider_api_base_url(provider_name, api_base_url)
         if not normalized_base:
@@ -192,11 +201,13 @@ class OpenAICompatibleModelClient:
         self.jitter = jitter
         self.thinking_mode = thinking_mode
         self.reasoning_effort = reasoning_effort
+        self.thinking = thinking or ThinkingConfig()
         self.adapter = OpenAICompatibleAdapter(
             provider_name=provider_name,
             cohere_compatibility=_is_cohere_compatibility_base_url(normalized_base),
             thinking_mode=thinking_mode,
             reasoning_effort=reasoning_effort,
+            thinking=self.thinking,
         )
 
     async def complete(self, request: RuntimeRequest) -> RuntimeResponse:

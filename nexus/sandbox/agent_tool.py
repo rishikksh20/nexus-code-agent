@@ -330,6 +330,8 @@ class SubAgentTool:
                                 role=pending_message.role,
                                 content=pending_message.content,
                                 name=pending_message.name,
+                                reasoning_content=pending_message.reasoning_content,
+                                provider_state=pending_message.provider_state,
                                 tool_calls=(resume_call,),
                                 tool_call_id=pending_message.tool_call_id,
                             )

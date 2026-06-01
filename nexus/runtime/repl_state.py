@@ -56,6 +56,7 @@ class ReplState:
     current_turn_task: asyncio.Task | None = None
     abort_requested: bool = False
     model_client_reloader: Callable[[AgentConfig], None] | None = None
+    provider_settings_opener: Callable[[], None] | None = None
 
     def begin_running_turn(self, task: asyncio.Task | None = None) -> None:
         self.current_turn_task = task or asyncio.current_task()
@@ -326,6 +327,7 @@ def _bound_durable_tool_outputs(
                 ),
                 name=message.name,
                 reasoning_content=message.reasoning_content,
+                provider_state=message.provider_state,
                 tool_calls=message.tool_calls,
                 tool_call_id=message.tool_call_id,
             )

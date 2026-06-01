@@ -1188,6 +1188,64 @@ async def test_provider_set_slash_command_updates_model_name(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_provider_use_and_profile_owned_set_write_workspace_override(tmp_path, monkeypatch):
+    monkeypatch.delenv("MODEL", raising=False)
+    monkeypatch.delenv("AGENT_MODEL_NAME", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+    global_config = global_root / "config.toml"
+    global_config.write_text(
+        '[models.fast]\n'
+        'provider = "fake"\n'
+        'model_name = "fake-one"\n'
+        'context_length = 32000\n'
+        'max_output_tokens = 4000\n'
+        'reserved_output_tokens = 4000\n',
+        encoding="utf-8",
+    )
+    config = load_config(workspace, global_root=global_root)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("profile-use"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True, width=200),
+    )
+    router = build_router()
+
+    assert await router.dispatch(state, "/provider use fast") is True
+    assert state.config.active_model_profile == "fast"
+    assert await router.dispatch(state, "/provider set model_name fake-two") is True
+
+    local = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8"))
+    assert local["active_model_profile"] == "fast"
+    assert local["models"]["fast"]["model_name"] == "fake-two"
+    assert state.config.model_name == "fake-two"
+
+
+@pytest.mark.asyncio
+async def test_provider_manage_classic_terminal_prints_textual_requirement(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("profile-manage"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    assert await build_router().dispatch(state, "/provider manage") is True
+    assert "requires the Textual UI" in console.export_text()
+
+
+@pytest.mark.asyncio
 async def test_provider_set_slash_command_rejects_restricted_key(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
@@ -1319,7 +1377,7 @@ async def test_config_upgrade_removes_deprecated_multi_agent_mode(tmp_path):
     assert handled is True
     content = local_config.read_text(encoding="utf-8")
     assert "multi_agent_mode" not in content
-    assert "config_version = 2" in content
+    assert "config_version = 3" in content
     assert "removed deprecated multi_agent_mode" in console.export_text()
 
 

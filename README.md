@@ -39,7 +39,7 @@
 - **Context compaction** — token-budget management with carry-over summaries; soft/hard limits auto-tuned to the active model's context window
 - **Skills** — Markdown skill files loaded from builtin, global, and workspace directories; activated per-session
 - **MCP integration** — tool discovery over subprocess stdio
-- **Plugin system** — drop `.py` files into `~/.nexus/plugins/` to register custom tools
+- **Plugin system** — load custom-tool `.py` files from global and project roots
 - **Cognitive sub-agents** — specialized agent tools with isolated context and normal nested tool permissions
 - **Sandbox** — Docker-backed command execution with resource and network limits
 - **Lifecycle hooks** — JSONL runtime logs, aggregated metrics, and audit trail for mutating actions
@@ -74,7 +74,7 @@ nexus/                         # Main package
 │   └── loop_detector.py       # Repetition and cycle detection
 │
 ├── extensions/
-│   └── plugins.py             # Plugin loader — registers tools from ~/.nexus/plugins/
+│   └── plugins.py             # Plugin loader — registers tools from global and project roots
 │
 ├── hooks/                     # Event-driven hook system
 │   ├── events.py              # HookEvent enum
@@ -200,7 +200,7 @@ BASE_URL=https://api.mistral.ai/v1
 > **Tip**: `BASE_URL` can point to any OpenAI-compatible endpoint — Mistral, OpenAI,
 > Ollama (`http://localhost:11434/v1`), vLLM, LM Studio, etc.
 
-**Initialize workspace state** (creates `.nexus/` config and state directories):
+**Initialize workspace state** (creates `.nexus/` state and seeds `.agents/skills/`):
 
 ```bash
 uv run nexus init
@@ -271,7 +271,9 @@ cd workspace
 uv run nexus init
 ```
 
-This creates `workspace/.nexus/` with a `config.toml`, `sessions/`, `memory/`, and `knowledge.md`.
+This creates `workspace/.nexus/` with a `config.toml`, `sessions/`, `memory/`,
+and `knowledge.md`, then copies missing packaged skills into
+`workspace/.agents/skills/`.
 
 **Step 3 — Run the agent:**
 
@@ -347,7 +349,7 @@ uv run --directory workspace nexus --prompt "summarize this project"
 
 | Command | Description |
 |---|---|
-| `nexus init [--force]` | Create `.nexus/` and `~/.nexus/` config and state directories |
+| `nexus init [--force]` | Create config/state directories and seed workspace `.agents/skills/` |
 | `nexus version` | Print version and exit |
 | `nexus doctor [--output-format text\|json\|jsonl]` | Run production-readiness gate checks |
 | `nexus config [global\|local\|merged]` | Print a config layer |
@@ -364,7 +366,7 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 | `/mode [plan\|default\|auto]` | Show or switch execution mode |
 | `/context [show\|usage]` | Print system prompt or show supervisor token/context-window usage, including tool, MCP, sub-agent, and skill prompt/schema estimates |
 | `/context agents\|agent \<id\>\|usage \<id\>` | Inspect per-agent context isolation, handoffs, and usage |
-| `/provider [list\|set \<param\> \<value\>]` | Show or update provider, model, temperature, and session parameters |
+| `/provider [list\|profiles\|use \<profile\>\|manage\|set \<param\> \<value\>]` | Inspect providers, activate reusable profiles, open Textual settings, or update live parameters |
 | `/config [show\|set\|reset\|reset-defaults\|reload\|upgrade\|reinit]` | Inspect or edit configuration; `reset-defaults` rewrites clean defaults |
 | `/skills [list\|show\|add\|remove\|reload]` | Manage session skills and skill-backed sub-agent tools |
 | `/agent [status\|tools\|skills\|mcp\|allow\|disallow]` | Inspect and scope supervisor tools, skills, and MCP servers |
@@ -659,6 +661,12 @@ Later roots override earlier roots when skill names collide:
 4. Workspace skills — `.nexus/skills/`
 5. Standard Agent Skills path — `.agents/skills/`
 
+`nexus init` copies missing packaged built-ins into `.agents/skills/`. This
+workspace copy wins during discovery and is readable by filesystem tools, so
+the agent can inspect full skill instructions and bundled resources when
+needed. Existing workspace copies are preserved unless `nexus init --force`
+is used.
+
 ### Activation
 
 Workspace activation is stored in `.nexus/config.toml`:
@@ -766,6 +774,44 @@ BASE_URL=https://api.mistral.ai/v1  # any OpenAI-compatible endpoint
 
 ### Workspace-Level Config (`.nexus/config.toml`)
 
+Provider names are fixed adapter cards. Reusable provider settings and model
+profiles belong in `~/.nexus/config.toml`; a workspace selects one profile in
+`.nexus/config.toml`. Use `/provider manage` in the Textual UI, or
+`/provider profiles` and `/provider use <profile>` in either interactive UI.
+
+```toml
+# ~/.nexus/config.toml
+[providers.ollama]
+enabled = true
+base_url = "http://localhost:11434"
+timeout_seconds = 300
+max_retries = 0
+
+[models.fast-local-coder]
+provider = "ollama"
+model_name = "qwen2.5-coder:7b"
+context_length = 32768
+max_output_tokens = 8192
+reserved_output_tokens = 8192
+temperature = 0.05
+top_p = 0.9
+supports_tools = true
+supports_streaming = true
+supports_reasoning = false
+
+[models.fast-local-coder.thinking]
+enabled = false
+mode = "provider_default"
+```
+
+```toml
+# .nexus/config.toml
+active_model_profile = "fast-local-coder"
+```
+
+Without an active profile, Nexus synthesizes a `legacy-current` profile from
+the existing flat provider fields, so older configs continue to work.
+
 ```toml
 # Provider and model — can be omitted if set via .env
 provider = "openai-compatible"
@@ -799,7 +845,7 @@ max_sessions_retained = 50
 
 # Approvals and path policy
 approval_policy = "on-request"     # on-request | approve-turn | approve-session | auto | plan
-allow_hidden_paths = false         # .nexus remains blocked even when true
+allow_hidden_paths = false         # .agents/skills and .agents/tools stay readable; .nexus stays blocked
 
 # Tool filtering
 allowed_tools = []               # empty = all tools allowed
@@ -844,7 +890,7 @@ disabled_mcp_servers = []       # disable local or global MCP entries by name
 # Optional MCP fields: env, cwd, disabled, disabled_tools.
 
 # Agent profile
-config_version = 2
+config_version = 3
 agent_mode = "basic" # basic | advanced
 # basic = single-LLM execution with no cognitive sub-agent tools.
 # advanced = supervisor LLM with cognitive sub-agent tools.
@@ -874,6 +920,27 @@ schema version, merges default tool allowlist entries, and reloads live tools.
 ### User-Level Config (`~/.nexus/config.toml`)
 
 Same format as the workspace config. Applied to all workspaces; overridden by workspace-level settings.
+
+---
+
+### Custom Tools
+
+Custom tools are Python plugin files with a `register(registry, hooks)`
+function. Nexus discovers them from these roots; later roots override an
+earlier file with the same stem:
+
+1. Global plugins — `~/.nexus/plugins/`
+2. Workspace compatibility plugins — `.nexus/plugins/`
+3. Project-readable custom tools — `.agents/tools/`
+
+Use `.agents/tools/` for project custom tools that the agent should inspect
+with `read_file`, `glob`, `grep`, or `list_dir`. Run `/tools reload` after
+editing a plugin while the REPL is open. Nexus does not currently ship
+packaged custom-tool plugins, so `nexus init` has nothing to copy into this
+directory.
+
+Plugin files execute Python during startup. Review project plugins before
+running Nexus in an unfamiliar workspace.
 
 ---
 
@@ -928,9 +995,9 @@ enabled_mcp_servers = ["filesystem", "git"]
 disabled_mcp_servers = []
 ```
 
-Do not add MCP tool names to `allowed_tools`. Workspace-local MCP servers are
-active by default; global MCP servers are a reusable catalog and are activated
-per workspace by name. Once a server is active, Nexus discovers its tools at
+Do not add MCP tool names to `allowed_tools`. Local and global MCP server
+definitions form a catalog and are activated per workspace by name. Once a
+server is active, Nexus discovers its tools at
 startup and registers all discovered tools except any remote names listed in
 that server's `disabled_tools`.
 
@@ -975,6 +1042,8 @@ See [`docs/mcp-integration.md`](docs/mcp-integration.md) for the full configurat
 | `.nexus/facts.json` | Structured workspace facts |
 | `.nexus/audit-trail.jsonl` | Audit log for every mutating action |
 | `.nexus/skills/` | Workspace-level custom skills |
+| `.agents/skills/` | Workspace-readable Agent Skills, including seeded packaged skills |
+| `.agents/tools/` | Workspace-readable custom-tool plugins (`.py` files) |
 | `~/.nexus/config.toml` | Global user config |
 | `~/.nexus/skills/` | Global user skills |
 | `~/.nexus/plugins/` | Custom tool plugins (`.py` files) |
@@ -1033,6 +1102,16 @@ The compaction prompt (`nexus/prompts/compression.py`) uses a structured 7-secti
 ---
 
 ## Providers
+
+Provider cards are registered in `nexus/integrations/registry.py`. The provider
+name identifies the API adapter class; the user-created entity is the model
+profile. All agents and cognitive sub-agents use the same resolved active
+profile in this release.
+
+The Textual UI exposes `/provider manage` with **Providers** and **Model
+Profiles** tabs. Credential forms store environment-variable names only, never
+secret values. Live profile tests require a second confirmation click because
+they can incur a small provider charge.
 
 | Provider | Value | Notes |
 |---|---|---|

@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from nexus.config.defaults import AgentConfig, build_default_config, config_to_plain_dict
+from nexus.config.provider_profiles import ModelProfile, deep_merge_named_tables
 from nexus.config.upgrade import normalize_legacy_config_values
+from nexus.integrations.registry import PROVIDER_DEFINITIONS, provider_defaults
 from nexus.runtime.agent_scope import SUBAGENT_PROFILE_FIELDS, SUPERVISOR_SCOPE_FIELDS
 
 
@@ -56,6 +58,7 @@ def load_config(
         merged.update(_read_environment(defaults))
         merged = _apply_agent_mode_profile(merged)
         merged = _apply_provider_defaults(merged)
+        merged = _ensure_legacy_profile(merged)
         for field_name, value in merged.items():
             if hasattr(defaults, field_name):
                 setattr(defaults, field_name, _coerce_value(value, getattr(defaults, field_name)))
@@ -97,6 +100,18 @@ def _load_config_strict(
     global_values = normalize_legacy_config_values(global_values)
     local_values = normalize_legacy_config_values(local_values)
     cli_values = normalize_legacy_config_values(cli_values)
+    legacy_api_key_configured = bool(global_values.get("api_key") or local_values.get("api_key"))
+    merged_providers = deep_merge_named_tables(
+        provider_defaults(),
+        global_values.pop("providers", {}),
+        local_values.pop("providers", {}),
+        cli_values.pop("providers", {}),
+    )
+    merged_models = deep_merge_named_tables(
+        global_values.pop("models", {}),
+        local_values.pop("models", {}),
+        cli_values.pop("models", {}),
+    )
     global_mcp_servers = _as_mcp_server_list(global_values.pop("mcp_servers", []))
     local_mcp_servers = _as_mcp_server_list(local_values.pop("mcp_servers", []))
     for duplicate_name in (
@@ -106,11 +121,25 @@ def _load_config_strict(
         if duplicate_name is not None:
             raise ConfigError(f"Duplicate mcp_servers entry '{duplicate_name}'.")
 
+    environment_values = _read_environment(defaults)
+    explicit_compaction_limits = any(
+        key in values
+        for values in (global_values, local_values, environment_values, cli_values)
+        for key in ("compaction_soft_limit", "compaction_hard_limit")
+    )
     merged = dict(base)
     merged.update(global_values)
     merged.update(local_values)
-    merged.update(_read_environment(defaults))
+    merged["providers"] = merged_providers
+    merged["models"] = merged_models
+    merged["active_model_profile"] = cli_values.get(
+        "active_model_profile",
+        environment_values.get("active_model_profile", merged.get("active_model_profile", "")),
+    )
+    merged = _apply_active_model_profile(merged)
+    merged.update(environment_values)
     merged.update(cli_values)
+    merged["compaction_limits_auto"] = not explicit_compaction_limits
     merged["mcp_servers"] = _active_mcp_servers(
         global_mcp_servers=global_mcp_servers,
         local_mcp_servers=local_mcp_servers,
@@ -119,6 +148,7 @@ def _load_config_strict(
     )
     merged = _apply_agent_mode_profile(merged)
     merged = _apply_provider_defaults(merged)
+    merged = _ensure_legacy_profile(merged)
 
     merged["workspace_root"] = str(defaults.workspace_root)
     merged["global_root"] = str(defaults.global_root)
@@ -134,7 +164,13 @@ def _load_config_strict(
         if item.name in PATH_LIST_FIELDS:
             values[item.name] = _resolve_path_list(values[item.name], defaults.workspace_root)
     _validate_config_values(values)
-    return AgentConfig(**values)
+    config = AgentConfig(**values)
+    if legacy_api_key_configured:
+        config.config_warnings.append(
+            "Config key 'api_key' is deprecated. Store the secret in an environment variable "
+            "and set providers.<name>.api_key_env instead."
+        )
+    return config
 
 
 def _as_mcp_server_list(value: Any) -> list[dict[str, Any]]:
@@ -450,7 +486,7 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     valid_llm_thinking_modes = {"auto", "enabled", "disabled"}
     valid_llm_reasoning_efforts = {"", "low", "medium", "high", "xhigh", "max"}
     valid_log_formats = {"text", "json"}
-    valid_providers = {"anthropic", "cohere", "fake", "gemini", "mistral", "openai", "openai-compatible", "ollama"}
+    valid_providers = set(PROVIDER_DEFINITIONS)
     valid_approval_policies = {
         "on-request", "approve-turn", "approve-session", "auto", "plan"
     }
@@ -463,6 +499,8 @@ def _validate_config_values(values: dict[str, Any]) -> None:
 
     if provider in {"mistral", "openai", "openai-compatible"} and not str(values["api_base_url"]).strip():
         raise ConfigError(f"provider '{provider}' requires api_base_url to be set.")
+
+    _validate_provider_profiles(values)
 
     default_mode = values["default_mode"]
     if default_mode not in valid_modes:
@@ -657,6 +695,161 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         if name in server_names:
             raise ConfigError(f"Duplicate mcp_servers entry '{name}'.")
         server_names.add(name)
+
+
+def _validate_provider_profiles(values: dict[str, Any]) -> None:
+    providers = values.get("providers", {})
+    models = values.get("models", {})
+    if not isinstance(providers, dict):
+        raise ConfigError("providers must be a table of fixed provider settings.")
+    if not isinstance(models, dict):
+        raise ConfigError("models must be a table of model profiles.")
+    for name, payload in providers.items():
+        if name not in PROVIDER_DEFINITIONS:
+            raise ConfigError(
+                f"Unknown provider '{name}'. Available providers: {', '.join(sorted(PROVIDER_DEFINITIONS))}."
+            )
+        if not isinstance(payload, dict):
+            raise ConfigError(f"providers.{name} must be a table.")
+        if float(payload.get("timeout_seconds", 120.0)) <= 0:
+            raise ConfigError(f"providers.{name}.timeout_seconds must be greater than 0.")
+        if int(payload.get("max_retries", 3)) < 0:
+            raise ConfigError(f"providers.{name}.max_retries must be greater than or equal to 0.")
+        for field_name in ("retry_base_delay_seconds", "retry_jitter_seconds"):
+            if float(payload.get(field_name, 0.0)) < 0:
+                raise ConfigError(f"providers.{name}.{field_name} must be greater than or equal to 0.")
+
+    active_name = str(values.get("active_model_profile", "") or "").strip()
+    if active_name and active_name not in models:
+        raise ConfigError(f"Unknown active_model_profile '{active_name}'.")
+    for name, payload in models.items():
+        if not str(name).strip():
+            raise ConfigError("Model profile names must be non-empty.")
+        if not isinstance(payload, dict):
+            raise ConfigError(f"models.{name} must be a table.")
+        try:
+            profile = ModelProfile.from_dict(str(name), payload)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"Invalid model profile '{name}': {exc}") from exc
+        if profile.provider not in PROVIDER_DEFINITIONS:
+            raise ConfigError(f"models.{name}.provider has unknown provider '{profile.provider}'.")
+        provider_payload = providers.get(profile.provider, {})
+        if name == active_name and not bool(provider_payload.get("enabled", True)):
+            raise ConfigError(f"models.{name} references disabled provider '{profile.provider}'.")
+        if not profile.model_name.strip():
+            raise ConfigError(f"models.{name}.model_name must be set.")
+        if profile.context_length <= 0:
+            raise ConfigError(f"models.{name}.context_length must be greater than 0.")
+        if not 0 < profile.max_output_tokens <= profile.reserved_output_tokens < profile.context_length:
+            raise ConfigError(
+                f"models.{name} token budgets must satisfy "
+                "0 < max_output_tokens <= reserved_output_tokens < context_length."
+            )
+        if not 0.0 <= profile.temperature <= 2.0:
+            raise ConfigError(f"models.{name}.temperature must be between 0.0 and 2.0.")
+        if not 0.0 <= profile.top_p <= 1.0:
+            raise ConfigError(f"models.{name}.top_p must be between 0.0 and 1.0.")
+        if profile.thinking.enabled and not profile.supports_reasoning:
+            raise ConfigError(f"models.{name}.thinking requires supports_reasoning = true.")
+        if profile.thinking.enabled and profile.thinking.mode == "budget_tokens":
+            if profile.thinking.budget_tokens is None or profile.thinking.budget_tokens <= 0:
+                raise ConfigError(f"models.{name}.thinking.budget_tokens must be greater than 0.")
+        if profile.thinking.enabled and profile.thinking.mode == "reasoning_effort":
+            if not profile.thinking.reasoning_effort:
+                raise ConfigError(f"models.{name}.thinking.reasoning_effort must be set.")
+        definition = PROVIDER_DEFINITIONS[profile.provider]
+        if profile.thinking.enabled and profile.thinking.mode not in definition.supported_thinking_modes:
+            raise ConfigError(
+                f"models.{name}.thinking.mode '{profile.thinking.mode}' is not supported by provider '{profile.provider}'."
+            )
+        if name == active_name and not profile.supports_tools:
+            raise ConfigError(f"Active model profile '{name}' must set supports_tools = true.")
+
+
+def validate_profile_catalog(
+    providers: dict[str, dict[str, Any]],
+    models: dict[str, dict[str, Any]],
+    *,
+    active_model_profile: str = "",
+) -> None:
+    _validate_provider_profiles(
+        {
+            "providers": providers,
+            "models": models,
+            "active_model_profile": active_model_profile,
+        }
+    )
+
+
+def _apply_active_model_profile(values: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(values)
+    active_name = str(resolved.get("active_model_profile", "") or "").strip()
+    models = resolved.get("models", {})
+    if not active_name or not isinstance(models, dict) or not isinstance(models.get(active_name), dict):
+        return resolved
+    profile = ModelProfile.from_dict(active_name, models[active_name])
+    resolved.update(
+        {
+            "active_model_profile_legacy": False,
+            "provider": profile.provider,
+            "model_name": profile.model_name,
+            "context_length": profile.context_length,
+            "max_output_tokens": profile.max_output_tokens,
+            "reserved_output_tokens": profile.reserved_output_tokens,
+            "temperature": profile.temperature,
+            "top_p": profile.top_p,
+            "supports_tools": profile.supports_tools,
+            "supports_streaming": profile.supports_streaming,
+            "supports_reasoning": profile.supports_reasoning,
+            "llm_thinking_mode": "enabled" if profile.thinking.enabled else "disabled",
+            "llm_reasoning_effort": profile.thinking.reasoning_effort,
+        }
+    )
+    providers = resolved.get("providers", {})
+    provider_payload = providers.get(profile.provider, {}) if isinstance(providers, dict) else {}
+    if isinstance(provider_payload, dict) and str(provider_payload.get("base_url", "") or "").strip():
+        resolved["api_base_url"] = str(provider_payload["base_url"])
+    return resolved
+
+
+def _ensure_legacy_profile(values: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(values)
+    if str(resolved.get("active_model_profile", "") or "").strip():
+        return resolved
+    context_length = int(resolved.get("context_length", 0) or 0)
+    if context_length <= 0:
+        from nexus.config.model_limits import get_model_context_limit
+
+        context_length = get_model_context_limit(str(resolved.get("model_name", "")))
+    max_output_tokens = int(resolved.get("max_output_tokens", 4096))
+    reserved_output_tokens = int(resolved.get("reserved_output_tokens", 0) or max_output_tokens)
+    if reserved_output_tokens >= context_length:
+        reserved_output_tokens = max_output_tokens
+    legacy = {
+        "provider": str(resolved.get("provider", "openai-compatible")),
+        "model_name": str(resolved.get("model_name", "")),
+        "context_length": context_length,
+        "max_output_tokens": max_output_tokens,
+        "reserved_output_tokens": reserved_output_tokens,
+        "temperature": float(resolved.get("temperature", 0.0)),
+        "top_p": float(resolved.get("top_p", 1.0)),
+        "supports_tools": True,
+        "supports_streaming": bool(resolved.get("stream_output", True)),
+        "supports_reasoning": str(resolved.get("llm_thinking_mode", "auto")) == "enabled",
+        "thinking": {
+            "enabled": str(resolved.get("llm_thinking_mode", "auto")) == "enabled",
+            "mode": "reasoning_effort",
+            "reasoning_effort": str(resolved.get("llm_reasoning_effort", "") or ""),
+        },
+    }
+    models = dict(resolved.get("models", {}))
+    models["legacy-current"] = legacy
+    resolved["models"] = models
+    resolved["active_model_profile"] = "legacy-current"
+    resolved["active_model_profile_legacy"] = True
+    resolved["context_length"] = context_length
+    resolved["reserved_output_tokens"] = reserved_output_tokens
+    return resolved
 
 
 def _apply_provider_defaults(values: dict[str, Any]) -> dict[str, Any]:

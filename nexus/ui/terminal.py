@@ -903,24 +903,12 @@ class TerminalUI:
             )
 
     def print_provider_setup_reminder(self, config) -> None:
-        from os import environ
+        from nexus.integrations.registry import provider_has_api_key
 
         provider = config.provider
         if provider == "fake":
             return
-        has_key = bool(
-            config.api_key
-            or environ.get("ANTHROPIC_API_KEY")
-            or environ.get("COHERE_API_KEY")
-            or environ.get("CO_API_KEY")
-            or environ.get("GEMINI_API_KEY")
-            or environ.get("GOOGLE_API_KEY")
-            or environ.get("MISTRAL_API_KEY")
-            or environ.get("NEXUS_API_KEY")
-            or environ.get("OPENAI_API_KEY")
-            or environ.get("API_KEY")
-        )
-        if has_key:
+        if provider_has_api_key(config):
             return
 
         self._console.print()

@@ -146,6 +146,25 @@ class TestReadFileTool:
         assert "hidden/private" in result.output.lower()
 
     @pytest.mark.asyncio
+    async def test_reads_standard_agent_resource_files_by_default(self, tool_context):
+        skill_dir = tool_context.working_directory / ".agents" / "skills" / "review"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Review\n", encoding="utf-8")
+        tools_dir = tool_context.working_directory / ".agents" / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "demo.py").write_text("# Demo tool\n", encoding="utf-8")
+
+        skill_result = await ReadFileTool().execute(
+            "c7", {"path": ".agents/skills/review/SKILL.md"}, tool_context
+        )
+        tool_result = await ReadFileTool().execute("c8", {"path": ".agents/tools/demo.py"}, tool_context)
+
+        assert not skill_result.is_error
+        assert skill_result.output == "# Review"
+        assert not tool_result.is_error
+        assert tool_result.output == "# Demo tool"
+
+    @pytest.mark.asyncio
     async def test_allows_hidden_file_reads_when_enabled_except_nexus(self, tool_context):
         (tool_context.working_directory / ".env").write_text("API_KEY=test\n")
         (tool_context.working_directory / ".nexus").mkdir(exist_ok=True)
@@ -493,6 +512,25 @@ class TestGlobTool:
         assert ".hidden.py" in override_result.output
         assert "private_docs/secret.py" in override_result.output
 
+    @pytest.mark.asyncio
+    async def test_finds_standard_agent_resource_files_by_default(self, tool_context):
+        skill_dir = tool_context.working_directory / ".agents" / "skills" / "review"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Review\n", encoding="utf-8")
+        tools_dir = tool_context.working_directory / ".agents" / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "demo.py").write_text("# Demo tool\n", encoding="utf-8")
+
+        skill_result = await GlobTool().execute(
+            "c6", {"pattern": ".agents/skills/**/SKILL.md"}, tool_context
+        )
+        tool_result = await GlobTool().execute("c7", {"pattern": ".agents/tools/**/*.py"}, tool_context)
+
+        assert not skill_result.is_error
+        assert ".agents/skills/review/SKILL.md" in skill_result.output
+        assert not tool_result.is_error
+        assert ".agents/tools/demo.py" in tool_result.output
+
 
 # ---------------------------------------------------------------------------
 # GrepTool
@@ -562,6 +600,25 @@ class TestGrepTool:
         assert result.is_error
         assert ".nexus" in result.output
 
+    @pytest.mark.asyncio
+    async def test_searches_standard_agent_resources_but_not_other_agents_paths(self, tool_context):
+        skill_dir = tool_context.working_directory / ".agents" / "skills" / "review"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("workspace-skill-marker\n", encoding="utf-8")
+        tools_dir = tool_context.working_directory / ".agents" / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "demo.py").write_text("workspace-skill-marker\n", encoding="utf-8")
+        (tool_context.working_directory / ".agents" / "private.txt").write_text(
+            "workspace-skill-marker\n", encoding="utf-8"
+        )
+
+        result = await GrepTool().execute("c8", {"pattern": "workspace-skill-marker"}, tool_context)
+
+        assert not result.is_error
+        assert ".agents/skills/review/SKILL.md" in result.output
+        assert ".agents/tools/demo.py" in result.output
+        assert ".agents/private.txt" not in result.output
+
 
 # ---------------------------------------------------------------------------
 # ListDirTool
@@ -623,6 +680,22 @@ class TestListDirTool:
         result = await ListDirTool().execute("c4", {"path": "sub"}, tool_context)
         assert not result.is_error
         assert "child.txt" in result.output
+
+    @pytest.mark.asyncio
+    async def test_lists_standard_agent_resource_directories_by_default(self, tool_context):
+        skill_dir = tool_context.working_directory / ".agents" / "skills" / "review"
+        skill_dir.mkdir(parents=True)
+        tools_dir = tool_context.working_directory / ".agents" / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "demo.py").write_text("# Demo tool\n", encoding="utf-8")
+
+        skill_result = await ListDirTool().execute("c9", {"path": ".agents/skills"}, tool_context)
+        tool_result = await ListDirTool().execute("c10", {"path": ".agents/tools"}, tool_context)
+
+        assert not skill_result.is_error
+        assert "review/" in skill_result.output
+        assert not tool_result.is_error
+        assert "demo.py" in tool_result.output
 
     @pytest.mark.asyncio
     async def test_rejects_outside_workspace(self, tool_context):

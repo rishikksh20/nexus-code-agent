@@ -53,6 +53,34 @@ def test_session_round_trip_preserves_tool_call_metadata(tmp_path):
     assert loaded.messages[1].tool_call_id == "call-1"
 
 
+def test_session_round_trip_preserves_opaque_provider_state(tmp_path):
+    store = SessionStore(tmp_path)
+    snapshot = new_snapshot("provider-state")
+    snapshot.messages.extend(
+        [
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=(ToolCall("call-1", "read_file", {"path": "README.md"}),),
+                provider_state={
+                    "anthropic_content_blocks": [
+                        {"type": "thinking", "thinking": "opaque", "signature": "signed"}
+                    ]
+                },
+            ),
+            Message(role="tool", content="README", name="read_file", tool_call_id="call-1"),
+        ]
+    )
+
+    store.save(snapshot)
+
+    assert store.load("provider-state").messages[0].provider_state == {
+        "anthropic_content_blocks": [
+            {"type": "thinking", "thinking": "opaque", "signature": "signed"}
+        ]
+    }
+
+
 def test_session_round_trip_preserves_reasoning_content(tmp_path):
     store = SessionStore(tmp_path)
     snapshot = new_snapshot("reasoning")

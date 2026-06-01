@@ -34,7 +34,7 @@ from textual.selection import Selection
 from textual.strip import Strip
 from textual.widgets import Input, RichLog, Static
 
-from nexus.config.model_limits import get_model_context_limit
+from nexus.config.provider_profiles import usable_prompt_budget
 from nexus.context import TokenEstimator
 from nexus.hooks import HookEvent
 from nexus.models import (
@@ -75,6 +75,8 @@ _ALERT_PREVIEW_CHARS = 150
 _SIDE_BY_SIDE_DIFF_WIDTH = 104
 _MUTATING_FILE_TOOLS = {"write_file", "edit", "insert_edit_into_file", "apply_patch"}
 _VERIFY_TOOL_NAMES = {"bash", "run_tests", "run_python_check"}
+_AGENT_BULLET = "● "
+_TOOL_ROW_INDENT = "   "
 
 
 @dataclass(frozen=True)
@@ -419,12 +421,15 @@ class TextualTerminalUI(TerminalUI):
 
     def _render_subagent_header(self, tool_name: str, args: dict[str, Any]) -> Text:
         title = _subagent_title(args)
-        header = Text("| ", style="dim")
+        header = Text(_AGENT_BULLET, style="bold magenta")
         header.append(_subagent_task_label(tool_name), style="bold magenta")
         if title:
             header.append(" - ", style="dim")
             header.append(title, style="bold white")
         return header
+
+    def _render_supervisor_header(self) -> Text:
+        return Text(f"{_AGENT_BULLET}Supervisor Agent", style="bold cyan")
 
     def _render_subagent_tool_row(
         self,
@@ -440,7 +445,12 @@ class TextualTerminalUI(TerminalUI):
         )
         target = self._tool_target(tool_name, args, result)
         style = "error" if result is not None and result.is_error else self._tool_border_style(tool_name)
-        row = Text("|--> ", style="dim")
+        if result is None:
+            row = Text(f"{_TOOL_ROW_INDENT}· ", style="dim")
+        elif result.is_error:
+            row = Text(f"{_TOOL_ROW_INDENT}✗ ", style="bold red")
+        else:
+            row = Text(f"{_TOOL_ROW_INDENT}✓ ", style="bold green")
         row.append(label, style=style)
         if target:
             row.append(f" {target}", style="dim")
@@ -469,7 +479,12 @@ class TextualTerminalUI(TerminalUI):
         )
         target = self._tool_target(tool_name, args, result)
         style = "error" if result is not None and result.is_error else self._tool_border_style(tool_name)
-        row = Text("|-> ", style="dim")
+        if result is None:
+            row = Text(f"{_TOOL_ROW_INDENT}· ", style="dim")
+        elif result.is_error:
+            row = Text(f"{_TOOL_ROW_INDENT}✗ ", style="bold red")
+        else:
+            row = Text(f"{_TOOL_ROW_INDENT}✓ ", style="bold green")
         row.append(label, style=style)
         if target:
             row.append(f" {target}", style="dim")
@@ -479,7 +494,7 @@ class TextualTerminalUI(TerminalUI):
             row.append(" · failed", style="bold red")
             if result.output:
                 truncated = result.output[:200].strip()
-                row.append(f"\n|   {truncated}", style="dim red")
+                row.append(f"\n{_TOOL_ROW_INDENT}  {truncated}", style="dim red")
         else:
             self._append_elapsed(row, self._elapsed_label(call_id, result))
         return row
@@ -489,7 +504,7 @@ class TextualTerminalUI(TerminalUI):
         status = "failed" if result.is_error else "done"
         target = self._tool_target(result.tool_name, args, result)
         header = self._inline_header(
-            "x " if result.is_error else "< ",
+            "✗ " if result.is_error else "✓ ",
             self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error),
             " · ".join(part for part in (target, status) if part),
             style="error" if result.is_error else "tool.shell",
@@ -576,7 +591,7 @@ class TextualTerminalUI(TerminalUI):
         label = self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error)
         detail = " · ".join(part for part in (target, "failed" if result.is_error else "done") if part)
         header = self._inline_header(
-            "x " if result.is_error else "< ",
+            "✗ " if result.is_error else "✓ ",
             label,
             detail,
             style="error" if result.is_error else "tool.write",
@@ -694,7 +709,7 @@ class TextualTerminalUI(TerminalUI):
         label = self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error)
         detail = self._tool_target(result.tool_name, args, result)
         header = self._inline_header(
-            "x " if result.is_error else "< ",
+            "✗ " if result.is_error else "✓ ",
             label,
             detail,
             style="error" if result.is_error else self._tool_border_style(result.tool_name),
@@ -785,10 +800,7 @@ class TextualTerminalUI(TerminalUI):
                 self._tool_started_at[call_id] = time.perf_counter()
                 self._app._turn_had_tool_calls = True
                 if self._app._supervisor_entry is None:
-                    sup_header = Text()
-                    sup_header.append("● ", style="bold cyan")
-                    sup_header.append("Supervisor Agent", style="bold white")
-                    self._app.begin_supervisor_group(sup_header)
+                    self._app.begin_supervisor_group(self._render_supervisor_header())
                 self._app.record_supervisor_row(
                     call_id,
                     self._render_supervisor_row(call_id, tool_name, arguments),
@@ -1266,12 +1278,25 @@ class NexusTextualApp(App[None]):
         self._footer = self.query_one("#footer", Static)
         self.console.push_theme(NEXUS_THEME)
         self.state.console = self.ui
+        self.state.provider_settings_opener = self.open_provider_settings
         self._render_startup()
         self.refresh_footer()
         self._input.focus()
 
     def on_unmount(self) -> None:
+        self.state.provider_settings_opener = None
         self.state.console = self._original_console
+
+    def open_provider_settings(self) -> None:
+        from nexus.ui.provider_settings import ProviderSettingsScreen
+
+        self.push_screen(ProviderSettingsScreen(self.state, on_reload=self._reload_provider_settings))
+
+    def _reload_provider_settings(self) -> None:
+        from nexus.runtime.slash_commands import _reload_config
+
+        _reload_config(self.state)
+        self.refresh_footer()
 
     def write(self, renderable: RenderableType) -> None:
         self._transcript_entries.append({"type": "renderable", "renderable": renderable})
@@ -1310,8 +1335,8 @@ class NexusTextualApp(App[None]):
             "type": "collapsible",
             "id": uuid4().hex[:8],
             "header": header,
-            "expanded": Text("| Starting sub-agent...", style="dim"),
-            "preview": Text("| Running...", style="dim"),
+            "expanded": Text(f"{_TOOL_ROW_INDENT}Starting sub-agent...", style="dim"),
+            "preview": Text(f"{_TOOL_ROW_INDENT}Running...", style="dim"),
             "summary": "running",
             "expanded_state": True,
             "subagent_actor": actor,
@@ -1356,8 +1381,8 @@ class NexusTextualApp(App[None]):
             "type": "collapsible",
             "id": uuid4().hex[:8],
             "header": header,
-            "expanded": Text("| Working...", style="dim"),
-            "preview": Text("| Working...", style="dim"),
+            "expanded": Text(f"{_TOOL_ROW_INDENT}Working...", style="dim"),
+            "preview": Text(f"{_TOOL_ROW_INDENT}Working...", style="dim"),
             "summary": "running",
             "expanded_state": True,
             "supervisor_tool_order": [],
@@ -1406,9 +1431,9 @@ class NexusTextualApp(App[None]):
         order = cast("list[str]", entry.get("supervisor_tool_order", []))
         rows = cast("dict[str, RenderableType]", entry.get("supervisor_tool_rows", {}))
         body_parts: list[RenderableType] = [rows[cid] for cid in order if cid in rows]
-        entry["expanded"] = Group(*body_parts) if body_parts else Text("| Working...", style="dim")
+        entry["expanded"] = Group(*body_parts) if body_parts else Text(f"{_TOOL_ROW_INDENT}Working...", style="dim")
         preview_rows: list[RenderableType] = [rows[cid] for cid in order[:5] if cid in rows]
-        entry["preview"] = Group(*preview_rows) if preview_rows else Text("| Working...", style="dim")
+        entry["preview"] = Group(*preview_rows) if preview_rows else Text(f"{_TOOL_ROW_INDENT}Working...", style="dim")
 
     def finish_subagent_task(
         self,
@@ -1451,10 +1476,10 @@ class NexusTextualApp(App[None]):
         if isinstance(payload, dict):
             body_parts.append(_subagent_result_summary_block(payload, str(entry.get("subagent_result_status", ""))))
         if order:
-            body_parts.append(Text("| Tool calls", style="dim"))
+            body_parts.append(Text(f"{_TOOL_ROW_INDENT}Tool calls", style="dim"))
             body_parts.extend(rows[call_id] for call_id in order if call_id in rows)
         if isinstance(entry.get("subagent_result_output"), str):
-            body_parts.append(Text("| Result JSON", style="dim"))
+            body_parts.append(Text(f"{_TOOL_ROW_INDENT}Result JSON", style="dim"))
             body_parts.append(_subagent_result_body(str(entry.get("subagent_result_output") or ""), payload if isinstance(payload, dict) else {}))
             entry["preview"] = _subagent_result_preview(
                 ToolResult(
@@ -1466,10 +1491,10 @@ class NexusTextualApp(App[None]):
                 payload if isinstance(payload, dict) else {},
             )
         elif order:
-            entry["preview"] = Group(Text("| Running tool calls", style="dim"), *[rows[call_id] for call_id in order[:3] if call_id in rows])
+            entry["preview"] = Group(Text(f"{_TOOL_ROW_INDENT}Running tool calls", style="dim"), *[rows[call_id] for call_id in order[:3] if call_id in rows])
         else:
-            entry["preview"] = Text("| Running...", style="dim")
-        entry["expanded"] = Group(*body_parts) if body_parts else Text("| Starting sub-agent...", style="dim")
+            entry["preview"] = Text(f"{_TOOL_ROW_INDENT}Running...", style="dim")
+        entry["expanded"] = Group(*body_parts) if body_parts else Text(f"{_TOOL_ROW_INDENT}Starting sub-agent...", style="dim")
 
     def toggle_collapsible(self, toggle_id: str) -> None:
         for entry in self._transcript_entries:
@@ -1580,7 +1605,7 @@ class NexusTextualApp(App[None]):
         history_tokens = sum(estimator.estimate(message.content) for message in self.state.history)
         system_tokens = estimator.estimate(self.state.current_system_prompt or "")
         total_tokens = history_tokens + system_tokens
-        context_limit = get_model_context_limit(self.state.config.model_name)
+        context_limit = usable_prompt_budget(self.state.config)
         pct = min(100.0, round((total_tokens / context_limit * 100), 1)) if context_limit else 0.0
         thinking_enabled = self.state.config.llm_thinking_mode != "disabled"
         workspace = _compact_workspace_label(self.state.config.workspace_root)
@@ -1608,6 +1633,8 @@ class NexusTextualApp(App[None]):
         text.append("  ")
         text.append("workspace ", style="dim")
         text.append(workspace, style="white")
+        text.append("  ")
+        text.append("/provider manage", style="bold cyan")
         if self._status_text:
             text.append("  ")
             text.append("status ", style="dim")
@@ -1941,7 +1968,7 @@ class NexusTextualApp(App[None]):
         self._print_provider_notice_or_warning()
 
     def _print_provider_notice_or_warning(self) -> None:
-        from os import environ
+        from nexus.integrations.registry import provider_has_api_key
 
         cfg = self.state.config
         if cfg.provider == "fake":
@@ -1949,33 +1976,7 @@ class NexusTextualApp(App[None]):
             return
         if cfg.provider == "ollama":
             return
-        if cfg.provider in {"mistral", "openai", "openai-compatible"}:
-            has_key = bool(
-                cfg.api_key
-                or environ.get("MISTRAL_API_KEY")
-                or environ.get("NEXUS_API_KEY")
-                or environ.get("OPENAI_API_KEY")
-                or environ.get("API_KEY")
-            )
-        elif cfg.provider in {"anthropic", "gemini"}:
-            has_key = bool(
-                cfg.api_key
-                or environ.get("ANTHROPIC_API_KEY")
-                or environ.get("GEMINI_API_KEY")
-                or environ.get("GOOGLE_API_KEY")
-                or environ.get("API_KEY")
-            )
-        elif cfg.provider == "cohere":
-            has_key = bool(
-                cfg.api_key
-                or environ.get("COHERE_API_KEY")
-                or environ.get("CO_API_KEY")
-                or environ.get("NEXUS_API_KEY")
-                or environ.get("API_KEY")
-            )
-        else:
-            has_key = True
-        if not has_key:
+        if not provider_has_api_key(cfg):
             self.ui.print_no_api_key_warning(cfg.provider)
 
     async def _handle_prompt(self, raw_input: str) -> None:
@@ -2266,7 +2267,7 @@ def _parse_json_object(value: str) -> dict[str, Any]:
 def _subagent_completion_header(result: ToolResult, payload: dict[str, Any], *, elapsed: str = "") -> Text:
     del elapsed
     title = _single_line(str(payload.get("title") or result.metadata.get("title") or result.tool_name), limit=120)
-    header = Text("| ", style="dim")
+    header = Text(_AGENT_BULLET, style="bold magenta")
     header.append(_subagent_task_label(result.tool_name), style="bold magenta")
     if title:
         header.append(" - ", style="dim")
@@ -2296,26 +2297,26 @@ def _subagent_completion_summary(
 def _subagent_result_preview(result: ToolResult, payload: dict[str, Any]) -> Text:
     status = str(payload.get("status") or result.metadata.get("status") or ("failed" if result.is_error else "completed"))
     summary = _single_line(str(payload.get("summary") or payload.get("raw_result") or result.output or ""), limit=160)
-    text = Text("| Status ", style="dim")
+    text = Text(f"{_TOOL_ROW_INDENT}Status ", style="dim")
     text.append(status, style=_subagent_status_style(status, is_error=result.is_error))
     if summary:
-        text.append("\n| Summary - ", style="dim")
+        text.append(f"\n{_TOOL_ROW_INDENT}Summary - ", style="dim")
         text.append(summary, style="white")
-    text.append("\n| Expand to view sub-agent tool calls and JSON.", style="dim")
+    text.append(f"\n{_TOOL_ROW_INDENT}Expand to view sub-agent tool calls and JSON.", style="dim")
     return text
 
 
 def _subagent_result_summary_block(payload: dict[str, Any], status: str) -> Text:
     summary = _single_line(str(payload.get("summary") or payload.get("raw_result") or ""), limit=180)
-    text = Text("| Status ", style="dim")
+    text = Text(f"{_TOOL_ROW_INDENT}Status ", style="dim")
     rendered_status = status or str(payload.get("status") or "completed")
     text.append(rendered_status, style=_subagent_status_style(rendered_status))
     if summary:
-        text.append("\n| Summary - ", style="dim")
+        text.append(f"\n{_TOOL_ROW_INDENT}Summary - ", style="dim")
         text.append(summary, style="white")
     next_action = _single_line(str(payload.get("recommended_next_action") or ""), limit=100)
     if next_action:
-        text.append("\n| Next - ", style="dim")
+        text.append(f"\n{_TOOL_ROW_INDENT}Next - ", style="dim")
         text.append(next_action, style="white")
     return text
 

@@ -73,6 +73,7 @@ find . -maxdepth 3 | sort
 ### Expected result
 
 - `.nexus/` is created in the current workspace
+- `.agents/skills/` contains workspace-readable copies of packaged skills
 - you should see files and folders such as:
   - `.nexus/config.toml`
   - `.nexus/knowledge.md`
@@ -440,4 +441,3 @@ Document anything unclear about:
 - install/setup friction
 - missing onboarding guidance
 - whether the `/provider` allowlist covers the parameters you commonly need to change
-

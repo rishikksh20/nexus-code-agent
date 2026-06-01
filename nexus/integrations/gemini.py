@@ -14,6 +14,7 @@ from nexus.models import (
     ToolCall,
     UsageSnapshot,
 )
+from nexus.config.provider_profiles import ThinkingConfig
 
 
 _GEMINI_UNSUPPORTED_SCHEMA_KEYS = {
@@ -135,10 +136,17 @@ class GeminiAdapter:
 class GeminiModelClient:
     """Small native Google Gen AI SDK client with stream and non-stream support."""
 
-    def __init__(self, *, api_key: str | None = None, api_version: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        api_version: str | None = None,
+        thinking: ThinkingConfig | None = None,
+    ) -> None:
         self.api_key = resolve_gemini_api_key(api_key)
         self.api_version = resolve_gemini_api_version(api_version)
         self.adapter = GeminiAdapter()
+        self.thinking = thinking or ThinkingConfig()
         self._call_counter = 0
 
     async def complete(self, request: RuntimeRequest) -> RuntimeResponse:
@@ -199,7 +207,12 @@ class GeminiModelClient:
         kwargs: dict[str, Any] = {
             "system_instruction": request.system_prompt,
             "temperature": request.temperature,
+            "top_p": request.top_p,
         }
+        if self.thinking.enabled and self.thinking.budget_tokens is not None:
+            kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=self.thinking.budget_tokens
+            )
         if request.max_output_tokens is not None:
             kwargs["max_output_tokens"] = request.max_output_tokens
         tools = self.adapter.typed_tools(types, request.tool_schemas)

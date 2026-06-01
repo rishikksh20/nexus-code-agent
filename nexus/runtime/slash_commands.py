@@ -3,17 +3,29 @@ from __future__ import annotations
 import json
 import shlex
 import shutil
-from pathlib import Path
 import tomllib
+from copy import deepcopy
+from pathlib import Path
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from rich.table import Table
 
 from nexus.config import config_to_plain_dict, load_config
-from nexus.config.model_limits import get_model_context_limit
+from nexus.config.editor import (
+    remove_top_level,
+    set_active_model_profile,
+    update_top_level,
+    update_model_profile_fields,
+    update_provider_fields,
+)
+from nexus.config.loader import validate_profile_catalog
+from nexus.config.provider_profiles import ModelProfile, active_model_profile, usable_prompt_budget
 from nexus.config.upgrade import inspect_config_upgrade, upgrade_config_file
 from nexus.cli.init import _global_config_toml, _local_config_toml
+from nexus.extensions.plugins import get_plugin_roots, load_plugins_from_roots
+from nexus.integrations.registry import PROVIDER_DEFINITIONS
+from nexus.hooks import HookExecutor
 from nexus.memory.store import MemoryEntry
 from nexus.context import CarryOverState, TokenEstimator
 from nexus.runtime.context_state import (
@@ -72,6 +84,9 @@ PROVIDER_SETTABLE_PARAMS: frozenset[str] = frozenset({
     "api_base_url",
     "temperature",
     "max_output_tokens",
+    "reserved_output_tokens",
+    "context_length",
+    "top_p",
     "llm_thinking_mode",
     "llm_reasoning_effort",
     "max_loop_iterations",
@@ -166,7 +181,7 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
         ("/agent [status|tools|skills|mcp|allow|disallow]", "Inspect and scope supervisor resources."),
         ("/sub-agent [list|show|tools|skills|mcp|allow|disallow]", "Inspect and scope sub-agent resources."),
         ("/mode [plan|default|auto]", "Show or switch execution mode."),
-        ("/provider [list|set <param> <value>]", "Show active provider and update model/session parameters."),
+        ("/provider [list|profiles|use|manage|set]", "Inspect provider cards, activate profiles, or update model/session parameters."),
         ("/skills [list|show|add|remove|reload]", "Inspect and activate session skills."),
         ("/config show [scope]", "Print config for merged, local, or global scope."),
         ("/config upgrade [local|global]", "Add new config keys/tool allowlist entries from latest Nexus defaults, then reload tools."),
@@ -519,6 +534,9 @@ async def handle_provider(state: ReplState, args: list[str]) -> None:
             (
                 ("(no args) / status",      "Show the current provider, model, temperature, etc.",             "/provider"),
                 ("list",                    "List all available providers with active flag.",                  "/provider list"),
+                ("profiles",                "List reusable model profiles.",                                  "/provider profiles"),
+                ("use <profile>",           "Activate a model profile for this workspace.",                    "/provider use fast-local-coder"),
+                ("manage",                  "Open provider settings in the Textual UI.",                       "/provider manage"),
                 ("set <param> <value>",     "Update a provider parameter and hot-reload config.",              "/provider set model_name mistral-large-latest"),
                 ("",                        "Settable params: provider, model_name, api_base_url,",             ""),
                 ("",                        "temperature, max_output_tokens, llm_thinking_mode,",                ""),
@@ -534,6 +552,28 @@ async def handle_provider(state: ReplState, args: list[str]) -> None:
     if args[0].lower() == "list":
         _print_provider_list(state)
         return
+    if args[0].lower() == "profiles":
+        _print_model_profiles(state)
+        return
+    if args[0].lower() == "manage":
+        if state.provider_settings_opener is None:
+            state.console.print("/provider manage requires the Textual UI.")
+        else:
+            state.provider_settings_opener()
+        return
+    if args[0].lower() == "use":
+        if len(args) != 2:
+            state.console.print("Usage: /provider use <profile>")
+            return
+        profile_name = args[1]
+        if profile_name not in state.config.models:
+            state.console.print(f"Unknown model profile: {profile_name}")
+            return
+        validate_profile_catalog(state.config.providers, state.config.models, active_model_profile=profile_name)
+        set_active_model_profile(state.config.local_config_file, profile_name)
+        _reload_config(state)
+        state.console.print(f"Active model profile: {profile_name}")
+        return
     if args[0].lower() == "set" and len(args) > 2:
         key = args[1].lower()
         value = " ".join(args[2:])
@@ -543,22 +583,15 @@ async def handle_provider(state: ReplState, args: list[str]) -> None:
                 f"Settable parameters: {', '.join(sorted(PROVIDER_SETTABLE_PARAMS))}"
             )
             return
-        _update_toml_value(state.config.local_config_file, key, value)
-        state.config = load_config(
-            state.config.workspace_root,
-            global_root=state.config.global_root,
-            local_config_path=state.config.local_config_file,
-            global_config_path=state.config.global_config_file,
-            cli_overrides={key: _coerce_toml_value(value)},
-        )
-        state.reload_model_client()
-        state.refresh_system_prompt()
+        legacy_profile = bool(getattr(state.config, "active_model_profile_legacy", True))
+        _update_provider_value(state, key, value)
+        _reload_config(state, cli_overrides={key: _coerce_toml_value(value)} if legacy_profile else None)
         state.console.print(f"Updated {key} = {getattr(state.config, key)!r}")
         return
     if args[0].lower() == "set" and len(args) <= 2:
         state.console.print("Usage: /provider set <param> <value>")
         return
-    state.console.print("Usage: /provider [status|list|set <param> <value>]")
+    state.console.print("Usage: /provider [status|list|profiles|use <profile>|manage|set <param> <value>]")
 
 
 def _print_provider_status(state: ReplState) -> None:
@@ -571,6 +604,9 @@ def _print_provider_status(state: ReplState) -> None:
         "api_base_url",
         "temperature",
         "max_output_tokens",
+        "reserved_output_tokens",
+        "context_length",
+        "top_p",
         "llm_thinking_mode",
         "llm_reasoning_effort",
         "max_loop_iterations",
@@ -587,19 +623,56 @@ def _print_provider_list(state: ReplState) -> None:
     table.add_column("Provider")
     table.add_column("Description")
     table.add_column("Active")
-    rows: tuple[tuple[str, str], ...] = (
-        ("anthropic", "Anthropic Messages API (requires ANTHROPIC_API_KEY)."),
-        ("cohere", "Cohere Chat API v2 (requires COHERE_API_KEY or CO_API_KEY)."),
-        ("fake", "Deterministic local fake client. No API key required."),
-        ("gemini", "Google Gemini API (requires GEMINI_API_KEY or GOOGLE_API_KEY)."),
-        ("mistral", "Mistral AI API endpoint (requires MISTRAL_API_KEY)."),
-        ("openai", "OpenAI API endpoint (requires api_base_url and API key)."),
-        ("openai-compatible", "Any OpenAI-compatible API endpoint (Ollama, vLLM, etc.)."),
-        ("ollama", "Local Ollama server (no API key required)."),
-    )
-    for provider, description in rows:
-        table.add_row(provider, description, "yes" if state.config.provider == provider else "no")
+    for provider, definition in PROVIDER_DEFINITIONS.items():
+        table.add_row(provider, definition.description, "yes" if state.config.provider == provider else "no")
     state.console.print(table)
+
+
+def _print_model_profiles(state: ReplState) -> None:
+    table = Table(title="Model Profiles")
+    table.add_column("Profile")
+    table.add_column("Provider")
+    table.add_column("Model")
+    table.add_column("Context")
+    table.add_column("Active")
+    for name, payload in state.config.models.items():
+        profile = ModelProfile.from_dict(name, payload)
+        table.add_row(name, profile.provider, profile.model_name, str(profile.context_length), "yes" if name == state.config.active_model_profile else "no")
+    state.console.print(table)
+
+
+def _update_provider_value(state: ReplState, key: str, raw_value: str) -> None:
+    value = _coerce_toml_value(raw_value)
+    profile_name = str(getattr(state.config, "active_model_profile", "") or "")
+    if bool(getattr(state.config, "active_model_profile_legacy", True)) or not profile_name:
+        _update_toml_value(state.config.local_config_file, key, raw_value)
+        return
+    profile = active_model_profile(state.config)
+    if key == "api_base_url":
+        providers = deepcopy(state.config.providers)
+        providers.setdefault(profile.provider, {})["base_url"] = value
+        validate_profile_catalog(providers, state.config.models, active_model_profile=profile_name)
+        update_provider_fields(state.config.local_config_file, profile.provider, {"base_url": value})
+        return
+    if key in {"provider", "model_name", "context_length", "max_output_tokens", "reserved_output_tokens", "temperature", "top_p"}:
+        models = deepcopy(state.config.models)
+        models.setdefault(profile_name, {})[key] = value
+        validate_profile_catalog(state.config.providers, models, active_model_profile=profile_name)
+        update_model_profile_fields(state.config.local_config_file, profile_name, {key: value})
+        return
+    if key == "llm_thinking_mode":
+        models = deepcopy(state.config.models)
+        models.setdefault(profile_name, {}).setdefault("thinking", {})["enabled"] = value == "enabled"
+        validate_profile_catalog(state.config.providers, models, active_model_profile=profile_name)
+        update_model_profile_fields(state.config.local_config_file, profile_name, {"thinking": {"enabled": value == "enabled"}})
+        return
+    if key == "llm_reasoning_effort":
+        models = deepcopy(state.config.models)
+        models.setdefault(profile_name, {}).setdefault("thinking", {})["reasoning_effort"] = value
+        validate_profile_catalog(state.config.providers, models, active_model_profile=profile_name)
+        update_model_profile_fields(state.config.local_config_file, profile_name, {"thinking": {"reasoning_effort": value}})
+        return
+    _update_toml_value(state.config.local_config_file, key, raw_value)
 
 
 async def handle_config(state: ReplState, args: list[str]) -> None:
@@ -917,7 +990,7 @@ async def handle_tools(state: ReplState, args: list[str]) -> None:
             state, "tools", "List or reload registered tools.",
             (
                 ("(no args)", "Print a table of all tools: name, source, mutating flag, and description.", "/tools"),
-                ("reload",   "Reload config and re-register builtin tools without restarting.",            "/tools reload"),
+                ("reload",   "Reload config and re-register builtin and plugin tools without restarting.", "/tools reload"),
                 ("help",     "Show this help.",                                                            "/tools help"),
             ),
         )
@@ -1041,7 +1114,7 @@ def _print_supervisor_context_usage(state: ReplState) -> None:
         + definition_tokens["mcp_schemas"]
     )
     total_estimated = history_tokens + system_tokens + schema_tokens
-    ctx_limit = get_model_context_limit(state.config.model_name)
+    ctx_limit = usable_prompt_budget(state.config)
     soft = state.config.compaction_soft_limit
     hard = state.config.compaction_hard_limit
     pct = round(total_estimated / ctx_limit * 100, 1) if ctx_limit else 0.0
@@ -1184,7 +1257,7 @@ def _print_agent_context_usage(state: ReplState, agent_id: str) -> None:
     if record is None:
         state.console.print(f"Agent context not found: {agent_id}")
         return
-    ctx_limit = get_model_context_limit(state.config.model_name)
+    ctx_limit = usable_prompt_budget(state.config)
     tokens = int(record.get("token_estimate", 0) or 0)
     pct = round(tokens / ctx_limit * 100, 1) if ctx_limit else 0.0
     table = Table(title=f"Context Usage: {agent_id}")
@@ -1919,12 +1992,13 @@ async def _handle_config_upgrade(state: ReplState, scope: str) -> None:
         state.console.print(f"  [bold]+[/bold] allowed_tools: {tool_name}")
 
 
-def _reload_config(state: ReplState) -> None:
+def _reload_config(state: ReplState, *, cli_overrides: dict[str, object] | None = None) -> None:
     state.config = load_config(
         state.config.workspace_root,
         global_root=state.config.global_root,
         local_config_path=state.config.local_config_file,
         global_config_path=state.config.global_config_file,
+        cli_overrides=cli_overrides,
         strict=False,
     )
     state.reload_model_client()
@@ -1941,7 +2015,7 @@ def _reload_tools(state: ReplState) -> int:
     from nexus.tools.registry import register_core_tools, tool_enabled
 
     cfg = state.config
-    rebuilt_sources = {"core", "agent", "agent-skill", "agent-yaml"}
+    rebuilt_sources = {"core", "plugin", "agent", "agent-skill", "agent-yaml"}
     preserved_records = [
         record
         for record in state.tool_registry.records()
@@ -1950,6 +2024,12 @@ def _reload_tools(state: ReplState) -> int:
 
     state.tool_registry.clear()
     register_core_tools(state.tool_registry, cfg)
+    load_plugins_from_roots(
+        get_plugin_roots(cfg),
+        state.tool_registry,
+        state.hooks or HookExecutor(),
+        can_register=lambda tool: tool_enabled(cfg, tool.name),
+    )
 
     for record in preserved_records:
         if record.source == "mcp" or tool_enabled(cfg, record.name):
@@ -1973,15 +2053,11 @@ def _reload_tools(state: ReplState) -> int:
 
 
 def _update_toml_value(path: Path, key: str, value: str) -> None:
-    existing = tomllib.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    existing[key] = _coerce_toml_value(value)
-    _write_toml(path, existing)
+    update_top_level(path, key, _coerce_toml_value(value))
 
 
 def _remove_toml_key(path: Path, key: str) -> None:
-    existing = tomllib.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    existing.pop(key, None)
-    _write_toml(path, existing)
+    remove_top_level(path, key)
 
 
 def _coerce_toml_value(value: str):

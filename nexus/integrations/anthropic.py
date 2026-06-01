@@ -14,6 +14,7 @@ from nexus.models import (
     ToolCall,
     UsageSnapshot,
 )
+from nexus.config.provider_profiles import ThinkingConfig
 
 
 class AnthropicAdapter:
@@ -55,6 +56,13 @@ class AnthropicAdapter:
                 continue
             if msg.role == "assistant" and msg.tool_calls:
                 content: list[dict[str, Any]] = []
+                preserved = msg.provider_state.get("anthropic_content_blocks", [])
+                if isinstance(preserved, list):
+                    content.extend(
+                        dict(block)
+                        for block in preserved
+                        if isinstance(block, dict) and block.get("type") in {"thinking", "redacted_thinking"}
+                    )
                 if msg.content:
                     content.append({"type": "text", "text": msg.content})
                 content.extend(
@@ -77,15 +85,23 @@ class AnthropicAdapter:
 class AnthropicModelClient:
     """Small native Anthropic SDK client with stream and non-stream support."""
 
-    def __init__(self, *, api_key: str | None = None, timeout_seconds: float = 30.0) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        timeout_seconds: float = 30.0,
+        thinking: ThinkingConfig | None = None,
+    ) -> None:
         self.api_key = resolve_anthropic_api_key(api_key)
         self.timeout_seconds = timeout_seconds
         self.adapter = AnthropicAdapter()
+        self.thinking = thinking or ThinkingConfig()
 
     async def complete(self, request: RuntimeRequest) -> RuntimeResponse:
         text = ""
         tool_calls: list[ToolCall] = []
         usage: UsageSnapshot | None = None
+        provider_state: dict[str, Any] = {}
         finish_reason = "stop"
         async for event in self.chat_completion(request, stream=False):
             if event.type == StreamEventType.TEXT_DELTA and event.text_delta:
@@ -95,10 +111,17 @@ class AnthropicModelClient:
             elif event.type == StreamEventType.MESSAGE_COMPLETE:
                 usage = event.usage
                 finish_reason = event.finish_reason or finish_reason
+                if event.provider_state:
+                    provider_state.update(event.provider_state)
             elif event.type == StreamEventType.ERROR:
                 raise RuntimeError(event.error or "Anthropic request failed.")
         return RuntimeResponse(
-            message=Message(role="assistant", content=text, tool_calls=tuple(tool_calls)),
+            message=Message(
+                role="assistant",
+                content=text,
+                provider_state=provider_state,
+                tool_calls=tuple(tool_calls),
+            ),
             tool_calls=tuple(tool_calls),
             usage=usage,
             finish_reason=finish_reason,
@@ -124,6 +147,7 @@ class AnthropicModelClient:
 
         text_blocks: dict[int, str] = {}
         tool_blocks: dict[int, dict[str, Any]] = {}
+        thinking_blocks: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None
         usage: UsageSnapshot | None = None
         try:
@@ -139,6 +163,12 @@ class AnthropicModelClient:
                                 "name": _get(block, "name", ""),
                                 "input_json": "",
                             }
+                        elif _get(block, "type") in {"thinking", "redacted_thinking"}:
+                            thinking_blocks[idx] = {
+                                "type": _get(block, "type"),
+                                "thinking": str(_get(block, "thinking", "")),
+                                "signature": str(_get(block, "signature", "")),
+                            }
                     elif event_type == "content_block_delta":
                         idx = int(_get(event, "index", 0))
                         delta = _get(event, "delta", {})
@@ -149,6 +179,10 @@ class AnthropicModelClient:
                             yield StreamEvent(type=StreamEventType.TEXT_DELTA, text_delta=TextDelta(content=text))
                         elif delta_type == "input_json_delta" and idx in tool_blocks:
                             tool_blocks[idx]["input_json"] += str(_get(delta, "partial_json", ""))
+                        elif delta_type == "thinking_delta" and idx in thinking_blocks:
+                            thinking_blocks[idx]["thinking"] += str(_get(delta, "thinking", ""))
+                        elif delta_type == "signature_delta" and idx in thinking_blocks:
+                            thinking_blocks[idx]["signature"] += str(_get(delta, "signature", ""))
                     elif event_type == "message_delta":
                         delta = _get(event, "delta", {})
                         finish_reason = _get(delta, "stop_reason") or finish_reason
@@ -167,19 +201,37 @@ class AnthropicModelClient:
                     arguments=_json_dict(tool["input_json"]),
                 ),
             )
-        yield StreamEvent(type=StreamEventType.MESSAGE_COMPLETE, finish_reason=finish_reason, usage=usage)
+        provider_state = {
+            "anthropic_content_blocks": [
+                block for _, block in sorted(thinking_blocks.items())
+            ]
+        } if thinking_blocks else None
+        yield StreamEvent(
+            type=StreamEventType.MESSAGE_COMPLETE,
+            finish_reason=finish_reason,
+            usage=usage,
+            provider_state=provider_state,
+        )
 
     def _request_kwargs(self, request: RuntimeRequest) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": request.model_name,
             "system": request.system_prompt,
             "messages": self.adapter.messages(request.messages),
-            "temperature": request.temperature,
             "max_tokens": request.max_output_tokens or 4096,
         }
+        if not self.thinking.enabled:
+            kwargs["temperature"] = request.temperature
+        if request.top_p != 1.0:
+            kwargs["top_p"] = request.top_p
         tools = self.adapter.tools(request.tool_schemas)
         if tools:
             kwargs["tools"] = tools
+        if self.thinking.enabled:
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": self.thinking.budget_tokens or 1024,
+            }
         return kwargs
 
     def _client(self):
@@ -194,6 +246,7 @@ def _events_from_message(response: Any, model: str):
     tool_calls: list[ToolCall] = []
     usage = _anthropic_usage(_get(response, "usage"), model)
     finish_reason = _get(response, "stop_reason") or "stop"
+    thinking_blocks: list[dict[str, Any]] = []
     for block in _get(response, "content", []) or []:
         block_type = _get(block, "type")
         if block_type == "text":
@@ -206,9 +259,23 @@ def _events_from_message(response: Any, model: str):
                     arguments=dict(_get(block, "input", {}) or {}),
                 )
             )
+        elif block_type in {"thinking", "redacted_thinking"}:
+            thinking_blocks.append(
+                {
+                    "type": block_type,
+                    "thinking": str(_get(block, "thinking", "")),
+                    "signature": str(_get(block, "signature", "")),
+                }
+            )
     for tc in tool_calls:
         yield StreamEvent(type=StreamEventType.TOOL_CALL_COMPLETE, tool_call=tc)
-    yield StreamEvent(type=StreamEventType.MESSAGE_COMPLETE, finish_reason=finish_reason, usage=usage)
+    provider_state = {"anthropic_content_blocks": thinking_blocks} if thinking_blocks else None
+    yield StreamEvent(
+        type=StreamEventType.MESSAGE_COMPLETE,
+        finish_reason=finish_reason,
+        usage=usage,
+        provider_state=provider_state,
+    )
 
 
 def _anthropic_usage(usage: Any, model: str) -> UsageSnapshot | None:

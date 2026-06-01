@@ -33,6 +33,7 @@ from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
+from nexus.config.provider_profiles import active_model_profile
 from nexus.security.manager import ApprovalManager
 from nexus.tools.base import FileDiff, ToolConfirmation, ToolKind, ToolRegistry, tool_to_schema
 
@@ -445,6 +446,8 @@ class Agent:
         for turn_index in range(max_turns):
             if turn_index > 0:
                 yield AgentEvent.thinking_started(actor=_tool_actor(context))
+            runtime_config = context.metadata.get("config")
+            profile = active_model_profile(runtime_config) if runtime_config is not None else None
             request = RuntimeRequest(
                 model_name=model_name,
                 system_prompt=system_prompt,
@@ -452,6 +455,8 @@ class Agent:
                 tool_schemas=_tool_schemas_for_context(self.tool_registry, context),
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
+                top_p=profile.top_p if profile is not None else 1.0,
+                thinking=profile.thinking if profile is not None else None,
             )
             logger.debug(
                 "agent.model_batch.start session_id=%s actor=%s turn_index=%s max_turns=%s model=%s messages=%s last_role=%s tool_schemas=%s",
@@ -473,6 +478,7 @@ class Agent:
             usage: UsageSnapshot | None = None
             stream_finish_reason: str | None = None
             stream_reasoning_content = ""
+            stream_provider_state: dict[str, Any] = {}
             model_call_id = uuid4().hex[:12]
 
             await self.hooks.emit(
@@ -535,6 +541,8 @@ class Agent:
                         stream_finish_reason = stream_event.finish_reason or stream_finish_reason
                         if stream_event.reasoning_content:
                             stream_reasoning_content += stream_event.reasoning_content
+                        if stream_event.provider_state:
+                            stream_provider_state.update(stream_event.provider_state)
                         if monitor is not None and usage is not None:
                             monitor.update_current_span(
                                 attributes={
@@ -621,6 +629,7 @@ class Agent:
                 role="assistant",
                 content=response_text or "",
                 reasoning_content=stream_reasoning_content,
+                provider_state=stream_provider_state,
                 tool_calls=tool_calls,
             )
             should_record_message = bool(message.content or message.tool_calls)

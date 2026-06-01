@@ -3,11 +3,13 @@ from __future__ import annotations
 from rich.console import Console
 
 from nexus.app import RuntimeResources
+from nexus.cli.init import init_workspace
 from nexus.config import load_config
 from nexus.runtime.runtime_session import RuntimeSession
 from nexus.skills import (
     BUILTIN_SKILLS_DIR,
     SkillParseError,
+    get_skill_roots,
     load_skill_registry,
     parse_skill_markdown,
     resolve_active_skill_names,
@@ -133,8 +135,6 @@ def test_skill_metadata_fields_are_loaded(tmp_path):
 
 
 def test_get_skill_roots_discovers_skill_paths_and_agents_standard(tmp_path):
-    from nexus.skills import get_skill_roots
-
     config = load_config(tmp_path, global_root=tmp_path / "global")
     extra = tmp_path / "extra"
     config.skill_paths = [extra]
@@ -148,6 +148,17 @@ def test_get_skill_roots_discovers_skill_paths_and_agents_standard(tmp_path):
     agents_skill = registry.get("agents-skill")
     assert agents_skill is not None
     assert agents_skill.source == "agent-standard"
+
+
+def test_workspace_init_makes_builtin_skill_path_tool_readable(tmp_path):
+    init_workspace(tmp_path, global_root=tmp_path / "global", project_name="workspace")
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+
+    skill = load_skill_registry(*get_skill_roots(config), config=config).get("nexus-agent")
+
+    assert skill is not None
+    assert skill.source == "agent-standard"
+    assert skill.skill_path == (tmp_path / ".agents" / "skills" / "nexus-agent" / "SKILL.md").resolve()
 
 
 def test_resolve_active_skill_names_supports_glob_and_regex(tmp_path):

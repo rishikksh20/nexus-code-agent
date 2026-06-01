@@ -8,8 +8,141 @@ import pytest
 from nexus.cli.init import init_workspace
 from nexus.config import load_config
 from nexus.config.loader import ConfigError
+from nexus.config.editor import update_model_profile_fields
 from nexus.config.model_limits import get_model_context_limit
 from nexus.config.upgrade import inspect_config_upgrade, upgrade_config_file
+from nexus.skills import BUILTIN_SKILLS_DIR
+
+
+def test_model_profiles_deep_merge_global_and_local_catalogs(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+    global_root.mkdir()
+    (global_root / "config.toml").write_text(
+        '[models.fast]\n'
+        'provider = "fake"\n'
+        'model_name = "fake-global"\n'
+        'context_length = 32000\n'
+        'max_output_tokens = 4000\n'
+        'reserved_output_tokens = 5000\n'
+        '[models.fast.thinking]\n'
+        'enabled = false\n'
+        'mode = "provider_default"\n',
+        encoding="utf-8",
+    )
+    local = workspace / ".nexus" / "config.toml"
+    local.parent.mkdir()
+    local.write_text(
+        'active_model_profile = "fast"\n'
+        '[models.fast]\n'
+        'model_name = "fake-local"\n'
+        'temperature = 0.25\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(workspace, global_root=global_root)
+
+    assert config.active_model_profile == "fast"
+    assert config.provider == "fake"
+    assert config.model_name == "fake-local"
+    assert config.context_length == 32000
+    assert config.max_output_tokens == 4000
+    assert config.reserved_output_tokens == 5000
+    assert config.temperature == 0.25
+
+
+def test_config_synthesizes_legacy_current_profile_without_selection(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+
+    assert config.active_model_profile == "legacy-current"
+    assert config.active_model_profile_legacy is True
+    assert config.models["legacy-current"]["model_name"] == config.model_name
+
+
+@pytest.mark.parametrize(
+    ("profile_body", "message"),
+    [
+        ("context_length = 5000\nmax_output_tokens = 5000\nreserved_output_tokens = 5000\n", "token budgets"),
+        ("context_length = 32000\nmax_output_tokens = 4000\nreserved_output_tokens = 4000\nsupports_tools = false\n", "supports_tools"),
+        ("context_length = 32000\nmax_output_tokens = 4000\nreserved_output_tokens = 4000\nsupports_reasoning = false\nthinking = { enabled = true, mode = \"provider_default\" }\n", "supports_reasoning"),
+    ],
+)
+def test_config_rejects_invalid_active_model_profiles(tmp_path, profile_body, message):
+    config_file = tmp_path / ".nexus" / "config.toml"
+    config_file.parent.mkdir()
+    config_file.write_text(
+        'active_model_profile = "bad"\n'
+        '[models.bad]\n'
+        'provider = "fake"\n'
+        'model_name = "fake"\n'
+        f"{profile_body}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match=message):
+        load_config(tmp_path, global_root=tmp_path / "global")
+
+
+def test_profile_editor_preserves_comments_and_nested_thinking(tmp_path):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        "# keep me\n"
+        "[models.fast]\n"
+        'provider = "fake"\n'
+        '[models.fast.thinking]\n'
+        'enabled = false\n',
+        encoding="utf-8",
+    )
+
+    update_model_profile_fields(config_file, "fast", {"thinking": {"mode": "provider_default"}})
+
+    content = config_file.read_text(encoding="utf-8")
+    assert "# keep me" in content
+    parsed = tomllib.loads(content)
+    assert parsed["models"]["fast"]["thinking"] == {"enabled": False, "mode": "provider_default"}
+
+
+def test_global_config_upgrade_adds_non_destructive_legacy_profile(tmp_path):
+    from nexus.cli.init import _global_config_toml
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        'provider = "fake"\n'
+        'model_name = "old-model"\n'
+        'max_output_tokens = 2048\n',
+        encoding="utf-8",
+    )
+
+    upgrade_config_file(config_file, _global_config_toml())
+
+    parsed = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    assert parsed["provider"] == "fake"
+    assert parsed["model_name"] == "old-model"
+    assert parsed["models"]["legacy-current"]["provider"] == "fake"
+    assert parsed["models"]["legacy-current"]["model_name"] == "old-model"
+    assert parsed["models"]["legacy-current"]["max_output_tokens"] == 2048
+    assert "active_model_profile" not in parsed
+
+
+def test_config_rejects_activation_of_profile_with_disabled_provider(tmp_path):
+    config_file = tmp_path / ".nexus" / "config.toml"
+    config_file.parent.mkdir()
+    config_file.write_text(
+        'active_model_profile = "offline"\n'
+        '[providers.fake]\n'
+        'enabled = false\n'
+        '[models.offline]\n'
+        'provider = "fake"\n'
+        'model_name = "fake"\n'
+        'context_length = 32000\n'
+        'max_output_tokens = 4000\n'
+        'reserved_output_tokens = 4000\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="disabled provider"):
+        load_config(tmp_path, global_root=tmp_path / "global")
 
 
 def test_config_merges_local_overrides(tmp_path, monkeypatch):
@@ -40,6 +173,34 @@ def test_init_creates_knowledge_file(tmp_path):
     assert (workspace / ".nexus" / "knowledge.md").exists()
 
 
+def test_init_copies_builtin_skills_without_overwriting_workspace_edits(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+
+    workspace_skills = workspace / ".agents" / "skills"
+    builtin_names = {
+        path.name
+        for path in BUILTIN_SKILLS_DIR.iterdir()
+        if path.is_dir() and (path / "SKILL.md").is_file()
+    }
+    assert {path.name for path in workspace_skills.iterdir()} == builtin_names
+    local_skill = workspace_skills / "nexus-agent" / "SKILL.md"
+    local_skill.write_text("workspace edit\n", encoding="utf-8")
+
+    init_workspace(workspace, global_root=global_root, project_name="workspace")
+
+    assert local_skill.read_text(encoding="utf-8") == "workspace edit\n"
+
+    init_workspace(workspace, global_root=global_root, project_name="workspace", force=True)
+
+    assert local_skill.read_text(encoding="utf-8") == (
+        BUILTIN_SKILLS_DIR / "nexus-agent" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+
 def test_config_rejects_invalid_mode(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -65,7 +226,7 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
 
     assert config.agent_mode == "basic"
     assert config.delegation_subagents == []
-    assert config.config_version == 2
+    assert config.config_version == 3
     assert config.textual_transcript_max_lines == 5000
     assert config.prompt_history_max_entries == 200
     assert config.tool_output_max_chars == 102400
@@ -383,7 +544,7 @@ def test_config_upgrade_rehomes_config_version_before_existing_tables(tmp_path):
     after = inspect_config_upgrade(local_config, template)
 
     assert content.count("# Added by Nexus config upgrade") == 1
-    assert parsed["config_version"] == 2
+    assert parsed["config_version"] == 3
     assert "config_version" not in parsed["agents"]
     assert after.needs_upgrade is False
 

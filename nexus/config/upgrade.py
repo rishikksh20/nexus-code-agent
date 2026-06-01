@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nexus.config.model_limits import get_model_context_limit
 
-CURRENT_CONFIG_VERSION = 2
+
+CURRENT_CONFIG_VERSION = 3
 UPGRADE_MARKER = "# Added by Nexus config upgrade"
 DEPRECATED_CONFIG_KEYS: dict[str, str] = {
     "multi_agent_mode": "Use agent_mode = \"basic\" or agent_mode = \"advanced\" instead.",
@@ -140,12 +142,18 @@ def upgrade_config_file(path: Path, template_str: str) -> ConfigUpgradeReport:
     additions.append(UPGRADE_MARKER)
     additions.append(f"config_version = {CURRENT_CONFIG_VERSION}")
     migrated_subagents = _migrated_subagent_profiles(existing)
+    migrated_profile_values = _migrated_provider_profile_values(existing, template)
     for key in template:
         if key == "config_version" or key in existing:
             continue
+        if key == "active_model_profile":
+            # Existing flat configs remain active until the user explicitly
+            # selects a generated or newly created model profile.
+            continue
         if key == "sub-agents" and migrated_subagents:
             continue
-        value = _migrated_agent_scope(existing, template[key]) if key == "agents" else template[key]
+        value = migrated_profile_values.get(key, template[key])
+        value = _migrated_agent_scope(existing, value) if key == "agents" else value
         additions.extend(_render_toml_assignment(key, value))
     if _needs_agent_scope_migration(existing) and "agents" in existing:
         additions.extend(_render_toml_assignment("agents", _migrated_agent_scope(existing, template.get("agents", {}))))
@@ -289,12 +297,7 @@ def _normalize_bare_all_assignments(content: str) -> str:
 
 def _render_toml_assignment(key: str, value: Any) -> list[str]:
     if isinstance(value, dict):
-        lines = [f"[{key}]"]
-        for child_key, child_value in value.items():
-            if isinstance(child_value, dict):
-                continue
-            lines.append(f"{child_key} = {_render_toml_value(child_value)}")
-        return lines
+        return _render_toml_table(key, value)
     if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
         lines: list[str] = []
         for entry in value:
@@ -307,6 +310,54 @@ def _render_toml_assignment(key: str, value: Any) -> list[str]:
                 lines.append(f"{child_key} = {_render_toml_value(child_value)}")
         return lines
     return [f"{key} = {_render_toml_value(value)}"]
+
+
+def _render_toml_table(name: str, value: dict[str, Any]) -> list[str]:
+    lines = [f"[{name}]"]
+    for child_key, child_value in value.items():
+        if not isinstance(child_value, dict):
+            lines.append(f"{child_key} = {_render_toml_value(child_value)}")
+    for child_key, child_value in value.items():
+        if not isinstance(child_value, dict):
+            continue
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend(_render_toml_table(f"{name}.{child_key}", child_value))
+    return lines
+
+
+def _migrated_provider_profile_values(existing: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]:
+    if "active_model_profile" in existing or "models" not in template:
+        return {}
+    provider = str(existing.get("provider", "openai-compatible") or "openai-compatible")
+    model_name = str(existing.get("model_name", "mistral-medium-latest") or "mistral-medium-latest")
+    max_output_tokens = int(existing.get("max_output_tokens", 4096) or 4096)
+    providers = dict(template.get("providers", {}))
+    provider_payload = dict(providers.get(provider, {}))
+    provider_payload["enabled"] = True
+    base_url = str(existing.get("api_base_url", "") or "")
+    if base_url:
+        provider_payload["base_url"] = base_url
+    providers[provider] = provider_payload
+    return {
+        "active_model_profile": "legacy-current",
+        "providers": providers,
+        "models": {
+            "legacy-current": {
+                "provider": provider,
+                "model_name": model_name,
+                "context_length": get_model_context_limit(model_name),
+                "max_output_tokens": max_output_tokens,
+                "reserved_output_tokens": int(existing.get("reserved_output_tokens", max_output_tokens) or max_output_tokens),
+                "temperature": float(existing.get("temperature", 0.0) or 0.0),
+                "top_p": float(existing.get("top_p", 1.0) or 1.0),
+                "supports_tools": True,
+                "supports_streaming": True,
+                "supports_reasoning": False,
+                "thinking": {"enabled": False, "mode": "provider_default"},
+            }
+        },
+    }
 
 
 def _needs_agent_scope_migration(existing: dict[str, Any]) -> bool:

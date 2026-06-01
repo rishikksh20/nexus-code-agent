@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from rich.console import Console
 from rich.text import Text
 from textual.geometry import Offset
 from textual.selection import Selection
@@ -56,8 +57,9 @@ def test_textual_input_strips_leaked_mouse_reports():
 
 def test_textual_user_prompt_block_is_inline_label():
     block = _user_prompt_block("adjust the TUI")
-    # _user_prompt_block now returns a Padding wrapper; unwrap to get the Text
-    assert block.renderable.plain == "You: adjust the TUI"
+    console = Console(record=True, no_color=True)
+    console.print(block)
+    assert "You: adjust the TUI" in console.export_text()
 
 
 def test_clipboard_commands_use_pbcopy_on_macos(monkeypatch):
@@ -255,6 +257,31 @@ async def test_textual_app_mounts_and_restores_console(tmp_path):
         assert app.query_one("#transcript").max_lines == config.textual_transcript_max_lines
 
     assert state.console is original_console
+
+
+@pytest.mark.asyncio
+async def test_textual_provider_manage_opens_settings_screen(tmp_path):
+    from nexus.ui.provider_settings import ProviderSettingsScreen
+
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual-provider-settings"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    app = NexusTextualApp(state, Agent(model_client=FakeModelClient(), tool_registry=registry), build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert state.provider_settings_opener is not None
+        state.provider_settings_opener()
+        await pilot.pause()
+        assert isinstance(app.screen, ProviderSettingsScreen)
 
 
 @pytest.mark.asyncio
@@ -665,7 +692,7 @@ async def test_textual_write_completion_collapses_diff_without_echoing_file_cont
         )
 
         transcript = app._transcript_text()
-        assert "[+] < Wrote calculator/calculator.py" in transcript
+        assert "[+] ✓ Wrote calculator/calculator.py" in transcript
         assert "-OLD" in transcript
         assert "+NEW" in transcript
         assert "NEW FILE CONTENT" not in transcript
@@ -1034,7 +1061,8 @@ async def test_textual_long_assistant_response_is_expanded_by_default(tmp_path):
         )
 
         transcript_text = app._transcript_text()
-        assert "[-] < Assistant response" in transcript_text
+        assert "Assistant:" in transcript_text
+        assert "[-] · (30 lines)" in transcript_text
         assert "assistant line 29" in transcript_text
         assert app._transcript_entries[-1]["expanded_state"] is True
 
@@ -1112,14 +1140,72 @@ async def test_textual_bash_output_uses_inline_blocks_and_collapses_long_output(
         transcript_text = app._transcript_text()
         assert "$ uv run pytest" in transcript_text
         assert "bash output" not in transcript_text
-        assert "[+] < Ran uv run pytest" in transcript_text
+        assert "[+] ✓ Ran uv run pytest" in transcript_text
         assert "line 14" in transcript_text
         assert "line 16" not in transcript_text
 
         app.toggle_collapsible(app._transcript_entries[-1]["id"])
         expanded = app._transcript_text()
-        assert "[-] < Ran uv run pytest" in expanded
+        assert "[-] ✓ Ran uv run pytest" in expanded
         assert "line 29" in expanded
+
+
+@pytest.mark.asyncio
+async def test_textual_supervisor_tools_use_colored_header_and_indented_status_symbols(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start("call-list", "list_dir", {"path": "algorithms"}),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(call_id="call-list", tool_name="list_dir", output="heap.py", metadata={"duration_ms": 4})
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_start("call-grep", "grep", {"query": "needle"}),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(call_id="call-grep", tool_name="grep", output="not found", is_error=True)
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        header = app._supervisor_entry["header"]
+        assert isinstance(header, Text)
+        assert header.plain == "● Supervisor Agent"
+        assert header.style == "bold cyan"
+        transcript_text = app._transcript_text()
+        assert "   ✓ Listed algorithms" in transcript_text
+        assert "   ✗ Failed query=needle" in transcript_text
+        assert "|->" not in transcript_text
 
 
 @pytest.mark.asyncio
@@ -1224,18 +1310,19 @@ async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_p
         )
 
         collapsed = app._transcript_text()
-        assert "[+] | Explore Task - Summarize the algorithms directory" in collapsed
+        assert "[+] ● Explore Task - Summarize the algorithms directory" in collapsed
         assert "completed · 21.0s · 2 tools" in collapsed
         assert "Algorithms contains heap and table examples." in collapsed
         assert "> Delegate" not in collapsed
         assert "< Delegated" not in collapsed
         assert '"schema_version"' not in collapsed
-        assert "|--> Listed algorithms" not in collapsed
+        assert "   ✓ Listed algorithms" not in collapsed
 
         app.toggle_collapsible(app._transcript_entries[-1]["id"])
         expanded = app._transcript_text()
-        assert "|--> Listed algorithms" in expanded
-        assert "|--> Read algorithms/README.md" in expanded
+        assert "   ✓ Listed algorithms" in expanded
+        assert "   ✓ Read algorithms/README.md" in expanded
+        assert "|-->" not in expanded
         assert "4ms" in expanded
         assert "8ms" in expanded
         assert '"schema_version"' in expanded
@@ -1282,7 +1369,7 @@ async def test_textual_file_change_completion_collapses_side_by_side_diff(tmp_pa
         )
 
         collapsed = app._transcript_text()
-        assert "[+] < Edited calculator.py" in collapsed
+        assert "[+] ✓ Edited calculator.py" in collapsed
         assert "-print('old')" in collapsed
         assert "+print('new')" in collapsed
         assert "Before" in collapsed

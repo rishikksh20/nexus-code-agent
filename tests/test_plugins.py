@@ -2,17 +2,39 @@ from __future__ import annotations
 
 from textwrap import dedent
 
+import pytest
 from rich.console import Console
 
+from nexus.app import NexusApp
 from nexus.config import load_config
-from nexus.extensions.plugins import PluginLoader
+from nexus.extensions.plugins import PluginLoader, get_plugin_roots, load_plugins_from_roots
 from nexus.memory.store import MemoryStore
 from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookExecutor
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
-from nexus.runtime.slash_commands import build_router
+from nexus.runtime.slash_commands import _reload_tools, build_router
 from nexus.tools.base import ToolRegistry
+from nexus.ui import TerminalUI
+
+
+def _plugin_source(tool_name: str) -> str:
+    return dedent(
+        f"""
+        class DemoTool:
+            name = "{tool_name}"
+            description = "Tool from plugin"
+            input_schema = {{"type": "object", "properties": {{}}, "required": [], "additionalProperties": False}}
+            is_mutating = False
+
+            async def execute(self, call_id, arguments, context):
+                raise NotImplementedError
+
+        def register(registry, hooks):
+            del hooks
+            registry.register(DemoTool())
+        """
+    )
 
 
 def test_plugin_loader_registers_tools_with_plugin_source(tmp_path):
@@ -129,3 +151,64 @@ def test_plugin_loader_respects_allow_policy(tmp_path):
         pass
     else:
         raise AssertionError("Plugin tool should have been filtered out by policy")
+
+
+def test_workspace_agent_tools_override_same_named_global_plugin(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.plugins_dir.mkdir(parents=True)
+    workspace_tools = tmp_path / ".agents" / "tools"
+    workspace_tools.mkdir(parents=True)
+    (config.plugins_dir / "demo_plugin.py").write_text(_plugin_source("global_tool"), encoding="utf-8")
+    (workspace_tools / "demo_plugin.py").write_text(_plugin_source("workspace_tool"), encoding="utf-8")
+    registry = ToolRegistry()
+
+    loaded = load_plugins_from_roots(get_plugin_roots(config), registry, HookExecutor())
+
+    assert loaded == ["demo_plugin"]
+    assert registry.record("workspace_tool").origin == "demo_plugin"
+    with pytest.raises(LookupError):
+        registry.record("global_tool")
+
+
+@pytest.mark.asyncio
+async def test_app_initialization_loads_workspace_agent_tools(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.provider = "fake"
+    workspace_tools = tmp_path / ".agents" / "tools"
+    workspace_tools.mkdir(parents=True)
+    (workspace_tools / "workspace.py").write_text(_plugin_source("workspace_tool"), encoding="utf-8")
+    app = NexusApp(config, TerminalUI(color=False))
+
+    try:
+        await app.initialize()
+        assert app._registry.record("workspace_tool").source == "plugin"
+    finally:
+        await app.close()
+
+
+def test_tools_reload_replaces_stale_workspace_agent_tools(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    workspace_tools = tmp_path / ".agents" / "tools"
+    workspace_tools.mkdir(parents=True)
+    old_plugin = workspace_tools / "old.py"
+    old_plugin.write_text(_plugin_source("old_tool"), encoding="utf-8")
+    registry = ToolRegistry()
+    load_plugins_from_roots(get_plugin_roots(config), registry, HookExecutor())
+    old_plugin.unlink()
+    (workspace_tools / "new.py").write_text(_plugin_source("new_tool"), encoding="utf-8")
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("plugin-reload"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True),
+        hooks=HookExecutor(),
+    )
+
+    _reload_tools(state)
+
+    assert state.tool_registry.record("new_tool").source == "plugin"
+    with pytest.raises(LookupError):
+        state.tool_registry.record("old_tool")

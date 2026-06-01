@@ -95,6 +95,8 @@ class CohereAdapter:
             "messages": messages,
             "temperature": request.temperature,
         }
+        if request.top_p != 1.0:
+            payload["p"] = request.top_p
         if tools:
             payload["tools"] = tools
             if strict_tools:
