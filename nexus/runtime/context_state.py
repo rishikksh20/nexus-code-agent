@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
@@ -15,7 +16,12 @@ _SCHEMA_VERSION = 1
 _PACKET_LIMIT = 50
 _ARTIFACT_LIMIT = 50
 _EVENT_LIMIT = 200
+_CONTINUATION_LIMIT = 20
 _ARTIFACT_CONTENT_LIMIT = 12_000
+_CONTINUATION_TEXT_LIMIT = 4_000
+_CONTINUATION_ITEM_LIMIT = 12
+_CONTINUATION_ITEM_TEXT_LIMIT = 500
+_CONTINUATION_RESUME_LIMIT = 12_000
 
 
 class ContextScope(str, Enum):
@@ -241,6 +247,103 @@ class AgentSessionState:
 
 
 @dataclass(slots=True, frozen=True)
+class SubAgentClarificationAnswer:
+    question: str
+    answer: str
+    selected_option_id: str | None = None
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "question": self.question,
+            "answer": self.answer,
+            "selected_option_id": self.selected_option_id,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "SubAgentClarificationAnswer":
+        return cls(
+            question=_compact_text(payload.get("question")),
+            answer=_compact_text(payload.get("answer")),
+            selected_option_id=_optional_str(payload.get("selected_option_id")),
+            created_at=str(payload.get("created_at") or datetime.now(UTC).isoformat()),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class SubAgentContinuation:
+    task_id: str
+    agent_name: str
+    title: str
+    original_user_request: str
+    delegated_task: str
+    status: str
+    summary: str = ""
+    findings: tuple[str, ...] = ()
+    related_files: tuple[str, ...] = ()
+    changed_files: tuple[str, ...] = ()
+    tests_run: tuple[str, ...] = ()
+    risks: tuple[str, ...] = ()
+    clarifications_needed: tuple[str, ...] = ()
+    input_packet_ids: tuple[str, ...] = ()
+    output_packet_ids: tuple[str, ...] = ()
+    clarification_answers: tuple[SubAgentClarificationAnswer, ...] = ()
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "agent_name": self.agent_name,
+            "title": self.title,
+            "original_user_request": self.original_user_request,
+            "delegated_task": self.delegated_task,
+            "status": self.status,
+            "summary": self.summary,
+            "findings": list(self.findings),
+            "related_files": list(self.related_files),
+            "changed_files": list(self.changed_files),
+            "tests_run": list(self.tests_run),
+            "risks": list(self.risks),
+            "clarifications_needed": list(self.clarifications_needed),
+            "input_packet_ids": list(self.input_packet_ids),
+            "output_packet_ids": list(self.output_packet_ids),
+            "clarification_answers": [answer.to_dict() for answer in self.clarification_answers],
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "SubAgentContinuation":
+        raw_answers = payload.get("clarification_answers", [])
+        return cls(
+            task_id=str(payload.get("task_id") or ""),
+            agent_name=str(payload.get("agent_name") or ""),
+            title=_compact_text(payload.get("title"), limit=200),
+            original_user_request=_compact_text(payload.get("original_user_request")),
+            delegated_task=_compact_text(payload.get("delegated_task")),
+            status=str(payload.get("status") or "unknown"),
+            summary=_compact_text(payload.get("summary")),
+            findings=_compact_tuple(payload.get("findings")),
+            related_files=_compact_tuple(payload.get("related_files")),
+            changed_files=_compact_tuple(payload.get("changed_files")),
+            tests_run=_compact_tuple(payload.get("tests_run")),
+            risks=_compact_tuple(payload.get("risks")),
+            clarifications_needed=_compact_tuple(payload.get("clarifications_needed")),
+            input_packet_ids=_tuple_of_str(payload.get("input_packet_ids")),
+            output_packet_ids=_tuple_of_str(payload.get("output_packet_ids")),
+            clarification_answers=tuple(
+                SubAgentClarificationAnswer.from_dict(answer)
+                for answer in raw_answers
+                if isinstance(answer, dict)
+            )[-_CONTINUATION_ITEM_LIMIT:],
+            created_at=str(payload.get("created_at") or datetime.now(UTC).isoformat()),
+            updated_at=str(payload.get("updated_at") or datetime.now(UTC).isoformat()),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class ArtifactRecord:
     artifact_id: str
     artifact_type: str
@@ -358,6 +461,7 @@ class MultiAgentSessionState:
     objective: str = ""
     tasks: dict[str, TaskContext] = field(default_factory=dict)
     agents: dict[str, AgentSessionState] = field(default_factory=dict)
+    continuations: dict[str, SubAgentContinuation] = field(default_factory=dict)
     packets: list[ContextPacket] = field(default_factory=list)
     artifacts: dict[str, ArtifactRecord] = field(default_factory=dict)
     events: list[MultiAgentEvent] = field(default_factory=list)
@@ -371,6 +475,10 @@ class MultiAgentSessionState:
             "objective": self.objective,
             "tasks": {task_id: task.to_dict() for task_id, task in self.tasks.items()},
             "agents": {agent_id: agent.to_dict() for agent_id, agent in self.agents.items()},
+            "continuations": {
+                task_id: continuation.to_dict()
+                for task_id, continuation in self.continuations.items()
+            },
             "packets": [packet.to_dict() for packet in self.packets],
             "artifacts": {artifact_id: artifact.to_dict() for artifact_id, artifact in self.artifacts.items()},
             "events": [event.to_dict() for event in self.events],
@@ -392,6 +500,15 @@ class MultiAgentSessionState:
             for agent_id, agent_payload in raw_agents.items()
             if isinstance(agent_payload, dict)
         } if isinstance(raw_agents, dict) else {}
+        raw_continuations = payload.get("continuations", {})
+        continuations = {
+            str(task_id): SubAgentContinuation.from_dict(continuation_payload)
+            for task_id, continuation_payload in raw_continuations.items()
+            if isinstance(continuation_payload, dict)
+        } if isinstance(raw_continuations, dict) else {}
+        if len(continuations) > _CONTINUATION_LIMIT:
+            keep_ids = list(continuations)[-_CONTINUATION_LIMIT:]
+            continuations = {task_id: continuations[task_id] for task_id in keep_ids}
         raw_packets = payload.get("packets", [])
         packets = [
             ContextPacket.from_dict(packet_payload)
@@ -418,6 +535,7 @@ class MultiAgentSessionState:
             objective=str(payload.get("objective") or ""),
             tasks=tasks,
             agents=agents,
+            continuations=continuations,
             packets=packets[-_PACKET_LIMIT:],
             artifacts=artifacts,
             events=events[-_EVENT_LIMIT:],
@@ -594,6 +712,158 @@ def upsert_agent_state(metadata: dict[str, Any], agent_state: AgentSessionState)
     save_multi_agent_state(metadata, _replace_state(state, agents=agents))
 
 
+def resolve_session_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Return durable REPL session metadata when a tool turn exposes it."""
+    session_metadata = metadata.get("session_metadata")
+    return session_metadata if isinstance(session_metadata, dict) else metadata
+
+
+def load_subagent_continuation(metadata: dict[str, Any], task_id: str) -> SubAgentContinuation | None:
+    return load_multi_agent_state(resolve_session_metadata(metadata)).continuations.get(task_id)
+
+
+def save_subagent_continuation(metadata: dict[str, Any], continuation: SubAgentContinuation) -> None:
+    durable_metadata = resolve_session_metadata(metadata)
+    state = load_multi_agent_state(durable_metadata)
+    continuations = dict(state.continuations)
+    continuations[continuation.task_id] = continuation
+    dropped_ids: set[str] = set()
+    if len(continuations) > _CONTINUATION_LIMIT:
+        keep_ids = list(continuations)[-_CONTINUATION_LIMIT:]
+        dropped_ids = set(continuations) - set(keep_ids)
+        continuations = {task_id: continuations[task_id] for task_id in keep_ids}
+    tasks = {
+        task_id: task
+        for task_id, task in state.tasks.items()
+        if task_id not in dropped_ids
+    }
+    tasks[continuation.task_id] = TaskContext(
+        task_id=continuation.task_id,
+        role=continuation.agent_name.removeprefix("subagent_"),
+        objective=continuation.delegated_task,
+        status=continuation.status,
+        assigned_agent_id=continuation.agent_name,
+        input_packet_ids=continuation.input_packet_ids,
+        output_packet_ids=continuation.output_packet_ids,
+        related_files=continuation.related_files,
+        modified_files=continuation.changed_files,
+    )
+    agents = dict(state.agents)
+    agents[continuation.agent_name] = AgentSessionState(
+        agent_id=continuation.agent_name,
+        role=continuation.agent_name.removeprefix("subagent_"),
+        task_id=continuation.task_id,
+        status=continuation.status,
+        working_summary=continuation.summary,
+        input_packet_ids=continuation.input_packet_ids,
+        output_packet_ids=continuation.output_packet_ids,
+    )
+    save_multi_agent_state(
+        durable_metadata,
+        _replace_state(state, continuations=continuations, tasks=tasks, agents=agents),
+    )
+
+
+def make_subagent_continuation(
+    *,
+    task_id: str,
+    agent_name: str,
+    title: str,
+    original_user_request: str,
+    delegated_task: str,
+    payload: dict[str, Any],
+    input_packet_ids: tuple[str, ...],
+    output_packet_ids: tuple[str, ...],
+    previous: SubAgentContinuation | None = None,
+) -> SubAgentContinuation:
+    return SubAgentContinuation(
+        task_id=task_id,
+        agent_name=agent_name,
+        title=_compact_text(title, limit=200),
+        original_user_request=_compact_text(
+            previous.original_user_request if previous else original_user_request
+        ),
+        delegated_task=_compact_text(previous.delegated_task if previous else delegated_task),
+        status=str(payload.get("status") or "unknown"),
+        summary=_compact_text(payload.get("summary")),
+        findings=_merge_compact(previous.findings if previous else (), payload.get("findings")),
+        related_files=_merge_compact(previous.related_files if previous else (), payload.get("related_files")),
+        changed_files=_merge_compact(previous.changed_files if previous else (), payload.get("changed_files")),
+        tests_run=_merge_compact(previous.tests_run if previous else (), payload.get("tests_run")),
+        risks=_merge_compact(previous.risks if previous else (), payload.get("risks")),
+        clarifications_needed=_merge_compact(
+            previous.clarifications_needed if previous else (),
+            payload.get("clarifications_needed"),
+        ),
+        input_packet_ids=(
+            tuple(dict.fromkeys((*previous.input_packet_ids, *input_packet_ids)))
+            if previous
+            else tuple(dict.fromkeys(input_packet_ids))
+        ),
+        output_packet_ids=(
+            tuple(dict.fromkeys((*previous.output_packet_ids, *output_packet_ids)))
+            if previous
+            else tuple(dict.fromkeys(output_packet_ids))
+        ),
+        clarification_answers=previous.clarification_answers if previous else (),
+        created_at=previous.created_at if previous else datetime.now(UTC).isoformat(),
+    )
+
+
+def append_subagent_clarification_answer(
+    continuation: SubAgentContinuation,
+    *,
+    question: str,
+    answer: str,
+    selected_option_id: str | None = None,
+) -> SubAgentContinuation:
+    clarification = SubAgentClarificationAnswer(
+        question=_compact_text(question),
+        answer=_compact_text(answer),
+        selected_option_id=_optional_str(selected_option_id),
+    )
+    return replace(
+        continuation,
+        clarification_answers=(*continuation.clarification_answers, clarification)[-_CONTINUATION_ITEM_LIMIT:],
+        updated_at=datetime.now(UTC).isoformat(),
+    )
+
+
+def render_subagent_resume_context(continuation: SubAgentContinuation) -> str:
+    latest_answer = continuation.clarification_answers[-1] if continuation.clarification_answers else None
+    lines = [
+        "You are resuming the same logical delegated sub-agent task with a fresh model call.",
+        f"Logical task id: {continuation.task_id}",
+        f"Original supervisor request: {continuation.original_user_request or '(not captured)'}",
+        f"Original delegated title: {continuation.title}",
+        f"Original delegated task: {continuation.delegated_task}",
+        f"Previous status: {continuation.status}",
+        f"Previous summary: {continuation.summary or '(none)'}",
+    ]
+    _append_resume_items(lines, "Previous findings", continuation.findings)
+    _append_resume_items(lines, "Files already inspected or related", continuation.related_files)
+    _append_resume_items(lines, "Files already changed", continuation.changed_files)
+    _append_resume_items(lines, "Tests already run", continuation.tests_run)
+    _append_resume_items(lines, "Known risks", continuation.risks)
+    _append_resume_items(lines, "Clarifications previously requested", continuation.clarifications_needed)
+    if latest_answer is not None:
+        lines.extend(
+            [
+                f"Clarification question: {latest_answer.question or '(not repeated by supervisor)'}",
+                f"User answer: {latest_answer.answer}",
+            ]
+        )
+        if latest_answer.selected_option_id:
+            lines.append(f"Selected option id: {latest_answer.selected_option_id}")
+    lines.extend(
+        [
+            "Continue from this point. Do not repeat completed exploration unless the answer makes it necessary.",
+            "Do not ask the same clarification again. Return the next structured result for the supervisor.",
+        ]
+    )
+    return "\n".join(lines)[:_CONTINUATION_RESUME_LIMIT]
+
+
 def append_multi_agent_event(
     metadata: dict[str, Any],
     event_type: str,
@@ -688,6 +958,7 @@ def _replace_state(state: MultiAgentSessionState, **changes: Any) -> MultiAgentS
         "objective": state.objective,
         "tasks": state.tasks,
         "agents": state.agents,
+        "continuations": state.continuations,
         "packets": state.packets,
         "artifacts": state.artifacts,
         "events": state.events,
@@ -742,3 +1013,38 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _compact_text(value: Any, *, limit: int = _CONTINUATION_TEXT_LIMIT) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        text = str(value).strip()
+    return text[:limit]
+
+
+def _compact_tuple(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple, set)):
+        return ()
+    items: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            text = json.dumps(item, sort_keys=True)
+        else:
+            text = str(item).strip()
+        if text:
+            items.append(text[:_CONTINUATION_ITEM_TEXT_LIMIT])
+    return tuple(dict.fromkeys(items))[:_CONTINUATION_ITEM_LIMIT]
+
+
+def _merge_compact(existing: tuple[str, ...], value: Any) -> tuple[str, ...]:
+    return tuple(dict.fromkeys((*existing, *_compact_tuple(value))))[:_CONTINUATION_ITEM_LIMIT]
+
+
+def _append_resume_items(lines: list[str], label: str, items: tuple[str, ...]) -> None:
+    if not items:
+        return
+    lines.append(label + ":")
+    lines.extend(f"- {item}" for item in items)

@@ -107,6 +107,25 @@ def test_prepare_turn_compaction_metadata_counts_carry_over_entries_without_len_
     assert prepared.context.metadata["context_compaction"]["carry_over_entries"] == 4
 
 
+def test_prepare_turn_exposes_durable_session_metadata_to_tools(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    session = new_snapshot("durable-tool-metadata")
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=session,
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True, width=120),
+    )
+
+    prepared = state.prepare_turn("inspect auth", turn_id="turn-1", trace_id="trace-1")
+
+    assert prepared.context.metadata["session_metadata"] is session.metadata
+    assert prepared.context.metadata["supervisor_task_input"] == "inspect auth"
+
+
 def test_load_all_memory_uses_single_store_read_path():
     class Store:
         def __init__(self):

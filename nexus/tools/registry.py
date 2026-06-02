@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from nexus.tools.base import ToolRegistry
 from nexus.tools.builtin import (
+    AskUserTool,
     ApplyPatchTool,
     CodeIndexTool,
     EditTool,
@@ -47,6 +48,7 @@ def tool_enabled(config, tool_name: str) -> bool:
 def get_core_tools(config) -> list:
     """Return pre-constructed first-party coding-agent tool instances."""
     return [
+        AskUserTool(),
         GetTimeTool(),
         ReadFileTool(),
         WriteFileTool(),

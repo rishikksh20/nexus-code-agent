@@ -218,3 +218,35 @@ def test_terminal_ui_stops_tool_wait_on_completion():
     )
 
     assert ui._tool_status is None  # type: ignore[attr-defined]
+
+
+def test_terminal_ui_renders_dedicated_ask_user_panel():
+    ui = _build_ui()
+    event = AgentEvent(
+        kind=AgentEventType.CONFIRMATION_REQUESTED,
+        payload=ConfirmationRequest(
+            kind=ConfirmationKind.CLARIFICATION,
+            tool_name="ask_user",
+            prompt="Where should provider config live?",
+            reason="This changes override behavior.",
+            call_id="ask12345",
+            payload={
+                "interaction": "ask_user",
+                "answer_type": "choice",
+                "options": [
+                    {"id": "global", "label": "Global config"},
+                    {"id": "project", "label": "Project config", "description": "Override per workspace."},
+                ],
+                "default_option_id": "project",
+            },
+        ),
+    )
+
+    ui.render_event(event, stream_output=False, show_tool_calls=True)
+    output = ui.console.export_text()
+
+    assert "Nexus needs clarification" in output
+    assert "Where should provider config live?" in output
+    assert "Why this matters: This changes override behavior." in output
+    assert "2. Project config (project) [default]" in output
+    assert "Override per workspace." in output

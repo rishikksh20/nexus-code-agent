@@ -226,7 +226,7 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
 
     assert config.agent_mode == "basic"
     assert config.delegation_subagents == []
-    assert config.config_version == 3
+    assert config.config_version == 4
     assert config.textual_transcript_max_lines == 5000
     assert config.prompt_history_max_entries == 200
     assert config.tool_output_max_chars == 102400
@@ -545,7 +545,7 @@ def test_config_upgrade_rehomes_config_version_before_existing_tables(tmp_path):
 
     assert content.count("# Added by Nexus config upgrade") == 1
     assert content.splitlines().count("[[sub-agents]]") == 4
-    assert parsed["config_version"] == 3
+    assert parsed["config_version"] == 4
     assert "config_version" not in parsed["agents"]
     assert after.needs_upgrade is False
 

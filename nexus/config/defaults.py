@@ -7,7 +7,7 @@ from typing import Any
 
 @dataclass(slots=True)
 class AgentConfig:
-    config_version: int = 3
+    config_version: int = 4
     provider: str = "openai-compatible"
     model_name: str = "mistral-medium-latest"
     api_base_url: str = "https://api.mistral.ai/v1"
@@ -34,6 +34,7 @@ class AgentConfig:
     auto_confirm_read_only: bool = True
     max_loop_iterations: int = 50
     max_tool_calls_per_turn: int = 30
+    ask_user_max_questions_per_turn: int = 3
     parallel_tools: bool = True
     parallel_tool_window: int = 4
     stream_output: bool = True

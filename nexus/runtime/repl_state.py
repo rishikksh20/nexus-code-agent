@@ -172,6 +172,8 @@ class ReplState:
             metadata={
                 "turn_id": turn_id,
                 "trace_id": trace_id,
+                "supervisor_task_input": prompt_text,
+                "session_metadata": self.session.metadata,
                 "active_skills": supervisor_skill_names(self.config, self.active_skills),
                 "global_active_skills": list(self.active_skills),
                 "skill_catalog": skill_metadata_catalog(self.skill_registry),

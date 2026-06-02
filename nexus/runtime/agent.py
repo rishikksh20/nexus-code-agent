@@ -30,6 +30,7 @@ from nexus.models import (
 )
 from nexus.observability import capture_exception_from_hooks, sentry_monitor_from_hooks
 from nexus.runtime.execution import ExecutionMode
+from nexus.runtime.clarifications import ClarificationManager, is_ask_user_confirmation
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
@@ -245,6 +246,23 @@ class Agent:
                 yield AgentEvent.tool_call_complete(result)
                 yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
                 continue
+            user_input = _prepare_user_input_interrupt(record, tool_call, context)
+            if isinstance(user_input, ToolResult):
+                yield AgentEvent.tool_call_start(
+                    tool_call.call_id,
+                    tool.name,
+                    tool_call.arguments,
+                    actor=_tool_actor(context),
+                    display=_tool_display_metadata(is_mutating=False),
+                )
+                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                yield AgentEvent.tool_call_complete(user_input)
+                yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=user_input)
+                continue
+            if isinstance(user_input, ConfirmationRequest):
+                await self._emit_user_input_requested_notification(user_input, record, context)
+                yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=user_input)
+                return
             confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
             confirmation_preview = _confirmation_preview(confirmation)
             affected_paths = _affected_file_paths(tool, tool_call.arguments, confirmation, context)
@@ -1058,6 +1076,27 @@ class Agent:
                     )
                     return
 
+                user_input = _prepare_user_input_interrupt(record, tool_call, context)
+                if isinstance(user_input, ToolResult):
+                    tool_calls_executed += 1
+                    tool_result_messages.append(_tool_result_message(user_input))
+                    yield AgentEvent.tool_call_start(
+                        tool_call.call_id,
+                        tool.name,
+                        tool_call.arguments,
+                        actor=_tool_actor(context),
+                        display=_tool_display_metadata(is_mutating=False),
+                    )
+                    yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                    yield AgentEvent.tool_call_complete(user_input)
+                    yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=user_input)
+                    loop_detector.record_action("tool_call", tool_name=tool.name, result="ask_user_error")
+                    continue
+                if isinstance(user_input, ConfirmationRequest):
+                    await self._emit_user_input_requested_notification(user_input, record, context)
+                    yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=user_input)
+                    return
+
                 confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
                 confirmation_preview = _confirmation_preview(confirmation)
                 affected_paths = _affected_file_paths(tool, tool_call.arguments, confirmation, context)
@@ -1417,6 +1456,8 @@ class Agent:
             target_list.append(prepared)
             if prepared.tool is not None and prepared.tool.is_mutating:
                 mutating_paths_this_batch.update(prepared.affected_paths)
+            if prepared.confirmation_request is not None and is_ask_user_confirmation(prepared.confirmation_request):
+                break
 
         window_size = max(1, min(int(parallel_tool_window or 1), 8))
         for start in range(0, len(parallel_items), window_size):
@@ -1669,6 +1710,16 @@ class Agent:
                 prepared.stop_message = _invalid_tool_call_stop_message(record.tool.name, "missing required arguments")
             return prepared
 
+        user_input = _prepare_user_input_interrupt(record, tool_call, context)
+        if isinstance(user_input, ToolResult):
+            prepared.immediate_result = user_input
+            prepared.emit_start_event = True
+            prepared.loop_result = "ask_user_error"
+            return prepared
+        if isinstance(user_input, ConfirmationRequest):
+            prepared.confirmation_request = user_input
+            return prepared
+
         confirmation = await _get_tool_confirmation(record.tool, tool_call.call_id, tool_call.arguments, context)
         prepared.confirmation_preview = _confirmation_preview(confirmation)
         prepared.affected_paths = _affected_file_paths(record.tool, tool_call.arguments, confirmation, context)
@@ -1795,6 +1846,9 @@ class Agent:
         prepared: _PreparedToolCall,
         context: ToolExecutionContext,
     ) -> None:
+        if is_ask_user_confirmation(request):
+            await self._emit_user_input_requested_notification(request, prepared.record, context)
+            return
         await self.hooks.emit(
             HookEvent.NOTIFICATION,
             {
@@ -1804,6 +1858,27 @@ class Agent:
                 "tool_origin": prepared.record.origin if prepared.record is not None else None,
                 "arguments": request.arguments,
                 "reason": request.reason,
+                "session_id": context.session_id,
+                "call_id": request.call_id,
+                **_correlation_payload(context, tool_call_id=request.call_id),
+            },
+        )
+
+    async def _emit_user_input_requested_notification(
+        self,
+        request: ConfirmationRequest,
+        record: Any,
+        context: ToolExecutionContext,
+    ) -> None:
+        await self.hooks.emit(
+            HookEvent.NOTIFICATION,
+            {
+                "event": "clarification_requested",
+                "interaction": "ask_user",
+                "tool_name": request.tool_name,
+                "tool_source": getattr(record, "source", "unknown"),
+                "tool_origin": getattr(record, "origin", None),
+                "answer_type": request.payload.get("answer_type", "text"),
                 "session_id": context.session_id,
                 "call_id": request.call_id,
                 **_correlation_payload(context, tool_call_id=request.call_id),
@@ -1858,7 +1933,43 @@ def _tool_call_can_run_in_parallel(record: Any, context: ToolExecutionContext) -
     name = str(getattr(record, "name", ""))
     if name == "delegate_task" or name.startswith("subagent_"):
         return False
-    return getattr(tool, "kind", None) is not ToolKind.AGENT
+    return getattr(tool, "kind", None) not in {ToolKind.AGENT, ToolKind.USER_INPUT}
+
+
+def _prepare_user_input_interrupt(
+    record: Any,
+    tool_call: ToolCall,
+    context: ToolExecutionContext,
+) -> ConfirmationRequest | ToolResult | None:
+    tool = record.tool
+    if getattr(tool, "kind", None) is not ToolKind.USER_INPUT:
+        return None
+    manager = context.metadata.get("clarification_manager")
+    if not isinstance(manager, ClarificationManager):
+        manager = ClarificationManager(
+            context.metadata.setdefault("session_metadata", {}),
+            turn_id=str(context.metadata.get("turn_id", "direct")),
+            max_questions_per_turn=int(context.metadata.get("ask_user_max_questions_per_turn", 3)),
+        )
+        context.metadata["clarification_manager"] = manager
+    try:
+        request = tool.get_user_input_request(tool_call.call_id, tool_call.arguments, context)
+    except ValueError as exc:
+        return ToolResult(
+            call_id=tool_call.call_id,
+            tool_name=tool.name,
+            output=str(exc),
+            is_error=True,
+            metadata={"ask_user_invalid_request": True},
+        )
+    if request is None:
+        return ToolResult(
+            call_id=tool_call.call_id,
+            tool_name=tool.name,
+            output="Internal runtime error: user-input tool did not provide a clarification request.",
+            is_error=True,
+        )
+    return manager.create_request(tool_call, request, actor=_tool_actor(context))
 
 
 def _missing_required_fields(schema: dict[str, Any], arguments: dict[str, Any]) -> list[str]:
@@ -2079,7 +2190,7 @@ def _missing_fields_should_be_repaired_by_model(tool_name: str, missing_fields: 
         "insert_edit_into_file",
         "write_file",
     }
-    return any(
+    return tool_name == "ask_user" or any(
         field in model_owned_fields
         or (field == "path" and tool_name in model_owned_path_tools)
         for field in missing_fields
@@ -2246,7 +2357,7 @@ def _tool_schemas_for_context(registry: ToolRegistry, context: ToolExecutionCont
     records = [
         record
         for record in _supervisor_preferred_tool_records(registry.records())
-        if record.name.startswith("subagent_")
+        if record.name.startswith("subagent_") or getattr(record.tool, "kind", None) is ToolKind.USER_INPUT
     ]
     return tuple(_supervisor_tool_schema(record, records) for record in records)
 
@@ -2306,7 +2417,7 @@ def _tool_available_in_context(record: Any, context: ToolExecutionContext) -> bo
         return str(record.name) in {str(name) for name in scoped_available}
     if not context.metadata.get("supervisor_cognitive_tools_only"):
         return True
-    return str(record.name).startswith("subagent_")
+    return str(record.name).startswith("subagent_") or getattr(record.tool, "kind", None) is ToolKind.USER_INPUT
 
 
 async def _get_tool_confirmation(

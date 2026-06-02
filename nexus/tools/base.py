@@ -6,7 +6,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
-from nexus.models import ToolExecutionContext, ToolResult
+from nexus.models import AskUserRequest, ToolExecutionContext, ToolResult
 
 
 class ToolKind(str, Enum):
@@ -24,6 +24,7 @@ class ToolKind(str, Enum):
     MCP = "mcp"          # Remote MCP server tools
     AGENT = "agent"      # Cognitive sub-agent tools
     SANDBOX = "sandbox"  # Isolated container execution
+    USER_INPUT = "user_input"  # Blocking supervisor clarification interrupts
 
 
 @dataclass
@@ -104,6 +105,15 @@ class Tool(abc.ABC):
         The default implementation returns ``None`` (auto-approved).  Override
         for tools that show diffs or need explicit user consent.
         """
+        return None
+
+    def get_user_input_request(
+        self,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> AskUserRequest | None:
+        """Return a blocking user-input request for runtime-owned handling."""
         return None
 
     def validate_params(self, arguments: dict[str, Any]) -> list[str]:

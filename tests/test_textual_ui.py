@@ -1831,3 +1831,52 @@ async def test_textual_clarification_callback_reprompts_until_non_empty(tmp_path
 
         response = await task
         assert response.clarification == "filled"
+
+
+@pytest.mark.asyncio
+async def test_textual_ask_user_request_renders_options_and_accepts_default(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual-ask-user"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    app = NexusTextualApp(state, Agent(model_client=FakeModelClient(), tool_registry=registry), build_router())
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.CLARIFICATION,
+        tool_name="ask_user",
+        prompt="Where should provider config live?",
+        reason="This changes override behavior.",
+        call_id="ask12345",
+        payload={
+            "interaction": "ask_user",
+            "answer_type": "choice",
+            "options": [
+                {"id": "global", "label": "Global config"},
+                {"id": "project", "label": "Project config"},
+            ],
+            "default_option_id": "project",
+        },
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=False,
+            show_tool_calls=True,
+        )
+        assert "Nexus needs clarification" in app._transcript_text()
+        assert "2. Project config (project) [default]" in app._transcript_text()
+
+        task = asyncio.create_task(app._approval_callback()(request))
+        await pilot.pause()
+        await pilot.press("enter")
+
+        response = await task
+        assert response.selected_option_id == "project"

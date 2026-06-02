@@ -23,6 +23,8 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
+from nexus.runtime.clarifications import ask_user_display_lines, is_ask_user_confirmation
+
 if TYPE_CHECKING:
     from nexus.models import AgentEvent, ConfirmationRequest, ToolResult
 
@@ -705,6 +707,18 @@ class TerminalUI:
         return "Approval: [y]es once  •  yes [t]urn  •  [n]o"
 
     def print_clarification_request(self, req: ConfirmationRequest) -> None:
+        if is_ask_user_confirmation(req):
+            self._console.print(
+                Panel(
+                    Text("\n".join(ask_user_display_lines(req))),
+                    title=Text("Nexus needs clarification", style="clarification.header"),
+                    title_align="left",
+                    border_style="info",
+                    box=box.ROUNDED,
+                    padding=(1, 2),
+                )
+            )
+            return
         self._console.print(
             Panel(
                 Group(
@@ -844,6 +858,10 @@ class TerminalUI:
                     )
                 )
             else:
+                if is_ask_user_confirmation(req):
+                    self.print_clarification_request(req)
+                    self._console.print()
+                    return
                 actor = str(req.payload.get("actor", "") or "").strip()
                 display_name = self._tool_display_name(req.tool_name, actor)
                 self._console.print(

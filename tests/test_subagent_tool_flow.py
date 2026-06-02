@@ -9,7 +9,7 @@ import pytest
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import AgentEventType, Message, RuntimeResponse, ToolCall, ToolExecutionContext, ToolResult
 from nexus.runtime.agent import Agent
-from nexus.runtime.context_state import load_multi_agent_state
+from nexus.runtime.context_state import load_multi_agent_state, load_subagent_continuation
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.tools.base import Tool, ToolKind, ToolRegistry
 from nexus.tools.builtin import WriteFileTool
@@ -449,6 +449,147 @@ async def test_impact_analyzer_subagent_persists_structured_handoff_packet(tmp_p
     assert state.packets[0].modified_files == ("nexus/runtime/agent.py",)
     assert state.packets[0].recommended_tests == ("tests/test_subagent_tool_flow.py",)
     assert state.packets[0].artifacts
+
+
+@pytest.mark.asyncio
+async def test_subagent_packets_persist_to_durable_session_metadata(tmp_path):
+    registry = ToolRegistry()
+    durable_metadata = {}
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(
+                    role="assistant",
+                    content=json.dumps(
+                        {
+                            "status": "needs_clarification",
+                            "summary": "Need a product decision.",
+                            "findings": ["Both config layouts are viable."],
+                            "clarifications_needed": ["Should config be global, project-specific, or both?"],
+                        }
+                    ),
+                )
+            ),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="explorer",
+            description="Explore focused work.",
+            goal_prompt="Inspect and summarize.",
+            allowed_tools=[],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+    context = ToolExecutionContext(
+        session_id="test-session",
+        working_directory=tmp_path,
+        metadata={"session_metadata": durable_metadata},
+    )
+
+    result = await tool.execute("explore-call", {"title": "Explore config", "instructions": "Inspect config scope."}, context)
+
+    state = load_multi_agent_state(durable_metadata)
+    assert result.is_error is False
+    assert state.packets[0].task_id == "explore-call"
+    assert state.continuations["explore-call"].status == "needs_clarification"
+    assert context.metadata["multi_agent_packet_summaries"]["packet-0001"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_resume_rehydrates_compact_logical_task_context(tmp_path):
+    class RecordingModel(FakeModelClient):
+        def __init__(self, response):
+            super().__init__([RuntimeResponse(message=Message(role="assistant", content=json.dumps(response)))])
+            self.requests = []
+
+        async def complete(self, request):
+            self.requests.append(request)
+            return await super().complete(request)
+
+    registry = ToolRegistry()
+    durable_metadata = {}
+    first_model = RecordingModel(
+        {
+            "status": "needs_clarification",
+            "summary": "Two auth strategies are viable.",
+            "findings": ["No existing auth implementation was found."],
+            "related_files": ["nexus/app.py"],
+            "clarifications_needed": ["Should Nexus use JWT or session auth?"],
+        }
+    )
+    resumed_model = RecordingModel(
+        {
+            "status": "completed",
+            "summary": "Updated the plan for JWT auth.",
+            "findings": ["Use JWT auth."],
+        }
+    )
+    models = iter((first_model, resumed_model))
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="explorer",
+            description="Explore focused work.",
+            goal_prompt="Inspect and summarize.",
+            allowed_tools=[],
+        ),
+        model_client_factory=lambda: next(models),
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+    context = ToolExecutionContext(
+        session_id="test-session",
+        working_directory=tmp_path,
+        metadata={
+            "session_metadata": durable_metadata,
+            "supervisor_task_input": "Add authentication to Nexus.",
+        },
+    )
+
+    first_result = await tool.execute(
+        "explore-call",
+        {"title": "Explore auth", "instructions": "Inspect existing auth patterns and propose a plan."},
+        context,
+    )
+    resumed_result = await tool.execute(
+        "resume-call",
+        {
+            "resume_task_id": "explore-call",
+            "clarification": {
+                "question": "Should Nexus use JWT or session auth?",
+                "answer": "Use JWT auth.",
+                "selected_option_id": "jwt",
+            },
+        },
+        context,
+    )
+
+    payload = json.loads(resumed_result.output)
+    continuation = load_subagent_continuation(durable_metadata, "explore-call")
+    state = load_multi_agent_state(durable_metadata)
+    assert json.loads(first_result.output)["status"] == "needs_clarification"
+    assert payload["task_id"] == "explore-call"
+    assert resumed_result.metadata["task_id"] == "explore-call"
+    assert continuation is not None
+    assert continuation.status == "completed"
+    assert state.tasks["explore-call"].status == "completed"
+    assert state.tasks["explore-call"].assigned_agent_id == "subagent_explorer"
+    assert state.agents["subagent_explorer"].task_id == "explore-call"
+    assert continuation.clarification_answers[-1].selected_option_id == "jwt"
+    assert "No existing auth implementation was found." in continuation.findings
+    assert "Use JWT auth." in continuation.findings
+    assert resumed_model.requests
+    prompt = resumed_model.requests[0].system_prompt
+    assert "Original supervisor request: Add authentication to Nexus." in prompt
+    assert "Original delegated task: Inspect existing auth patterns and propose a plan." in prompt
+    assert "Previous findings:" in prompt
+    assert "No existing auth implementation was found." in prompt
+    assert "Clarification question: Should Nexus use JWT or session auth?" in prompt
+    assert "User answer: Use JWT auth." in prompt
+    assert "Selected option id: jwt" in prompt
+    assert "Do not ask the same clarification again." in prompt
 
 
 @pytest.mark.asyncio

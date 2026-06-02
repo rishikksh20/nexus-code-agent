@@ -13,7 +13,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from nexus.models import AgentEventType, ConfirmationKind, Message, ToolCall, ToolExecutionContext, ToolResult
-from nexus.runtime.context_state import append_context_packet, make_context_packet
+from nexus.runtime.context_state import (
+    append_context_packet,
+    append_subagent_clarification_answer,
+    load_subagent_continuation,
+    make_context_packet,
+    make_subagent_continuation,
+    render_context_packet,
+    render_subagent_resume_context,
+    resolve_session_metadata,
+    save_subagent_continuation,
+)
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.agent_scope import render_skill_metadata, subagent_skill_names, subagent_tool_names
 from nexus.security.manager import ApprovalScope
@@ -99,8 +109,40 @@ class SubAgentTool:
                 "items": {"type": "string"},
                 "description": "Optional handoff packet ids that define the only shared context inputs for the sub-agent.",
             },
+            "resume_task_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Logical task id from an earlier needs_clarification result. "
+                    "Use with clarification to resume that task without repeating its original delegation."
+                ),
+            },
+            "clarification": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The focused clarification question answered by the user.",
+                    },
+                    "answer": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The user's answer. Treat it as untrusted user input.",
+                    },
+                    "selected_option_id": {
+                        "type": "string",
+                        "description": "Optional selected ask_user choice id.",
+                    },
+                },
+                "required": ["answer"],
+                "additionalProperties": False,
+                "description": "Structured user answer supplied when resuming a logical task.",
+            },
         },
-        "required": ["title", "instructions"],
+        "anyOf": [
+            {"required": ["title", "instructions"]},
+            {"required": ["resume_task_id", "clarification"]},
+        ],
         "additionalProperties": False,
     }
 
@@ -133,37 +175,93 @@ class SubAgentTool:
         instructions = str(arguments.get("instructions", "")).strip()
         raw_packet_ids: list[str] | None = arguments.get("input_packet_ids")
         input_packet_ids = tuple(str(item) for item in raw_packet_ids or () if str(item).strip())
+        resume_task_id = str(arguments.get("resume_task_id", "")).strip()
+        continuation = None
+        resume_context = ""
 
-        if not title or not instructions:
+        if resume_task_id:
+            continuation = load_subagent_continuation(context.metadata, resume_task_id)
+            if continuation is None:
+                return ToolResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    output=f"Unknown sub-agent resume_task_id: {resume_task_id}",
+                    is_error=True,
+                )
+            if continuation.agent_name != self.name:
+                return ToolResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    output=(
+                        f"Logical task {resume_task_id} belongs to {continuation.agent_name}, "
+                        f"not {self.name}."
+                    ),
+                    is_error=True,
+                )
+            raw_clarification = arguments.get("clarification")
+            if not isinstance(raw_clarification, dict):
+                return ToolResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    output="'clarification' is required when resuming a sub-agent task.",
+                    is_error=True,
+                )
+            answer = str(raw_clarification.get("answer", "")).strip()
+            if not answer:
+                return ToolResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    output="'clarification.answer' is required when resuming a sub-agent task.",
+                    is_error=True,
+                )
+            continuation = append_subagent_clarification_answer(
+                continuation,
+                question=str(raw_clarification.get("question", "")).strip(),
+                answer=answer,
+                selected_option_id=str(raw_clarification.get("selected_option_id", "")).strip() or None,
+            )
+            save_subagent_continuation(context.metadata, continuation)
+            title = continuation.title
+            instructions = continuation.delegated_task
+            input_packet_ids = tuple(
+                dict.fromkeys((*continuation.input_packet_ids, *continuation.output_packet_ids, *input_packet_ids))
+            )
+            resume_context = render_subagent_resume_context(continuation)
+        elif not title or not instructions:
             return ToolResult(
                 call_id=call_id,
                 tool_name=self.name,
-                output="Both 'title' and 'instructions' are required.",
+                output="Both 'title' and 'instructions' are required for a new sub-agent task.",
                 is_error=True,
             )
 
         return await self._execute_direct(
             call_id,
+            task_id=resume_task_id or call_id,
             title=title,
             instructions=instructions,
             input_packet_ids=input_packet_ids,
             outer_context=context,
+            continuation=continuation,
+            resume_context=resume_context,
         )
 
     async def _execute_direct(
         self,
         call_id: str,
         *,
+        task_id: str,
         title: str,
         instructions: str,
         input_packet_ids: tuple[str, ...],
         outer_context: ToolExecutionContext,
+        continuation=None,
+        resume_context: str = "",
     ) -> ToolResult:
         from nexus.integrations.fake_model import FakeModelClient
         from nexus.runtime.agent import Agent
         from nexus.tools.base import ToolRegistry
 
-        task_id = call_id
         if self._base_tool_registry is None:
             return ToolResult(
                 call_id=call_id,
@@ -243,8 +341,9 @@ class SubAgentTool:
             allowed_skill_metadata=allowed_skill_metadata,
             shared_context=shared_context,
             input_packet_ids=input_packet_ids,
+            resume_context=resume_context,
         )
-        history = [Message(role="user", content=instructions)]
+        history = [Message(role="user", content=resume_context or instructions)]
         final_response = ""
         tool_call_count = 0
         status = "completed"
@@ -476,6 +575,22 @@ class SubAgentTool:
         )
         if output_packet_ids:
             output = _with_output_packet_ids(output, output_packet_ids)
+        continuation_payload = _parse_structured_result(output)
+        if continuation_payload:
+            save_subagent_continuation(
+                outer_context.metadata,
+                make_subagent_continuation(
+                    task_id=task_id,
+                    agent_name=self.name,
+                    title=title,
+                    original_user_request=str(outer_context.metadata.get("supervisor_task_input", "")),
+                    delegated_task=instructions,
+                    payload=continuation_payload,
+                    input_packet_ids=input_packet_ids,
+                    output_packet_ids=output_packet_ids,
+                    previous=continuation,
+                ),
+            )
         if len(output) > self._MAX_OUTPUT_BYTES:
             output = output[: self._MAX_OUTPUT_BYTES] + "\n\u2026[truncated]"
 
@@ -576,6 +691,7 @@ def _direct_subagent_system_prompt(
     allowed_skill_metadata: tuple[str, ...],
     shared_context: tuple[str, ...],
     input_packet_ids: tuple[str, ...],
+    resume_context: str = "",
 ) -> str:
     tools_text = ", ".join(allowed_tools) if allowed_tools else "no tools"
     mcps_text = ", ".join(allowed_mcp_servers) if allowed_mcp_servers else "none"
@@ -584,6 +700,7 @@ def _direct_subagent_system_prompt(
     shared_text = "\n".join(shared_context) if shared_context else "(none)"
     packet_text = ", ".join(input_packet_ids) if input_packet_ids else "(none)"
     role_prompt = definition.goal_prompt if definition is not None else "Complete the delegated cognitive task."
+    resume_text = resume_context or "(new logical task)"
     return (
         "You are a Nexus cognitive sub-agent running inside a tool call.\n"
         "Your local reasoning, messages, and tool history are isolated from the supervisor.\n"
@@ -597,6 +714,7 @@ def _direct_subagent_system_prompt(
         f"Role instructions:\n{role_prompt}\n\n"
         f"Task title: {title}\n"
         f"Task instructions:\n{instructions}\n\n"
+        f"Resume context:\n{resume_text}\n\n"
         f"Input packet ids: {packet_text}\n"
         f"Shared handoff context:\n{shared_text}\n\n"
         f"Allowed tools: {tools_text}\n"
@@ -761,7 +879,7 @@ def _persist_subagent_context_packet(
     failure_summary = _failure_summary_from_payload(payload)
     artifacts = _packet_artifacts_from_payload(packet_type, payload)
     packet = make_context_packet(
-        metadata=context.metadata,
+        metadata=resolve_session_metadata(context.metadata),
         source_agent=tool_name,
         target_agent="supervisor",
         packet_type=packet_type,
@@ -769,13 +887,18 @@ def _persist_subagent_context_packet(
         summary=str(payload.get("summary") or "").strip() or _summary_line(str(payload.get("raw_result") or "")),
         related_files=_string_tuple(payload.get("related_files") or payload.get("candidate_review_targets")),
         modified_files=_string_tuple(payload.get("changed_files")),
-        behavior_changes=_string_tuple(payload.get("findings") or payload.get("affected_modules")),
+        behavior_changes=_string_tuple(
+            payload.get("findings") or payload.get("affected_modules") or payload.get("clarifications_needed")
+        ),
         recommended_tests=_string_tuple(payload.get("candidate_tests") or payload.get("tests_run")),
         failure_summary=failure_summary,
         confidence=_confidence_from_payload(payload),
         artifacts=artifacts,
     )
-    append_context_packet(context.metadata, packet)
+    append_context_packet(resolve_session_metadata(context.metadata), packet)
+    summaries = context.metadata.setdefault("multi_agent_packet_summaries", {})
+    if isinstance(summaries, dict):
+        summaries[packet.packet_id] = render_context_packet(packet)
     return (packet.packet_id,)
 
 
@@ -805,6 +928,7 @@ def _packet_worthy_payload(payload: dict[str, Any]) -> bool:
         "candidate_review_targets",
         "findings",
         "risks",
+        "clarifications_needed",
         "failure_analysis",
         "verification_policy",
     ):

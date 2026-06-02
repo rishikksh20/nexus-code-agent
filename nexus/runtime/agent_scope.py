@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from nexus.tools.base import ToolRegistry
+from nexus.tools.base import ToolKind
 
 
 SUPERVISOR_SCOPE_FIELDS: tuple[str, ...] = (
@@ -103,6 +104,11 @@ def supervisor_tool_names(config: Any, registry: ToolRegistry) -> set[str]:
     records = registry.records()
     all_names = {record.name for record in records}
     subagent_names = {record.name for record in records if record.name.startswith("subagent_")}
+    user_input_names = {
+        record.name
+        for record in records
+        if getattr(record.tool, "kind", None) is ToolKind.USER_INPUT
+    }
     direct_normal_names = {
         record.name
         for record in records
@@ -133,6 +139,7 @@ def supervisor_tool_names(config: Any, registry: ToolRegistry) -> set[str]:
     # Always ensure delegation tools are reachable regardless of mode or explicit scope;
     # configuring direct tools like bash should not silently remove sub-agent access.
     allowed |= subagent_names
+    allowed |= user_input_names
     return allowed
 
 
@@ -186,7 +193,12 @@ def subagent_tool_names(
     normal_candidate_names = {
         record.name
         for record in registry.records()
-        if record.source != "mcp" and not record.name.startswith("subagent_") and record.name != "delegate_task"
+        if (
+            record.source != "mcp"
+            and not record.name.startswith("subagent_")
+            and record.name != "delegate_task"
+            and getattr(record.tool, "kind", None) is not ToolKind.USER_INPUT
+        )
     }
 
     configured_tool_scope = profile.get("allowed_tools", [])

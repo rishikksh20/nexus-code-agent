@@ -465,6 +465,7 @@ All tools pass through the permission system and lifecycle hooks. **Risk level**
 | Tool | Risk | Mutating | Description |
 |---|---|---|---|
 | `get_time` | — | No | Returns the current UTC timestamp |
+| `ask_user` | — | No | Pauses the supervisor for one focused text, choice, or yes/no clarification |
 | `read_file` | low | No | Reads a file or line range within the workspace |
 | `glob` | low | No | Finds files by glob pattern within the workspace |
 | `grep` | low | No | Searches file content by regex; returns path, line number, match |
@@ -621,6 +622,10 @@ YAML agents participate in the same definition priority chain as built-in and co
 ### Approval Flow
 
 In `default` mode, mutating or risky tools emit a confirmation event before execution. The turn runner owns the user prompt for both interactive and headless flows. After approval, Nexus resumes `Agent.run()` with the exact pending tool call that was displayed in the confirmation panel; it does not ask the model to regenerate the call. This keeps approval behavior deterministic across providers.
+
+`ask_user` is a separate supervisor-owned clarification interrupt. Sub-agents return `clarifications_needed` to the supervisor instead of calling it directly. Answers are stored as matching structured tool results, and mixed batches discard calls after the question so the model can decide again with the answer. Non-TTY headless runs return exit code `4` with a JSON `needs_input` request and never auto-select defaults.
+
+When a sub-agent result has `status: needs_clarification`, Nexus retains a bounded logical-task record in session metadata. After asking the user, the supervisor calls the same `subagent_*` tool with `resume_task_id` and a structured `clarification` answer. Nexus starts a fresh sub-agent model call with the original delegation, compact prior findings, packet ids, and user decision; it does not retain or replay the full private sub-agent transcript.
 
 Approval policies:
 
@@ -825,6 +830,7 @@ max_loop_iterations = 8
 auto_confirm_read_only = true
 parallel_tools = true             # run eligible non-mutating tools in parallel within a single turn
 parallel_tool_window = 4          # max parallel non-mutating tool calls per window (1-8)
+ask_user_max_questions_per_turn = 3
 
 # Context and compaction
 compaction_soft_limit = 85197    # auto-tuned to 65% of model context window
@@ -872,6 +878,7 @@ project_description = ""
 - `parallel_tool_window = 4` sets the batch size for each parallel window. Valid values are `1` through `8`.
 - The scheduler still runs mutating tools sequentially. When a turn mixes reads and writes, Nexus drains the read-only parallel windows first and then executes the remaining sequential tools.
 - This applies to both the supervisor agent and sub-agents. Nested `subagent_*` tool calls themselves are still kept out of the parallel lane.
+- `ask_user` is supervisor-only and always stays out of the parallel lane.
 #
 # Git MCP (Python package — use uvx or pip install mcp-server-git):
 #   Command: ["uvx", "mcp-server-git", "--repository", "/absolute/git/repo/root"]
@@ -890,7 +897,7 @@ disabled_mcp_servers = []       # disable local or global MCP entries by name
 # Optional MCP fields: env, cwd, disabled, disabled_tools.
 
 # Agent profile
-config_version = 3
+config_version = 4
 agent_mode = "basic" # basic | advanced
 # basic = single-LLM execution with no cognitive sub-agent tools.
 # advanced = supervisor LLM with cognitive sub-agent tools.

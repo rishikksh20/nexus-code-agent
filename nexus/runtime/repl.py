@@ -11,6 +11,11 @@ from nexus.config import load_config
 from nexus.config.upgrade import inspect_config_upgrade, upgrade_config_file
 from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message
 from nexus.runtime.agent import Agent
+from nexus.runtime.clarifications import (
+    ask_user_input_prompt,
+    is_ask_user_confirmation,
+    parse_ask_user_response,
+)
 from nexus.runtime.repl_state import ReplState
 from nexus.runtime.turn_runner import (
     ConfirmationCallback,
@@ -137,6 +142,13 @@ def _interactive_approval_callback(ui: TerminalUI) -> ConfirmationCallback:
     async def ask_for_approval(request: ConfirmationRequest) -> ConfirmationResponse:
         try:
             if request.kind is ConfirmationKind.CLARIFICATION:
+                if is_ask_user_confirmation(request):
+                    while True:
+                        answer = ui.input(f"  [bold]{ask_user_input_prompt(request)}[/bold] ")
+                        response, error = parse_ask_user_response(request, answer)
+                        if response is not None:
+                            return response
+                        ui.print_muted(error or "A valid answer is required.")
                 field = request.payload.get("field", "value")
                 while True:
                     answer = ui.input(f"  [bold]Value for [cyan]{field!r}[/cyan]:[/bold] ").strip()

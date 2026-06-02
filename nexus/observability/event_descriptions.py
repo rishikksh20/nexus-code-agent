@@ -74,6 +74,8 @@ def describe_notification_event(event_name: str, payload: dict[str, Any]) -> str
         return "Approval checkpoint emitted before a gated tool call can continue."
     if normalized == "clarification_requested":
         return "Clarification checkpoint emitted because required user input is missing or ambiguous."
+    if normalized == "clarification_answered":
+        return "Clarification answer received and correlated without recording raw user input."
     if normalized == "tool_denied":
         return "Tool execution was denied by approval policy or an earlier user refusal."
     if normalized == "mcp_server_error":

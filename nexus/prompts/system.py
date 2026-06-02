@@ -142,6 +142,19 @@ def _get_tool_guidelines_section(tool_registry: "ToolRegistry") -> str:
         "- Use memory only for durable user preferences or important project facts.",
     ]
 
+    if any(record.name == "ask_user" for record in records):
+        lines.extend(
+            [
+                "",
+                "## User Clarification Contract",
+                "",
+                "- Inspect the repository first and infer low-risk defaults from existing patterns.",
+                "- Use `ask_user` only when unresolved ambiguity affects architecture, product behavior, or required user-owned information.",
+                "- Ask one focused question. Prefer bounded choices when the valid options are known.",
+                "- Do not use `ask_user` for routine exploration, internal implementation choices, or permission approval.",
+            ]
+        )
+
     if any(record.source == "mcp" for record in records):
         lines.extend(_mcp_guidance_lines(records))
 
@@ -207,16 +220,21 @@ def _subagent_guidance_lines(records) -> list[str]:
         "- Require manual-validation notes for UI/UX, accessibility feel, animations, responsiveness, external services, and business correctness that cannot be fully auto-validated.",
         "- If active skill metadata is relevant, mention the skill name and expected workflow in the sub-agent instructions; do not expand hidden skill bodies yourself.",
         "- You are the only agent that talks to the user; sub-agents return findings, blockers, and clarification requests to you.",
-        "- Treat sub-agent local conversation and tool history as isolated private context.",
-        "- Share context with sub-agents only through focused `instructions` and relevant `input_packet_ids`; do not copy the full conversation.",
+        "- Treat sub-agent local conversation and tool history as isolated private context. Nexus resumes clarification-blocked work with a compact logical-task record, not the full hidden transcript.",
+        "- Share context with sub-agents only through focused `instructions`, relevant `input_packet_ids`, and the resume fields below; do not copy the full conversation.",
         "- Keep each delegation bounded: include the role, exact files/symbols if known, constraints, expected output, and stop condition.",
         "- Prefer packet ids over pasted summaries when packet ids are available in context.",
         "- A sub-agent result is a JSON envelope with `status`, `agent`, `task_id`, `summary`, `raw_result`, `context`, and `recommended_next_action`.",
-        "- If a sub-agent reports `status: needs_clarification`, ask the user yourself and then resume the appropriate workflow.",
+        "- If a sub-agent reports `status: needs_clarification`, ask the user yourself with `ask_user`, then call the same `subagent_*` tool with its returned `task_id` as `resume_task_id` and the structured user answer as `clarification`. Do not start a disconnected replacement task with only the answer.",
         "",
         "Sub-agent input shape:",
         '```json',
         '{"title": "Short task title", "instructions": "Role-specific objective, constraints, expected output, and stop condition", "input_packet_ids": ["packet-..."]}',
+        '```',
+        "",
+        "Sub-agent resume shape after supervisor clarification:",
+        '```json',
+        '{"resume_task_id": "original-tool-call-id", "clarification": {"question": "Focused question", "answer": "User answer", "selected_option_id": "optional-choice-id"}, "input_packet_ids": ["optional-additional-packet-..."]}',
         '```',
         "",
         "Available cognitive tools:",

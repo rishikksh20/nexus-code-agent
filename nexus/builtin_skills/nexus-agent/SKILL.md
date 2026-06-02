@@ -83,6 +83,9 @@ tell the user to run `/help` for the full command list.
 - `/agent` and `/sub-agent` allow or disallow only resources that are already globally active through `/skills` or `/mcp`.
 - Agent-scoped config lives under `[agents]` and `[[sub-agents]]`; sub-agent entries use `name`, `allowed_tools`, `allowed_mcps`, and `allowed_skills`. In advanced mode, empty supervisor `allowed_*` lists mean delegate through sub-agents by default; add `[agents]` allowlist entries for direct supervisor tools, skills, or MCP servers. The generated config lists the four built-in sub-agents with their code allowlists. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are accepted as aliases; obsolete attach/detach keys are ignored. Empty sub-agent `allowed_*` lists preserve sub-agent defaults; `allowed_* = "all"` means every normal workspace tool, active skill, or active MCP server for that scope.
 - Built-in and sub-agent tools may be listed in config tool filters.
+- `ask_user` is a supervisor-owned blocking clarification tool for focused `text`, `choice`, and `yes_no` questions. It bypasses narrow supervisor scopes when registered, is always hidden from sub-agents, and is limited by `ask_user_max_questions_per_turn`.
+- If a sub-agent returns `status: needs_clarification`, ask the user and resume the same `subagent_*` tool with `resume_task_id` plus a structured `clarification` answer. Nexus rehydrates a bounded logical-task packet into a fresh isolated sub-agent call; do not restart with only the answer or paste the full conversation.
+- In non-TTY headless mode, `ask_user` returns exit code `4` with a structured `needs_input` request. Defaults are never selected automatically.
 
 ## Answering Style
 

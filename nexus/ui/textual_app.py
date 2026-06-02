@@ -48,6 +48,12 @@ from nexus.models import (
     ToolResult,
 )
 from nexus.runtime.orchestration import run_orchestrated_turn
+from nexus.runtime.clarifications import (
+    ask_user_display_lines,
+    ask_user_input_prompt,
+    is_ask_user_confirmation,
+    parse_ask_user_response,
+)
 from nexus.runtime.turn_runner import (
     ConfirmationCallback,
     approval_policy_for_request,
@@ -939,6 +945,19 @@ class TextualTerminalUI(TerminalUI):
                     policy=str(req.payload.get("approval_policy", "on-request")),
                 )
             else:
+                if is_ask_user_confirmation(req):
+                    self._write(
+                        Group(
+                            self._inline_header(
+                                "? ",
+                                "Nexus needs clarification",
+                                f"#{req.call_id[:8] or 'pending'}",
+                                style="info",
+                            ),
+                            Text("\n".join(ask_user_display_lines(req))),
+                        )
+                    )
+                    return
                 actor = str(req.payload.get("actor", "") or "").strip()
                 display_name = self._tool_display_name(req.tool_name, actor)
                 self._write(
@@ -2141,6 +2160,13 @@ class NexusTextualApp(App[None]):
     def _approval_callback(self) -> ConfirmationCallback:
         async def ask_for_approval(request: ConfirmationRequest) -> ConfirmationResponse:
             if request.kind is ConfirmationKind.CLARIFICATION:
+                if is_ask_user_confirmation(request):
+                    while True:
+                        answer = await self.ask(ask_user_input_prompt(request))
+                        response, error = parse_ask_user_response(request, answer)
+                        if response is not None:
+                            return response
+                        self.ui.print_muted(error or "A valid answer is required.")
                 field = request.payload.get("field", "value")
                 while True:
                     answer = await self.ask(f"Value for {field!r}:")

@@ -1377,7 +1377,7 @@ async def test_config_upgrade_removes_deprecated_multi_agent_mode(tmp_path):
     assert handled is True
     content = local_config.read_text(encoding="utf-8")
     assert "multi_agent_mode" not in content
-    assert "config_version = 3" in content
+    assert "config_version = 4" in content
     assert "removed deprecated multi_agent_mode" in console.export_text()
 
 

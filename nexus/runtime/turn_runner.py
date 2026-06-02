@@ -24,6 +24,13 @@ from nexus.models import (
 )
 from nexus.observability import capture_exception_from_hooks, sentry_monitor_from_hooks
 from nexus.runtime.agent import Agent, MAX_TURNS_FINISH_REASON, TOOL_CALL_LIMIT_FINISH_REASON
+from nexus.runtime.clarifications import (
+    ClarificationManager,
+    ask_user_display_lines,
+    ask_user_input_prompt,
+    is_ask_user_confirmation,
+    parse_ask_user_response,
+)
 from nexus.runtime.repl_state import ReplState, apply_events_to_messages
 from nexus.security.manager import ApprovalScope
 from nexus.security.policy import ApprovalPolicy
@@ -42,6 +49,17 @@ def prompt_for_confirmation(
     input_reader = input if input_func is None else input_func
     try:
         if request.kind is ConfirmationKind.CLARIFICATION:
+            if is_ask_user_confirmation(request):
+                print("\n".join(ask_user_display_lines(request)))
+                while True:
+                    response, error = parse_ask_user_response(
+                        request,
+                        input_reader(f"{ask_user_input_prompt(request)} ").strip(),
+                    )
+                    if response is not None:
+                        return response
+                    if error:
+                        print(error)
             answer = input_reader(f"{request.prompt} ").strip()
             return ConfirmationResponse(clarification=answer) if answer else ConfirmationResponse()
         approval_policy = approval_policy_for_request(request)
@@ -73,6 +91,11 @@ async def run_agent_turn(
     initial_prompt_text = prompt_text
     turn_id = state.current_turn_id or uuid4().hex[:12]
     trace_id = state.current_trace_id or uuid4().hex
+    clarification_manager = ClarificationManager(
+        state.session.metadata,
+        turn_id=turn_id,
+        max_questions_per_turn=state.config.ask_user_max_questions_per_turn,
+    )
     started_at = time.perf_counter()
     start_payload = _turn_lifecycle_payload(
         state,
@@ -109,6 +132,7 @@ async def run_agent_turn(
                 )
                 prepared_turn.context.metadata["approval_callback"] = approval_callback
                 prepared_turn.context.metadata["approval_manager"] = state.approval_manager
+                prepared_turn.context.metadata["clarification_manager"] = clarification_manager
                 prepared_turn.context.metadata["execution_mode"] = state.mode.value
                 prepared_turn.context.metadata["auto_confirm"] = auto_confirm
                 prepared_turn.context.metadata["auto_confirm_read_only"] = state.config.auto_confirm_read_only
@@ -165,7 +189,7 @@ async def run_agent_turn(
                         approval_scope_for_policy(state.approval_manager.policy),
                         arguments=confirmation_request.arguments,
                     )
-                    await _resume_approved_tool_calls(
+                    paused = await _resume_approved_tool_calls(
                         state,
                         agent,
                         prepared_turn.context,
@@ -178,6 +202,17 @@ async def run_agent_turn(
                         approval_callback=approval_callback,
                         auto_confirm=auto_confirm,
                     )
+                    if paused:
+                        await _finish_turn(
+                            state,
+                            committed_events,
+                            initial_prompt_text=initial_prompt_text,
+                            turn_id=turn_id,
+                            trace_id=trace_id,
+                            started_at=started_at,
+                            status="awaiting_confirmation",
+                        )
+                        return committed_events
                     continue
 
                 if approval_callback is None:
@@ -194,9 +229,21 @@ async def run_agent_turn(
                     return pending_events
 
                 response = await approval_callback(confirmation_request)
+                if is_ask_user_confirmation(confirmation_request) and response.clarification:
+                    await _commit_ask_user_answer(
+                        state,
+                        prepared_turn.context,
+                        batch,
+                        confirmation_index,
+                        confirmation_request,
+                        response,
+                        working_history,
+                        committed_events,
+                    )
+                    continue
                 if confirmation_request.kind is ConfirmationKind.APPROVAL and response.approved:
                     record_approval_response(state, confirmation_request, response)
-                    await _resume_approved_tool_calls(
+                    paused = await _resume_approved_tool_calls(
                         state,
                         agent,
                         prepared_turn.context,
@@ -209,6 +256,17 @@ async def run_agent_turn(
                         approval_callback=approval_callback,
                         auto_confirm=auto_confirm,
                     )
+                    if paused:
+                        await _finish_turn(
+                            state,
+                            committed_events,
+                            initial_prompt_text=initial_prompt_text,
+                            turn_id=turn_id,
+                            trace_id=trace_id,
+                            started_at=started_at,
+                            status="awaiting_confirmation",
+                        )
+                        return committed_events
                     continue
 
                 if confirmation_request.kind is ConfirmationKind.APPROVAL and response.denied:
@@ -382,7 +440,7 @@ async def _resume_approved_tool_calls(
     ui: TerminalUI | None,
     approval_callback: ConfirmationCallback | None,
     auto_confirm: bool,
-) -> None:
+) -> bool:
     pending_tool_calls = _pending_tool_calls_from_confirmation_model_response(
         batch,
         confirmation_index,
@@ -446,7 +504,7 @@ async def _resume_approved_tool_calls(
             )
 
         if next_confirmation_index is None:
-            return
+            return False
 
         next_request = cast(ConfirmationRequest, execution_events[next_confirmation_index].payload)
         if auto_confirm and next_request.kind is ConfirmationKind.APPROVAL:
@@ -458,9 +516,21 @@ async def _resume_approved_tool_calls(
             continue
         if approval_callback is None:
             committed_events.append(execution_events[next_confirmation_index])
-            return
+            return True
 
         response = await approval_callback(next_request)
+        if is_ask_user_confirmation(next_request) and response.clarification:
+            await _commit_ask_user_answer(
+                state,
+                context,
+                batch,
+                confirmation_index,
+                next_request,
+                response,
+                working_history,
+                committed_events,
+            )
+            return False
         if next_request.kind is ConfirmationKind.APPROVAL and response.approved:
             record_approval_response(state, next_request, response)
             continue
@@ -471,7 +541,65 @@ async def _resume_approved_tool_calls(
             )
             continue
         committed_events.append(execution_events[next_confirmation_index])
-        return
+        return True
+    return False
+
+
+async def _commit_ask_user_answer(
+    state: ReplState,
+    context: ToolExecutionContext,
+    batch: list[AgentEvent],
+    confirmation_index: int,
+    request: ConfirmationRequest,
+    response: ConfirmationResponse,
+    working_history: list[Message],
+    committed_events: list[AgentEvent],
+) -> None:
+    manager = context.metadata.get("clarification_manager")
+    if not isinstance(manager, ClarificationManager):
+        manager = ClarificationManager(
+            state.session.metadata,
+            turn_id=str(context.metadata.get("turn_id", "")),
+            max_questions_per_turn=state.config.ask_user_max_questions_per_turn,
+        )
+    tool_call = _tool_call_for_confirmation(batch, confirmation_index, request)
+    model_event = _model_response_for_pending_tool_calls(
+        batch,
+        confirmation_index,
+        [tool_call],
+        include_usage=not _pending_model_response_usage_was_committed(
+            batch,
+            confirmation_index,
+            committed_events,
+        ),
+    )
+    if model_event is not None:
+        working_history.append(model_event.payload.message)
+        committed_events.append(model_event)
+    result = manager.answer_request(request, response)
+    answer_events = [
+        AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call),
+        AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result),
+    ]
+    apply_events_to_messages(working_history, answer_events)
+    committed_events.extend(answer_events)
+    if state.hooks is not None:
+        await state.hooks.emit(
+            HookEvent.NOTIFICATION,
+            {
+                "event": "clarification_answered",
+                "interaction": "ask_user",
+                "session_id": context.session_id,
+                "tool_name": request.tool_name,
+                "turn_id": context.metadata.get("turn_id", ""),
+                "trace_id": context.metadata.get("trace_id", ""),
+                "call_id": request.call_id,
+                "tool_call_id": request.call_id,
+                "answer_type": request.payload.get("answer_type", "text"),
+                "selected_option_id": response.selected_option_id,
+                "answer_length": len(response.clarification),
+            },
+        )
 
 
 def _commit_history_safe_prefix(
@@ -827,6 +955,11 @@ def _turn_steps(events: list[AgentEvent]) -> list[dict[str, object]]:
         if event.kind == AgentEventType.TOOL_RESULT:
             result = cast(ToolResult, event.payload)
             matched_input = tool_inputs_by_call_id.get(result.call_id)
+            output_content = (
+                "[redacted ask_user answer]"
+                if result.metadata.get("ask_user_answer")
+                else result.output
+            )
             steps.append(
                 {
                     "kind": "tool_execution",
@@ -840,7 +973,7 @@ def _turn_steps(events: list[AgentEvent]) -> list[dict[str, object]]:
                         "arguments": {},
                     },
                     "output": {
-                        "content": result.output,
+                        "content": output_content,
                         "metadata": dict(result.metadata),
                     },
                     "is_subagent": result.tool_name == "delegate_task" or result.tool_name.startswith("subagent_"),

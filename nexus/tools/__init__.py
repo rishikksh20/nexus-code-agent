@@ -2,6 +2,7 @@
 
 from nexus.tools.base import FileDiff, Tool, ToolConfirmation, ToolKind, ToolRegistry
 from nexus.tools.builtin import (
+    AskUserTool,
     EditTool,
     GetTimeTool,
     GlobTool,
@@ -38,6 +39,7 @@ __all__ = [
     "ToolKind",
     "ToolRegistry",
     # Builtin tools
+    "AskUserTool",
     "EditTool",
     "GetTimeTool",
     "GlobTool",

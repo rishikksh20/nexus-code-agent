@@ -12,12 +12,14 @@ from nexus.models import ConfirmationKind, Message
 from nexus.hooks import HookEvent
 from nexus.runtime.orchestration import run_orchestrated_turn
 from nexus.runtime.repl_state import ReplState
+from nexus.runtime.clarifications import headless_ask_user_payload, is_ask_user_confirmation
 from nexus.runtime.turn_runner import prompt_for_confirmation
 
 
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NEEDS_CONFIRM = 3
+EXIT_NEEDS_INPUT = 4
 
 
 @dataclass(slots=True)
@@ -26,6 +28,7 @@ class HeadlessResult:
     response: str
     history: list[Message] = field(default_factory=list)
     error: str | None = None
+    needs_input: dict | None = None
 
 
 async def run_headless(
@@ -91,6 +94,25 @@ async def run_headless(
             error=str(exc),
         )
     confirmation = next((event for event in events if event.kind == "confirmation_requested"), None)
+    if (
+        confirmation is not None
+        and approval_callback is None
+        and is_ask_user_confirmation(confirmation.payload)
+    ):
+        payload = headless_ask_user_payload(confirmation.payload)
+        _write_output(
+            json.dumps(payload, indent=2),
+            output_path,
+            console=state.console,
+            emit_to_stdout=True,
+        )
+        return HeadlessResult(
+            exit_code=EXIT_NEEDS_INPUT,
+            response="",
+            history=list(state.history),
+            error=confirmation.payload.prompt,
+            needs_input=payload,
+        )
     if confirmation is not None and approval_callback is None and (
         confirmation.payload.kind is ConfirmationKind.CLARIFICATION or not auto_confirm
     ):

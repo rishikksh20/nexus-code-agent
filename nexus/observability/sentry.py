@@ -30,6 +30,7 @@ _SUPPRESSED_BY_DEFAULT_KEYS = {
     "content",
     "shared_context",
     "multi_agent_packet_summaries",
+    "session_metadata",
 }
 _PROMPT_KEYS = {"prompt", "effective_prompt", "system_prompt", "messages", "content"}
 _TOOL_OUTPUT_KEYS = {"output", "raw_output", "tool_output", "assistant_output", "shared_context"}
@@ -370,7 +371,7 @@ class SentryHookService:
             self.monitor.set_runtime_context(context)
             self.monitor.breadcrumb("nexus.model", "model usage", data=context)
             return
-        if event_name in {"confirmation_requested", "clarification_requested", "tool_denied"}:
+        if event_name in {"confirmation_requested", "clarification_requested", "clarification_answered", "tool_denied"}:
             context.update(_tool_context(payload))
             context.update(
                 {
@@ -378,6 +379,9 @@ class SentryHookService:
                     "reason": payload.get("reason"),
                     "field": payload.get("field"),
                     "risk_level": payload.get("risk_level"),
+                    "answer_type": payload.get("answer_type"),
+                    "selected_option_id": payload.get("selected_option_id"),
+                    "answer_length": payload.get("answer_length"),
                     "description": description,
                 }
             )

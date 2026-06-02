@@ -9,7 +9,7 @@ from typing import Any
 from nexus.config.model_limits import get_model_context_limit
 
 
-CURRENT_CONFIG_VERSION = 3
+CURRENT_CONFIG_VERSION = 4
 UPGRADE_MARKER = "# Added by Nexus config upgrade"
 DEPRECATED_CONFIG_KEYS: dict[str, str] = {
     "multi_agent_mode": "Use agent_mode = \"basic\" or agent_mode = \"advanced\" instead.",
