@@ -1255,6 +1255,7 @@ async def test_textual_bash_output_uses_inline_blocks_and_collapses_long_output(
         )
 
         transcript_text = app._transcript_text()
+        assert ". Run Command : #call-1" in transcript_text
         assert "Command" in transcript_text
         assert "uv run pytest" in transcript_text
         assert "bash output" not in transcript_text
@@ -1351,10 +1352,15 @@ async def test_textual_command_argument_tool_start_uses_fenced_command_preview(t
         )
 
         transcript_text = app._transcript_text()
-        assert "> sandbox_exec command #call-com" in transcript_text
+        assert transcript.lines[0].text == ""
+        assert ". Run Command : #call-com" in transcript_text
+        assert "> sandbox_exec command" not in transcript_text
         assert "Command" in transcript_text
         assert "pwd" in transcript_text
         assert app._supervisor_entry is None
+        header = app.ui._command_start_header("call-command")
+        assert header.plain == "\n. Run Command : #call-com"
+        assert str(header.spans[0].style) == "bold tool.shell"
 
 
 def test_textual_bash_command_preview_builds_markdown_fence():

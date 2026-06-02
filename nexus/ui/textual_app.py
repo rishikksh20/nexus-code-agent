@@ -426,6 +426,12 @@ class TextualTerminalUI(TerminalUI):
         text.append(" · ", style="dim")
         text.append(elapsed, style="bold bright_cyan")
 
+    def _command_start_header(self, call_id: str) -> Text:
+        text = Text("\n. ", style="dim")
+        text.append("Run Command :", style="bold tool.shell")
+        text.append(f" #{call_id[:8]}", style="dim")
+        return text
+
     def _render_inline_tool_start(
         self,
         call_id: str,
@@ -442,7 +448,7 @@ class TextualTerminalUI(TerminalUI):
         command = _command_from_arguments(args)
         if command:
             return Group(
-                self._inline_header("> ", f"{label} command", f"#{call_id[:8]}", style="tool.shell"),
+                self._command_start_header(call_id),
                 _bash_command_block(command),
             )
         target = self._tool_target(tool_name, args)
@@ -460,8 +466,7 @@ class TextualTerminalUI(TerminalUI):
         command = _command_from_arguments(args)
         if command:
             self._tool_started_at[call_id] = time.perf_counter()
-            label = self._semantic_tool_label(tool_name)
-            header = self._inline_header("> ", f"{label} command", f"#{call_id[:8]}", style="tool.shell")
+            header = self._command_start_header(call_id)
             if _should_collapse_text(command):
                 self._app.write_collapsible(
                     header,
