@@ -222,7 +222,7 @@ def get_builtin_subagent_definitions() -> list[SubagentDefinition]:
                 "summary directly answers the objective. Do not modify files or invent implementation plans unless "
                 "the instructions ask for one."
             ),
-            allowed_tools=["read_file", "glob", "grep", "list_dir", "lsp"],
+            allowed_tools=["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"],
             max_turns=20,
             timeout_seconds=300,
         ),

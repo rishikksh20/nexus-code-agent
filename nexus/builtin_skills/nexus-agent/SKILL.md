@@ -87,6 +87,41 @@ tell the user to run `/help` for the full command list.
 - If a sub-agent returns `status: needs_clarification`, ask the user and resume the same `subagent_*` tool with `resume_task_id` plus a structured `clarification` answer. Nexus rehydrates a bounded logical-task packet into a fresh isolated sub-agent call; do not restart with only the answer or paste the full conversation.
 - In non-TTY headless mode, `ask_user` returns exit code `4` with a structured `needs_input` request. Defaults are never selected automatically.
 
+## Generated Agent Scopes
+
+New workspace configs use these conservative defaults:
+
+```toml
+[agents]
+allowed_skills = []
+allowed_mcp_servers = []
+allowed_tools = ["bash", "read_file", "ask_user"]
+
+[[sub-agents]]
+name = "explorer"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]
+
+[[sub-agents]]
+name = "coding"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_python_check", "run_formatter"]
+
+[[sub-agents]]
+name = "code_reviewer"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["git_diff", "read_file", "grep", "lsp", "git_status", "run_tests", "run_python_check"]
+
+[[sub-agents]]
+name = "impact_analyzer"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]
+```
+
 ## Answering Style
 
 - Prefer exact live slash commands and config keys.

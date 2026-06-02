@@ -511,8 +511,8 @@ allowed_tools = [
   "get_time", "read_file", "write_file", "edit", "insert_edit_into_file",
   "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff",
   "run_tests", "run_python_check", "bash",
-  "subagent_planning_analysis", "subagent_execution",
-  "subagent_review", "subagent_verification",
+  "subagent_explorer", "subagent_coding",
+  "subagent_code_reviewer", "subagent_impact_analyzer",
 ]
 ```
 
@@ -520,10 +520,10 @@ Built-in cognitive tools:
 
 | Tool | Purpose |
 |---|---|
-| `subagent_planning_analysis` | Read-only repo analysis and implementation planning |
-| `subagent_execution` | Focused implementation work using normal workspace tools |
-| `subagent_review` | Code review for bugs, regressions, and maintainability risks |
-| `subagent_verification` | Runs tests, lint/type checks, and summarizes failures |
+| `subagent_explorer` | Bounded read-only repo exploration, including status and diff inspection |
+| `subagent_coding` | Focused implementation work with edit tools and cheap local validation |
+| `subagent_code_reviewer` | Code review and scoped automated verification |
+| `subagent_impact_analyzer` | Read-only blast-radius analysis and verification planning |
 
 Custom workspace sub-agents are configured in `.nexus/config.toml` with `delegation_subagents`. Each entry becomes a tool named `subagent_<name>`:
 
@@ -550,18 +550,36 @@ Agent-scoped resources are layered on top of global activation. Use `/mcp activa
 
 ```toml
 [agents]
-allowed_tools = []          # empty = default supervisor behavior; "all" = every normal workspace tool
-allowed_skills = []         # empty = all globally active skills; "all" = every active skill
-allowed_mcps = []           # empty = default MCP behavior; "all" = every active MCP server
+allowed_skills = []
+allowed_mcp_servers = []
+allowed_tools = ["bash", "read_file", "ask_user"]
 
 [[sub-agents]]
-name = "execution"
-allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_tests", "run_python_check", "bash"]
-allowed_skills = []         # empty = no extra skill metadata by default; "all" = every active skill
-allowed_mcps = []           # empty = built-in sub-agent MCP inheritance/defaults; "all" = every active MCP server
+name = "explorer"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]
+
+[[sub-agents]]
+name = "coding"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_python_check", "run_formatter"]
+
+[[sub-agents]]
+name = "code_reviewer"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["git_diff", "read_file", "grep", "lsp", "git_status", "run_tests", "run_python_check"]
+
+[[sub-agents]]
+name = "impact_analyzer"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]
 ```
 
-In advanced mode, the supervisor sees cognitive `subagent_*` tools by default and only the direct normal tools, MCP servers, and skills allowed under `[agents]`; work outside that supervisor allowlist should be delegated to an appropriate sub-agent. In basic mode, direct tools remain available unless narrowed by config. Sub-agents start from their normal `allowed_tools`; a non-empty `[[sub-agents]].allowed_tools` list replaces that base. Set an `allowed_*` value to `"all"` to use every workspace-active tool, skill, or MCP server for that scope. Agent-scoped skills are shown as metadata only. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are still accepted as aliases; obsolete attach/detach keys are ignored.
+These are the generated workspace defaults. In advanced mode, the supervisor sees cognitive `subagent_*` tools plus the direct normal tools, MCP servers, and skills allowed under `[agents]`; work outside that supervisor allowlist should be delegated to an appropriate sub-agent. `ask_user` is supervisor-owned and always hidden from sub-agents. In basic mode, direct tools remain available unless narrowed by config. Sub-agents start from their normal `allowed_tools`; a non-empty `[[sub-agents]].allowed_tools` list replaces that base. Set an `allowed_*` value to `"all"` to use every workspace-active tool, skill, or MCP server for that scope. Agent-scoped skills are shown as metadata only. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are still accepted as aliases; obsolete attach/detach keys are ignored.
 
 Useful commands after editing `.nexus/config.toml`:
 
@@ -572,7 +590,7 @@ Useful commands after editing `.nexus/config.toml`:
 /tools                 # confirm which subagent_* tools are registered
 /skills reload         # rescan skills and register skill-backed sub-agent tools
 /agent tools           # inspect supervisor-scoped tool visibility
-/sub-agent show execution # inspect one sub-agent's effective resources
+/sub-agent show coding    # inspect one sub-agent's effective resources
 /context agents        # inspect sub-agent context isolation and handoffs
 ```
 
@@ -901,8 +919,8 @@ config_version = 4
 agent_mode = "basic" # basic | advanced
 # basic = single-LLM execution with no cognitive sub-agent tools.
 # advanced = supervisor LLM with cognitive sub-agent tools.
-# Built-in cognitive tools in advanced mode: subagent_planning_analysis,
-# subagent_execution, subagent_review, subagent_verification
+# Built-in cognitive tools in advanced mode: subagent_explorer,
+# subagent_coding, subagent_code_reviewer, subagent_impact_analyzer
 delegation_subagents = []
 # Custom sub-agents become tools named subagent_<name>.
 # Example:
