@@ -32,6 +32,7 @@ from typing import Any
 from urllib import error, request as urllib_request
 
 from nexus.integrations.retry import call_with_backoff
+from nexus.config.provider_profiles import ThinkingConfig
 from nexus.models import (
     Message,
     RuntimeRequest,
@@ -69,8 +70,12 @@ class OllamaAdapter:
             "model": request.model_name,
             "messages": messages,
             "stream": stream,
-            "options": {"temperature": request.temperature},
+            "options": {"temperature": request.temperature, "top_p": request.top_p},
         }
+        thinking = request.thinking
+        if getattr(thinking, "enabled", False):
+            effort = str(getattr(thinking, "reasoning_effort", "") or "")
+            payload["think"] = effort if effort in {"low", "medium", "high"} else True
         if request.tool_schemas:
             payload["tools"] = list(request.tool_schemas)
         if request.max_output_tokens is not None:
@@ -79,7 +84,7 @@ class OllamaAdapter:
 
     def _serialise_message(self, msg: Message) -> dict[str, Any]:
         if msg.role == "assistant" and msg.tool_calls:
-            return {
+            item = {
                 "role": "assistant",
                 "content": msg.content or "",
                 "tool_calls": [
@@ -87,10 +92,15 @@ class OllamaAdapter:
                     for tc in msg.tool_calls
                 ],
             }
+            if msg.reasoning_content:
+                item["thinking"] = msg.reasoning_content
+            return item
         if msg.role == "tool":
             # Ollama doesn't require tool_call_id — plain content is enough.
             return {"role": "tool", "content": msg.content or ""}
         item: dict[str, Any] = {"role": msg.role, "content": msg.content or ""}
+        if msg.role == "assistant" and msg.reasoning_content:
+            item["thinking"] = msg.reasoning_content
         return item
 
     # ------------------------------------------------------------------
@@ -151,6 +161,7 @@ class OllamaModelClient:
         retries: int = 3,
         base_delay: float = 0.5,
         jitter: float = 0.2,
+        thinking: ThinkingConfig | None = None,
     ) -> None:
         resolved = (base_url or "").strip().rstrip("/")
         if not resolved:
@@ -168,6 +179,7 @@ class OllamaModelClient:
         self.retries = retries
         self.base_delay = base_delay
         self.jitter = jitter
+        self.thinking = thinking or ThinkingConfig()
         self.adapter = OllamaAdapter(model_name=model_name)
         self._call_counter = 0
 
@@ -229,6 +241,7 @@ class OllamaModelClient:
 
             msg = response_json.get("message") or {}
             content: str = msg.get("content") or ""
+            thinking_content: str = msg.get("thinking") or ""
             raw_tool_calls: list[dict[str, Any]] = msg.get("tool_calls") or []
 
             if content:
@@ -249,6 +262,7 @@ class OllamaModelClient:
                 type=StreamEventType.MESSAGE_COMPLETE,
                 finish_reason=done_reason,
                 usage=usage,
+                reasoning_content=thinking_content or None,
             )
 
     # ------------------------------------------------------------------
@@ -303,6 +317,7 @@ class OllamaModelClient:
         # Accumulate tool calls — Ollama emits them in a single done=true chunk
         # or in the final message delta.
         pending_tool_calls: list[dict[str, Any]] = []
+        thinking_content = ""
 
         while True:
             item = await queue.get()
@@ -315,6 +330,7 @@ class OllamaModelClient:
             chunk: dict[str, Any] = item
             msg = chunk.get("message") or {}
             content: str = msg.get("content") or ""
+            thinking_chunk: str = msg.get("thinking") or ""
             raw_tool_calls: list[dict[str, Any]] = msg.get("tool_calls") or []
 
             if content:
@@ -322,6 +338,8 @@ class OllamaModelClient:
                     type=StreamEventType.TEXT_DELTA,
                     text_delta=TextDelta(content=content),
                 )
+            if thinking_chunk:
+                thinking_content += thinking_chunk
 
             if raw_tool_calls:
                 pending_tool_calls.extend(raw_tool_calls)
@@ -343,6 +361,7 @@ class OllamaModelClient:
             type=StreamEventType.MESSAGE_COMPLETE,
             finish_reason=finish_reason,
             usage=usage,
+            reasoning_content=thinking_content or None,
         )
 
     # ------------------------------------------------------------------

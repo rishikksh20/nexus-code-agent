@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from rich.console import Console
 from rich.text import Text
 from textual.geometry import Offset
 from textual.selection import Selection
@@ -56,8 +57,9 @@ def test_textual_input_strips_leaked_mouse_reports():
 
 def test_textual_user_prompt_block_is_inline_label():
     block = _user_prompt_block("adjust the TUI")
-    # _user_prompt_block now returns a Padding wrapper; unwrap to get the Text
-    assert block.renderable.plain == "You: adjust the TUI"
+    console = Console(record=True, no_color=True)
+    console.print(block)
+    assert "You: adjust the TUI" in console.export_text()
 
 
 def test_clipboard_commands_use_pbcopy_on_macos(monkeypatch):
@@ -255,6 +257,31 @@ async def test_textual_app_mounts_and_restores_console(tmp_path):
         assert app.query_one("#transcript").max_lines == config.textual_transcript_max_lines
 
     assert state.console is original_console
+
+
+@pytest.mark.asyncio
+async def test_textual_provider_manage_opens_settings_screen(tmp_path):
+    from nexus.ui.provider_settings import ProviderSettingsScreen
+
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual-provider-settings"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    app = NexusTextualApp(state, Agent(model_client=FakeModelClient(), tool_registry=registry), build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert state.provider_settings_opener is not None
+        state.provider_settings_opener()
+        await pilot.pause()
+        assert isinstance(app.screen, ProviderSettingsScreen)
 
 
 @pytest.mark.asyncio
@@ -509,6 +536,11 @@ async def test_textual_streamed_tool_output_is_capped_and_cleaned_up(tmp_path):
         app.append_tool_output("call-1", "stdout", "abcdefghij")
         assert app._streaming_tool_outputs == {"call-1"}
         assert app._streaming_tool_output_chars["call-1"] == 5
+        assert app._transcript_entries[-1]["type"] == "collapsible"
+        assert app._transcript_entries[-1]["expanded_state"] is False
+        assert "[+] > bash live output  #call-1" in app._transcript_text()
+        assert "abcde" in app._transcript_text()
+        assert "[live output capped at 5 chars]" in app._transcript_text()
         app.ui.render_event(
             AgentEvent.tool_call_complete(ToolResult(call_id="call-1", tool_name="bash", output="done")),
             stream_output=True,
@@ -516,6 +548,9 @@ async def test_textual_streamed_tool_output_is_capped_and_cleaned_up(tmp_path):
         )
         assert "call-1" not in app._streaming_tool_outputs
         assert "call-1" not in app._streaming_tool_output_chars
+        assert "call-1" not in app._streaming_tool_output_text
+        assert "call-1" not in app._streaming_tool_output_entries
+        assert "bash live output" not in app._transcript_text()
 
 
 @pytest.mark.asyncio
@@ -665,7 +700,7 @@ async def test_textual_write_completion_collapses_diff_without_echoing_file_cont
         )
 
         transcript = app._transcript_text()
-        assert "[+] < Wrote calculator/calculator.py" in transcript
+        assert "[+] ✓ Wrote file calculator/calculator.py" in transcript
         assert "-OLD" in transcript
         assert "+NEW" in transcript
         assert "NEW FILE CONTENT" not in transcript
@@ -727,7 +762,7 @@ async def test_textual_approval_request_shows_collapsible_file_diff_preview(tmp_
         )
 
         collapsed = app._transcript_text()
-        assert "[+] ? Approval required write_file" in collapsed
+        assert "[+] ? Approval required Write file app.py" in collapsed
         assert "Before" in collapsed
         assert "After" in collapsed
         assert "old 0" in collapsed
@@ -738,7 +773,7 @@ async def test_textual_approval_request_shows_collapsible_file_diff_preview(tmp_
 
         app.toggle_collapsible(app._transcript_entries[-1]["id"])
         expanded = app._transcript_text()
-        assert "[-] ? Approval required write_file" in expanded
+        assert "[-] ? Approval required Write file app.py" in expanded
         assert "Before" in expanded
         assert "After" in expanded
         assert "new 19" in expanded
@@ -880,6 +915,82 @@ async def test_textual_write_file_new_file_preview_uses_single_added_view(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_textual_clicking_inline_diff_expand_hint_opens_approval_preview(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+    content = "\n".join(f"line {index}" for index in range(1, 21))
+    diff = "\n".join(
+        [
+            "--- /dev/null",
+            "+++ b/algorithms/binary_search.py",
+            "@@ -0,0 +1,20 @@",
+            *[f"+{line}" for line in content.splitlines()],
+        ]
+    )
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow write_file?",
+        reason="write_file creates a file.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-inline-expand",
+        arguments={"path": "algorithms/binary_search.py", "content": content},
+        preview={
+            "diff": {
+                "path": "algorithms/binary_search.py",
+                "is_new_file": True,
+                "old_content": "",
+                "new_content": content,
+                "unified_diff": diff,
+            }
+        },
+    )
+
+    async with app.run_test(size=(160, 60)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        entry = app._transcript_entries[-1]
+        assert entry["expanded_state"] is False
+        hint_y, hint_line = next(
+            (index, line.text)
+            for index, line in enumerate(transcript.lines)
+            if "click [+] to expand" in line.text
+        )
+        content_offset_x = transcript.content_region.x - transcript.region.x
+        content_offset_y = transcript.content_region.y - transcript.region.y
+
+        await pilot.click(
+            transcript,
+            offset=(hint_line.index("click") + 1 + content_offset_x, hint_y + content_offset_y),
+        )
+        await pilot.pause()
+
+        assert entry["expanded_state"] is True
+        assert "20 | +line 20" in app._transcript_text()
+
+
+@pytest.mark.asyncio
 async def test_textual_bash_approval_uses_command_block_and_structured_details(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
@@ -929,7 +1040,7 @@ async def test_textual_bash_approval_uses_command_block_and_structured_details(t
 
 
 @pytest.mark.asyncio
-async def test_textual_diff_preview_stacks_on_narrow_width(tmp_path, monkeypatch):
+async def test_textual_diff_preview_reflows_when_terminal_width_changes(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
     state = ReplState(
@@ -943,7 +1054,6 @@ async def test_textual_diff_preview_stacks_on_narrow_width(tmp_path, monkeypatch
     )
     agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
     app = NexusTextualApp(state, agent, build_router())
-    monkeypatch.setattr(NexusTextualApp, "transcript_width", property(lambda self: 80))
     diff = "\n".join(
         [
             "--- a/app.py",
@@ -954,7 +1064,7 @@ async def test_textual_diff_preview_stacks_on_narrow_width(tmp_path, monkeypatch
         ]
     )
 
-    async with app.run_test() as pilot:
+    async with app.run_test(size=(140, 40)) as pilot:
         await pilot.pause()
         transcript = app.query_one("#transcript", TranscriptLog)
         transcript.clear()
@@ -963,9 +1073,43 @@ async def test_textual_diff_preview_stacks_on_narrow_width(tmp_path, monkeypatch
 
         app.write(app.ui._render_diff_editor_preview(diff, path="app.py"))
 
-        rendered = app._transcript_text()
-        assert rendered.index("After") > rendered.index("40 | -old 40")
-        assert "40 | +new 40" in rendered
+        wide = app._transcript_text()
+        assert "Before | app.py" in wide
+        assert "After | app.py" in wide
+        assert wide.index("After | app.py") < wide.index("40 | -old 40")
+
+        await pilot.resize_terminal(80, 40)
+        await pilot.pause()
+
+        narrow = app._transcript_text()
+        assert narrow.index("After | app.py") > narrow.index("40 | -old 40")
+        assert "40 | +new 40" in narrow
+
+
+def test_textual_wide_diff_preview_uses_full_width_and_keeps_wrapped_rows_aligned():
+    from nexus.ui.textual_app import _DiffRow, _ResponsiveDiff, _renderable_plain_text
+
+    renderable = _ResponsiveDiff(
+        rows=(
+            _DiffRow(
+                1,
+                1,
+                "short",
+                "this replacement line is intentionally much longer than the available split panel width so it wraps",
+                "change",
+            ),
+            _DiffRow(2, 2, "next()", "next()", "context"),
+        ),
+        path="src/example.py",
+        language="python",
+    )
+
+    rendered = _renderable_plain_text(renderable, width=110)
+    lines = rendered.splitlines()
+
+    assert len(lines[0]) == 110
+    aligned_context_line = next(line for line in lines if "2 |  next()" in line)
+    assert aligned_context_line.count("2 |  next()") == 2
 
 
 @pytest.mark.asyncio
@@ -1034,7 +1178,8 @@ async def test_textual_long_assistant_response_is_expanded_by_default(tmp_path):
         )
 
         transcript_text = app._transcript_text()
-        assert "[-] < Assistant response" in transcript_text
+        assert "Assistant:" in transcript_text
+        assert "[-] · (30 lines)" in transcript_text
         assert "assistant line 29" in transcript_text
         assert app._transcript_entries[-1]["expanded_state"] is True
 
@@ -1089,7 +1234,7 @@ async def test_textual_bash_output_uses_inline_blocks_and_collapses_long_output(
     agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
     app = NexusTextualApp(state, agent, build_router())
 
-    async with app.run_test() as pilot:
+    async with app.run_test(size=(120, 60)) as pilot:
         await pilot.pause()
         transcript = app.query_one("#transcript", TranscriptLog)
         transcript.clear()
@@ -1110,16 +1255,189 @@ async def test_textual_bash_output_uses_inline_blocks_and_collapses_long_output(
         )
 
         transcript_text = app._transcript_text()
-        assert "$ uv run pytest" in transcript_text
+        assert ". Run Command : #call-1" in transcript_text
+        assert "Command" in transcript_text
+        assert "uv run pytest" in transcript_text
         assert "bash output" not in transcript_text
-        assert "[+] < Ran uv run pytest" in transcript_text
+        assert "[+] ✓ Ran uv run pytest" in transcript_text
+        assert "Console output" in transcript_text
         assert "line 14" in transcript_text
         assert "line 16" not in transcript_text
 
-        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        hint_y, hint_line = next(
+            (index, line.text)
+            for index, line in enumerate(transcript.lines)
+            if "click [+] to expand" in line.text
+        )
+        content_offset_x = transcript.content_region.x - transcript.region.x
+        content_offset_y = transcript.content_region.y - transcript.region.y
+        await pilot.click(
+            transcript,
+            offset=(hint_line.index("click") + 1 + content_offset_x, hint_y + content_offset_y),
+        )
+        await pilot.pause()
+
         expanded = app._transcript_text()
-        assert "[-] < Ran uv run pytest" in expanded
+        assert "[-] ✓ Ran uv run pytest" in expanded
         assert "line 29" in expanded
+
+
+@pytest.mark.asyncio
+async def test_textual_bash_short_output_still_uses_collapsible_console_preview(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    app = NexusTextualApp(state, Agent(model_client=FakeModelClient(), tool_registry=registry), build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start("call-short", "bash", {"command": "printf hello"}),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(ToolResult(call_id="call-short", tool_name="bash", output="hello")),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        entry = app._transcript_entries[-1]
+        assert entry["type"] == "collapsible"
+        assert entry["expanded_state"] is False
+        assert "[+] ✓ Ran printf hello" in app._transcript_text()
+        assert "Console output" in app._transcript_text()
+        assert "hello" in app._transcript_text()
+
+
+@pytest.mark.asyncio
+async def test_textual_command_argument_tool_start_uses_fenced_command_preview(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    app = NexusTextualApp(state, Agent(model_client=FakeModelClient(), tool_registry=registry), build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start("call-command", "sandbox_exec", {"command": "pwd"}),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        transcript_text = app._transcript_text()
+        assert transcript.lines[0].text == ""
+        assert ". Run Command : #call-com" in transcript_text
+        assert "> sandbox_exec command" not in transcript_text
+        assert "Command" in transcript_text
+        assert "pwd" in transcript_text
+        assert app._supervisor_entry is None
+        header = app.ui._command_start_header("call-command")
+        assert header.plain == "\n. Run Command : #call-com"
+        assert str(header.spans[0].style) == "bold tool.shell"
+
+
+def test_textual_bash_command_preview_builds_markdown_fence():
+    from nexus.ui.textual_app import _markdown_code_fence
+
+    assert _markdown_code_fence("printf hello", language="bash") == "```bash\nprintf hello\n```"
+
+
+def test_textual_bash_console_preview_bounds_single_long_line():
+    from nexus.ui.textual_app import _bash_output_block, _renderable_plain_text
+
+    output = ("a" * 1800) + "TAIL"
+
+    collapsed = _renderable_plain_text(_bash_output_block(output, collapsed=True))
+    expanded = _renderable_plain_text(_bash_output_block(output))
+
+    assert "TAIL" not in collapsed
+    assert "click [+] to expand" in collapsed
+    assert "TAIL" in expanded
+
+
+@pytest.mark.asyncio
+async def test_textual_supervisor_tools_use_colored_header_and_indented_status_symbols(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    app = NexusTextualApp(state, agent, build_router())
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start("call-list", "list_dir", {"path": "algorithms"}),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(call_id="call-list", tool_name="list_dir", output="heap.py", metadata={"duration_ms": 4})
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_start("call-grep", "grep", {"query": "needle"}),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(call_id="call-grep", tool_name="grep", output="not found", is_error=True)
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        header = app._supervisor_entry["header"]
+        assert isinstance(header, Text)
+        assert header.plain == "● Supervisor Agent"
+        assert header.style == "bold cyan"
+        transcript_text = app._transcript_text()
+        assert "   ✓ Listed algorithms" in transcript_text
+        assert "   ✗ Failed query=needle" in transcript_text
+        assert "|->" not in transcript_text
 
 
 @pytest.mark.asyncio
@@ -1224,18 +1542,19 @@ async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_p
         )
 
         collapsed = app._transcript_text()
-        assert "[+] | Explore Task - Summarize the algorithms directory" in collapsed
+        assert "[+] ● Explore Task - Summarize the algorithms directory" in collapsed
         assert "completed · 21.0s · 2 tools" in collapsed
         assert "Algorithms contains heap and table examples." in collapsed
         assert "> Delegate" not in collapsed
         assert "< Delegated" not in collapsed
         assert '"schema_version"' not in collapsed
-        assert "|--> Listed algorithms" not in collapsed
+        assert "   ✓ Listed algorithms" not in collapsed
 
         app.toggle_collapsible(app._transcript_entries[-1]["id"])
         expanded = app._transcript_text()
-        assert "|--> Listed algorithms" in expanded
-        assert "|--> Read algorithms/README.md" in expanded
+        assert "   ✓ Listed algorithms" in expanded
+        assert "   ✓ Read algorithms/README.md" in expanded
+        assert "|-->" not in expanded
         assert "4ms" in expanded
         assert "8ms" in expanded
         assert '"schema_version"' in expanded
@@ -1282,7 +1601,7 @@ async def test_textual_file_change_completion_collapses_side_by_side_diff(tmp_pa
         )
 
         collapsed = app._transcript_text()
-        assert "[+] < Edited calculator.py" in collapsed
+        assert "[+] ✓ Edited file calculator.py" in collapsed
         assert "-print('old')" in collapsed
         assert "+print('new')" in collapsed
         assert "Before" in collapsed

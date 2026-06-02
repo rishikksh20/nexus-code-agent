@@ -175,7 +175,8 @@ async def run_agent_turn(
                         working_history,
                         committed_events,
                         ui=ui,
-                        include_preapproved_batch=state.approval_manager.policy is ApprovalPolicy.APPROVE_TURN,
+                        approval_callback=approval_callback,
+                        auto_confirm=auto_confirm,
                     )
                     continue
 
@@ -205,10 +206,8 @@ async def run_agent_turn(
                         working_history,
                         committed_events,
                         ui=ui,
-                        include_preapproved_batch=(
-                            response.scope == ApprovalScope.TURN.value
-                            and supports_turn_wide_approval(confirmation_request)
-                        ),
+                        approval_callback=approval_callback,
+                        auto_confirm=auto_confirm,
                     )
                     continue
 
@@ -381,41 +380,98 @@ async def _resume_approved_tool_calls(
     committed_events: list[AgentEvent],
     *,
     ui: TerminalUI | None,
-    include_preapproved_batch: bool,
+    approval_callback: ConfirmationCallback | None,
+    auto_confirm: bool,
 ) -> None:
-    tool_call = _tool_call_for_confirmation(batch, confirmation_index, request)
-    tool_calls = [tool_call]
-    if include_preapproved_batch:
-        tool_calls = list(
-            agent.preapproved_tool_calls_from_batch(
-                _tool_calls_from_confirmation_model_response(batch, confirmation_index),
-                first_tool_call=tool_call,
-                mode=state.mode,
-                context=context,
-                approval_manager=state.approval_manager,
-                auto_confirm_read_only=state.config.auto_confirm_read_only,
-            )
+    pending_tool_calls = _pending_tool_calls_from_confirmation_model_response(
+        batch,
+        confirmation_index,
+        request,
+    )
+    model_usage_committed = _pending_model_response_usage_was_committed(
+        batch,
+        confirmation_index,
+        committed_events,
+    )
+    while pending_tool_calls:
+        execution_events: list[AgentEvent] = []
+        async for event in agent.run(
+            working_history,
+            context,
+            mode=state.mode,
+            approval_manager=state.approval_manager,
+            auto_confirm=auto_confirm,
+            auto_confirm_read_only=state.config.auto_confirm_read_only,
+            parallel_tools=state.config.parallel_tools,
+            parallel_tool_window=state.config.parallel_tool_window,
+            resume_tool_calls=pending_tool_calls,
+        ):
+            _render_event(ui, state, event)
+            execution_events.append(event)
+
+        next_confirmation_index = _first_unresolved_confirmation_index(execution_events)
+        completed_events = (
+            execution_events
+            if next_confirmation_index is None
+            else execution_events[:next_confirmation_index]
         )
+        completed_call_ids = {
+            event.payload.call_id
+            for event in completed_events
+            if event.kind == AgentEventType.TOOL_RESULT
+        }
+        completed_tool_calls = [
+            tool_call
+            for tool_call in pending_tool_calls
+            if tool_call.call_id in completed_call_ids
+        ]
+        if completed_tool_calls:
+            model_event = _model_response_for_pending_tool_calls(
+                batch,
+                confirmation_index,
+                completed_tool_calls,
+                include_usage=not model_usage_committed,
+            )
+            if model_event is not None:
+                working_history.append(model_event.payload.message)
+                committed_events.append(model_event)
+                model_usage_committed = model_usage_committed or model_event.payload.usage is not None
+            safe_events = _history_safe_completed_events(completed_events)
+            apply_events_to_messages(working_history, safe_events)
+            committed_events.extend(safe_events)
+            pending_tool_calls = tuple(
+                tool_call
+                for tool_call in pending_tool_calls
+                if tool_call.call_id not in completed_call_ids
+            )
 
-    model_event = _model_response_for_pending_tool_calls(batch, confirmation_index, tool_calls)
-    if model_event is not None:
-        working_history.append(model_event.payload.message)
-        committed_events.append(model_event)
+        if next_confirmation_index is None:
+            return
 
-    execution_events: list[AgentEvent] = []
-    async for event in agent.run(
-        working_history,
-        context,
-        approval_manager=state.approval_manager,
-        parallel_tools=state.config.parallel_tools,
-        parallel_tool_window=state.config.parallel_tool_window,
-        resume_tool_calls=tuple(tool_calls),
-    ):
-        _render_event(ui, state, event)
-        execution_events.append(event)
+        next_request = cast(ConfirmationRequest, execution_events[next_confirmation_index].payload)
+        if auto_confirm and next_request.kind is ConfirmationKind.APPROVAL:
+            state.approval_manager.record_approval(
+                next_request.tool_name,
+                approval_scope_for_policy(state.approval_manager.policy),
+                arguments=next_request.arguments,
+            )
+            continue
+        if approval_callback is None:
+            committed_events.append(execution_events[next_confirmation_index])
+            return
 
-    apply_events_to_messages(working_history, execution_events)
-    committed_events.extend(execution_events)
+        response = await approval_callback(next_request)
+        if next_request.kind is ConfirmationKind.APPROVAL and response.approved:
+            record_approval_response(state, next_request, response)
+            continue
+        if next_request.kind is ConfirmationKind.APPROVAL and response.denied:
+            state.approval_manager.record_refusal(
+                next_request.tool_name,
+                arguments=next_request.arguments,
+            )
+            continue
+        committed_events.append(execution_events[next_confirmation_index])
+        return
 
 
 def _commit_history_safe_prefix(
@@ -572,10 +628,26 @@ def _tool_calls_from_confirmation_model_response(
     return ()
 
 
+def _pending_tool_calls_from_confirmation_model_response(
+    batch: list[AgentEvent],
+    confirmation_index: int,
+    request: ConfirmationRequest,
+) -> tuple[ToolCall, ...]:
+    tool_calls = _tool_calls_from_confirmation_model_response(batch, confirmation_index)
+    for index, tool_call in enumerate(tool_calls):
+        if request.call_id and tool_call.call_id == request.call_id:
+            return tool_calls[index:]
+        if not request.call_id and tool_call.tool_name == request.tool_name and tool_call.arguments == request.arguments:
+            return tool_calls[index:]
+    return (_tool_call_for_confirmation(batch, confirmation_index, request),)
+
+
 def _model_response_for_pending_tool_calls(
     batch: list[AgentEvent],
     confirmation_index: int,
     tool_calls: list[ToolCall],
+    *,
+    include_usage: bool = True,
 ) -> AgentEvent | None:
     call_ids = {tool_call.call_id for tool_call in tool_calls}
     for event in reversed(batch[:confirmation_index]):
@@ -590,6 +662,7 @@ def _model_response_for_pending_tool_calls(
             content=source_message.content,
             name=source_message.name,
             reasoning_content=source_message.reasoning_content,
+            provider_state=source_message.provider_state,
             tool_calls=tuple(tool_calls),
             tool_call_id=source_message.tool_call_id,
         )
@@ -598,11 +671,30 @@ def _model_response_for_pending_tool_calls(
             payload=RuntimeResponse(
                 message=message,
                 tool_calls=tuple(tool_calls),
-                usage=payload.usage,
+                usage=payload.usage if include_usage else None,
                 finish_reason="tool_calls",
             ),
         )
     return None
+
+
+def _pending_model_response_usage_was_committed(
+    batch: list[AgentEvent],
+    confirmation_index: int,
+    committed_events: list[AgentEvent],
+) -> bool:
+    for event in reversed(batch[:confirmation_index]):
+        if event.kind != AgentEventType.MODEL_RESPONSE:
+            continue
+        usage = cast(RuntimeResponse, event.payload).usage
+        if usage is None:
+            return False
+        return any(
+            committed.kind == AgentEventType.MODEL_RESPONSE
+            and cast(RuntimeResponse, committed.payload).usage is usage
+            for committed in committed_events
+        )
+    return False
 
 
 def _sync_paused_turn_state(state: ReplState, events: list[AgentEvent], *, prompt_text: str) -> None:
@@ -845,6 +937,7 @@ def _history_safe_completed_events(events: list[AgentEvent]) -> list[AgentEvent]
                             content=message.content,
                             name=message.name,
                             reasoning_content=message.reasoning_content,
+                            provider_state=message.provider_state,
                             tool_calls=completed_calls,
                             tool_call_id=message.tool_call_id,
                         ),

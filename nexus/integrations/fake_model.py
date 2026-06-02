@@ -84,6 +84,7 @@ class FakeModelClient:
             finish_reason=response.finish_reason,
             usage=response.usage,
             reasoning_content=response.message.reasoning_content or None,
+            provider_state=response.message.provider_state or None,
         )
 
     async def stream(self, request: RuntimeRequest) -> AsyncIterator[str]:

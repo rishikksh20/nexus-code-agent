@@ -62,6 +62,11 @@ Skills are discovered in this order; later roots override earlier roots:
 4. Workspace skills: `.nexus/skills/`
 5. Standard Agent Skills project path: `.agents/skills/`
 
+Workspace initialization copies missing packaged built-ins into
+`.agents/skills/`. Those project copies override the packaged source and are
+readable by filesystem tools even when general hidden-path reads are disabled.
+Existing workspace copies are preserved unless `nexus init --force` is used.
+
 Invalid skills are skipped with a warning. Heading-only legacy `SKILL.md` files
 without frontmatter must be migrated before Nexus will load them.
 

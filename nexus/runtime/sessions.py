@@ -16,6 +16,7 @@ def message_to_dict(message: Message) -> dict[str, object]:
         "content": message.content,
         "name": message.name,
         "reasoning_content": message.reasoning_content,
+        "provider_state": message.provider_state,
         "tool_calls": [
             {
                 "call_id": tool_call.call_id,
@@ -44,6 +45,7 @@ def message_from_dict(payload: dict[str, object]) -> Message:
         content=str(payload.get("content", "")),
         name=str(payload["name"]) if payload.get("name") is not None else None,
         reasoning_content=str(payload.get("reasoning_content", "")),
+        provider_state=dict(payload.get("provider_state", {})),  # type: ignore[arg-type]
         tool_calls=tool_calls,
         tool_call_id=(
             str(payload["tool_call_id"])

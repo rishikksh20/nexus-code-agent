@@ -44,6 +44,11 @@ pip install mcp-server-git
 Define reusable MCP servers globally in `~/.nexus/config.toml`, or define
 workspace-only servers in `.nexus/config.toml`.
 
+MCP definitions intentionally stay in protected config instead of a readable
+`.agents/` directory: an MCP entry may contain environment variables,
+credentials, or remote URLs. Nexus does not currently ship packaged MCP server
+definitions to copy into a workspace.
+
 ```toml
 mcp_servers = [
   {
@@ -72,8 +77,8 @@ Replace `/path/to/your/workspace` and `/path/to/your/git-repo-root` with absolut
 
 ### Step 3 — Activate Servers for a Workspace
 
-Workspace-local `mcp_servers` are active by default. Global MCP servers are a
-catalog; activate them per workspace by name:
+Local and global `mcp_servers` entries form a catalog. Activate servers for a
+workspace by name:
 
 ```toml
 enabled_mcp_servers = ["filesystem", "git"]

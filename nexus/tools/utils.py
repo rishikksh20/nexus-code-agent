@@ -14,6 +14,7 @@ from typing import Iterable
 # ---------------------------------------------------------------------------
 
 _SKIP_DIRS = frozenset({"node_modules", "__pycache__", ".git", ".venv", "venv", ".hg", ".svn", ".nexus"})
+_READABLE_HIDDEN_SUBTREES = ((".agents", "skills"), (".agents", "tools"))
 
 BINARY_EXTENSIONS = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico",
@@ -70,7 +71,10 @@ def read_path_policy_error(
         relative = target.relative_to(workspace_root)
     except ValueError:
         return None
-    restricted_part = next(_restricted_path_part(relative.parts, allow_hidden=allow_hidden), None)
+    restricted_part = next(
+        _restricted_path_part(_visible_read_parts(relative.parts), allow_hidden=allow_hidden),
+        None,
+    )
     if restricted_part is None:
         return None
     if restricted_part == ".nexus":
@@ -138,10 +142,27 @@ def _restricted_path_part(parts: Iterable[str], *, allow_hidden: bool) -> Iterab
             yield part
 
 
+def _visible_read_parts(parts: tuple[str, ...]) -> tuple[str, ...]:
+    for subtree in _READABLE_HIDDEN_SUBTREES:
+        if parts[: len(subtree)] == subtree:
+            return parts[len(subtree) :]
+    return parts
+
+
+def _is_readable_hidden_subtree_parent(path: Path, root: Path) -> bool:
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    return any(subtree[: len(parts)] == parts for subtree in _READABLE_HIDDEN_SUBTREES)
+
+
 def _include_walk_entry(path: Path, root: Path, *, allow_hidden: bool, is_dir: bool) -> bool:
     name = path.name
     if name in _SKIP_DIRS:
         return False
+    if is_dir and _is_readable_hidden_subtree_parent(path, root):
+        return True
     if not can_read_match(path, root, allow_hidden=allow_hidden):
         return False
     if is_dir:

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import readline  # noqa: F401 - activates arrow-key / history line editing for input()
-from os import environ
 from uuid import uuid4
 
 from nexus.hooks import HookEvent
+from nexus.integrations.registry import provider_has_api_key
 from nexus.cli.init import _local_config_toml
 from nexus.config import load_config
 from nexus.config.upgrade import inspect_config_upgrade, upgrade_config_file
@@ -169,33 +169,7 @@ def _print_provider_notice_or_warning(state: ReplState) -> None:
         return
     if cfg.provider == "ollama":
         return
-    if cfg.provider in {"mistral", "openai", "openai-compatible"}:
-        has_key = bool(
-            cfg.api_key
-            or environ.get("MISTRAL_API_KEY")
-            or environ.get("NEXUS_API_KEY")
-            or environ.get("OPENAI_API_KEY")
-            or environ.get("API_KEY")
-        )
-    elif cfg.provider in {"anthropic", "gemini"}:
-        has_key = bool(
-            cfg.api_key
-            or environ.get("ANTHROPIC_API_KEY")
-            or environ.get("GEMINI_API_KEY")
-            or environ.get("GOOGLE_API_KEY")
-            or environ.get("API_KEY")
-        )
-    elif cfg.provider == "cohere":
-        has_key = bool(
-            cfg.api_key
-            or environ.get("COHERE_API_KEY")
-            or environ.get("CO_API_KEY")
-            or environ.get("NEXUS_API_KEY")
-            or environ.get("API_KEY")
-        )
-    else:
-        has_key = True
-    if not has_key:
+    if not provider_has_api_key(cfg):
         state.console.print_no_api_key_warning(cfg.provider)
 
 

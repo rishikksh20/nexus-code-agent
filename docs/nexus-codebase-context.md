@@ -16,10 +16,10 @@ Nexus is a CLI-first coding agent implemented as a Python package under `nexus/`
 - `nexus/runtime/context_state.py` owns compact per-agent context records and handoff packets for multi-agent context isolation, sharing, and `/context` visibility.
 - `nexus/runtime/repl_state.py` prepares each turn: system prompt construction, history preparation, tool-output pruning, context compaction, metadata, and durable history updates.
 - `nexus/runtime/runtime_session.py` builds `ReplState` from config, sessions, skills, memory, hooks, delegation resources, and approval policy.
-- `nexus/config/` contains defaults, TOML/env/CLI merge logic, validation, and model-context limit helpers.
+- `nexus/config/` contains defaults, comment-preserving TOML edits, TOML/env/CLI merge logic, profile validation, and model-context limit helpers.
 - `nexus/tools/` contains the first-party tool system, MCP adapters, registry helpers, compatibility filesystem tools, and sub-agent tool registration.
 - `nexus/security/` contains approval policies, approval state, permission checks, and shell-risk classification.
-- `nexus/integrations/` contains provider adapters: fake, OpenAI-compatible HTTP providers, native Ollama, native Anthropic, Cohere Chat API v2, native Gemini, and retry support.
+- `nexus/integrations/` contains the fixed provider registry and adapters: fake, OpenAI-compatible HTTP providers, native Ollama, native Anthropic, Cohere Chat API v2, native Gemini, and retry support.
 - `nexus/extensions/`, `nexus/hooks/`, `nexus/skills/`, `nexus/memory/`, `nexus/context/`, `nexus/sandbox/`, and `nexus/observability/` provide optional runtime capabilities around the core loop.
 
 ## Runtime Flow
@@ -109,7 +109,10 @@ The security layer is intentionally conservative around shell and whole-file wri
 
 ## Providers
 
-Provider selection is validated in `nexus/config/loader.py`.
+Provider selection and reusable model profiles are validated in
+`nexus/config/loader.py`. `nexus/integrations/registry.py` owns fixed provider
+metadata, defaults, credential lookup, client construction, and tiny live
+probes.
 
 Valid providers:
 
@@ -131,7 +134,12 @@ Valid providers:
 - `CohereModelClient` for Cohere Chat API v2.
 - `GeminiModelClient` for Gemini.
 
-Config supports provider-specific defaults, API-key resolution, and model context-limit adjustments.
+Provider settings and model profiles are keyed catalogs merged global to local.
+`active_model_profile` selects one workspace profile; without a selection,
+Nexus synthesizes `legacy-current` from flat fields. The resolved flat fields
+remain available to existing consumers. The Textual UI opens provider settings
+through `/provider manage`; classic terminal mode keeps `/provider profiles`
+and `/provider use <profile>`.
 
 ## Sessions And Context
 
@@ -150,7 +158,7 @@ Important session behavior:
 
 Optional runtime features include:
 
-- Plugins loaded from the configured plugins directory.
+- Custom-tool plugins loaded from global, workspace compatibility, and readable `.agents/tools/` roots.
 - MCP tools registered through connected MCP servers.
 - Skills from global, local, and builtin roots.
 - Cognitive sub-agent tools registered in advanced mode.

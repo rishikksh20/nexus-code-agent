@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from nexus.memory.workspace import AgentDirs, bootstrap_workspace_knowledge
+from nexus.skills import BUILTIN_SKILLS_DIR
 from nexus.tools.mcp import mcp_server_example_for_workspace
 from nexus.config.upgrade import CURRENT_CONFIG_VERSION
 
@@ -39,7 +41,23 @@ def init_workspace(
             description=project_description,
         )
         created.append(dirs.knowledge_file)
+    created.extend(_copy_builtin_skills_to_workspace(workspace_root, force=force))
     return created
+
+
+def _copy_builtin_skills_to_workspace(workspace_root: Path, *, force: bool) -> list[Path]:
+    """Copy packaged skills into the standard workspace-visible skills root."""
+    workspace_skills_dir = workspace_root.resolve() / ".agents" / "skills"
+    copied: list[Path] = []
+    for source_dir in sorted(BUILTIN_SKILLS_DIR.iterdir()):
+        if not source_dir.is_dir() or not (source_dir / "SKILL.md").is_file():
+            continue
+        destination_dir = workspace_skills_dir / source_dir.name
+        if destination_dir.exists() and not force:
+            continue
+        shutil.copytree(source_dir, destination_dir, dirs_exist_ok=force)
+        copied.append(destination_dir)
+    return copied
 
 
 def _global_config_toml() -> str:
@@ -76,6 +94,29 @@ def _global_config_toml() -> str:
             'sandbox_read_only_workspace = true',
             'sandbox_tmp_size = "64m"',
             '',
+            '[providers.openai-compatible]',
+            'enabled = true',
+            'api_key_env = "API_KEY"',
+            'base_url = "https://api.mistral.ai/v1"',
+            'timeout_seconds = 120',
+            'max_retries = 3',
+            '',
+            '[models.default-mistral-compatible]',
+            'provider = "openai-compatible"',
+            'model_name = "mistral-medium-latest"',
+            'context_length = 32768',
+            'max_output_tokens = 4096',
+            'reserved_output_tokens = 4096',
+            'temperature = 0.0',
+            'top_p = 1.0',
+            'supports_tools = true',
+            'supports_streaming = true',
+            'supports_reasoning = false',
+            '',
+            '[models.default-mistral-compatible.thinking]',
+            'enabled = false',
+            'mode = "provider_default"',
+            '',
         ]
     )
 
@@ -86,6 +127,8 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             f'project_name = "{project_name}"',
             f'project_description = "{project_description}"',
             f'config_version = {CURRENT_CONFIG_VERSION}',
+            '# Select a reusable model profile for this workspace:',
+            '# active_model_profile = "default-mistral-compatible"',
             '# Allowlist of tools available in this workspace.',
             '# Remove this key entirely (or set to []) to allow ALL registered tools.',
             '# Builtin tool names: get_time, read_file, write_file, edit,',
@@ -100,8 +143,9 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             '# activate/deactivate MCP servers by name instead of adding MCP tool names here.',
             'allowed_tools = ["get_time", "read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "code_index", "semantic_search", "git_status", "git_diff", "run_tests", "run_python_check", "run_formatter", "bash", "memory", "todos", "web_fetch", "web_search", "subagent_explorer", "subagent_coding", "subagent_code_reviewer", "subagent_impact_analyzer"]',
             'denied_tools = []',
-            '# Hidden/private dot-path reads are blocked by default. Set this to true to allow',
-            '# reading hidden/private paths other than .nexus for this workspace. .nexus stays blocked.',
+            '# Hidden/private dot-path reads are blocked by default. .agents/skills and',
+            '# .agents/tools stay readable so agents can inspect project resources.',
+            '# Set this to true to allow other hidden/private paths. .nexus stays blocked.',
             'allow_hidden_paths = false',
             'textual_transcript_max_lines = 5000',
             'prompt_history_max_entries = 200',

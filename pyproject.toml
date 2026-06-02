@@ -18,6 +18,7 @@ dependencies = [
   "pyyaml>=6.0.2",
   "pyfiglet>=1.0.4",
   "sentry-sdk>=2.60.0",
+  "tomlkit>=0.13.3",
 ]
 
 [project.optional-dependencies]

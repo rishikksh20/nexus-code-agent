@@ -77,7 +77,9 @@ tell the user to run `/help` for the full command list.
 - Skills are discovered from built-ins, `skill_paths`, `~/.nexus/skills/`, `.nexus/skills/`, and `.agents/skills/`.
 - Skill activation uses `enabled_skills` and `disabled_skills` in workspace config.
 - CLI `--skill <name>` is run-only and does not edit config.
+- Project custom-tool plugins live under readable `.agents/tools/`; global plugins live under `~/.nexus/plugins/`.
 - MCP server activation is maintained by MCP config; MCP tool names should not be hand-added to `allowed_tools`.
+- MCP definitions stay in protected `.nexus/config.toml` or `~/.nexus/config.toml` because they may contain credentials.
 - `/agent` and `/sub-agent` allow or disallow only resources that are already globally active through `/skills` or `/mcp`.
 - Agent-scoped config lives under `[agents]` and `[[sub-agents]]`; sub-agent entries use `name`, `allowed_tools`, `allowed_mcps`, and `allowed_skills`. In advanced mode, empty supervisor `allowed_*` lists mean delegate through sub-agents by default; add `[agents]` allowlist entries for direct supervisor tools, skills, or MCP servers. The generated config lists the four built-in sub-agents with their code allowlists. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are accepted as aliases; obsolete attach/detach keys are ignored. Empty sub-agent `allowed_*` lists preserve sub-agent defaults; `allowed_* = "all"` means every normal workspace tool, active skill, or active MCP server for that scope.
 - Built-in and sub-agent tools may be listed in config tool filters.

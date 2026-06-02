@@ -9,6 +9,7 @@ import pytest
 
 from nexus.app import _build_model_client
 from nexus.config import load_config
+from nexus.config.provider_profiles import ThinkingConfig
 from nexus.integrations.anthropic import AnthropicAdapter, AnthropicModelClient
 from nexus.integrations.cohere import (
     CohereAdapter,
@@ -19,7 +20,7 @@ from nexus.integrations.cohere import (
 )
 from nexus.integrations.fake_model import FakeModelClient
 from nexus.integrations.gemini import GeminiAdapter, GeminiModelClient
-from nexus.integrations.ollama import OllamaModelClient
+from nexus.integrations.ollama import OllamaAdapter, OllamaModelClient
 from nexus.integrations.openai_compatible import OpenAICompatibleAdapter, OpenAICompatibleModelClient
 from nexus.models import Message, RuntimeRequest, StreamEventType, ToolCall
 
@@ -877,6 +878,110 @@ def test_openai_adapter_can_disable_thinking_mode():
     assert payload["thinking"] == {"type": "disabled"}
     assert "reasoning_effort" not in payload
     assert "reasoning_content" not in payload["messages"][1]
+
+
+def test_openai_reasoning_profile_uses_completion_tokens_and_effort():
+    thinking = ThinkingConfig(enabled=True, mode="reasoning_effort", reasoning_effort="high")
+    payload = OpenAICompatibleAdapter(
+        provider_name="openai",
+        thinking_mode="enabled",
+        reasoning_effort="high",
+        thinking=thinking,
+    ).to_wire_request(
+        RuntimeRequest(
+            model_name="o-demo",
+            system_prompt="system",
+            messages=(Message(role="user", content="hello"),),
+            max_output_tokens=64,
+        )
+    )
+
+    assert payload["max_completion_tokens"] == 64
+    assert "max_tokens" not in payload
+    assert payload["reasoning_effort"] == "high"
+
+
+def test_anthropic_adapter_replays_signed_thinking_before_tool_use():
+    messages = AnthropicAdapter.messages(
+        (
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=(ToolCall("call-1", "read_file", {"path": "README.md"}),),
+                provider_state={
+                    "anthropic_content_blocks": [
+                        {"type": "thinking", "thinking": "opaque", "signature": "signed"}
+                    ]
+                },
+            ),
+        )
+    )
+
+    assert messages[0]["content"][0] == {
+        "type": "thinking",
+        "thinking": "opaque",
+        "signature": "signed",
+    }
+    assert messages[0]["content"][1]["type"] == "tool_use"
+
+
+def test_anthropic_request_maps_budget_tokens_and_omits_temperature():
+    client = AnthropicModelClient(
+        api_key="secret",
+        thinking=ThinkingConfig(enabled=True, mode="budget_tokens", budget_tokens=2048),
+    )
+
+    payload = client._request_kwargs(
+        RuntimeRequest(
+            model_name="claude-demo",
+            system_prompt="system",
+            messages=(Message(role="user", content="hello"),),
+            temperature=0.5,
+        )
+    )
+
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+    assert "temperature" not in payload
+
+
+def test_gemini_config_maps_thinking_budget():
+    class Types:
+        class ThinkingConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class GenerateContentConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+    config = GeminiModelClient(
+        api_key="secret",
+        thinking=ThinkingConfig(enabled=True, mode="budget_tokens", budget_tokens=1024),
+    )._config(
+        Types,
+        RuntimeRequest(
+            model_name="gemini-demo",
+            system_prompt="system",
+            messages=(Message(role="user", content="hello"),),
+        ),
+    )
+
+    assert config.kwargs["thinking_config"].kwargs == {"thinking_budget": 1024}
+
+
+def test_ollama_adapter_maps_think_effort_and_history():
+    payload = OllamaAdapter(model_name="demo").to_wire_request(
+        RuntimeRequest(
+            model_name="demo",
+            system_prompt="system",
+            messages=(Message(role="assistant", content="", reasoning_content="stored reasoning"),),
+            thinking=ThinkingConfig(enabled=True, mode="reasoning_effort", reasoning_effort="medium"),
+        ),
+        stream=True,
+    )
+
+    assert payload["think"] == "medium"
+    assert payload["messages"][1]["thinking"] == "stored reasoning"
 
 
 def test_anthropic_adapter_converts_tools_and_messages():

@@ -487,7 +487,7 @@ async def test_subagent_tool_preserves_failed_test_output_after_vague_final_resp
 
 
 @pytest.mark.asyncio
-async def test_subagent_tool_marks_unresolved_clarification_as_error(tool_context):
+async def test_subagent_tool_reports_missing_mutation_path_as_model_repair_error(tool_context):
     registry = ToolRegistry()
     registry.register(WriteFileTool(), source="core", origin="builtin")
     model = FakeModelClient(
@@ -521,9 +521,10 @@ async def test_subagent_tool_marks_unresolved_clarification_as_error(tool_contex
 
     payload = json.loads(result.output)
     assert result.is_error is True
-    assert result.metadata["status"] == "needs_clarification"
-    assert payload["status"] == "needs_clarification"
-    assert payload["runtime_status"] == "needs_clarification"
+    assert result.metadata["status"] == "failed"
+    assert payload["status"] == "failed"
+    assert payload["runtime_status"] == "failed"
+    assert "Missing required argument(s) for tool 'write_file': 'path'" in payload["raw_result"]
 
 
 @pytest.mark.asyncio

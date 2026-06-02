@@ -208,7 +208,7 @@ async def test_headless_runner_accumulates_usage_metadata(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_headless_runner_exits_when_clarification_is_required(tmp_path):
+async def test_headless_runner_asks_model_to_repair_missing_path(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
     registry.register(WriteFileTool())
@@ -226,6 +226,18 @@ async def test_headless_runner_exits_when_clarification_is_required(tmp_path):
                     ),
                     finish_reason="tool_calls",
                 ),
+                RuntimeResponse(
+                    message=Message(role="assistant", content="Writing the note."),
+                    tool_calls=(
+                        ToolCall(
+                            call_id="write-1",
+                            tool_name="write_file",
+                            arguments={"path": "note.txt", "content": "hello"},
+                        ),
+                    ),
+                    finish_reason="tool_calls",
+                ),
+                RuntimeResponse(message=Message(role="assistant", content="Done.")),
             ]
         ),
         tool_registry=registry,
@@ -250,8 +262,8 @@ async def test_headless_runner_exits_when_clarification_is_required(tmp_path):
         quiet=True,
     )
 
-    assert result.exit_code == EXIT_NEEDS_CONFIRM
-    assert "Provide a value for 'path'" in result.error
+    assert result.exit_code == EXIT_OK
+    assert (tmp_path / "note.txt").read_text(encoding="utf-8") == "hello"
 
 
 @pytest.mark.asyncio

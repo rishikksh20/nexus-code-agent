@@ -7,17 +7,28 @@ from typing import Any
 
 @dataclass(slots=True)
 class AgentConfig:
-    config_version: int = 2
+    config_version: int = 3
     provider: str = "openai-compatible"
     model_name: str = "mistral-medium-latest"
     api_base_url: str = "https://api.mistral.ai/v1"
     api_key: str = ""       # Set via API_KEY in .env or api_key in config.toml
+    providers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    models: dict[str, dict[str, Any]] = field(default_factory=dict)
+    active_model_profile: str = ""
+    active_model_profile_legacy: bool = True
+    context_length: int = 0
     max_output_tokens: int = 4096
+    reserved_output_tokens: int = 4096
     temperature: float = 0.0
+    top_p: float = 1.0
+    supports_tools: bool = True
+    supports_streaming: bool = True
+    supports_reasoning: bool = False
     llm_thinking_mode: str = "auto"
     llm_reasoning_effort: str = "high"
     compaction_soft_limit: int = 10_000
     compaction_hard_limit: int = 14_000
+    compaction_limits_auto: bool = True
     compaction_keep_recent: int = 12
     default_mode: str = "default"
     auto_confirm_read_only: bool = True

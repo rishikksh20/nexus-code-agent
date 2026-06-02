@@ -29,19 +29,11 @@ from nexus.cli.init import init_workspace
 from nexus.cli.input import resolve_prompt
 from nexus.config import config_to_plain_dict, ensure_config_dirs, load_config
 from nexus.config.loader import ConfigError
-from nexus.config.model_limits import get_model_context_limit
-from nexus.extensions.plugins import PluginLoader
+from nexus.config.provider_profiles import active_model_profile, active_provider_config
+from nexus.extensions.plugins import get_plugin_roots, load_plugins_from_roots
 from nexus.hooks import HookEvent, HookExecutor, setup_hooks
-from nexus.integrations.anthropic import AnthropicModelClient, resolve_anthropic_api_key
-from nexus.integrations.cohere import CohereModelClient, resolve_cohere_api_key
-from nexus.integrations.fake_model import FakeModelClient
-from nexus.integrations.gemini import GeminiModelClient, resolve_gemini_api_key
+from nexus.integrations.registry import build_model_client, provider_definition, provider_has_api_key
 from nexus.tools.mcp import MCPServerConfig, MCPServerRuntime, register_discovered_mcp_tools
-from nexus.integrations.ollama import OllamaModelClient, resolve_ollama_base_url
-from nexus.integrations.openai_compatible import (
-    OpenAICompatibleModelClient,
-    resolve_provider_api_key,
-)
 from nexus.runtime.agent import Agent
 from nexus.observability import (
     configure_root_text_logging,
@@ -221,7 +213,8 @@ class NexusApp:
 
         # 2. Plugins
         if load_plugins:
-            PluginLoader(self.config.plugins_dir).load_all(
+            load_plugins_from_roots(
+                get_plugin_roots(self.config),
                 registry,
                 self._hooks,
                 can_register=lambda tool: self._tool_enabled(tool.name),
@@ -288,35 +281,7 @@ class NexusApp:
 
     def _build_model_client(self):
         """Construct the LLM client from the current config."""
-        if self.config.provider == "fake":
-            return FakeModelClient()
-        if self.config.provider == "ollama":
-            return OllamaModelClient(
-                base_url=resolve_ollama_base_url(self.config.api_base_url or None),
-                model_name=self.config.model_name,
-            )
-        if self.config.provider == "anthropic":
-            explicit_key = self.config.api_key or None
-            return AnthropicModelClient(api_key=resolve_anthropic_api_key(explicit_key))
-        if self.config.provider == "cohere":
-            explicit_key = self.config.api_key or None
-            return CohereModelClient(
-                api_base_url=self.config.api_base_url,
-                api_key=resolve_cohere_api_key(explicit_key),
-            )
-        if self.config.provider == "gemini":
-            explicit_key = self.config.api_key or None
-            return GeminiModelClient(api_key=resolve_gemini_api_key(explicit_key))
-        if self.config.provider in {"mistral", "openai-compatible", "openai"}:
-            explicit_key = self.config.api_key or None
-            return OpenAICompatibleModelClient(
-                api_base_url=self.config.api_base_url,
-                api_key=resolve_provider_api_key(self.config.provider, explicit_key),
-                provider_name=self.config.provider,
-                thinking_mode=self.config.llm_thinking_mode,
-                reasoning_effort=self.config.llm_reasoning_effort,
-            )
-        raise ValueError(f"Unsupported provider: {self.config.provider}")
+        return build_model_client(self.config)
 
     def _reload_model_client(self, config) -> None:
         """Apply a live config update to the app and running agent client."""
@@ -331,17 +296,16 @@ class NexusApp:
         Only overrides the built-in defaults (10 000 / 14 000); explicit user
         settings in ``config.toml`` or env vars are left untouched.
         """
-        _SOFT_DEFAULT, _HARD_DEFAULT = 10_000, 14_000
-        if (
-            self.config.compaction_soft_limit != _SOFT_DEFAULT
-            and self.config.compaction_hard_limit != _HARD_DEFAULT
-        ):
+        if not bool(getattr(self.config, "compaction_limits_auto", True)):
             return  # user overrode both; respect their settings
-        ctx_limit = get_model_context_limit(self.config.model_name)
-        if self.config.compaction_soft_limit == _SOFT_DEFAULT:
-            self.config.compaction_soft_limit = int(ctx_limit * 0.65)
-        if self.config.compaction_hard_limit == _HARD_DEFAULT:
-            self.config.compaction_hard_limit = int(ctx_limit * 0.85)
+        profile = active_model_profile(self.config)
+        ctx_limit = (
+            profile.context_length - profile.reserved_output_tokens
+            if not getattr(self.config, "active_model_profile_legacy", True)
+            else self.config.context_length
+        )
+        self.config.compaction_soft_limit = int(ctx_limit * 0.65)
+        self.config.compaction_hard_limit = int(ctx_limit * 0.85)
 
     def _log_registered_tools(self) -> None:
         for record in self._registry.records():
@@ -364,8 +328,6 @@ def _resolve_session(*args, **kwargs) -> tuple:
 
 def provider_error_message(exc: Exception, config) -> str:
     """Return a user-friendly explanation for common LLM provider failures."""
-    from os import environ
-
     msg = str(exc)
     provider = config.provider
 
@@ -385,20 +347,10 @@ def provider_error_message(exc: Exception, config) -> str:
             )
         return f"Ollama error: {msg}"
 
-    has_key = bool(
-        config.api_key
-        or environ.get("ANTHROPIC_API_KEY")
-        or environ.get("COHERE_API_KEY")
-        or environ.get("CO_API_KEY")
-        or environ.get("GEMINI_API_KEY")
-        or environ.get("GOOGLE_API_KEY")
-        or environ.get("MISTRAL_API_KEY")
-        or environ.get("NEXUS_API_KEY")
-        or environ.get("OPENAI_API_KEY")
-        or environ.get("API_KEY")
-    )
+    has_key = provider_has_api_key(config)
     if not has_key:
-        key_env = "API_KEY"
+        provider_config = active_provider_config(config)
+        key_env = provider_config.api_key_env or provider_definition(provider).default_api_key_env or "API_KEY"
         return (
             f"No API key found for provider [bold]{provider}[/bold]. "
             f"Set [bold]{key_env}[/bold] in your [bold].env[/bold] file or environment, "

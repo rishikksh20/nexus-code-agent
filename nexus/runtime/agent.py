@@ -33,6 +33,7 @@ from nexus.runtime.execution import ExecutionMode
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
+from nexus.config.provider_profiles import active_model_profile
 from nexus.security.manager import ApprovalManager
 from nexus.tools.base import FileDiff, ToolConfirmation, ToolKind, ToolRegistry, tool_to_schema
 
@@ -149,7 +150,10 @@ class Agent:
             async for event in self._execute_approved_tool_calls(
                 resume_tool_calls,
                 context,
+                mode=mode,
                 approval_manager=approval_manager,
+                auto_confirm=auto_confirm,
+                auto_confirm_read_only=auto_confirm_read_only,
             ):
                 yield event
             return
@@ -185,7 +189,10 @@ class Agent:
         tool_calls: tuple[ToolCall, ...],
         context: ToolExecutionContext,
         *,
+        mode: ExecutionMode,
         approval_manager: ApprovalManager | None = None,
+        auto_confirm: bool = False,
+        auto_confirm_read_only: bool = True,
     ) -> AsyncGenerator[AgentEvent, None]:
         mutating_paths_this_batch: set[str] = set()
         for tool_call in tool_calls:
@@ -218,15 +225,122 @@ class Agent:
                 yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
                 continue
             tool = record.tool
+            missing_fields = _missing_required_fields(tool.input_schema, tool_call.arguments)
+            if missing_fields:
+                result = _missing_required_argument_result(
+                    tool_call,
+                    tool.name,
+                    missing_fields,
+                    retry_count=1,
+                    retry_limit=INVALID_TOOL_CALL_RETRY_LIMIT,
+                )
+                yield AgentEvent.tool_call_start(
+                    tool_call.call_id,
+                    tool.name,
+                    tool_call.arguments,
+                    actor=_tool_actor(context),
+                    display=_tool_display_metadata(is_mutating=tool.is_mutating),
+                )
+                yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                yield AgentEvent.tool_call_complete(result)
+                yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
+                continue
             confirmation = await _get_tool_confirmation(tool, tool_call.call_id, tool_call.arguments, context)
             confirmation_preview = _confirmation_preview(confirmation)
             affected_paths = _affected_file_paths(tool, tool_call.arguments, confirmation, context)
+            decision = self.permission_checker.evaluate(
+                tool,
+                tool_call.arguments,
+                mode,
+                context=context,
+                auto_confirm_read_only=auto_confirm_read_only,
+            )
+            risk_level = _risk_level_name(decision.risk_level)
+            if decision.decision is PermissionDecision.DENY:
+                result = _denied_tool_result(
+                    tool_call.call_id,
+                    tool.name,
+                    decision.reason,
+                    risk_level=risk_level,
+                )
+                await self.hooks.emit(
+                    HookEvent.NOTIFICATION,
+                    {
+                        "event": "tool_denied",
+                        "tool_name": tool.name,
+                        "tool_source": record.source,
+                        "tool_origin": record.origin,
+                        "arguments": tool_call.arguments,
+                        "reason": decision.reason,
+                        "session_id": context.session_id,
+                        "call_id": tool_call.call_id,
+                        **_correlation_payload(context, tool_call_id=tool_call.call_id),
+                    },
+                )
+                yield AgentEvent(kind=AgentEventType.TOOL_DENIED, payload=decision)
+                yield AgentEvent.tool_call_complete(result)
+                yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
+                continue
+            if approval_manager is not None and approval_manager.is_refused(tool.name, tool_call.arguments):
+                result = _denied_tool_result(
+                    tool_call.call_id,
+                    tool.name,
+                    "User previously denied this tool call in the current turn. Continue without running it.",
+                    risk_level=risk_level,
+                )
+                yield AgentEvent.tool_call_complete(result)
+                yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=result)
+                continue
             duplicate_paths = affected_paths & mutating_paths_this_batch if tool.is_mutating else set()
             if duplicate_paths:
                 blocked_result = _same_file_mutation_result(tool_call, duplicate_paths)
                 yield AgentEvent.tool_call_complete(blocked_result)
                 yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=blocked_result)
                 continue
+            if (
+                decision.decision is PermissionDecision.CONFIRM
+                and not auto_confirm
+                and not _is_tool_preapproved(
+                    tool.name,
+                    tool_call.arguments,
+                    is_mutating=tool.is_mutating,
+                    risk_level=risk_level,
+                    approved_tools=set(),
+                    approval_manager=approval_manager,
+                )
+            ):
+                request = ConfirmationRequest(
+                    kind=ConfirmationKind.APPROVAL,
+                    tool_name=tool.name,
+                    prompt=f"Allow tool '{tool.name}'?",
+                    reason=decision.reason,
+                    call_id=tool_call.call_id,
+                    payload={
+                        "tool_name": tool.name,
+                        "reason": decision.reason,
+                        "approval_policy": str(context.metadata.get("approval_policy", "on-request")),
+                        "risk_level": risk_level,
+                        "actor": _tool_actor(context),
+                    },
+                    arguments=tool_call.arguments,
+                    preview=confirmation_preview,
+                )
+                await self.hooks.emit(
+                    HookEvent.NOTIFICATION,
+                    {
+                        "event": "confirmation_requested",
+                        "tool_name": tool.name,
+                        "tool_source": record.source,
+                        "tool_origin": record.origin,
+                        "arguments": tool_call.arguments,
+                        "reason": decision.reason,
+                        "session_id": context.session_id,
+                        "call_id": tool_call.call_id,
+                        **_correlation_payload(context, tool_call_id=tool_call.call_id),
+                    },
+                )
+                yield AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request)
+                return
             if tool.is_mutating:
                 mutating_paths_this_batch.update(affected_paths)
             async for event in self._execute_tool_call(
@@ -445,6 +559,8 @@ class Agent:
         for turn_index in range(max_turns):
             if turn_index > 0:
                 yield AgentEvent.thinking_started(actor=_tool_actor(context))
+            runtime_config = context.metadata.get("config")
+            profile = active_model_profile(runtime_config) if runtime_config is not None else None
             request = RuntimeRequest(
                 model_name=model_name,
                 system_prompt=system_prompt,
@@ -452,6 +568,8 @@ class Agent:
                 tool_schemas=_tool_schemas_for_context(self.tool_registry, context),
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
+                top_p=profile.top_p if profile is not None else 1.0,
+                thinking=profile.thinking if profile is not None else None,
             )
             logger.debug(
                 "agent.model_batch.start session_id=%s actor=%s turn_index=%s max_turns=%s model=%s messages=%s last_role=%s tool_schemas=%s",
@@ -473,6 +591,7 @@ class Agent:
             usage: UsageSnapshot | None = None
             stream_finish_reason: str | None = None
             stream_reasoning_content = ""
+            stream_provider_state: dict[str, Any] = {}
             model_call_id = uuid4().hex[:12]
 
             await self.hooks.emit(
@@ -535,6 +654,8 @@ class Agent:
                         stream_finish_reason = stream_event.finish_reason or stream_finish_reason
                         if stream_event.reasoning_content:
                             stream_reasoning_content += stream_event.reasoning_content
+                        if stream_event.provider_state:
+                            stream_provider_state.update(stream_event.provider_state)
                         if monitor is not None and usage is not None:
                             monitor.update_current_span(
                                 attributes={
@@ -621,6 +742,7 @@ class Agent:
                 role="assistant",
                 content=response_text or "",
                 reasoning_content=stream_reasoning_content,
+                provider_state=stream_provider_state,
                 tool_calls=tool_calls,
             )
             should_record_message = bool(message.content or message.tool_calls)
@@ -865,7 +987,7 @@ class Agent:
                     read_keys_this_batch[read_cache_key] = tool_call.call_id
                 missing_fields = _missing_required_fields(tool.input_schema, tool_call.arguments)
                 if missing_fields:
-                    if _missing_fields_should_be_repaired_by_model(missing_fields):
+                    if _missing_fields_should_be_repaired_by_model(tool.name, missing_fields):
                         retry_key = (tool.name, tuple(missing_fields))
                         retry_count = invalid_argument_retries.get(retry_key, 0) + 1
                         invalid_argument_retries[retry_key] = retry_count
@@ -1518,7 +1640,7 @@ class Agent:
                 getattr(record.tool, "kind", None) is ToolKind.READ
                 and context.metadata.get("approval_callback") is None
             )
-            if not _missing_fields_should_be_repaired_by_model(missing_fields) and not read_without_clarification_callback:
+            if not _missing_fields_should_be_repaired_by_model(record.tool.name, missing_fields) and not read_without_clarification_callback:
                 missing_field = missing_fields[0]
                 prepared.confirmation_request = ConfirmationRequest(
                     kind=ConfirmationKind.CLARIFICATION,
@@ -1942,7 +2064,7 @@ def _duplicate_read_result(
     )
 
 
-def _missing_fields_should_be_repaired_by_model(missing_fields: list[str]) -> bool:
+def _missing_fields_should_be_repaired_by_model(tool_name: str, missing_fields: list[str]) -> bool:
     model_owned_fields = {
         "content",
         "new_content",
@@ -1952,7 +2074,16 @@ def _missing_fields_should_be_repaired_by_model(missing_fields: list[str]) -> bo
         "code",
         "patch",
     }
-    return any(field in model_owned_fields for field in missing_fields)
+    model_owned_path_tools = {
+        "edit",
+        "insert_edit_into_file",
+        "write_file",
+    }
+    return any(
+        field in model_owned_fields
+        or (field == "path" and tool_name in model_owned_path_tools)
+        for field in missing_fields
+    )
 
 
 def _missing_required_argument_result(

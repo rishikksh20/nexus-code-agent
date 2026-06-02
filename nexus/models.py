@@ -81,6 +81,9 @@ class Message:
     # Provider-specific hidden reasoning that must round-trip for some
     # thinking-mode APIs when an assistant turn includes tool calls.
     reasoning_content: str = ""
+    # Opaque adapter-owned continuation state. Runtime code persists and
+    # round-trips this value but must not interpret provider-specific fields.
+    provider_state: dict[str, Any] = field(default_factory=dict)
     # Populated on assistant messages that called tools; required for Mistral/OpenAI
     # multi-turn history so the provider can correlate assistant → tool results.
     tool_calls: tuple[ToolCall, ...] = ()
@@ -137,6 +140,7 @@ class StreamEvent:
     tool_call: ToolCall | None = None
     usage: UsageSnapshot | None = None
     reasoning_content: str | None = None
+    provider_state: dict[str, Any] | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -156,6 +160,8 @@ class RuntimeRequest:
     tool_schemas: tuple[dict[str, Any], ...] = ()
     max_output_tokens: int | None = None
     temperature: float = 0.0
+    top_p: float = 1.0
+    thinking: Any | None = None
 
 
 @dataclass(slots=True, frozen=True)

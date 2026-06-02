@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher, unified_diff
 import io
 import json
@@ -18,7 +18,9 @@ from uuid import uuid4
 
 from rich import box
 from rich.console import Console
+from rich.console import ConsoleOptions
 from rich.console import Group
+from rich.console import RenderResult
 from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.panel import Panel
@@ -34,7 +36,7 @@ from textual.selection import Selection
 from textual.strip import Strip
 from textual.widgets import Input, RichLog, Static
 
-from nexus.config.model_limits import get_model_context_limit
+from nexus.config.provider_profiles import usable_prompt_budget
 from nexus.context import TokenEstimator
 from nexus.hooks import HookEvent
 from nexus.models import (
@@ -72,9 +74,15 @@ _COLLAPSED_PREVIEW_LINES = 15
 _COLLAPSE_LINE_LIMIT = 18
 _COLLAPSE_CHAR_LIMIT = 2400
 _ALERT_PREVIEW_CHARS = 150
+_COMMAND_PREVIEW_CHARS = 1600
 _SIDE_BY_SIDE_DIFF_WIDTH = 104
+_DIFF_EDITOR_BACKGROUND = "#272822"
+_DIFF_DELETE_BACKGROUND = "#3a2020"
+_DIFF_ADD_BACKGROUND = "#203a24"
 _MUTATING_FILE_TOOLS = {"write_file", "edit", "insert_edit_into_file", "apply_patch"}
 _VERIFY_TOOL_NAMES = {"bash", "run_tests", "run_python_check"}
+_AGENT_BULLET = "● "
+_TOOL_ROW_INDENT = "   "
 
 
 @dataclass(frozen=True)
@@ -84,6 +92,56 @@ class _DiffRow:
     before: str
     after: str
     kind: str
+
+
+@dataclass(frozen=True)
+class _ResponsiveDiff:
+    """Render a file diff using the width available at paint time."""
+
+    rows: tuple[_DiffRow, ...]
+    path: str = ""
+    language: str = "text"
+    new_file: bool = False
+    toggle_id: str = ""
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        del console
+        yield _render_diff_layout(
+            list(self.rows),
+            path=self.path,
+            language=self.language,
+            width=max(1, options.max_width),
+            new_file=self.new_file,
+            toggle_id=self.toggle_id,
+        )
+
+
+@dataclass(frozen=True)
+class _FencedCodeBlock:
+    """Render command text or console output as a Markdown code fence."""
+
+    value: str
+    language: str = "text"
+    label: str = ""
+    collapsed: bool = False
+    toggle_id: str = ""
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        del console, options
+        value = self.value.rstrip() or "(empty)"
+        truncated = False
+        if self.collapsed:
+            value, truncated = _bounded_command_preview(value)
+        blocks: list[RenderableType] = []
+        if self.label:
+            blocks.append(Text(self.label, style="dim"))
+        blocks.append(Markdown(_markdown_code_fence(value, language=self.language)))
+        if truncated:
+            hint = Text("... click [+] to expand", style="dim")
+            if self.toggle_id:
+                hint.stylize(Style(meta={"nexus_toggle": self.toggle_id}))
+            blocks.append(hint)
+        yield Group(*blocks)
 
 
 def _strip_mouse_escape_sequences(value: str) -> str:
@@ -306,10 +364,10 @@ class TextualTerminalUI(TerminalUI):
             return "Failed"
         labels = {
             "bash": "Ran" if completed else "Run",
-            "write_file": "Wrote" if completed else "Write",
-            "edit": "Edited" if completed else "Edit",
-            "insert_edit_into_file": "Edited" if completed else "Edit",
-            "apply_patch": "Patched" if completed else "Patch",
+            "write_file": "Wrote file" if completed else "Write file",
+            "edit": "Edited file" if completed else "Edit file",
+            "insert_edit_into_file": "Edited file" if completed else "Edit file",
+            "apply_patch": "Patched files" if completed else "Patch files",
             "read_file": "Read" if completed else "Read",
             "list_dir": "Listed" if completed else "List",
             "grep": "Searched" if completed else "Search",
@@ -368,6 +426,12 @@ class TextualTerminalUI(TerminalUI):
         text.append(" · ", style="dim")
         text.append(elapsed, style="bold bright_cyan")
 
+    def _command_start_header(self, call_id: str) -> Text:
+        text = Text("\n. ", style="dim")
+        text.append("Run Command :", style="bold tool.shell")
+        text.append(f" #{call_id[:8]}", style="dim")
+        return text
+
     def _render_inline_tool_start(
         self,
         call_id: str,
@@ -381,11 +445,11 @@ class TextualTerminalUI(TerminalUI):
         if _is_subagent_tool(tool_name):
             return self._render_subagent_header(tool_name, args)
         label = self._semantic_tool_label(tool_name)
-        if tool_name == "bash":
-            command = str(args.get("command", "") or "").strip()
+        command = _command_from_arguments(args)
+        if command:
             return Group(
-                self._inline_header("> ", f"{label} command", f"#{call_id[:8]}", style="tool.shell"),
-                self._block_text(f"$ {command}", style="dim on #1f1f1f"),
+                self._command_start_header(call_id),
+                _bash_command_block(command),
             )
         target = self._tool_target(tool_name, args)
         style = self._tool_border_style(tool_name)
@@ -399,32 +463,34 @@ class TextualTerminalUI(TerminalUI):
         args: dict[str, Any],
         display: dict[str, Any],
     ) -> None:
-        if tool_name == "bash":
+        command = _command_from_arguments(args)
+        if command:
             self._tool_started_at[call_id] = time.perf_counter()
-            label = self._semantic_tool_label(tool_name)
-            command = str(args.get("command", "") or "").strip()
-            header = self._inline_header("> ", f"{label} command", f"#{call_id[:8]}", style="tool.shell")
+            header = self._command_start_header(call_id)
             if _should_collapse_text(command):
                 self._app.write_collapsible(
                     header,
-                    Syntax(command, "bash", theme="monokai", word_wrap=True),
+                    _bash_command_block(command),
                     summary=f"{_line_count(command)} lines",
                     initially_expanded=False,
-                    preview=_preview_text_block(command, style="dim on #1f1f1f"),
+                    preview=_bash_command_block(command, collapsed=True),
                 )
                 return
-            self._write(Group(header, self._block_text(f"$ {command}", style="dim on #1f1f1f")))
+            self._write(Group(header, _bash_command_block(command)))
             return
         self._write(self._render_inline_tool_start(call_id, tool_name, actor, args, display))
 
     def _render_subagent_header(self, tool_name: str, args: dict[str, Any]) -> Text:
         title = _subagent_title(args)
-        header = Text("| ", style="dim")
+        header = Text(_AGENT_BULLET, style="bold magenta")
         header.append(_subagent_task_label(tool_name), style="bold magenta")
         if title:
             header.append(" - ", style="dim")
             header.append(title, style="bold white")
         return header
+
+    def _render_supervisor_header(self) -> Text:
+        return Text(f"{_AGENT_BULLET}Supervisor Agent", style="bold cyan")
 
     def _render_subagent_tool_row(
         self,
@@ -440,7 +506,12 @@ class TextualTerminalUI(TerminalUI):
         )
         target = self._tool_target(tool_name, args, result)
         style = "error" if result is not None and result.is_error else self._tool_border_style(tool_name)
-        row = Text("|--> ", style="dim")
+        if result is None:
+            row = Text(f"{_TOOL_ROW_INDENT}· ", style="dim")
+        elif result.is_error:
+            row = Text(f"{_TOOL_ROW_INDENT}✗ ", style="bold red")
+        else:
+            row = Text(f"{_TOOL_ROW_INDENT}✓ ", style="bold green")
         row.append(label, style=style)
         if target:
             row.append(f" {target}", style="dim")
@@ -469,7 +540,12 @@ class TextualTerminalUI(TerminalUI):
         )
         target = self._tool_target(tool_name, args, result)
         style = "error" if result is not None and result.is_error else self._tool_border_style(tool_name)
-        row = Text("|-> ", style="dim")
+        if result is None:
+            row = Text(f"{_TOOL_ROW_INDENT}· ", style="dim")
+        elif result.is_error:
+            row = Text(f"{_TOOL_ROW_INDENT}✗ ", style="bold red")
+        else:
+            row = Text(f"{_TOOL_ROW_INDENT}✓ ", style="bold green")
         row.append(label, style=style)
         if target:
             row.append(f" {target}", style="dim")
@@ -479,7 +555,7 @@ class TextualTerminalUI(TerminalUI):
             row.append(" · failed", style="bold red")
             if result.output:
                 truncated = result.output[:200].strip()
-                row.append(f"\n|   {truncated}", style="dim red")
+                row.append(f"\n{_TOOL_ROW_INDENT}  {truncated}", style="dim red")
         else:
             self._append_elapsed(row, self._elapsed_label(call_id, result))
         return row
@@ -489,7 +565,7 @@ class TextualTerminalUI(TerminalUI):
         status = "failed" if result.is_error else "done"
         target = self._tool_target(result.tool_name, args, result)
         header = self._inline_header(
-            "x " if result.is_error else "< ",
+            "✗ " if result.is_error else "✓ ",
             self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error),
             " · ".join(part for part in (target, status) if part),
             style="error" if result.is_error else "tool.shell",
@@ -499,13 +575,12 @@ class TextualTerminalUI(TerminalUI):
         if not output:
             self._write(header)
             return
-        output_style = "red on #1f1f1f" if result.is_error else "dim on #1f1f1f"
-        output_block = self._block_text(output, style=output_style)
-        output_preview = _preview_text_block(output, style=output_style)
-        if _should_collapse_text(output):
-            self._app.write_collapsible(header, output_block, summary=f"{_line_count(output)} lines", preview=output_preview)
-        else:
-            self._write(Group(header, output_block))
+        self._app.write_collapsible(
+            header,
+            _bash_output_block(output),
+            summary=f"{_line_count(output)} lines",
+            preview=_bash_output_block(output, collapsed=True),
+        )
 
     def _render_confirmation_preview(
         self,
@@ -524,14 +599,13 @@ class TextualTerminalUI(TerminalUI):
                 self._render_file_diff_preview(tool_name, diff_data, diff, path=target, collapsed=True),
                 _diff_summary(diff),
             )
-        if tool_name == "bash":
-            command = str(args.get("command", "") or "").strip()
-            if command:
-                return (
-                    _bash_command_block(command),
-                    _bash_command_block(command, collapsed=True),
-                    f"{_line_count(command)} line{'s' if _line_count(command) != 1 else ''}",
-                )
+        command = _command_from_preview_or_arguments(preview, args)
+        if command:
+            return (
+                _bash_command_block(command),
+                _bash_command_block(command, collapsed=True),
+                f"{_line_count(command)} line{'s' if _line_count(command) != 1 else ''}",
+            )
         return None
 
     def _write_confirmation_request(
@@ -545,10 +619,13 @@ class TextualTerminalUI(TerminalUI):
         del actor
         args = {str(key): value for key, value in req.arguments.items()}
         preview = {str(key): value for key, value in req.preview.items()}
+        target = self._tool_target(req.tool_name, args)
+        action = self._semantic_tool_label(req.tool_name)
+        request_detail = f"{action} {target}".strip() if req.tool_name in _MUTATING_FILE_TOOLS else display_name
         header = self._inline_header(
             "? ",
             "Approval required",
-            f"{display_name}  #{req.call_id[:8] or 'pending'}",
+            f"{request_detail}  #{req.call_id[:8] or 'pending'}",
             style="warning",
         )
         detail = self._render_approval_detail(req.tool_name, args, req.reason, policy)
@@ -576,7 +653,7 @@ class TextualTerminalUI(TerminalUI):
         label = self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error)
         detail = " · ".join(part for part in (target, "failed" if result.is_error else "done") if part)
         header = self._inline_header(
-            "x " if result.is_error else "< ",
+            "✗ " if result.is_error else "✓ ",
             label,
             detail,
             style="error" if result.is_error else "tool.write",
@@ -611,32 +688,19 @@ class TextualTerminalUI(TerminalUI):
             preview=self._render_file_diff_preview(result.tool_name, diff_data, diff, path=target, collapsed=True),
         )
 
-    def _render_diff_editor(self, diff_text: str, *, path: str = "") -> Group | Table:
+    def _render_diff_editor(self, diff_text: str, *, path: str = "") -> _ResponsiveDiff:
         return self._render_diff_rows(_diff_rows_from_unified_diff(diff_text), path=path)
 
-    def _render_diff_editor_preview(self, diff_text: str, *, path: str = "") -> Group | Table:
+    def _render_diff_editor_preview(self, diff_text: str, *, path: str = "") -> _ResponsiveDiff:
         rows = _collapsed_diff_rows(_diff_rows_from_unified_diff(diff_text), limit=_COLLAPSED_PREVIEW_LINES)
         return self._render_diff_rows(rows, path=path)
 
-    def _render_diff_rows(self, rows: list[_DiffRow], *, path: str = "") -> Group | Table:
-        del path
-        width = self._app.transcript_width
-        if width < _SIDE_BY_SIDE_DIFF_WIDTH:
-            return Group(
-                Text("Before", style="dim"),
-                _diff_side_text(rows, side="before"),
-                Text("After", style="dim"),
-                _diff_side_text(rows, side="after"),
-            )
-        table = Table.grid(expand=True, padding=(0, 1))
-        table.add_column(ratio=1, min_width=1)
-        table.add_column(ratio=1, min_width=1)
-        table.add_row(Text("Before", style="dim"), Text("After", style="dim"))
-        table.add_row(
-            _diff_side_text(rows, side="before"),
-            _diff_side_text(rows, side="after"),
+    def _render_diff_rows(self, rows: list[_DiffRow], *, path: str = "") -> _ResponsiveDiff:
+        return _ResponsiveDiff(
+            rows=tuple(rows),
+            path=path,
+            language=self._guess_language(path),
         )
-        return table
 
     def _render_file_diff_preview(
         self,
@@ -646,12 +710,17 @@ class TextualTerminalUI(TerminalUI):
         *,
         path: str = "",
         collapsed: bool = False,
-    ) -> Group | Table:
+    ) -> _ResponsiveDiff:
         old_content = str(diff_data.get("old_content", "") or "")
         new_content = str(diff_data.get("new_content", "") or "")
         has_contents = "old_content" in diff_data or "new_content" in diff_data
         if _should_render_as_new_file(tool_name, diff_data):
-            return _render_new_file_preview(new_content, collapsed=collapsed)
+            return _render_new_file_preview(
+                new_content,
+                path=path,
+                language=self._guess_language(path),
+                collapsed=collapsed,
+            )
         if has_contents:
             rows = _diff_rows_from_contents(old_content, new_content)
         else:
@@ -694,7 +763,7 @@ class TextualTerminalUI(TerminalUI):
         label = self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error)
         detail = self._tool_target(result.tool_name, args, result)
         header = self._inline_header(
-            "x " if result.is_error else "< ",
+            "✗ " if result.is_error else "✓ ",
             label,
             detail,
             style="error" if result.is_error else self._tool_border_style(result.tool_name),
@@ -781,14 +850,11 @@ class TextualTerminalUI(TerminalUI):
                     call_id,
                     self._render_subagent_tool_row(call_id, tool_name, arguments),
                 )
-            elif _is_supervisor_group_tool(tool_name):
+            elif _is_supervisor_group_tool(tool_name, arguments):
                 self._tool_started_at[call_id] = time.perf_counter()
                 self._app._turn_had_tool_calls = True
                 if self._app._supervisor_entry is None:
-                    sup_header = Text()
-                    sup_header.append("● ", style="bold cyan")
-                    sup_header.append("Supervisor Agent", style="bold white")
-                    self._app.begin_supervisor_group(sup_header)
+                    self._app.begin_supervisor_group(self._render_supervisor_header())
                 self._app.record_supervisor_row(
                     call_id,
                     self._render_supervisor_row(call_id, tool_name, arguments),
@@ -805,6 +871,7 @@ class TextualTerminalUI(TerminalUI):
             if result is None:
                 return
             if isinstance(result.metadata, dict) and result.metadata.get("tool_unavailable"):
+                self._app.finish_tool_output_stream(result.call_id)
                 self._clear_tool_call_state(result.call_id)
                 self._tool_started_at.pop(result.call_id, None)
                 return
@@ -814,6 +881,7 @@ class TextualTerminalUI(TerminalUI):
             del display
             arguments = self._tool_args_by_call_id.get(result.call_id, {})
             self._app.record_tool_completion(result)
+            self._app.finish_tool_output_stream(result.call_id)
             if _is_subagent_tool(result.tool_name):
                 self._app.finish_subagent_task(
                     result.call_id,
@@ -839,9 +907,6 @@ class TextualTerminalUI(TerminalUI):
                 self._render_generic_complete(result, arguments)
             self._clear_tool_call_state(result.call_id)
             self._tool_started_at.pop(result.call_id, None)
-            self._app._streaming_tool_outputs.discard(result.call_id)
-            self._app._streaming_tool_output_chars.pop(result.call_id, None)
-            self._app._streaming_tool_output_capped.discard(result.call_id)
             self.start_thinking()
             return
 
@@ -1036,6 +1101,12 @@ class TranscriptLog(RichLog):
         self.focus()
         cast("NexusTextualApp", self.app).copy_selection_or_transcript()
 
+    def on_resize(self, event: events.Resize) -> None:
+        del event
+        app = cast("NexusTextualApp", self.app)
+        if app._transcript is self:
+            app.call_after_refresh(app._rerender_transcript)
+
     def action_scroll_line_up(self) -> None:
         self.scroll_up(animate=False)
 
@@ -1221,6 +1292,8 @@ class NexusTextualApp(App[None]):
         self._streaming_tool_outputs: set[str] = set()
         self._streaming_tool_output_chars: dict[str, int] = {}
         self._streaming_tool_output_capped: set[str] = set()
+        self._streaming_tool_output_text: dict[str, str] = {}
+        self._streaming_tool_output_entries: dict[str, dict[str, Any]] = {}
         self._transcript_entries: list[dict[str, Any]] = []
         self._transcript_plain_parts: list[str] = []
         self._subagent_entries_by_actor: dict[str, dict[str, Any]] = {}
@@ -1266,12 +1339,25 @@ class NexusTextualApp(App[None]):
         self._footer = self.query_one("#footer", Static)
         self.console.push_theme(NEXUS_THEME)
         self.state.console = self.ui
+        self.state.provider_settings_opener = self.open_provider_settings
         self._render_startup()
         self.refresh_footer()
         self._input.focus()
 
     def on_unmount(self) -> None:
+        self.state.provider_settings_opener = None
         self.state.console = self._original_console
+
+    def open_provider_settings(self) -> None:
+        from nexus.ui.provider_settings import ProviderSettingsScreen
+
+        self.push_screen(ProviderSettingsScreen(self.state, on_reload=self._reload_provider_settings))
+
+    def _reload_provider_settings(self) -> None:
+        from nexus.runtime.slash_commands import _reload_config
+
+        _reload_config(self.state)
+        self.refresh_footer()
 
     def write(self, renderable: RenderableType) -> None:
         self._transcript_entries.append({"type": "renderable", "renderable": renderable})
@@ -1285,7 +1371,7 @@ class NexusTextualApp(App[None]):
         summary: str = "",
         initially_expanded: bool = False,
         preview: RenderableType | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         entry = {
             "type": "collapsible",
             "id": uuid4().hex[:8],
@@ -1297,6 +1383,7 @@ class NexusTextualApp(App[None]):
         }
         self._transcript_entries.append(entry)
         self._render_transcript_entry(entry)
+        return entry
 
     def begin_subagent_task(
         self,
@@ -1310,8 +1397,8 @@ class NexusTextualApp(App[None]):
             "type": "collapsible",
             "id": uuid4().hex[:8],
             "header": header,
-            "expanded": Text("| Starting sub-agent...", style="dim"),
-            "preview": Text("| Running...", style="dim"),
+            "expanded": Text(f"{_TOOL_ROW_INDENT}Starting sub-agent...", style="dim"),
+            "preview": Text(f"{_TOOL_ROW_INDENT}Running...", style="dim"),
             "summary": "running",
             "expanded_state": True,
             "subagent_actor": actor,
@@ -1356,8 +1443,8 @@ class NexusTextualApp(App[None]):
             "type": "collapsible",
             "id": uuid4().hex[:8],
             "header": header,
-            "expanded": Text("| Working...", style="dim"),
-            "preview": Text("| Working...", style="dim"),
+            "expanded": Text(f"{_TOOL_ROW_INDENT}Working...", style="dim"),
+            "preview": Text(f"{_TOOL_ROW_INDENT}Working...", style="dim"),
             "summary": "running",
             "expanded_state": True,
             "supervisor_tool_order": [],
@@ -1406,9 +1493,9 @@ class NexusTextualApp(App[None]):
         order = cast("list[str]", entry.get("supervisor_tool_order", []))
         rows = cast("dict[str, RenderableType]", entry.get("supervisor_tool_rows", {}))
         body_parts: list[RenderableType] = [rows[cid] for cid in order if cid in rows]
-        entry["expanded"] = Group(*body_parts) if body_parts else Text("| Working...", style="dim")
+        entry["expanded"] = Group(*body_parts) if body_parts else Text(f"{_TOOL_ROW_INDENT}Working...", style="dim")
         preview_rows: list[RenderableType] = [rows[cid] for cid in order[:5] if cid in rows]
-        entry["preview"] = Group(*preview_rows) if preview_rows else Text("| Working...", style="dim")
+        entry["preview"] = Group(*preview_rows) if preview_rows else Text(f"{_TOOL_ROW_INDENT}Working...", style="dim")
 
     def finish_subagent_task(
         self,
@@ -1451,10 +1538,10 @@ class NexusTextualApp(App[None]):
         if isinstance(payload, dict):
             body_parts.append(_subagent_result_summary_block(payload, str(entry.get("subagent_result_status", ""))))
         if order:
-            body_parts.append(Text("| Tool calls", style="dim"))
+            body_parts.append(Text(f"{_TOOL_ROW_INDENT}Tool calls", style="dim"))
             body_parts.extend(rows[call_id] for call_id in order if call_id in rows)
         if isinstance(entry.get("subagent_result_output"), str):
-            body_parts.append(Text("| Result JSON", style="dim"))
+            body_parts.append(Text(f"{_TOOL_ROW_INDENT}Result JSON", style="dim"))
             body_parts.append(_subagent_result_body(str(entry.get("subagent_result_output") or ""), payload if isinstance(payload, dict) else {}))
             entry["preview"] = _subagent_result_preview(
                 ToolResult(
@@ -1466,10 +1553,10 @@ class NexusTextualApp(App[None]):
                 payload if isinstance(payload, dict) else {},
             )
         elif order:
-            entry["preview"] = Group(Text("| Running tool calls", style="dim"), *[rows[call_id] for call_id in order[:3] if call_id in rows])
+            entry["preview"] = Group(Text(f"{_TOOL_ROW_INDENT}Running tool calls", style="dim"), *[rows[call_id] for call_id in order[:3] if call_id in rows])
         else:
-            entry["preview"] = Text("| Running...", style="dim")
-        entry["expanded"] = Group(*body_parts) if body_parts else Text("| Starting sub-agent...", style="dim")
+            entry["preview"] = Text(f"{_TOOL_ROW_INDENT}Running...", style="dim")
+        entry["expanded"] = Group(*body_parts) if body_parts else Text(f"{_TOOL_ROW_INDENT}Starting sub-agent...", style="dim")
 
     def toggle_collapsible(self, toggle_id: str) -> None:
         for entry in self._transcript_entries:
@@ -1515,7 +1602,7 @@ class NexusTextualApp(App[None]):
         if not expanded:
             preview = entry.get("preview")
             if preview is not None:
-                return Group(line, cast("RenderableType", preview))
+                return Group(line, _with_inline_toggle(cast("RenderableType", preview), toggle_id))
             return line
         return Group(line, cast("RenderableType", entry.get("expanded", Text(""))))
 
@@ -1580,7 +1667,7 @@ class NexusTextualApp(App[None]):
         history_tokens = sum(estimator.estimate(message.content) for message in self.state.history)
         system_tokens = estimator.estimate(self.state.current_system_prompt or "")
         total_tokens = history_tokens + system_tokens
-        context_limit = get_model_context_limit(self.state.config.model_name)
+        context_limit = usable_prompt_budget(self.state.config)
         pct = min(100.0, round((total_tokens / context_limit * 100), 1)) if context_limit else 0.0
         thinking_enabled = self.state.config.llm_thinking_mode != "disabled"
         workspace = _compact_workspace_label(self.state.config.workspace_root)
@@ -1608,6 +1695,8 @@ class NexusTextualApp(App[None]):
         text.append("  ")
         text.append("workspace ", style="dim")
         text.append(workspace, style="white")
+        text.append("  ")
+        text.append("/provider manage", style="bold cyan")
         if self._status_text:
             text.append("  ")
             text.append("status ", style="dim")
@@ -1728,7 +1817,7 @@ class NexusTextualApp(App[None]):
         if current_chars >= max_chars:
             if call_id not in self._streaming_tool_output_capped:
                 self._streaming_tool_output_capped.add(call_id)
-                self.write(Text(f"[live output capped at {max_chars} chars]", style="dim"))
+                self._append_streaming_tool_output(call_id, f"\n[live output capped at {max_chars} chars]")
             return
         remaining = max_chars - current_chars
         capped_now = False
@@ -1738,13 +1827,39 @@ class NexusTextualApp(App[None]):
         self._streaming_tool_output_chars[call_id] = current_chars + len(chunk)
         if call_id not in self._streaming_tool_outputs:
             self._streaming_tool_outputs.add(call_id)
-            self.write(Text(f"> bash live output  #{call_id[:8]}", style="dim"))
-        style = "red" if stream_name == "stderr" else "default"
         prefix = "[stderr] " if stream_name == "stderr" else ""
-        self.write(Text(prefix + chunk.rstrip("\n"), style=f"{style} on #1f1f1f"))
+        self._append_streaming_tool_output(call_id, prefix + chunk)
         if capped_now and call_id not in self._streaming_tool_output_capped:
             self._streaming_tool_output_capped.add(call_id)
-            self.write(Text(f"[live output capped at {max_chars} chars]", style="dim"))
+            self._append_streaming_tool_output(call_id, f"\n[live output capped at {max_chars} chars]")
+
+    def _append_streaming_tool_output(self, call_id: str, chunk: str) -> None:
+        output = self._streaming_tool_output_text.get(call_id, "") + chunk
+        self._streaming_tool_output_text[call_id] = output
+        entry = self._streaming_tool_output_entries.get(call_id)
+        if entry is None:
+            entry = self.write_collapsible(
+                Text(f"> bash live output  #{call_id[:8]}", style="dim"),
+                _bash_output_block(output),
+                summary=f"streaming · {_line_count(output)} lines",
+                preview=_bash_output_block(output, collapsed=True),
+            )
+            self._streaming_tool_output_entries[call_id] = entry
+            return
+        entry["expanded"] = _bash_output_block(output)
+        entry["preview"] = _bash_output_block(output, collapsed=True)
+        entry["summary"] = f"streaming · {_line_count(output)} lines"
+        self._rerender_transcript()
+
+    def finish_tool_output_stream(self, call_id: str) -> None:
+        entry = self._streaming_tool_output_entries.pop(call_id, None)
+        if entry is not None and entry in self._transcript_entries:
+            self._transcript_entries.remove(entry)
+            self._rerender_transcript()
+        self._streaming_tool_outputs.discard(call_id)
+        self._streaming_tool_output_chars.pop(call_id, None)
+        self._streaming_tool_output_capped.discard(call_id)
+        self._streaming_tool_output_text.pop(call_id, None)
 
     async def on_input_submitted(self, event: Any) -> None:
         raw = _strip_mouse_escape_sequences(str(event.value or "")).strip()
@@ -1941,7 +2056,7 @@ class NexusTextualApp(App[None]):
         self._print_provider_notice_or_warning()
 
     def _print_provider_notice_or_warning(self) -> None:
-        from os import environ
+        from nexus.integrations.registry import provider_has_api_key
 
         cfg = self.state.config
         if cfg.provider == "fake":
@@ -1949,33 +2064,7 @@ class NexusTextualApp(App[None]):
             return
         if cfg.provider == "ollama":
             return
-        if cfg.provider in {"mistral", "openai", "openai-compatible"}:
-            has_key = bool(
-                cfg.api_key
-                or environ.get("MISTRAL_API_KEY")
-                or environ.get("NEXUS_API_KEY")
-                or environ.get("OPENAI_API_KEY")
-                or environ.get("API_KEY")
-            )
-        elif cfg.provider in {"anthropic", "gemini"}:
-            has_key = bool(
-                cfg.api_key
-                or environ.get("ANTHROPIC_API_KEY")
-                or environ.get("GEMINI_API_KEY")
-                or environ.get("GOOGLE_API_KEY")
-                or environ.get("API_KEY")
-            )
-        elif cfg.provider == "cohere":
-            has_key = bool(
-                cfg.api_key
-                or environ.get("COHERE_API_KEY")
-                or environ.get("CO_API_KEY")
-                or environ.get("NEXUS_API_KEY")
-                or environ.get("API_KEY")
-            )
-        else:
-            has_key = True
-        if not has_key:
+        if not provider_has_api_key(cfg):
             self.ui.print_no_api_key_warning(cfg.provider)
 
     async def _handle_prompt(self, raw_input: str) -> None:
@@ -2162,6 +2251,16 @@ def _toggle_id_from_click(event: events.Click) -> str:
     return str(meta.get("nexus_toggle") or "")
 
 
+def _with_inline_toggle(renderable: RenderableType, toggle_id: str) -> RenderableType:
+    if isinstance(renderable, _ResponsiveDiff):
+        return replace(renderable, toggle_id=toggle_id)
+    if isinstance(renderable, _FencedCodeBlock):
+        return replace(renderable, toggle_id=toggle_id)
+    if isinstance(renderable, Group):
+        return Group(*(_with_inline_toggle(item, toggle_id) for item in renderable.renderables), fit=renderable.fit)
+    return renderable
+
+
 def _renderable_plain_text(renderable: RenderableType, *, width: int = 120) -> str:
     buffer = io.StringIO()
     console = Console(
@@ -2217,13 +2316,18 @@ def _is_subagent_actor(actor: str) -> bool:
     return bool(actor) and _is_subagent_tool(actor)
 
 
-def _is_supervisor_group_tool(tool_name: str) -> bool:
+def _is_supervisor_group_tool(tool_name: str, args: dict[str, Any] | None = None) -> bool:
     """Return True for tools that should be grouped in the supervisor collapsible block.
 
     Bash, file-mutating tools, and sub-agent dispatches are excluded because they
     need their own rich output or delegation UI.
     """
-    return not _is_subagent_tool(tool_name) and tool_name != "bash" and tool_name not in _MUTATING_FILE_TOOLS
+    return (
+        not _is_subagent_tool(tool_name)
+        and tool_name != "bash"
+        and tool_name not in _MUTATING_FILE_TOOLS
+        and not _command_from_arguments(args or {})
+    )
 
 
 def _subagent_title(args: dict[str, Any]) -> str:
@@ -2266,7 +2370,7 @@ def _parse_json_object(value: str) -> dict[str, Any]:
 def _subagent_completion_header(result: ToolResult, payload: dict[str, Any], *, elapsed: str = "") -> Text:
     del elapsed
     title = _single_line(str(payload.get("title") or result.metadata.get("title") or result.tool_name), limit=120)
-    header = Text("| ", style="dim")
+    header = Text(_AGENT_BULLET, style="bold magenta")
     header.append(_subagent_task_label(result.tool_name), style="bold magenta")
     if title:
         header.append(" - ", style="dim")
@@ -2296,26 +2400,26 @@ def _subagent_completion_summary(
 def _subagent_result_preview(result: ToolResult, payload: dict[str, Any]) -> Text:
     status = str(payload.get("status") or result.metadata.get("status") or ("failed" if result.is_error else "completed"))
     summary = _single_line(str(payload.get("summary") or payload.get("raw_result") or result.output or ""), limit=160)
-    text = Text("| Status ", style="dim")
+    text = Text(f"{_TOOL_ROW_INDENT}Status ", style="dim")
     text.append(status, style=_subagent_status_style(status, is_error=result.is_error))
     if summary:
-        text.append("\n| Summary - ", style="dim")
+        text.append(f"\n{_TOOL_ROW_INDENT}Summary - ", style="dim")
         text.append(summary, style="white")
-    text.append("\n| Expand to view sub-agent tool calls and JSON.", style="dim")
+    text.append(f"\n{_TOOL_ROW_INDENT}Expand to view sub-agent tool calls and JSON.", style="dim")
     return text
 
 
 def _subagent_result_summary_block(payload: dict[str, Any], status: str) -> Text:
     summary = _single_line(str(payload.get("summary") or payload.get("raw_result") or ""), limit=180)
-    text = Text("| Status ", style="dim")
+    text = Text(f"{_TOOL_ROW_INDENT}Status ", style="dim")
     rendered_status = status or str(payload.get("status") or "completed")
     text.append(rendered_status, style=_subagent_status_style(rendered_status))
     if summary:
-        text.append("\n| Summary - ", style="dim")
+        text.append(f"\n{_TOOL_ROW_INDENT}Summary - ", style="dim")
         text.append(summary, style="white")
     next_action = _single_line(str(payload.get("recommended_next_action") or ""), limit=100)
     if next_action:
-        text.append("\n| Next - ", style="dim")
+        text.append(f"\n{_TOOL_ROW_INDENT}Next - ", style="dim")
         text.append(next_action, style="white")
     return text
 
@@ -2345,6 +2449,16 @@ def _single_line(value: str, *, limit: int) -> str:
 def _first_lines(value: str, *, limit: int = _COLLAPSED_PREVIEW_LINES) -> str:
     lines = str(value or "").splitlines()
     return "\n".join(lines[:limit])
+
+
+def _bounded_command_preview(value: str) -> tuple[str, bool]:
+    lines = str(value or "").splitlines()
+    preview = "\n".join(lines[:_COLLAPSED_PREVIEW_LINES])
+    truncated = len(lines) > _COLLAPSED_PREVIEW_LINES
+    if len(preview) > _COMMAND_PREVIEW_CHARS:
+        preview = preview[:_COMMAND_PREVIEW_CHARS].rstrip()
+        truncated = True
+    return preview, truncated
 
 
 def _preview_text_block(value: str, *, style: str = "dim on #1f1f1f") -> Text:
@@ -2593,24 +2707,121 @@ def _collapsed_diff_rows(rows: list[_DiffRow], *, limit: int) -> list[_DiffRow]:
     return [*rows[: max(0, limit - 1)], _DiffRow(None, None, "", "click [+] to expand", "ellipsis")]
 
 
-def _diff_side_text(rows: list[_DiffRow], *, side: str) -> Text:
+def _render_diff_layout(
+    rows: list[_DiffRow],
+    *,
+    path: str,
+    language: str,
+    width: int,
+    new_file: bool = False,
+    toggle_id: str = "",
+) -> Panel | Group | Table:
+    if new_file:
+        return _render_diff_side_panel(rows, side="after", title="New file", path=path, language=language, toggle_id=toggle_id)
+    if width < _SIDE_BY_SIDE_DIFF_WIDTH:
+        return Group(
+            _render_diff_side_panel(rows, side="before", title="Before", path=path, language=language, toggle_id=toggle_id),
+            _render_diff_side_panel(rows, side="after", title="After", path=path, language=language, toggle_id=toggle_id),
+        )
+    return _render_side_by_side_diff_table(rows, path=path, language=language, toggle_id=toggle_id)
+
+
+def _render_side_by_side_diff_table(rows: list[_DiffRow], *, path: str, language: str, toggle_id: str = "") -> Table:
+    table = Table(
+        box=box.SQUARE,
+        border_style="grey35",
+        collapse_padding=True,
+        expand=True,
+        padding=(0, 0),
+        style=f"on {_DIFF_EDITOR_BACKGROUND}",
+    )
+    table.add_column(_diff_panel_title("Before", path=path, title_style="bold red"), ratio=1, min_width=1, overflow="fold")
+    table.add_column(_diff_panel_title("After", path=path, title_style="bold green"), ratio=1, min_width=1, overflow="fold")
     if not rows:
-        return Text("(empty)", style="dim on #1f1f1f")
-    width = _line_number_width(rows, side=side)
-    text = Text()
+        table.add_row(Text("(empty)", style="dim"), Text("(empty)", style="dim"))
+        return table
+    before_width = _line_number_width(rows, side="before")
+    after_width = _line_number_width(rows, side="after")
+    highlighter = Syntax("", language, theme="monokai")
     for row in rows:
-        if row.kind == "ellipsis":
-            _append_text_line(text, _diff_ellipsis_line(width), "dim")
-            continue
-        line_number = row.before_number if side == "before" else row.after_number
-        value = row.before if side == "before" else row.after
-        marker = _diff_marker(row, side=side)
-        style = _diff_row_style(row, side=side)
-        if not value and row.kind in {"add", "delete"}:
-            _append_text_line(text, _diff_blank_line(width), "dim")
-            continue
-        _append_text_line(text, f"{_format_line_number(line_number, width)} | {marker}{value}", style)
+        table.add_row(
+            _diff_side_line(row, side="before", width=before_width, highlighter=highlighter, toggle_id=toggle_id),
+            _diff_side_line(row, side="after", width=after_width, highlighter=highlighter, toggle_id=toggle_id),
+        )
+    return table
+
+
+def _render_diff_side_panel(
+    rows: list[_DiffRow],
+    *,
+    side: str,
+    title: str,
+    path: str,
+    language: str,
+    toggle_id: str = "",
+) -> Panel:
+    table = Table.grid(expand=True, padding=0)
+    table.add_column(ratio=1, min_width=1, overflow="fold")
+    if rows:
+        line_number_width = _line_number_width(rows, side=side)
+        highlighter = Syntax("", language, theme="monokai")
+        for row in rows:
+            table.add_row(_diff_side_line(row, side=side, width=line_number_width, highlighter=highlighter, toggle_id=toggle_id))
+    else:
+        table.add_row(Text("(empty)", style=f"dim on {_DIFF_EDITOR_BACKGROUND}"))
+    return Panel(
+        table,
+        title=_diff_panel_title(title, path=path),
+        title_align="left",
+        border_style="red" if side == "before" else "green",
+        box=box.SQUARE,
+        padding=(0, 0),
+        expand=True,
+        style=f"on {_DIFF_EDITOR_BACKGROUND}",
+    )
+
+
+def _diff_panel_title(title: str, *, path: str, title_style: str = "bold") -> Text:
+    text = Text(title, style=title_style)
+    clean_path = path.replace("\n", " ").strip()
+    if clean_path:
+        text.append(" | ", style="dim")
+        text.append(clean_path, style="dim")
     return text
+
+
+def _diff_side_line(row: _DiffRow, *, side: str, width: int, highlighter: Syntax, toggle_id: str = "") -> Text:
+    if row.kind == "ellipsis":
+        text = Text(_diff_ellipsis_line(width), style=f"dim on {_DIFF_EDITOR_BACKGROUND}")
+        if toggle_id:
+            text.stylize(Style(meta={"nexus_toggle": toggle_id}))
+        return text
+
+    line_number = row.before_number if side == "before" else row.after_number
+    value = row.before if side == "before" else row.after
+    marker = _diff_marker(row, side=side)
+    text = Text(overflow="fold")
+    text.append(f"{_format_line_number(line_number, width)} | ", style="grey62")
+    text.append(marker, style=_diff_marker_style(marker))
+    if value:
+        text.append_text(_syntax_highlight_line(value, highlighter=highlighter))
+    background = _diff_row_background(row, side=side)
+    text.stylize(Style(bgcolor=background))
+    return text
+
+
+def _syntax_highlight_line(value: str, *, highlighter: Syntax) -> Text:
+    highlighted = highlighter.highlight(value)
+    highlighted.rstrip()
+    return highlighted
+
+
+def _diff_marker_style(marker: str) -> str:
+    if marker == "-":
+        return "bold bright_red"
+    if marker == "+":
+        return "bold bright_green"
+    return "default"
 
 
 def _should_render_as_new_file(tool_name: str, diff_data: dict[str, Any]) -> bool:
@@ -2622,32 +2833,58 @@ def _should_render_as_new_file(tool_name: str, diff_data: dict[str, Any]) -> boo
     return bool(diff_data.get("is_new_file")) or old_content == ""
 
 
-def _render_new_file_preview(content: str, *, collapsed: bool = False) -> Group:
+def _render_new_file_preview(
+    content: str,
+    *,
+    path: str = "",
+    language: str = "text",
+    collapsed: bool = False,
+) -> _ResponsiveDiff:
     lines = content.splitlines()
-    header = Text("New file", style="dim")
-    if not lines:
-        return Group(header, Text("(empty file)", style="dim"))
-    line_number_width = max(1, len(str(len(lines))))
     visible_lines = lines
-    truncated = False
     if collapsed and len(lines) > _COLLAPSED_PREVIEW_LINES:
         visible_lines = lines[: max(0, _COLLAPSED_PREVIEW_LINES - 1)]
-        truncated = True
-    body = Text()
+    rows: list[_DiffRow] = []
     for index, line in enumerate(visible_lines, start=1):
-        _append_text_line(body, f"{index:>{line_number_width}} | +{line}", "green on #162a1a")
-    if truncated:
-        _append_text_line(body, f"{' ' * line_number_width} | ... click [+] to expand", "dim")
-    return Group(header, body)
+        rows.append(_DiffRow(None, index, "", line, "add"))
+    if len(visible_lines) < len(lines):
+        rows.append(_DiffRow(None, None, "", "click [+] to expand", "ellipsis"))
+    return _ResponsiveDiff(rows=tuple(rows), path=path, language=language, new_file=True)
 
 
-def _bash_command_block(command: str, *, collapsed: bool = False) -> Group:
-    command_text = command.rstrip()
-    if collapsed and _line_count(command_text) > _COLLAPSED_PREVIEW_LINES:
-        command_text = f"{_first_lines(command_text)}\n... click [+] to expand"
-    return Group(
-        Text("Command", style="dim"),
-        Syntax(command_text or "(empty command)", "bash", theme="monokai", word_wrap=True),
+def _command_from_arguments(args: dict[str, Any]) -> str:
+    command = args.get("command")
+    return str(command or "").strip() if isinstance(command, str) else ""
+
+
+def _command_from_preview_or_arguments(preview: dict[str, Any], args: dict[str, Any]) -> str:
+    command = preview.get("command")
+    if isinstance(command, str) and command.strip():
+        return command.strip()
+    return _command_from_arguments(args)
+
+
+def _markdown_code_fence(value: str, *, language: str) -> str:
+    longest_run = max((len(match.group(0)) for match in re.finditer(r"`+", value)), default=0)
+    fence = "`" * max(3, longest_run + 1)
+    return f"{fence}{language}\n{value}\n{fence}"
+
+
+def _bash_command_block(command: str, *, collapsed: bool = False) -> _FencedCodeBlock:
+    return _FencedCodeBlock(
+        command,
+        language="bash",
+        label="Command",
+        collapsed=collapsed,
+    )
+
+
+def _bash_output_block(output: str, *, collapsed: bool = False) -> _FencedCodeBlock:
+    return _FencedCodeBlock(
+        output,
+        language="text",
+        label="Console output",
+        collapsed=collapsed,
     )
 
 
@@ -2676,18 +2913,14 @@ def _diff_marker(row: _DiffRow, *, side: str) -> str:
     return " "
 
 
-def _diff_row_style(row: _DiffRow, *, side: str) -> str:
+def _diff_row_background(row: _DiffRow, *, side: str) -> str:
     if row.kind == "change":
-        return "red on #2a1717" if side == "before" else "green on #162a1a"
+        return _DIFF_DELETE_BACKGROUND if side == "before" else _DIFF_ADD_BACKGROUND
     if row.kind == "delete":
-        return "red on #2a1717" if side == "before" else "dim"
+        return _DIFF_DELETE_BACKGROUND if side == "before" else _DIFF_EDITOR_BACKGROUND
     if row.kind == "add":
-        return "green on #162a1a" if side == "after" else "dim"
-    return "default"
-
-
-def _diff_blank_line(width: int) -> str:
-    return f"{' ' * width} |"
+        return _DIFF_ADD_BACKGROUND if side == "after" else _DIFF_EDITOR_BACKGROUND
+    return _DIFF_EDITOR_BACKGROUND
 
 
 def _diff_ellipsis_line(width: int) -> str:

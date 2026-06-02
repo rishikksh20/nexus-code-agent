@@ -206,10 +206,11 @@ uv --directory /home/rishikesh/dev/exp/build-an-ai-agent/build-an-ai-agent run n
 
 ### Manual follow-up
 
-If you have local plugins, compare:
+If you have local plugins under `.agents/tools/`, compare:
 
 - `/tools` output with plugins enabled
 - `/tools` output with `--no-plugins`
+- `read_file` access to the plugin source under `.agents/tools/`
 
 ---
 
@@ -344,4 +345,3 @@ When you finish all five chapters, summarize findings under these headings:
 6. **feature gaps or missing commands**
 
 That report will be much more useful than a raw terminal transcript because it distinguishes implementation bugs from documentation or onboarding gaps.
-
