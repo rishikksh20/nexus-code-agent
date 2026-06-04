@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
@@ -31,10 +33,11 @@ from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.selection import Selection
 from textual.strip import Strip
-from textual.widgets import Input, RichLog, Static
+from textual.widgets import Button, Input, OptionList, RichLog, Static
 
 from nexus.config.provider_profiles import usable_prompt_budget
 from nexus.context import TokenEstimator
@@ -129,6 +132,7 @@ class _FencedCodeBlock:
     value: str
     language: str = "text"
     label: str = ""
+    label_style: str = "dim"
     collapsed: bool = False
     toggle_id: str = ""
 
@@ -140,7 +144,7 @@ class _FencedCodeBlock:
             value, truncated = _bounded_command_preview(value)
         blocks: list[RenderableType] = []
         if self.label:
-            blocks.append(Text(self.label, style="dim"))
+            blocks.append(Text(self.label, style=self.label_style))
         blocks.append(Markdown(_markdown_code_fence(value, language=self.language)))
         if truncated:
             hint = Text("... click [+] to expand", style="dim")
@@ -148,6 +152,13 @@ class _FencedCodeBlock:
                 hint.stylize(Style(meta={"nexus_toggle": self.toggle_id}))
             blocks.append(hint)
         yield Group(*blocks)
+
+
+@dataclass
+class _PendingApproval:
+    request: ConfirmationRequest
+    policy: ApprovalPolicy
+    future: asyncio.Future[ConfirmationResponse]
 
 
 def _strip_mouse_escape_sequences(value: str) -> str:
@@ -435,7 +446,7 @@ class TextualTerminalUI(TerminalUI):
     def _command_start_header(self, call_id: str) -> Text:
         text = Text("\n. ", style="dim")
         text.append("Run Command :", style="bold tool.shell")
-        text.append(f" #{call_id[:8]}", style="dim")
+        text.append(f" #{call_id[:8]}", style="bold tool.shell")
         return text
 
     def _render_inline_tool_start(
@@ -640,13 +651,15 @@ class TextualTerminalUI(TerminalUI):
             self._write(Group(header, detail))
             return
         expanded, collapsed_preview, summary = rendered_preview
-        self._app.write_collapsible(
+        entry = self._app.write_collapsible(
             header,
             Group(detail, expanded),
             summary=summary,
             initially_expanded=False,
             preview=Group(collapsed_preview, detail),
         )
+        if req.tool_name in _MUTATING_FILE_TOOLS:
+            entry["file_preview_request"] = req
 
     def _render_file_change_complete(
         self,
@@ -733,6 +746,31 @@ class TextualTerminalUI(TerminalUI):
             rows = _diff_rows_from_unified_diff(diff_text)
         if collapsed:
             rows = _collapsed_diff_rows(rows, limit=_COLLAPSED_PREVIEW_LINES)
+        return self._render_diff_rows(rows, path=path)
+
+    def _render_file_change_editor_preview(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        preview: dict[str, Any],
+        *,
+        path: str = "",
+    ) -> RenderableType:
+        diff_data = _diff_data_from_preview(preview) or _diff_data_from_arguments(tool_name, args)
+        diff_text = _diff_text_from_data(diff_data) or _diff_from_arguments(tool_name, args)
+        if not diff_text and tool_name == "apply_patch":
+            diff_text = str(args.get("patch", "") or "")
+
+        old_content = str(diff_data.get("old_content", "") or "")
+        new_content = str(diff_data.get("new_content", "") or "")
+        if "old_content" in diff_data or "new_content" in diff_data:
+            rows = _diff_rows_from_contents(old_content, new_content)
+        else:
+            rows = _diff_rows_from_unified_diff(diff_text)
+        if not rows and (old_content or new_content):
+            rows = _diff_rows_from_contents(old_content, new_content, context=0)
+        if not rows:
+            return Text("(no file preview available)", style="dim")
         return self._render_diff_rows(rows, path=path)
 
     def _render_approval_detail(
@@ -1014,10 +1052,26 @@ class PromptInput(Input):
     ]
 
     def action_history_previous(self) -> None:
-        cast("NexusTextualApp", self.app).action_prompt_history_previous()
+        app = cast("NexusTextualApp", self.app)
+        if app.move_slash_command_selection(-1):
+            return
+        app.action_prompt_history_previous()
 
     def action_history_next(self) -> None:
-        cast("NexusTextualApp", self.app).action_prompt_history_next()
+        app = cast("NexusTextualApp", self.app)
+        if app.move_slash_command_selection(1):
+            return
+        app.action_prompt_history_next()
+
+    def key_enter(self, event: events.Key) -> None:
+        if cast("NexusTextualApp", self.app).accept_slash_command_selection():
+            event.prevent_default()
+            event.stop()
+
+    def key_escape(self, event: events.Key) -> None:
+        if cast("NexusTextualApp", self.app).hide_slash_command_suggestions():
+            event.prevent_default()
+            event.stop()
 
     def key_tab(self, event: events.Key) -> None:
         # Let Tab bubble up to cycle focus to the transcript pane instead of
@@ -1201,9 +1255,116 @@ class TranscriptLog(RichLog):
         )
 
 
+class FileChangePreviewScreen(ModalScreen[None]):
+    """Read-only approval preview for a pending file change."""
+
+    CSS = """
+    FileChangePreviewScreen {
+        align: center middle;
+    }
+
+    #file-preview-shell {
+        width: 92%;
+        height: 90%;
+        border: round $accent;
+        background: #1f1f1f;
+        padding: 1 2;
+    }
+
+    #file-preview-title {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #file-preview-body-scroll {
+        height: 1fr;
+        border: round #3f3f3f;
+        background: #272822;
+        padding: 0 1;
+    }
+
+    #file-preview-body {
+        width: 100%;
+        height: auto;
+    }
+
+    #file-preview-actions {
+        height: 3;
+        margin-top: 1;
+    }
+
+    #file-preview-actions Button {
+        margin-right: 1;
+    }
+    """
+
+    BINDINGS = [("escape", "close", "Close")]
+
+    def __init__(
+        self,
+        request: ConfirmationRequest,
+        *,
+        title: Text,
+        preview_renderable: RenderableType,
+        on_accept: Callable[[], None],
+        on_reject: Callable[[], None],
+        on_close: Callable[[], None],
+    ) -> None:
+        super().__init__()
+        self.request = request
+        self.title_renderable = title
+        self.preview_renderable = preview_renderable
+        self._on_accept = on_accept
+        self._on_reject = on_reject
+        self._on_close = on_close
+        self._resolved = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="file-preview-shell"):
+            yield Static(self.title_renderable, id="file-preview-title")
+            with VerticalScroll(id="file-preview-body-scroll"):
+                yield Static(self.preview_renderable, id="file-preview-body")
+            with Horizontal(id="file-preview-actions"):
+                yield Button("Accept", id="file-preview-accept", variant="success")
+                yield Button("Reject", id="file-preview-reject", variant="error")
+                yield Button("Close", id="file-preview-close")
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == "file-preview-accept":
+            self._resolve(self._on_accept)
+            self.dismiss()
+            return
+        if button_id == "file-preview-reject":
+            self._resolve(self._on_reject)
+            self.dismiss()
+            return
+        if button_id == "file-preview-close":
+            self.dismiss()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+    def on_unmount(self) -> None:
+        self._on_close()
+
+    def _resolve(self, callback: Callable[[], None]) -> None:
+        if self._resolved:
+            return
+        self._resolved = True
+        for selector in ("#file-preview-accept", "#file-preview-reject", "#file-preview-close"):
+            with suppress(Exception):
+                self.query_one(selector, Button).disabled = True
+        callback()
+
+
 class NexusTextualApp(App[None]):
     ALLOW_SELECT = True
     CSS = """
+    NexusTextualApp {
+        layers: base overlay;
+    }
+
     Screen {
         background: $surface;
     }
@@ -1262,6 +1423,30 @@ class NexusTextualApp(App[None]):
         background-tint: transparent;
     }
 
+    #slash-suggestions {
+        display: none;
+        layer: overlay;
+        dock: bottom;
+        width: 84;
+        max-width: 92%;
+        height: 12;
+        margin: 0 2 6 4;
+        padding: 0 1;
+        border: round #666666;
+        background: #151515;
+        color: $text;
+        overflow-y: auto;
+    }
+
+    #slash-suggestions > .option-list--option {
+        padding: 0;
+    }
+
+    #slash-suggestions > .option-list--option-highlighted {
+        background: #3b3350;
+        color: white;
+    }
+
     #footer {
         height: 1;
         margin: 0 1 1 1;
@@ -1301,6 +1486,9 @@ class NexusTextualApp(App[None]):
         self._original_console = state.console
         self._pending_input: asyncio.Future[str] | None = None
         self._pending_input_prompt = ""
+        self._pending_approval: _PendingApproval | None = None
+        self._queued_preview_approvals: dict[str, ConfirmationResponse] = {}
+        self._active_file_preview_screen: FileChangePreviewScreen | None = None
         self._busy = False
         self._assistant_buffer = ""
         self.has_open_assistant_stream = False
@@ -1323,8 +1511,12 @@ class NexusTextualApp(App[None]):
         self._transcript: Any = None
         self._status: Any = None
         self._input: Any = None
+        self._slash_suggestions: OptionList | None = None
+        self._slash_suggestion_commands: tuple[Any, ...] = ()
+        self._slash_suggestion_suppressed_value = ""
         self._footer: Any = None
         self._turn_started_at = 0.0
+        self._active_transcript_turn_id = ""
         self._turn_tool_count = 0
         self._turn_edit_count = 0
         self._turn_error_count = 0
@@ -1349,12 +1541,14 @@ class NexusTextualApp(App[None]):
         with Horizontal(id="input-bar"):
             yield Static("|\n|\n|", id="prompt-marker")
             yield PromptInput(placeholder="Message Nexus or type /help", id="prompt")
+        yield OptionList(id="slash-suggestions", compact=True)
         yield Static("", id="footer")
 
     def on_mount(self) -> None:
         self._transcript = self.query_one("#transcript", TranscriptLog)
         self._status = self.query_one("#status", Static)
         self._input = self.query_one("#prompt", Input)
+        self._slash_suggestions = self.query_one("#slash-suggestions", OptionList)
         self._footer = self.query_one("#footer", Static)
         self.console.push_theme(NEXUS_THEME)
         self.state.console = self.ui
@@ -1580,9 +1774,77 @@ class NexusTextualApp(App[None]):
     def toggle_collapsible(self, toggle_id: str) -> None:
         for entry in self._transcript_entries:
             if entry.get("type") == "collapsible" and entry.get("id") == toggle_id:
+                request = entry.get("file_preview_request")
+                if isinstance(request, ConfirmationRequest):
+                    self.open_file_change_preview(request)
+                    return
                 entry["expanded_state"] = not bool(entry.get("expanded_state"))
                 self._rerender_transcript()
                 return
+
+    def open_file_change_preview(self, request: ConfirmationRequest) -> None:
+        args = {str(key): value for key, value in request.arguments.items()}
+        preview = {str(key): value for key, value in request.preview.items()}
+        target = self.ui._tool_target(request.tool_name, args)
+        title = self._file_preview_title(request, target)
+        body = self.ui._render_file_change_editor_preview(
+            request.tool_name,
+            args,
+            preview,
+            path=target,
+        )
+        if self._active_file_preview_screen is not None:
+            self._close_active_file_preview()
+        screen = FileChangePreviewScreen(
+            request,
+            title=title,
+            preview_renderable=body,
+            on_accept=lambda: self._resolve_file_preview_approval(
+                request,
+                ConfirmationResponse(approved=True, scope="once"),
+            ),
+            on_reject=lambda: self._resolve_file_preview_approval(request, ConfirmationResponse()),
+            on_close=lambda: self._clear_active_file_preview_screen(screen),
+        )
+        self._active_file_preview_screen = screen
+        self.push_screen(screen)
+
+    def _file_preview_title(self, request: ConfirmationRequest, target: str) -> Text:
+        action = self.ui._semantic_tool_label(request.tool_name)
+        title = Text()
+        title.append("File Preview", style="bold cyan")
+        if action or target:
+            title.append(" - ", style="dim")
+            title.append(" ".join(part for part in (action, target) if part), style="bold white")
+        if request.call_id:
+            title.append(f"  #{request.call_id[:8]}", style="dim")
+        title.append("\nRead-only preview", style="dim")
+        return title
+
+    def _resolve_file_preview_approval(
+        self,
+        request: ConfirmationRequest,
+        response: ConfirmationResponse,
+    ) -> None:
+        key = _approval_request_key(request)
+        pending = self._pending_approval
+        if pending is not None and _approval_request_key(pending.request) == key:
+            if not pending.future.done():
+                pending.future.set_result(response)
+            return
+        self._queued_preview_approvals[key] = response
+
+    def _close_active_file_preview(self) -> None:
+        screen = self._active_file_preview_screen
+        if screen is None:
+            return
+        self._active_file_preview_screen = None
+        with suppress(Exception):
+            screen.dismiss()
+
+    def _clear_active_file_preview_screen(self, screen: FileChangePreviewScreen) -> None:
+        if self._active_file_preview_screen is screen:
+            self._active_file_preview_screen = None
 
     @property
     def transcript_width(self) -> int:
@@ -1634,6 +1896,10 @@ class NexusTextualApp(App[None]):
             self._render_transcript_entry(entry)
 
     def begin_turn_transcript(self) -> None:
+        turn_id = str(self.state.current_turn_id or "")
+        if self._is_continuing_turn_transcript(turn_id):
+            return
+        self._active_transcript_turn_id = turn_id
         self._turn_started_at = time.perf_counter()
         self._turn_tool_count = 0
         self._turn_edit_count = 0
@@ -1644,7 +1910,16 @@ class NexusTextualApp(App[None]):
         self._supervisor_entry = None
         self._supervisor_entries_by_call_id.clear()
         self._turn_had_tool_calls = False
+        self._queued_preview_approvals.clear()
+        self._close_active_file_preview()
         self.refresh_footer()
+
+    def _is_continuing_turn_transcript(self, turn_id: str) -> bool:
+        if self._turn_started_at <= 0 or self._turn_footer_written:
+            return False
+        if self._active_transcript_turn_id and turn_id:
+            return self._active_transcript_turn_id == turn_id
+        return True
 
     def record_tool_completion(self, result: ToolResult) -> None:
         self._turn_tool_count += 1
@@ -1721,6 +1996,86 @@ class NexusTextualApp(App[None]):
             text.append("status ", style="dim")
             text.append(self._status_text, style="bold bright_cyan")
         self._footer.update(text)
+
+    def _refresh_slash_command_suggestions(self, value: str) -> None:
+        if self._slash_suggestions is None:
+            return
+        if self._pending_input is not None:
+            self._hide_slash_command_suggestions()
+            return
+        raw = str(value or "").lstrip()
+        if self._slash_suggestion_suppressed_value:
+            if raw == self._slash_suggestion_suppressed_value:
+                self._hide_slash_command_suggestions()
+                return
+            self._slash_suggestion_suppressed_value = ""
+        if not raw.startswith("/"):
+            self._hide_slash_command_suggestions()
+            return
+        query = raw[1:]
+        if any(char.isspace() for char in query):
+            self._hide_slash_command_suggestions()
+            return
+        suggestions = self.router.command_suggestions(query)
+        if not suggestions:
+            self._hide_slash_command_suggestions()
+            return
+        self._slash_suggestion_commands = suggestions
+        self._slash_suggestions.set_options(_slash_command_suggestion_options(suggestions))
+        self._slash_suggestions.styles.height = min(10, len(suggestions)) + 2
+        self._slash_suggestions.highlighted = 0
+        self._slash_suggestions.display = True
+
+    def _slash_command_suggestions_visible(self) -> bool:
+        return self._slash_suggestions is not None and bool(self._slash_suggestions.display)
+
+    def _hide_slash_command_suggestions(self) -> bool:
+        if self._slash_suggestions is None:
+            return False
+        was_visible = bool(self._slash_suggestions.display)
+        self._slash_suggestions.display = False
+        self._slash_suggestions.clear_options()
+        self._slash_suggestion_commands = ()
+        return was_visible
+
+    def hide_slash_command_suggestions(self) -> bool:
+        return self._hide_slash_command_suggestions()
+
+    def move_slash_command_selection(self, delta: int) -> bool:
+        palette = self._slash_suggestions
+        if palette is None or not palette.display or palette.option_count <= 0:
+            return False
+        current = palette.highlighted
+        if current is None or current < 0:
+            next_index = 0
+        else:
+            next_index = max(0, min(palette.option_count - 1, current + delta))
+        palette.highlighted = next_index
+        palette.scroll_to_highlight(top=False)
+        return True
+
+    def accept_slash_command_selection(self) -> bool:
+        palette = self._slash_suggestions
+        if palette is None or not palette.display or palette.option_count <= 0:
+            return False
+        index = palette.highlighted
+        if index is None or index < 0:
+            index = 0
+        return self._accept_slash_command_at_index(index)
+
+    def _accept_slash_command_at_index(self, index: int) -> bool:
+        if index < 0 or index >= len(self._slash_suggestion_commands):
+            return False
+        command_name = str(self._slash_suggestion_commands[index].name).strip()
+        if not command_name or self._input is None:
+            return False
+        value = f"/{command_name}"
+        self._slash_suggestion_suppressed_value = value
+        self._input.value = value
+        self._input.cursor_position = len(value)
+        self._hide_slash_command_suggestions()
+        self._input.focus()
+        return True
 
     def _render_transcript_plain_text(self, renderable: RenderableType) -> str:
         width = 100
@@ -1883,6 +2238,7 @@ class NexusTextualApp(App[None]):
     async def on_input_submitted(self, event: Any) -> None:
         raw = _strip_mouse_escape_sequences(str(event.value or "")).strip()
         self._input.value = ""
+        self._hide_slash_command_suggestions()
         if raw == "/abort" or raw.startswith("/abort "):
             if await self.router.dispatch(self.state, raw):
                 self._record_prompt_history(raw)
@@ -1906,22 +2262,47 @@ class NexusTextualApp(App[None]):
 
     def on_input_changed(self, event: Input.Changed) -> None:
         cleaned = _strip_mouse_escape_sequences(event.value)
+        self._refresh_slash_command_suggestions(cleaned)
         if cleaned == event.value:
             return
         event.stop()
         self._input.value = cleaned
 
     def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        if self._event_inside_slash_suggestions(event):
+            return
         event.stop()
         if self._transcript is not None:
             self._transcript.scroll_down(animate=False)
 
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        if self._event_inside_slash_suggestions(event):
+            return
         event.stop()
         if self._transcript is not None:
             self._transcript.scroll_up(animate=False)
 
+    def _event_inside_slash_suggestions(self, event: events.MouseEvent) -> bool:
+        palette = self._slash_suggestions
+        if palette is None or not palette.display:
+            return False
+        screen_x = getattr(event, "screen_x", None)
+        screen_y = getattr(event, "screen_y", None)
+        if screen_x is None or screen_y is None:
+            return False
+        try:
+            return palette.region.contains(int(screen_x), int(screen_y))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list is not self._slash_suggestions:
+            return
+        if self._accept_slash_command_at_index(event.option_index):
+            event.stop()
+
     async def ask(self, prompt: str) -> str:
+        self._hide_slash_command_suggestions()
         self._echo_input_prompt(prompt)
         self.set_status(prompt)
         self._input.placeholder = prompt
@@ -2157,6 +2538,53 @@ class NexusTextualApp(App[None]):
             self.clear_status()
             self._input.focus()
 
+    async def _ask_for_approval_response(
+        self,
+        request: ConfirmationRequest,
+        policy: ApprovalPolicy,
+    ) -> ConfirmationResponse:
+        key = _approval_request_key(request)
+        queued = self._queued_preview_approvals.pop(key, None)
+        if queued is not None:
+            return queued
+
+        approval_future: asyncio.Future[ConfirmationResponse] = asyncio.get_running_loop().create_future()
+        pending = _PendingApproval(request=request, policy=policy, future=approval_future)
+        self._pending_approval = pending
+        keyboard_task: asyncio.Task[str] | None = None
+        try:
+            while True:
+                queued = self._queued_preview_approvals.pop(key, None)
+                if queued is not None:
+                    return queued
+                keyboard_task = asyncio.create_task(
+                    self.ask(f"Allow? {approval_prompt_label(policy)}")
+                )
+                done, _pending = await asyncio.wait(
+                    {keyboard_task, approval_future},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if approval_future in done:
+                    if not keyboard_task.done():
+                        keyboard_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await keyboard_task
+                    return approval_future.result()
+
+                answer = keyboard_task.result().strip().lower()
+                response = approval_response_from_answer(answer, policy)
+                if response.approved or _is_explicit_denial_answer(answer):
+                    return response
+                self.ui.print_muted("Please answer with yes/y (or t/turn when offered), or no/n.")
+        finally:
+            if self._pending_approval is pending:
+                self._pending_approval = None
+            if keyboard_task is not None and not keyboard_task.done():
+                keyboard_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await keyboard_task
+            self._close_active_file_preview()
+
     def _approval_callback(self) -> ConfirmationCallback:
         async def ask_for_approval(request: ConfirmationRequest) -> ConfirmationResponse:
             if request.kind is ConfirmationKind.CLARIFICATION:
@@ -2181,12 +2609,7 @@ class NexusTextualApp(App[None]):
                 # Tolerate malformed approval payloads and keep prompting.
                 policy = ApprovalPolicy.ON_REQUEST
 
-            while True:
-                answer = (await self.ask(f"Allow? {approval_prompt_label(policy)}")).strip().lower()
-                response = approval_response_from_answer(answer, policy)
-                if response.approved or _is_explicit_denial_answer(answer):
-                    return response
-                self.ui.print_muted("Please answer with yes/y (or t/turn when offered), or no/n.")
+            return await self._ask_for_approval_response(request, policy)
 
         return ask_for_approval
 
@@ -2233,6 +2656,16 @@ def _is_explicit_denial_answer(answer: str) -> bool:
         answer.strip().lower().replace("(", " ").replace(")", " ").replace("-", " ").replace("_", " ").split()
     )
     return normalized in {"n", "no"}
+
+
+def _approval_request_key(request: ConfirmationRequest) -> str:
+    if request.call_id:
+        return request.call_id
+    try:
+        arguments = json.dumps(request.arguments, sort_keys=True, default=str)
+    except TypeError:
+        arguments = str(request.arguments)
+    return f"{request.tool_name}:{arguments}"
 
 
 def _copy_to_system_clipboard(text: str) -> bool:
@@ -2306,6 +2739,17 @@ def _assistant_header() -> Text:
     header.append("Assistant", style="bold green")
     header.append(":", style="green")
     return header
+
+
+def _slash_command_suggestion_options(commands: tuple[Any, ...]) -> list[Text]:
+    options: list[Text] = []
+    for command in commands:
+        row = Text()
+        row.append(f"/{command.name}", style="bold bright_magenta")
+        row.append("  ")
+        row.append(str(command.description), style="dim")
+        options.append(row)
+    return options
 
 
 def _user_prompt_block(raw_input: str) -> Table:
@@ -2901,6 +3345,7 @@ def _bash_command_block(command: str, *, collapsed: bool = False) -> _FencedCode
         command,
         language="bash",
         label="Command",
+        label_style="bold tool.shell",
         collapsed=collapsed,
     )
 

@@ -43,7 +43,7 @@ NEXUS_THEME = Theme(
         "tool": "bold bright_magenta",
         "tool.read": "cyan",
         "tool.write": "yellow",
-        "tool.shell": "magenta",
+        "tool.shell": "bright_magenta",
         "tool.network": "bright_blue",
         "tool.memory": "green",
         "tool.agent": "bright_cyan",

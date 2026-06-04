@@ -129,6 +129,23 @@ class SlashCommandRouter:
     def register(self, command: SlashCommand) -> None:
         self._commands[command.name] = command
 
+    def command_suggestions(self, query: str = "") -> tuple[SlashCommand, ...]:
+        """Return slash commands matching *query*, sorted alphabetically."""
+        normalized = query.strip().lower().lstrip("/")
+        commands = tuple(sorted(self._commands.values(), key=lambda command: command.name))
+        if not normalized:
+            return commands
+        exact = tuple(command for command in commands if command.name.lower() == normalized)
+        if exact:
+            return exact
+        matches = [
+            command
+            for command in commands
+            if normalized in command.name.lower()
+            or normalized in command.description.lower()
+        ]
+        return tuple(sorted(matches, key=lambda command: (_suggestion_match_rank(command, normalized), command.name)))
+
     async def dispatch(self, state: ReplState, raw_input: str) -> bool:
         if not raw_input.startswith("/"):
             return False
@@ -146,6 +163,15 @@ class SlashCommandRouter:
             return False
         await command.handler(state, parts[1:])
         return True
+
+
+def _suggestion_match_rank(command: SlashCommand, query: str) -> int:
+    name = command.name.lower()
+    if name.startswith(query):
+        return 0
+    if query in name:
+        return 1
+    return 2
 
 
 def build_router() -> SlashCommandRouter:
