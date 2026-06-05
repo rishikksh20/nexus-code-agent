@@ -480,7 +480,7 @@ async def test_agent_confirmation_request_includes_shell_command_preview(tool_co
 
 
 @pytest.mark.asyncio
-async def test_agent_turn_wide_approval_still_requires_confirmation_for_dangerous_bash(tool_context):
+async def test_agent_turn_wide_approval_skips_dangerous_bash_confirmation(tool_context):
     model = FakeModelClient(
         scripted=[
             RuntimeResponse(
@@ -512,9 +512,9 @@ async def test_agent_turn_wide_approval_still_requires_confirmation_for_dangerou
         )
     ]
 
-    confirmation = next(event for event in events if event.kind == "confirmation_requested")
-    assert confirmation.payload.tool_name == "bash"
-    assert confirmation.payload.payload["risk_level"] == "dangerous"
+    assert not [event for event in events if event.kind == "confirmation_requested"]
+    result = next(event.payload for event in events if event.kind == "tool_result")
+    assert result.tool_name == "bash"
 
 
 def test_agent_plans_same_batch_preapproved_tool_calls(tool_context):
@@ -549,7 +549,7 @@ def test_agent_plans_same_batch_preapproved_tool_calls(tool_context):
         auto_confirm_read_only=True,
     )
 
-    assert planned == (note_one, note_two)
+    assert planned == (note_one, note_two, dangerous_shell)
 
 
 def test_agent_filters_same_file_preapproved_mutations(tool_context):

@@ -696,6 +696,11 @@ def test_subagent_inner_approval_turn_scope_matches_supervisor_behavior():
         is_mutating=True,
         risk_level="medium",
     )
+    assert manager.is_turn_wide_mutating_preapproved(
+        "bash",
+        is_mutating=True,
+        risk_level="dangerous",
+    )
     assert manager.is_pre_approved("write_file", {"path": "two.txt", "content": "two"}) is False
 
 

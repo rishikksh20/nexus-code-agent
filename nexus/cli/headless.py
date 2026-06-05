@@ -59,7 +59,7 @@ async def run_headless(
                 "resumed_paused_turn": resumed_paused_turn,
             },
         )
-    state.history.append(Message(role="user", content=effective_prompt if resumed_paused_turn else prompt))
+    state.history.append(Message(role="user", content=prompt))
     if not resumed_paused_turn:
         state.approval_manager.begin_turn()
     try:

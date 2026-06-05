@@ -37,13 +37,33 @@ tell the user to run `/help` for the full command list.
 - Slash-command help is available from `/help` and from each command's `help` subcommand, such as `/context help`, `/config help`, `/skills help`, and `/provider help`.
 - Use live command output as authoritative when available; static notes can drift.
 
-## Common Slash Commands
+## Basic Slash Commands
 
+- `/abort`: abort the currently running agent turn.
+- `/agent`: inspect and scope supervisor tools, skills, and MCP.
+- `/config`: show merged, local, or global config; reload or upgrade config.
+- `/context`: show the system prompt, context usage, agent snapshots, task context, or session summary.
+- `/exit`: save and exit the REPL; alias for `/quit`.
 - `/help`: show available slash commands.
-- `/tools`: list registered tools, source, mutating flag, origin, and description.
+- `/history`: show recent message history.
+- `/mcp`: inspect and manage MCP server status, tools, activation, refresh, and reload.
+- `/memory`: inspect or update workspace memory entries.
+- `/mode`: show or switch execution mode.
+- `/provider`: show provider cards, activate profiles, open provider management, or update session parameters.
+- `/quit`: save and exit the REPL.
+- `/session`: inspect, create, resume, save, or export sessions.
+- `/skills`: inspect, activate, deactivate, create, remove, or reload skills.
+- `/sub-agent`: inspect and scope cognitive sub-agent resources.
+- `/subagent`: alias for `/sub-agent`.
+- `/tools`: list registered tools or reload the tool registry from config.
+
+## Useful Slash Subcommands
+
 - `/context usage`: show provider, model, estimated prompt/history tokens, context window, and compaction thresholds.
-- `/context compact`: compact conversation context.
-- `/context carry-over`: inspect compacted carry-over notes.
+- `/context agents`: list known supervisor and sub-agent context snapshots.
+- `/context agent <id>`: show one recorded agent context snapshot.
+- `/context task <id>`: show one typed multi-agent task context.
+- `/context summary`: show typed multi-agent session summary.
 - `/skills list`: list discovered skills, source, active state, description, and path.
 - `/skills show <name>`: print a skill's `SKILL.md`.
 - `/skills activate <name>` or `/skills add <name>`: persist skill activation in workspace config.

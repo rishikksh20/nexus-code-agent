@@ -8,6 +8,7 @@ from rich.console import Console
 from rich.text import Text
 from textual.geometry import Offset
 from textual.selection import Selection
+from textual.widgets import Button, Input, OptionList
 
 from nexus.config import load_config
 from nexus.integrations.fake_model import FakeModelClient
@@ -22,7 +23,32 @@ from nexus.runtime.sessions import EphemeralSessionStore, new_snapshot
 from nexus.runtime.slash_commands import build_router
 from nexus.tools.base import ToolRegistry
 from nexus.ui import TerminalUI
-from nexus.ui.textual_app import NexusTextualApp, TranscriptLog, _strip_mouse_escape_sequences, _user_prompt_block
+from nexus.ui.textual_app import (
+    FileChangePreviewScreen,
+    NexusTextualApp,
+    TranscriptLog,
+    _bash_command_block,
+    _context_pie_icon,
+    _renderable_plain_text,
+    _strip_mouse_escape_sequences,
+    _user_prompt_block,
+)
+
+
+def _new_textual_app(tmp_path, *, cli_overrides: dict[str, object] | None = None) -> NexusTextualApp:
+    config = load_config(tmp_path, global_root=tmp_path / "global", cli_overrides=cli_overrides)
+    registry = ToolRegistry()
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("textual"),
+        session_store=EphemeralSessionStore(),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=TerminalUI(color=False),
+    )
+    agent = Agent(model_client=FakeModelClient(), tool_registry=registry)
+    return NexusTextualApp(state, agent, build_router())
 
 
 @pytest.mark.asyncio
@@ -60,6 +86,14 @@ def test_textual_user_prompt_block_is_inline_label():
     console = Console(record=True, no_color=True)
     console.print(block)
     assert "You: adjust the TUI" in console.export_text()
+
+
+def test_textual_context_pie_uses_nearest_fill_level():
+    assert _context_pie_icon(12.4) == "○"
+    assert _context_pie_icon(12.5) == "◔"
+    assert _context_pie_icon(51.0) == "◑"
+    assert _context_pie_icon(74.0) == "◕"
+    assert _context_pie_icon(87.5) == "●"
 
 
 def test_clipboard_commands_use_pbcopy_on_macos(monkeypatch):
@@ -326,6 +360,74 @@ async def test_textual_prompt_history_uses_up_and_down_arrows(tmp_path):
 
         await pilot.press("down")
         assert prompt.value == "draft"
+
+
+@pytest.mark.asyncio
+async def test_textual_slash_command_dropdown_filters_commands_with_descriptions(tmp_path):
+    app = _new_textual_app(tmp_path)
+
+    async with app.run_test(size=(150, 50)) as pilot:
+        await pilot.pause()
+        prompt = app.query_one("#prompt")
+        suggestions = app.query_one("#slash-suggestions", OptionList)
+
+        assert suggestions.display is False
+
+        prompt.value = "/"
+        await pilot.pause()
+
+        assert suggestions.display is True
+        assert suggestions.option_count > 5
+        assert suggestions.region.height == 12
+        assert suggestions.region.y + suggestions.region.height <= prompt.region.y
+        all_text = "\n".join(
+            _renderable_plain_text(suggestions.get_option_at_index(index).prompt, width=160)
+            for index in range(suggestions.option_count)
+        )
+        assert all_text.index("/abort") < all_text.index("/agent")
+        assert "/provider" in all_text
+        assert "Show or update model provider and session parameters." in all_text
+
+        prompt.value = "/pro"
+        await pilot.pause()
+
+        filtered_text = "\n".join(
+            _renderable_plain_text(suggestions.get_option_at_index(index).prompt, width=160)
+            for index in range(suggestions.option_count)
+        )
+        assert "/provider" in filtered_text
+        assert "/tools" not in filtered_text
+
+        await pilot.press("enter")
+        assert prompt.value == "/provider"
+        assert suggestions.display is False
+
+        prompt.value = "/"
+        await pilot.pause()
+        await pilot.press("down")
+        assert suggestions.highlighted == 1
+        await pilot.press("enter")
+        assert prompt.value == "/agent"
+
+        prompt.value = "/tools"
+        await pilot.pause()
+        assert suggestions.option_count == 1
+        assert suggestions.region.height == 3
+        assert suggestions.region.y + suggestions.region.height <= prompt.region.y
+        await pilot.click(suggestions, offset=(2, 1))
+        await pilot.pause()
+        assert prompt.value == "/tools"
+        assert suggestions.display is False
+
+        prompt.value = "/zzzz"
+        await pilot.pause()
+
+        assert suggestions.display is False
+
+        prompt.value = "hello"
+        await pilot.pause()
+
+        assert suggestions.display is False
 
 
 @pytest.mark.asyncio
@@ -772,11 +874,67 @@ async def test_textual_approval_request_shows_collapsible_file_diff_preview(tmp_
         assert "hidden full content" not in collapsed
 
         app.toggle_collapsible(app._transcript_entries[-1]["id"])
-        expanded = app._transcript_text()
-        assert "[-] ? Approval required Write file app.py" in expanded
-        assert "Before" in expanded
-        assert "After" in expanded
+        await pilot.pause()
+
+        assert isinstance(app.screen, FileChangePreviewScreen)
+        expanded = _renderable_plain_text(app.screen.preview_renderable, width=160)
+        assert app._transcript_entries[-1]["expanded_state"] is False
+        assert "Before | app.py" in expanded
+        assert "After | app.py" in expanded
         assert "new 19" in expanded
+
+
+@pytest.mark.asyncio
+async def test_textual_approval_tile_collapses_after_keyboard_turn_approval(tmp_path):
+    app = _new_textual_app(tmp_path)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow write_file?",
+        reason="write_file creates a file.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-keyboard-turn-preview",
+        arguments={"path": "turn_approved.py", "content": "secret = True\n"},
+        preview={"diff": {"path": "turn_approved.py", "old_content": "", "new_content": "secret = True\n"}},
+    )
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        approval_entry = app._transcript_entries[-1]
+        task = asyncio.create_task(app._approval_callback()(request))
+        await pilot.pause()
+
+        prompt = app.query_one("#prompt")
+        prompt.value = "t"
+        await pilot.press("enter")
+
+        response = await asyncio.wait_for(task, timeout=1)
+        assert response.approved is True
+        assert response.scope == "turn"
+        assert approval_entry["expanded_state"] is False
+        assert approval_entry["preview"] is None
+        assert approval_entry["approval_resolved"] is True
+
+        collapsed = app._transcript_text()
+        assert "[+] ✓ Approval Request Write file turn_approved.py · approved for turn" in collapsed
+        assert "secret = True" not in collapsed
+
+        app.toggle_collapsible(approval_entry["id"])
+        await pilot.pause()
+
+        assert isinstance(app.screen, FileChangePreviewScreen)
+        assert app.screen.query_one("#file-preview-accept", Button).disabled is True
+        assert app.screen.query_one("#file-preview-reject", Button).disabled is True
 
 
 @pytest.mark.asyncio
@@ -986,8 +1144,534 @@ async def test_textual_clicking_inline_diff_expand_hint_opens_approval_preview(t
         )
         await pilot.pause()
 
-        assert entry["expanded_state"] is True
-        assert "20 | +line 20" in app._transcript_text()
+        assert entry["expanded_state"] is False
+        assert isinstance(app.screen, FileChangePreviewScreen)
+        preview = _renderable_plain_text(app.screen.preview_renderable, width=160)
+        assert "Before | algorithms/binary_search.py" in preview
+        assert "After | algorithms/binary_search.py" in preview
+        assert "20 | +line 20" in preview
+
+
+@pytest.mark.asyncio
+async def test_textual_write_file_create_preview_opens_read_only_before_after_screen(tmp_path):
+    app = _new_textual_app(tmp_path)
+    content = "alpha\nbeta\ngamma"
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow write_file?",
+        reason="write_file creates a file.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-create-preview",
+        arguments={"path": "new_module.py", "content": content},
+        preview={
+            "diff": {
+                "path": "new_module.py",
+                "is_new_file": True,
+                "old_content": "",
+                "new_content": content,
+            }
+        },
+    )
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause()
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        await pilot.pause()
+
+        assert isinstance(app.screen, FileChangePreviewScreen)
+        assert not list(app.screen.query(Input))
+        preview = _renderable_plain_text(app.screen.preview_renderable, width=160)
+        assert "Before | new_module.py" in preview
+        assert "After | new_module.py" in preview
+        assert "1 | +alpha" in preview
+        assert "3 | +gamma" in preview
+
+
+@pytest.mark.asyncio
+async def test_textual_write_file_overwrite_preview_shows_before_and_after(tmp_path):
+    app = _new_textual_app(tmp_path)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow write_file?",
+        reason="write_file overwrites a file.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-overwrite-preview",
+        arguments={"path": "app.py", "content": "value = 2\n"},
+        preview={
+            "diff": {
+                "path": "app.py",
+                "old_content": "value = 1\n",
+                "new_content": "value = 2\n",
+            }
+        },
+    )
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause()
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        await pilot.pause()
+
+        assert isinstance(app.screen, FileChangePreviewScreen)
+        preview = _renderable_plain_text(app.screen.preview_renderable, width=160)
+        assert "Before | app.py" in preview
+        assert "After | app.py" in preview
+        assert "1 | -value = 1" in preview
+        assert "1 | +value = 2" in preview
+
+
+@pytest.mark.asyncio
+async def test_textual_edit_preview_shows_before_and_after(tmp_path):
+    app = _new_textual_app(tmp_path)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="edit",
+        prompt="Allow edit?",
+        reason="edit modifies a file.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-edit-preview",
+        arguments={"path": "app.py", "old_string": "return old", "new_string": "return new"},
+        preview={
+            "diff": {
+                "path": "app.py",
+                "old_content": "def run():\n    return old\n",
+                "new_content": "def run():\n    return new\n",
+            }
+        },
+    )
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause()
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        await pilot.pause()
+
+        assert isinstance(app.screen, FileChangePreviewScreen)
+        preview = _renderable_plain_text(app.screen.preview_renderable, width=160)
+        assert "Before | app.py" in preview
+        assert "After | app.py" in preview
+        assert "2 | -    return old" in preview
+        assert "2 | +    return new" in preview
+
+
+@pytest.mark.asyncio
+async def test_textual_file_preview_accept_resolves_once_only_approval(tmp_path):
+    app = _new_textual_app(tmp_path)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow write_file?",
+        reason="write_file creates a file.",
+        payload={"approval_policy": "approve-session"},
+        call_id="call-accept-preview",
+        arguments={"path": "accepted.py", "content": "accepted = True\n"},
+        preview={"diff": {"path": "accepted.py", "old_content": "", "new_content": "accepted = True\n"}},
+    )
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        approval_entry = app._transcript_entries[-1]
+        task = asyncio.create_task(app._approval_callback()(request))
+        await pilot.pause()
+
+        app.toggle_collapsible(approval_entry["id"])
+        await pilot.pause()
+        await pilot.click(app.screen.query_one("#file-preview-accept", Button))
+
+        response = await asyncio.wait_for(task, timeout=1)
+        assert response.approved is True
+        assert response.scope == "once"
+        assert app._active_file_preview_screen is None
+        assert approval_entry["approval_resolved"] is True
+
+        app.toggle_collapsible(approval_entry["id"])
+        await pilot.pause()
+
+        assert app.screen.query_one("#file-preview-accept", Button).disabled is True
+        assert app.screen.query_one("#file-preview-reject", Button).disabled is True
+
+
+@pytest.mark.asyncio
+async def test_textual_file_preview_reject_denies_approval(tmp_path):
+    app = _new_textual_app(tmp_path)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="edit",
+        prompt="Allow edit?",
+        reason="edit modifies a file.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-reject-preview",
+        arguments={"path": "app.py", "old_string": "old", "new_string": "new"},
+        preview={"diff": {"path": "app.py", "old_content": "old\n", "new_content": "new\n"}},
+    )
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        approval_entry = app._transcript_entries[-1]
+        task = asyncio.create_task(app._approval_callback()(request))
+        await pilot.pause()
+
+        app.toggle_collapsible(approval_entry["id"])
+        await pilot.pause()
+        await pilot.click(app.screen.query_one("#file-preview-reject", Button))
+
+        response = await asyncio.wait_for(task, timeout=1)
+        assert response.denied is True
+        assert app._active_file_preview_screen is None
+        assert approval_entry["approval_resolved"] is True
+
+        app.toggle_collapsible(approval_entry["id"])
+        await pilot.pause()
+
+        assert app.screen.query_one("#file-preview-accept", Button).disabled is True
+        assert app.screen.query_one("#file-preview-reject", Button).disabled is True
+
+
+@pytest.mark.asyncio
+async def test_textual_completed_file_change_opens_read_only_preview(tmp_path):
+    app = _new_textual_app(tmp_path)
+    args = {"path": "auto_edit.py", "old_string": "value = 1", "new_string": "value = 2"}
+    preview = {
+        "diff": {
+            "path": "auto_edit.py",
+            "old_content": "value = 1\n",
+            "new_content": "value = 2\n",
+        }
+    }
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start("call-auto-edit", "edit", args, preview=preview),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(
+                    call_id="call-auto-edit",
+                    tool_name="edit",
+                    output="Patched 1 region.",
+                    metadata={"path": "auto_edit.py"},
+                )
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        complete_entry = app._transcript_entries[-1]
+        assert complete_entry["clickable_path"] == "auto_edit.py"
+        assert "[+] ✓ Edited file auto_edit.py" in app._transcript_text()
+
+        app.toggle_collapsible(complete_entry["id"])
+        await pilot.pause()
+
+        assert isinstance(app.screen, FileChangePreviewScreen)
+        assert app.screen.query_one("#file-preview-accept", Button).disabled is True
+        assert app.screen.query_one("#file-preview-reject", Button).disabled is True
+        preview_text = _renderable_plain_text(app.screen.preview_renderable, width=140)
+        assert "Before | auto_edit.py" in preview_text
+        assert "After | auto_edit.py" in preview_text
+        assert "1 | -value = 1" in preview_text
+        assert "1 | +value = 2" in preview_text
+
+
+@pytest.mark.asyncio
+async def test_textual_subagent_file_change_absorbs_resolved_approval_into_tool_row(tmp_path):
+    app = _new_textual_app(tmp_path)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow write_file?",
+        reason="write_file creates a file.",
+        payload={"approval_policy": "on-request", "actor": "subagent_execution"},
+        call_id="inner-write",
+        arguments={"path": "algorithms/go/lru.go", "content": "package main\n"},
+        preview={
+            "diff": {
+                "path": "algorithms/go/lru.go",
+                "old_content": "",
+                "new_content": "package main\n",
+            }
+        },
+    )
+
+    async with app.run_test(size=(150, 50)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start(
+                "call-sub",
+                "subagent_execution",
+                {"title": "Add in-depth comments to LRU cache implementation"},
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        approval_task = asyncio.create_task(app._approval_callback()(request))
+        await pilot.pause()
+
+        prompt = app.query_one("#prompt")
+        prompt.value = "y"
+        await pilot.press("enter")
+        response = await asyncio.wait_for(approval_task, timeout=1)
+        assert response.approved is True
+        assert "Approval Request Write file algorithms/go/lru.go" in app._transcript_text()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start(
+                "inner-write",
+                "write_file",
+                {"path": "algorithms/go/lru.go", "content": "package main\n"},
+                actor="subagent_execution",
+                preview={
+                    "diff": {
+                        "path": "algorithms/go/lru.go",
+                        "old_content": "",
+                        "new_content": "package main\n",
+                    }
+                },
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(
+                    call_id="inner-write",
+                    tool_name="write_file",
+                    output="Created algorithms/go/lru.go",
+                    metadata={"actor": "subagent_execution", "path": "algorithms/go/lru.go", "duration_ms": 1},
+                )
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        transcript_text = app._transcript_text()
+        assert "Approval Request Write file algorithms/go/lru.go" not in transcript_text
+        assert "Input required: Allow?" not in transcript_text
+        assert "Approval response: y" not in transcript_text
+        assert "   [+] ✓ Wrote file algorithms/go/lru.go" in transcript_text
+        assert app.has_file_preview("inner-write") is True
+        row = app._subagent_entries_by_actor["subagent_execution"]["subagent_tool_rows"]["inner-write"]
+        assert any(str(span.style) == "bold tool.write" for span in row.spans)
+
+        app.open_file_change_preview_for_call("inner-write")
+        await pilot.pause()
+
+        assert isinstance(app.screen, FileChangePreviewScreen)
+        assert app.screen.query_one("#file-preview-accept", Button).disabled is True
+        assert app.screen.query_one("#file-preview-reject", Button).disabled is True
+        preview_text = _renderable_plain_text(app.screen.preview_renderable, width=150)
+        assert "Before | algorithms/go/lru.go" in preview_text
+        assert "After | algorithms/go/lru.go" in preview_text
+        assert "1 | +package main" in preview_text
+
+
+@pytest.mark.asyncio
+async def test_textual_subagent_bash_approval_blends_into_collapsed_command_row(tmp_path):
+    app = _new_textual_app(tmp_path)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="bash",
+        prompt="Allow bash?",
+        reason="High-risk bash command requires confirmation.",
+        payload={"approval_policy": "on-request", "actor": "subagent_execution", "risk_level": "dangerous"},
+        call_id="inner-bash",
+        arguments={"command": "rm -rf build", "cwd": "algorithms/go"},
+        preview={"command": "rm -rf build"},
+    )
+
+    async with app.run_test(size=(150, 50)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start(
+                "call-sub",
+                "subagent_execution",
+                {"title": "Inspect Go algorithms"},
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        approval_wait = asyncio.create_task(app._approval_callback()(request))
+        await pilot.pause()
+
+        pending_text = app._transcript_text()
+        assert "Approval Request bash" not in pending_text
+        assert "   [+] ? Bash Run rm -rf build" in pending_text
+        assert "approval required" in pending_text
+
+        prompt = app.query_one("#prompt")
+        prompt.value = "y"
+        await pilot.press("enter")
+        response = await asyncio.wait_for(approval_wait, timeout=1)
+        assert response.approved is True
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start(
+                "inner-bash",
+                "bash",
+                {"command": "rm -rf build", "cwd": "algorithms/go"},
+                actor="subagent_execution",
+                preview={"command": "rm -rf build"},
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.append_tool_output("inner-bash", "stdout", "live line\n")
+        live_collapsed = app._transcript_text()
+        assert "bash live output" not in live_collapsed
+        assert "live line" not in live_collapsed
+
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(
+                    call_id="inner-bash",
+                    tool_name="bash",
+                    output="removed build",
+                    metadata={"actor": "subagent_execution", "duration_ms": 5},
+                )
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        collapsed = app._transcript_text()
+        assert "Input required: Allow?" not in collapsed
+        assert "Approval response: y" not in collapsed
+        assert "   [+] ✓ Bash Run rm -rf build" in collapsed
+        assert "Console output" not in collapsed
+        assert "removed build" not in collapsed
+
+        app.toggle_subagent_command_detail("inner-bash")
+        await pilot.pause()
+
+        expanded = app._transcript_text()
+        assert "   [-] ✓ Bash Run rm -rf build" in expanded
+        assert "Command" in expanded
+        assert "Console output" in expanded
+        assert "removed build" in expanded
+
+
+@pytest.mark.asyncio
+async def test_textual_file_preview_close_leaves_keyboard_approval_active(tmp_path):
+    app = _new_textual_app(tmp_path)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow write_file?",
+        reason="write_file creates a file.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-close-preview",
+        arguments={"path": "close_preview.py", "content": "value = 1\n"},
+        preview={"diff": {"path": "close_preview.py", "old_content": "", "new_content": "value = 1\n"}},
+    )
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        approval_entry = app._transcript_entries[-1]
+        task = asyncio.create_task(app._approval_callback()(request))
+        await pilot.pause()
+
+        app.toggle_collapsible(approval_entry["id"])
+        await pilot.pause()
+        await pilot.click(app.screen.query_one("#file-preview-close", Button))
+        await pilot.pause()
+
+        assert not task.done()
+        prompt = app.query_one("#prompt")
+        prompt.value = "n"
+        await pilot.press("enter")
+
+        response = await asyncio.wait_for(task, timeout=1)
+        assert response.denied is True
+
+
+@pytest.mark.asyncio
+async def test_textual_keyboard_approval_still_works_without_preview_action(tmp_path):
+    app = _new_textual_app(tmp_path)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="write_file",
+        prompt="Allow write_file?",
+        reason="write_file creates a file.",
+        payload={"approval_policy": "on-request"},
+        call_id="call-keyboard-approval",
+        arguments={"path": "keyboard.py", "content": "ok = True\n"},
+        preview={"diff": {"path": "keyboard.py", "old_content": "", "new_content": "ok = True\n"}},
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        task = asyncio.create_task(app._approval_callback()(request))
+        await pilot.pause()
+
+        prompt = app.query_one("#prompt")
+        prompt.value = "y"
+        await pilot.press("enter")
+
+        response = await asyncio.wait_for(task, timeout=1)
+        assert response.approved is True
+        assert response.scope == "once"
 
 
 @pytest.mark.asyncio
@@ -1037,6 +1721,80 @@ async def test_textual_bash_approval_uses_command_block_and_structured_details(t
         assert "cwd=calculator" in collapsed
         assert "reason" in collapsed
         assert "approval" in collapsed
+
+
+@pytest.mark.asyncio
+async def test_textual_bash_approval_absorbs_into_completed_bash_row(tmp_path):
+    app = _new_textual_app(tmp_path)
+    request = ConfirmationRequest(
+        kind=ConfirmationKind.APPROVAL,
+        tool_name="bash",
+        prompt="Allow bash?",
+        reason="Medium-risk bash command requires confirmation: `go run lfu.go 2>&1`",
+        payload={"approval_policy": "on-request"},
+        call_id="call-bash-approval",
+        arguments={"command": "go run lfu.go 2>&1", "cwd": "algorithms/go"},
+        preview={"command": "go run lfu.go 2>&1"},
+    )
+
+    async with app.run_test(size=(150, 50)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent(kind=AgentEventType.CONFIRMATION_REQUESTED, payload=request),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        approval_task = asyncio.create_task(app._approval_callback()(request))
+        await pilot.pause()
+        prompt = app.query_one("#prompt")
+        prompt.value = "y"
+        await pilot.press("enter")
+        response = await asyncio.wait_for(approval_task, timeout=1)
+        assert response.approved is True
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start(
+                "call-bash-approval",
+                "bash",
+                {"command": "go run lfu.go 2>&1", "cwd": "algorithms/go"},
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(
+                    call_id="call-bash-approval",
+                    tool_name="bash",
+                    output="/bin/bash: go: command not found\nExit code: 127",
+                    is_error=True,
+                    metadata={"duration_ms": 24},
+                )
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        collapsed = app._transcript_text()
+        assert "Approval Request bash" not in collapsed
+        assert "Input required: Allow?" not in collapsed
+        assert "Approval response: y" not in collapsed
+        assert "Run Command : #call-ba" not in collapsed
+        assert "[+] ✗ Bash Run algorithms/go · failed:" in collapsed
+        assert "Command" not in collapsed
+        assert "Console output" not in collapsed
+
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        expanded = app._transcript_text()
+        assert "Command" in expanded
+        assert "go run lfu.go 2>&1" in expanded
+        assert "Console output" in expanded
+        assert "/bin/bash: go: command not found" in expanded
 
 
 @pytest.mark.asyncio
@@ -1255,30 +2013,20 @@ async def test_textual_bash_output_uses_inline_blocks_and_collapses_long_output(
         )
 
         transcript_text = app._transcript_text()
-        assert ". Run Command : #call-1" in transcript_text
-        assert "Command" in transcript_text
-        assert "uv run pytest" in transcript_text
+        assert "Run Command : #call-1" not in transcript_text
+        assert "Command" not in transcript_text
         assert "bash output" not in transcript_text
-        assert "[+] ✓ Ran uv run pytest" in transcript_text
-        assert "Console output" in transcript_text
-        assert "line 14" in transcript_text
-        assert "line 16" not in transcript_text
+        assert "[+] ✓ Bash Run uv run pytest" in transcript_text
+        assert "Console output" not in transcript_text
+        assert "line 14" not in transcript_text
 
-        hint_y, hint_line = next(
-            (index, line.text)
-            for index, line in enumerate(transcript.lines)
-            if "click [+] to expand" in line.text
-        )
-        content_offset_x = transcript.content_region.x - transcript.region.x
-        content_offset_y = transcript.content_region.y - transcript.region.y
-        await pilot.click(
-            transcript,
-            offset=(hint_line.index("click") + 1 + content_offset_x, hint_y + content_offset_y),
-        )
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
         await pilot.pause()
 
         expanded = app._transcript_text()
-        assert "[-] ✓ Ran uv run pytest" in expanded
+        assert "[-] ✓ Bash Run uv run pytest" in expanded
+        assert "Command" in expanded
+        assert "Console output" in expanded
         assert "line 29" in expanded
 
 
@@ -1318,7 +2066,12 @@ async def test_textual_bash_short_output_still_uses_collapsible_console_preview(
         entry = app._transcript_entries[-1]
         assert entry["type"] == "collapsible"
         assert entry["expanded_state"] is False
-        assert "[+] ✓ Ran printf hello" in app._transcript_text()
+        assert "[+] ✓ Bash Run printf hello" in app._transcript_text()
+        assert "Console output" not in app._transcript_text()
+
+        app.toggle_collapsible(entry["id"])
+        await pilot.pause()
+
         assert "Console output" in app._transcript_text()
         assert "hello" in app._transcript_text()
 
@@ -1352,15 +2105,92 @@ async def test_textual_command_argument_tool_start_uses_fenced_command_preview(t
         )
 
         transcript_text = app._transcript_text()
-        assert transcript.lines[0].text == ""
-        assert ". Run Command : #call-com" in transcript_text
+        assert "[+] · sandbox_exec Run pwd" in transcript_text
         assert "> sandbox_exec command" not in transcript_text
-        assert "Command" in transcript_text
-        assert "pwd" in transcript_text
+        assert "Command" not in transcript_text
         assert app._supervisor_entry is None
-        header = app.ui._command_start_header("call-command")
-        assert header.plain == "\n. Run Command : #call-com"
-        assert str(header.spans[0].style) == "bold tool.shell"
+        assert _bash_command_block("pwd").label_style == "bold tool.shell"
+
+
+@pytest.mark.asyncio
+async def test_textual_git_tool_uses_collapsible_command_tile(tmp_path):
+    app = _new_textual_app(tmp_path)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start("call-git", "git_diff", {"target": "head", "path": "nexus/ui/textual_app.py"}),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(call_id="call-git", tool_name="git_diff", output="diff --git a/file b/file")
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        transcript_text = app._transcript_text()
+        assert app._supervisor_entry is None
+        assert "[+] ✓ Git Diff nexus/ui/textual_app.py · done" in transcript_text
+        assert "git diff HEAD -- nexus/ui/textual_app.py" not in transcript_text
+        assert "Console output" not in transcript_text
+        assert "diff --git" not in transcript_text
+
+        app.toggle_collapsible(app._transcript_entries[-1]["id"])
+        await pilot.pause()
+
+        expanded = app._transcript_text()
+        assert "git diff HEAD -- nexus/ui/textual_app.py" in expanded
+        assert "Console output" in expanded
+        assert "diff --git" in expanded
+
+
+@pytest.mark.asyncio
+async def test_textual_failed_tool_json_output_uses_readable_reason(tmp_path):
+    app = _new_textual_app(tmp_path)
+    payload = {
+        "tool": "run_tests",
+        "command": ["uv", "run", "pytest"],
+        "exit_code": 1,
+        "stderr_tail": "FAILED tests/test_demo.py::test_demo",
+    }
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(
+            AgentEvent.tool_call_start("call-tests", "run_tests", {}),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+        app.ui.render_event(
+            AgentEvent.tool_call_complete(
+                ToolResult(
+                    call_id="call-tests",
+                    tool_name="run_tests",
+                    output=json.dumps(payload, indent=2),
+                    is_error=True,
+                    metadata=payload,
+                )
+            ),
+            stream_output=True,
+            show_tool_calls=True,
+        )
+
+        transcript_text = app._transcript_text()
+        assert "[+] ✗ Test Run uv run pytest · failed: exit 1: FAILED tests/test_demo.py::test_demo" in transcript_text
+        assert '"stderr_tail"' not in transcript_text
 
 
 def test_textual_bash_command_preview_builds_markdown_fence():
@@ -1436,7 +2266,7 @@ async def test_textual_supervisor_tools_use_colored_header_and_indented_status_s
         assert header.style == "bold cyan"
         transcript_text = app._transcript_text()
         assert "   ✓ Listed algorithms" in transcript_text
-        assert "   ✗ Failed query=needle" in transcript_text
+        assert "   ✗ grep query=needle · failed: not found" in transcript_text
         assert "|->" not in transcript_text
 
 
@@ -1557,6 +2387,12 @@ async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_p
         assert "|-->" not in expanded
         assert "4ms" in expanded
         assert "8ms" in expanded
+        assert "   [+] ✓ Result: Output JSON · done · 21.0s" in expanded
+        assert '"schema_version"' not in expanded
+
+        app.toggle_subagent_result_json("call-sub")
+        expanded = app._transcript_text()
+        assert "   [-] ✓ Result: Output JSON · done · 21.0s" in expanded
         assert '"schema_version"' in expanded
         assert '"summary": "Algorithms contains heap and table examples."' in expanded
 
@@ -1641,6 +2477,7 @@ async def test_textual_turn_footer_summarizes_tools_edits_and_recovery(tmp_path)
         app.ui.render_event(AgentEvent.agent_start("do work"), stream_output=True, show_tool_calls=True)
         app.record_tool_completion(ToolResult(call_id="a", tool_name="bash", output="failed", is_error=True))
         app.record_tool_completion(ToolResult(call_id="b", tool_name="edit", output="patched"))
+        app.ui.render_event(AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="stop"), stream_output=True, show_tool_calls=True)
         app.ui.render_event(AgentEvent.agent_stop("done"), stream_output=True, show_tool_calls=True)
 
         transcript_text = app._transcript_text()
@@ -1649,6 +2486,66 @@ async def test_textual_turn_footer_summarizes_tools_edits_and_recovery(tmp_path)
         assert "1 edit" in transcript_text
         assert "1 failed" in transcript_text
         assert "1 recovered" in transcript_text
+
+
+@pytest.mark.asyncio
+async def test_textual_turn_footer_waits_for_turn_completed_before_agent_stop(tmp_path):
+    app = _new_textual_app(tmp_path)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.ui.render_event(AgentEvent.agent_start("needs approval"), stream_output=True, show_tool_calls=True)
+        app.record_tool_completion(ToolResult(call_id="a", tool_name="read_file", output="read"))
+        app.ui.render_event(AgentEvent.agent_stop(None), stream_output=True, show_tool_calls=True)
+
+        assert "Done" not in app._transcript_text()
+
+        app.ui.render_event(AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="stop"), stream_output=True, show_tool_calls=True)
+        app.ui.render_event(AgentEvent.agent_stop("done"), stream_output=True, show_tool_calls=True)
+
+        transcript_text = app._transcript_text()
+        assert "Done" in transcript_text
+        assert "1 tool" in transcript_text
+
+
+@pytest.mark.asyncio
+async def test_textual_turn_footer_accumulates_across_same_user_turn_restarts(tmp_path, monkeypatch):
+    from nexus.ui import textual_app
+
+    app = _new_textual_app(tmp_path)
+    now = 10.0
+    monkeypatch.setattr(textual_app.time, "perf_counter", lambda: now)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptLog)
+        transcript.clear()
+        app._transcript_entries.clear()
+        app._transcript_plain_parts.clear()
+
+        app.state.current_turn_id = "turn-stats"
+        app.ui.render_event(AgentEvent.agent_start("do work"), stream_output=True, show_tool_calls=True)
+        app.record_tool_completion(ToolResult(call_id="a", tool_name="read_file", output="read"))
+        app.record_tool_completion(ToolResult(call_id="b", tool_name="bash", output="ran"))
+
+        now = 12.0
+        app.ui.render_event(AgentEvent.agent_start("continue work"), stream_output=True, show_tool_calls=True)
+        app.record_tool_completion(ToolResult(call_id="c", tool_name="edit", output="patched"))
+
+        now = 16.0
+        app.ui.render_event(AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="stop"), stream_output=True, show_tool_calls=True)
+        app.ui.render_event(AgentEvent.agent_stop("done"), stream_output=True, show_tool_calls=True)
+
+        transcript_text = app._transcript_text()
+        assert "Done" in transcript_text
+        assert "3 tools" in transcript_text
+        assert "1 edit" in transcript_text
+        assert "6.0s" in transcript_text
 
 
 @pytest.mark.asyncio

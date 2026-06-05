@@ -95,6 +95,10 @@ class ReplState:
         stripped = raw_input.strip()
         paused_prompt = self.paused_turn_prompt
         if not paused_prompt:
+            if _is_continue_prompt(stripped):
+                previous_prompt = _previous_user_task_prompt(self.history)
+                if previous_prompt:
+                    return previous_prompt, False
             return stripped, False
         self.clear_paused_turn()
         if _is_continue_prompt(stripped):
@@ -292,6 +296,17 @@ def _is_continue_prompt(value: str) -> bool:
     normalized = value.strip().casefold().strip("`'\"")
     normalized = normalized.rstrip(".!?")
     return normalized == "continue"
+
+
+def _previous_user_task_prompt(history: list[Message]) -> str:
+    for message in reversed(history):
+        if message.role != "user":
+            continue
+        content = message.content.strip()
+        if not content or content.startswith("/") or _is_continue_prompt(content):
+            continue
+        return content
+    return ""
 
 
 def _load_all_memory(store: MemoryStore) -> list[str]:

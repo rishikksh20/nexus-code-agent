@@ -792,8 +792,8 @@ def _approval_scope_from_response(request, response) -> ApprovalScope:
 
 
 def _supports_turn_wide_approval(request) -> bool:
-    risk_level = str(request.payload.get("risk_level", "medium")).strip().lower().split(".")[-1]
-    return not (request.tool_name == "bash" and risk_level in {"high", "dangerous"})
+    del request
+    return True
 
 
 def _subagent_result_envelope(
