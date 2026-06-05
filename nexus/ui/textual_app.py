@@ -3,61 +3,42 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
-from difflib import SequenceMatcher, unified_diff
+from dataclasses import dataclass
 import io
-import json
-import re
-import shlex
 import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable
 from contextlib import suppress
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
-from rich import box
 from rich.console import Console
-from rich.console import ConsoleOptions
 from rich.console import Group
-from rich.console import RenderResult
 from rich.markdown import Markdown
-from rich.padding import Padding
-from rich.panel import Panel
-from rich.rule import Rule
 from rich.style import Style
-from rich.syntax import Syntax
-from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
-from textual.selection import Selection
-from textual.strip import Strip
-from textual.widgets import Button, Input, OptionList, RichLog, Static
+from textual.containers import Horizontal
+from textual.widgets import Input, OptionList, Static
 
 from nexus.config.provider_profiles import usable_prompt_budget
 from nexus.context import TokenEstimator
 from nexus.hooks import HookEvent
 from nexus.models import (
-    AgentEventType,
     ConfirmationKind,
     ConfirmationRequest,
     ConfirmationResponse,
     Message,
     ToolResult,
 )
-from nexus.runtime.orchestration import run_orchestrated_turn
 from nexus.runtime.clarifications import (
-    ask_user_display_lines,
     ask_user_input_prompt,
     is_ask_user_confirmation,
     parse_ask_user_response,
 )
+from nexus.runtime.orchestration import run_orchestrated_turn
 from nexus.runtime.turn_runner import (
     ConfirmationCallback,
     approval_policy_for_request,
@@ -65,100 +46,81 @@ from nexus.runtime.turn_runner import (
     approval_response_from_answer,
 )
 from nexus.security.policy import ApprovalPolicy
-from nexus.ui.terminal import (
-    NEXUS_THEME,
-    TerminalUI,
-    _MAX_TOOL_PARAM_SUMMARY_CHARS,
-    _solid_ascii_banner,
-    _tool_failure_reason,
+from nexus.ui.terminal import NEXUS_THEME
+from nexus.ui.textual_rendering import (
+    TextualTerminalUI,
+    _MUTATING_FILE_TOOLS,
+    _TOOL_ROW_INDENT,
+    _VERIFY_TOOL_NAMES,
+    _DiffRow,
+    _FileChangePreview,
+    _ResponsiveDiff,
+    _bash_command_block,
+    _bash_output_block,
+    _command_tool_body,
+    _first_lines,
+    _line_count,
+    _markdown_code_fence,
+    _parse_json_object,
+    _should_collapse_text,
+    _subagent_completion_header,
+    _subagent_completion_summary,
+    _subagent_result_body,
+    _subagent_result_json_row,
+    _subagent_result_preview,
+    _subagent_result_summary_block,
+    _subagent_title,
+    _with_inline_toggle,
 )
+from nexus.ui.textual_utils import (
+    _approval_request_key,
+    _approval_resolution_summary,
+    _compact_workspace_label,
+    _context_pie_icon,
+    _context_style,
+    _copy_to_system_clipboard as _utils_copy_to_system_clipboard,
+    _clipboard_commands as _utils_clipboard_commands,
+    _input_response_block,
+    _is_explicit_denial_answer,
+    _renderable_plain_text,
+    _slash_command_suggestion_options,
+    _strip_mouse_escape_sequences,
+    _user_prompt_block,
+)
+from nexus.ui.textual_widgets import FileChangePreviewScreen, PromptInput, TranscriptLog
 
 if TYPE_CHECKING:
     from rich.console import RenderableType
 
-    from nexus.models import AgentEvent
     from nexus.runtime.agent import Agent
     from nexus.runtime.repl_state import ReplState
     from nexus.runtime.slash_commands import SlashCommandRouter
 
 
-_MOUSE_ESCAPE_RE = re.compile(
-    r"(?:\x1b)?\[(?:<\d{1,4};\d{1,5};\d{1,5}[mM]|M.{3})"
-)
-_RIGHT_MOUSE_BUTTON = 3
-_COLLAPSED_PREVIEW_LINES = 15
-_COLLAPSE_LINE_LIMIT = 18
-_COLLAPSE_CHAR_LIMIT = 2400
-_ALERT_PREVIEW_CHARS = 150
-_COMMAND_PREVIEW_CHARS = 1600
-_SIDE_BY_SIDE_DIFF_WIDTH = 104
-_DIFF_EDITOR_BACKGROUND = "#272822"
-_DIFF_DELETE_BACKGROUND = "#3a2020"
-_DIFF_ADD_BACKGROUND = "#203a24"
-_MUTATING_FILE_TOOLS = {"write_file", "edit", "insert_edit_into_file", "apply_patch"}
-_VERIFY_TOOL_NAMES = {"bash", "run_tests", "run_python_check"}
-_AGENT_BULLET = "● "
-_TOOL_ROW_INDENT = "   "
-
-
-@dataclass(frozen=True)
-class _DiffRow:
-    before_number: int | None
-    after_number: int | None
-    before: str
-    after: str
-    kind: str
-
-
-@dataclass(frozen=True)
-class _ResponsiveDiff:
-    """Render a file diff using the width available at paint time."""
-
-    rows: tuple[_DiffRow, ...]
-    path: str = ""
-    language: str = "text"
-    new_file: bool = False
-    toggle_id: str = ""
-
-    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
-        del console
-        yield _render_diff_layout(
-            list(self.rows),
-            path=self.path,
-            language=self.language,
-            width=max(1, options.max_width),
-            new_file=self.new_file,
-            toggle_id=self.toggle_id,
-        )
-
-
-@dataclass(frozen=True)
-class _FencedCodeBlock:
-    """Render command text or console output as a Markdown code fence."""
-
-    value: str
-    language: str = "text"
-    label: str = ""
-    label_style: str = "dim"
-    collapsed: bool = False
-    toggle_id: str = ""
-
-    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
-        del console, options
-        value = self.value.rstrip() or "(empty)"
-        truncated = False
-        if self.collapsed:
-            value, truncated = _bounded_command_preview(value)
-        blocks: list[RenderableType] = []
-        if self.label:
-            blocks.append(Text(self.label, style=self.label_style))
-        blocks.append(Markdown(_markdown_code_fence(value, language=self.language)))
-        if truncated:
-            hint = Text("... click [+] to expand", style="dim")
-            if self.toggle_id:
-                hint.stylize(Style(meta={"nexus_toggle": self.toggle_id}))
-            blocks.append(hint)
-        yield Group(*blocks)
+__all__ = [
+    "FileChangePreviewScreen",
+    "NexusTextualApp",
+    "PromptInput",
+    "TextualTerminalUI",
+    "TranscriptLog",
+    "_DiffRow",
+    "_ResponsiveDiff",
+    "_bash_command_block",
+    "_bash_output_block",
+    "_clipboard_commands",
+    "_context_pie_icon",
+    "_copy_to_system_clipboard",
+    "_markdown_code_fence",
+    "_renderable_plain_text",
+    "_strip_mouse_escape_sequences",
+    "_user_prompt_block",
+    "can_use_textual_ui",
+    "run_textual_repl",
+    "shutil",
+    "subprocess",
+    "sys",
+    "time",
+]
 
 
 @dataclass
@@ -168,15 +130,14 @@ class _PendingApproval:
     future: asyncio.Future[ConfirmationResponse]
 
 
-@dataclass(frozen=True)
-class _FileChangePreview:
-    request: ConfirmationRequest
-    actions_enabled: bool = True
+def _clipboard_commands() -> list[list[str]]:
+    return _utils_clipboard_commands()
 
 
-def _strip_mouse_escape_sequences(value: str) -> str:
-    """Remove leaked terminal mouse reports from input text."""
-    return _MOUSE_ESCAPE_RE.sub("", value)
+def _copy_to_system_clipboard(text: str) -> bool:
+    return _utils_copy_to_system_clipboard(
+        text, commands=_clipboard_commands(), run=subprocess.run
+    )
 
 
 def can_use_textual_ui(config: Any) -> bool:
@@ -210,1421 +171,6 @@ async def run_textual_repl(
         await app.run_async(mouse=True)
     finally:
         await app.finalize_session()
-
-
-class TextualTerminalUI(TerminalUI):
-    """TerminalUI-compatible adapter that writes Rich renderables to Textual."""
-
-    def __init__(self, app: "NexusTextualApp") -> None:
-        super().__init__(color=True)
-        self._app = app
-        self._tool_started_at: dict[str, float] = {}
-
-    def _write(self, renderable: RenderableType) -> dict[str, Any]:
-        return self._app.write(renderable)
-
-    def print(self, *args: Any, **kwargs: Any) -> None:
-        if not args:
-            self._write(Text(""))
-            return
-        if len(args) == 1 and not isinstance(args[0], str):
-            self._write(cast("RenderableType", args[0]))
-            return
-        sep = str(kwargs.get("sep", " "))
-        markup = bool(kwargs.get("markup", True))
-        text = sep.join(str(arg) for arg in args)
-        self._write(Text.from_markup(text) if markup else Text(text))
-
-    def input(self, prompt: str = "") -> str:
-        raise RuntimeError("TextualTerminalUI input is asynchronous; use NexusTextualApp.ask().")
-
-    def prompt_user(self) -> str:
-        raise RuntimeError("TextualTerminalUI prompt_user is handled by the Textual input widget.")
-
-    def print_error(self, msg: str) -> None:
-        self.end_assistant()
-        self._write_alert("Request failed", msg, title_style="bold red", body_style="red on #2a1717")
-
-    def print_warning(self, msg: str) -> None:
-        self._write_alert("Warning", msg, title_style="bold yellow", body_style="yellow on #2b2516")
-
-    def print_success(self, msg: str) -> None:
-        self._write(Text(msg, style="bold green"))
-
-    def print_info(self, msg: str) -> None:
-        self._write(Text(msg, style="cyan"))
-
-    def print_muted(self, msg: str) -> None:
-        self._write(Text(msg, style="dim"))
-
-    def _write_alert(
-        self,
-        title: str,
-        msg: str,
-        *,
-        title_style: str,
-        body_style: str,
-    ) -> None:
-        header = Text()
-        header.append(title, style=title_style)
-        header.append(":", style=title_style)
-        body = Text(str(msg or ""), style=body_style)
-        if _should_collapse_alert(msg):
-            self._app.write_collapsible(
-                header,
-                body,
-                summary=f"{len(str(msg or ''))} chars",
-                preview=Text(_alert_preview(msg), style=body_style),
-            )
-            return
-        self._write(Group(header, body))
-
-    def print_rule(self, title: str = "", *, style: str = "border") -> None:
-        del style
-        self._write(Rule(title))
-
-    def print_markdown(self, content: str) -> None:
-        self._write(Markdown(content))
-
-    def print_banner(
-        self,
-        provider: str,
-        model: str,
-        mode: str,
-        *,
-        workspace: str | Path | None = None,
-    ) -> None:
-        self._workspace_root = Path(workspace).resolve() if workspace is not None else None
-        body = Table.grid(expand=True)
-        body.add_column(style="dim", width=12)
-        body.add_column(style="bold cyan")
-        body.add_row("Provider", provider)
-        body.add_row("Model", model)
-        body.add_row("Mode", mode)
-        if workspace is not None:
-            body.add_row("Workspace", str(Path(workspace).resolve()))
-        body.add_row("Quick help", "/help  |  /skills  |  /session  |  /quit")
-        self._write(
-            Panel(
-                Group(_solid_ascii_banner(), "", body),
-                title=Text("Nexus Coding Agent", style="bold white"),
-                title_align="left",
-                border_style="cyan",
-                box=box.ROUNDED,
-                padding=(1, 2),
-            )
-        )
-
-    def print_session_resumed(self, session_id: str, msg_count: int) -> None:
-        noun = "message" if msg_count == 1 else "messages"
-        self._write(
-            Panel(
-                Text(
-                    f"Resumed session {session_id} with {msg_count} {noun}. "
-                    "Use /session new to start fresh or /session list to switch.",
-                    style="dim",
-                ),
-                title=Text("Session", style="cyan"),
-                title_align="left",
-                border_style="cyan",
-                box=box.ROUNDED,
-                padding=(0, 2),
-            )
-        )
-
-    def print_help_hint(self) -> None:
-        self._write(Text("Type /help for commands, /skills for skill control, /abort to stop a running turn, or /quit to exit.", style="dim"))
-
-    def print_fake_provider_notice(self) -> None:
-        self._write(
-            Panel(
-                Text(
-                    "Using the fake provider. Responses are mocked; set a real provider, API_KEY, and BASE_URL in .env for live coding-agent responses.",
-                    style="yellow",
-                ),
-                title=Text("Provider notice", style="bold yellow"),
-                title_align="left",
-                border_style="yellow",
-                box=box.ROUNDED,
-                padding=(0, 2),
-            )
-        )
-
-    def print_no_api_key_warning(self, provider: str) -> None:
-        self._write(
-            Panel(
-                Text(
-                    f"No API key found for provider {provider}. Add API_KEY to .env or configure a provider-specific key before starting a live session.",
-                    style="yellow",
-                ),
-                title=Text("Provider setup required", style="bold yellow"),
-                title_align="left",
-                border_style="yellow",
-                box=box.ROUNDED,
-                padding=(0, 2),
-            )
-        )
-
-    def begin_assistant(self) -> None:
-        if self._assistant_stream_open:
-            return
-        self._app.close_supervisor_group()
-        if self._app._turn_had_tool_calls:
-            self._write(Text(""))
-        self._write(_assistant_header())
-        self._assistant_stream_open = True
-
-    def end_assistant(self) -> None:
-        self._assistant_stream_open = False
-
-    def start_thinking(self, label: str = "Thinking") -> None:
-        self._app.set_status(label)
-
-    def stop_thinking(self) -> None:
-        self._app.clear_status()
-
-    def start_tool_wait(self, label: str) -> None:
-        self._app.set_status(label)
-
-    def stop_tool_wait(self) -> None:
-        self._app.clear_status()
-
-    def _semantic_tool_label(self, tool_name: str, *, completed: bool = False, failed: bool = False) -> str:
-        if failed:
-            return "Failed"
-        labels = {
-            "bash": "Ran" if completed else "Run",
-            "write_file": "Wrote file" if completed else "Write file",
-            "edit": "Edited file" if completed else "Edit file",
-            "insert_edit_into_file": "Edited file" if completed else "Edit file",
-            "apply_patch": "Patched files" if completed else "Patch files",
-            "read_file": "Read" if completed else "Read",
-            "list_dir": "Listed" if completed else "List",
-            "grep": "Searched" if completed else "Search",
-            "glob": "Found" if completed else "Find",
-            "run_tests": "Tested" if completed else "Test",
-            "run_python_check": "Checked" if completed else "Check",
-            "run_formatter": "Formatted" if completed else "Format",
-            "git_status": "Git status" if completed else "Git status",
-            "git_diff": "Git diff" if completed else "Git diff",
-        }
-        if tool_name.startswith("subagent_"):
-            return "Delegated" if completed else "Delegate"
-        return labels.get(tool_name, tool_name)
-
-    def _elapsed_label(self, call_id: str, result: ToolResult | None = None) -> str:
-        duration = None
-        if result is not None:
-            raw_duration = result.metadata.get("duration_ms") if isinstance(result.metadata, dict) else None
-            if isinstance(raw_duration, (int, float)):
-                duration = float(raw_duration) / 1000
-        if duration is None and call_id in self._tool_started_at:
-            duration = max(0.0, time.perf_counter() - self._tool_started_at[call_id])
-        if duration is None:
-            return ""
-        if duration < 1:
-            return f"{duration * 1000:.0f}ms"
-        return f"{duration:.1f}s"
-
-    def _tool_target(self, tool_name: str, args: dict[str, Any], result: ToolResult | None = None) -> str:
-        metadata = result.metadata if result is not None and isinstance(result.metadata, dict) else {}
-        path = metadata.get("path") or args.get("path") or args.get("cwd")
-        if isinstance(path, str) and path.strip():
-            return self._relative_path(path)
-        command = _command_from_arguments(args)
-        if command:
-            return self._truncate_preview(command, limit=100)
-        if tool_name.startswith("subagent_"):
-            return self._compact_tool_detail(tool_name, args)
-        return self._compact_tool_detail(tool_name, args)
-
-    def _tool_label_style(self, tool_name: str, result: ToolResult | None = None) -> str:
-        if result is not None and result.is_error:
-            return "error"
-        if result is not None and tool_name == "write_file":
-            return "bold tool.write"
-        return self._tool_border_style(tool_name)
-
-    def _block_text(self, *lines: str, style: str = "default") -> Text:
-        text = Text()
-        for index, line in enumerate(lines):
-            if index:
-                text.append("\n")
-            text.append(line, style=style)
-        return text
-
-    def _inline_header(self, prefix: str, title: str, detail: str = "", *, style: str = "tool") -> Text:
-        text = Text(prefix, style="dim")
-        text.append(title, style=style)
-        if detail:
-            text.append(f" {detail}", style="dim")
-        return text
-
-    def _append_elapsed(self, text: Text, elapsed: str) -> None:
-        if not elapsed:
-            return
-        text.append(" · ", style="dim")
-        text.append(elapsed, style="bold bright_cyan")
-
-    def _command_start_header(self, call_id: str) -> Text:
-        text = Text("\n. ", style="dim")
-        text.append("Run Command :", style="bold tool.shell")
-        text.append(f" #{call_id[:8]}", style="bold tool.shell")
-        return text
-
-    def _command_tool_start_header(
-        self,
-        call_id: str,
-        tool_name: str,
-        args: dict[str, Any],
-    ) -> Text:
-        command = _command_for_tool(tool_name, args)
-        detail = self._tool_target(tool_name, args) or self._truncate_preview(command, limit=100)
-        label = _command_tool_title(tool_name)
-        return self._inline_header("· ", label, f"{detail}  #{call_id[:8]}", style=self._tool_border_style(tool_name))
-
-    def _command_tool_complete_header(
-        self,
-        result: ToolResult,
-        args: dict[str, Any],
-        command: str,
-    ) -> Text:
-        status = "failed" if result.is_error else "done"
-        target = self._tool_target(result.tool_name, args, result) or self._truncate_preview(command, limit=100)
-        detail_parts = [target, status]
-        if result.is_error:
-            detail_parts[-1] = f"failed: {_tool_failure_reason(result)}"
-        header = self._inline_header(
-            "✗ " if result.is_error else "✓ ",
-            _command_tool_title(result.tool_name),
-            " · ".join(part for part in detail_parts if part),
-            style="error" if result.is_error else self._tool_border_style(result.tool_name),
-        )
-        self._append_elapsed(header, self._elapsed_label(result.call_id, result))
-        return header
-
-    def _render_inline_tool_start(
-        self,
-        call_id: str,
-        tool_name: str,
-        actor: str,
-        args: dict[str, Any],
-        display: dict[str, Any],
-    ) -> Text | Group:
-        del actor, display
-        self._tool_started_at[call_id] = time.perf_counter()
-        if _is_subagent_tool(tool_name):
-            return self._render_subagent_header(tool_name, args)
-        label = self._semantic_tool_label(tool_name)
-        command = _command_from_arguments(args)
-        if command:
-            return Group(
-                self._command_start_header(call_id),
-                _bash_command_block(command),
-            )
-        target = self._tool_target(tool_name, args)
-        style = self._tool_border_style(tool_name)
-        return self._inline_header("> ", label, f"{target}  #{call_id[:8]}", style=style)
-
-    def _write_inline_tool_start(
-        self,
-        call_id: str,
-        tool_name: str,
-        actor: str,
-        args: dict[str, Any],
-        display: dict[str, Any],
-    ) -> None:
-        if _is_command_like_tool(tool_name, args):
-            self._tool_started_at[call_id] = time.perf_counter()
-            self._app.begin_command_tool_entry(
-                call_id,
-                header=self._command_tool_start_header(call_id, tool_name, args),
-                command=_command_for_tool(tool_name, args),
-            )
-            return
-        self._write(self._render_inline_tool_start(call_id, tool_name, actor, args, display))
-
-    def _render_subagent_header(self, tool_name: str, args: dict[str, Any]) -> Text:
-        title = _subagent_title(args)
-        header = Text(_AGENT_BULLET, style="bold magenta")
-        header.append(_subagent_task_label(tool_name), style="bold magenta")
-        if title:
-            header.append(" - ", style="dim")
-            header.append(title, style="bold white")
-        return header
-
-    def _render_supervisor_header(self) -> Text:
-        return Text(f"{_AGENT_BULLET}Supervisor Agent", style="bold cyan")
-
-    def _render_subagent_tool_row(
-        self,
-        call_id: str,
-        tool_name: str,
-        args: dict[str, Any],
-        result: ToolResult | None = None,
-        *,
-        file_preview_call_id: str = "",
-    ) -> Text:
-        label = self._semantic_tool_label(
-            tool_name,
-            completed=result is not None,
-            failed=bool(result.is_error) if result is not None else False,
-        )
-        if result is not None and result.is_error:
-            label = tool_name
-        target = self._tool_target(tool_name, args, result)
-        style = self._tool_label_style(tool_name, result)
-        has_file_preview = bool(file_preview_call_id)
-        if result is None:
-            row = Text(f"{_TOOL_ROW_INDENT}· ", style="dim")
-        elif result.is_error:
-            row = Text(f"{_TOOL_ROW_INDENT}✗ ", style="bold red")
-        elif has_file_preview:
-            row = Text(f"{_TOOL_ROW_INDENT}", style="dim")
-            marker_start = len(row.plain)
-            row.append("[+] ", style="cyan")
-            row.stylize(
-                Style(color="cyan", meta={"nexus_file_preview_call_id": file_preview_call_id}),
-                marker_start,
-                len(row.plain),
-            )
-            row.append("✓ ", style="bold green")
-        else:
-            row = Text(f"{_TOOL_ROW_INDENT}✓ ", style="bold green")
-        row.append(label, style=style)
-        if target:
-            row.append(" ", style="dim")
-            target_start = len(row.plain)
-            row.append(target, style="dim")
-            if has_file_preview:
-                row.stylize(
-                    Style(color="bright_cyan", underline=True, meta={"nexus_file_preview_call_id": file_preview_call_id}),
-                    target_start,
-                    len(row.plain),
-                )
-        row.append(f"  #{call_id[:8]}", style="dim")
-        if result is None:
-            row.append(" · running", style="dim")
-            return row
-        if result.is_error:
-            row.append(" · failed", style="bold red")
-            reason = _tool_failure_reason(result)
-            if reason:
-                row.append(f": {self._truncate_preview(reason, limit=120)}", style="dim red")
-        else:
-            row.append(" · done", style="dim")
-        self._append_elapsed(row, self._elapsed_label(call_id, result))
-        return row
-
-    def _render_subagent_command_tool_row(
-        self,
-        call_id: str,
-        tool_name: str,
-        args: dict[str, Any],
-        result: ToolResult | None = None,
-        *,
-        expanded: bool = False,
-        approval_required: bool = False,
-        live_output: str = "",
-    ) -> RenderableType:
-        marker = "[-]" if expanded else "[+]"
-        marker_style = Style(color="cyan", meta={"nexus_subagent_command_call_id": call_id})
-        row = Text(f"{_TOOL_ROW_INDENT}", style="dim")
-        marker_start = len(row.plain)
-        row.append(f"{marker} ", style="cyan")
-        row.stylize(marker_style, marker_start, len(row.plain))
-        if result is None:
-            row.append("? " if approval_required else "· ", style="bold yellow" if approval_required else "dim")
-        elif result.is_error:
-            row.append("✗ ", style="bold red")
-        else:
-            row.append("✓ ", style="bold green")
-        label_start = len(row.plain)
-        row.append(_command_tool_title(tool_name), style="error" if result is not None and result.is_error else self._tool_border_style(tool_name))
-        row.stylize(
-            Style(color="bright_cyan", underline=True, meta={"nexus_subagent_command_call_id": call_id}),
-            label_start,
-            len(row.plain),
-        )
-        command = _command_for_tool(tool_name, args, result)
-        if command:
-            row.append(" ", style="dim")
-            row.append(self._truncate_preview(command, limit=100), style="dim")
-        row.append(f"  #{call_id[:8]}", style="dim")
-        if result is None:
-            row.append(" · approval required" if approval_required else " · running", style="warning" if approval_required else "dim")
-            if not expanded:
-                return row
-            return Group(row, Padding(_command_tool_body(command, live_output, running=True), (0, 0, 0, 6)))
-        if result.is_error:
-            row.append(f" · failed: {self._truncate_preview(_tool_failure_reason(result), limit=120)}", style="dim red")
-        else:
-            row.append(" · done", style="dim")
-        self._append_elapsed(row, self._elapsed_label(call_id, result))
-        if not expanded:
-            return row
-        output = _tool_failure_reason(result) if result.is_error else (result.output or "").strip()
-        if not output:
-            output = "(no output)"
-        return Group(row, Padding(_command_tool_body(command, output), (0, 0, 0, 6)))
-
-    def _render_supervisor_row(
-        self,
-        call_id: str,
-        tool_name: str,
-        args: dict[str, Any],
-        result: ToolResult | None = None,
-    ) -> Text:
-        label = self._semantic_tool_label(
-            tool_name,
-            completed=result is not None,
-            failed=bool(result.is_error) if result is not None else False,
-        )
-        if result is not None and result.is_error:
-            label = tool_name
-        target = self._tool_target(tool_name, args, result)
-        style = self._tool_label_style(tool_name, result)
-        if result is None:
-            row = Text(f"{_TOOL_ROW_INDENT}· ", style="dim")
-        elif result.is_error:
-            row = Text(f"{_TOOL_ROW_INDENT}✗ ", style="bold red")
-        else:
-            row = Text(f"{_TOOL_ROW_INDENT}✓ ", style="bold green")
-        row.append(label, style=style)
-        if target:
-            row.append(f" {target}", style="dim")
-        if result is None:
-            return row
-        if result.is_error:
-            row.append(" · failed", style="bold red")
-            reason = _tool_failure_reason(result)
-            if reason:
-                row.append(f": {self._truncate_preview(reason, limit=160)}", style="dim red")
-        else:
-            self._append_elapsed(row, self._elapsed_label(call_id, result))
-        return row
-
-    def _render_bash_complete(self, result: ToolResult, args: dict[str, Any]) -> None:
-        self._render_command_tool_complete(result, args)
-
-    def _render_command_tool_complete(self, result: ToolResult, args: dict[str, Any]) -> None:
-        command = _command_for_tool(result.tool_name, args, result)
-        approval_request = ConfirmationRequest(
-            kind=ConfirmationKind.APPROVAL,
-            tool_name=result.tool_name,
-            prompt="",
-            reason="Command has already run.",
-            payload={"preview_only": True},
-            call_id=result.call_id,
-            arguments=dict(args),
-            preview={"command": command} if command else {},
-        )
-        absorbed_approval = self._app.absorb_approval_entries_for_request(approval_request)
-        if absorbed_approval:
-            self._app.absorb_tool_start_entries(result.call_id)
-        output = _tool_failure_reason(result) if result.is_error else (result.output or "").strip()
-        if not output:
-            output = "(no output)"
-        self._app.finish_command_tool_entry(
-            result.call_id,
-            header=self._command_tool_complete_header(result, args, command),
-            command=command,
-            output=output,
-            summary=_command_tool_summary(result, output),
-        )
-
-    def _render_confirmation_preview(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        preview: dict[str, Any],
-    ) -> tuple[RenderableType, RenderableType, str] | None:
-        diff_data = _diff_data_from_preview(preview) or _diff_data_from_arguments(tool_name, args)
-        diff = _diff_text_from_data(diff_data) or _diff_from_arguments(tool_name, args)
-        if not diff and tool_name == "apply_patch":
-            diff = str(args.get("patch", "") or "")
-        if diff:
-            target = self._tool_target(tool_name, args)
-            return (
-                self._render_file_diff_preview(tool_name, diff_data, diff, path=target, collapsed=False),
-                self._render_file_diff_preview(tool_name, diff_data, diff, path=target, collapsed=True),
-                _diff_summary(diff),
-            )
-        command = _command_from_preview_or_arguments(preview, args)
-        if command:
-            return (
-                _bash_command_block(command),
-                _bash_command_block(command, collapsed=True),
-                f"{_line_count(command)} line{'s' if _line_count(command) != 1 else ''}",
-            )
-        return None
-
-    def _write_confirmation_request(
-        self,
-        req: ConfirmationRequest,
-        *,
-        actor: str,
-        display_name: str,
-        policy: str,
-    ) -> None:
-        del actor
-        args = {str(key): value for key, value in req.arguments.items()}
-        preview = {str(key): value for key, value in req.preview.items()}
-        target = self._tool_target(req.tool_name, args)
-        action = self._semantic_tool_label(req.tool_name)
-        request_detail = f"{action} {target}".strip() if req.tool_name in _MUTATING_FILE_TOOLS else display_name
-        header = self._inline_header(
-            "? ",
-            "Approval required",
-            f"{request_detail}  #{req.call_id[:8] or 'pending'}",
-            style="warning",
-        )
-        detail = self._render_approval_detail(req.tool_name, args, req.reason, policy)
-        rendered_preview = self._render_confirmation_preview(req.tool_name, args, preview)
-        if rendered_preview is None:
-            entry = self._write(Group(header, detail))
-            if isinstance(entry, dict):
-                entry["approval_request_key"] = _approval_request_key(req)
-            return
-        expanded, collapsed_preview, summary = rendered_preview
-        entry = self._app.write_collapsible(
-            header,
-            Group(detail, expanded),
-            summary=summary,
-            initially_expanded=False,
-            preview=Group(collapsed_preview, detail),
-        )
-        entry["approval_request_key"] = _approval_request_key(req)
-        if req.tool_name in _MUTATING_FILE_TOOLS:
-            entry["file_preview"] = _FileChangePreview(req, actions_enabled=True)
-            entry["approval_pending"] = True
-            entry["clickable_path"] = target
-
-    def _render_file_change_complete(
-        self,
-        result: ToolResult,
-        args: dict[str, Any],
-        preview: dict[str, Any],
-    ) -> None:
-        elapsed = self._elapsed_label(result.call_id, result)
-        target = self._tool_target(result.tool_name, args, result)
-        label = self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error)
-        if result.is_error:
-            label = result.tool_name
-        detail = " · ".join(part for part in (target, "failed" if result.is_error else "done") if part)
-        header = self._inline_header(
-            "✗ " if result.is_error else "✓ ",
-            label,
-            detail,
-            style=self._tool_label_style(result.tool_name, result),
-        )
-        self._append_elapsed(header, elapsed)
-        if result.is_error:
-            body_text = f"{result.tool_name} failed: {_tool_failure_reason(result)}"
-            body = self._block_text(body_text, style="red on #1f1f1f")
-            if _should_collapse_text(result.output):
-                self._app.write_collapsible(
-                    header,
-                    body,
-                    summary=f"{_line_count(result.output)} lines",
-                    preview=_preview_text_block(body_text, style="red on #1f1f1f"),
-                )
-            else:
-                self._write(Group(header, body))
-            return
-
-        diff_data = _diff_data_from_preview(preview)
-        diff = _diff_text_from_data(diff_data) or _diff_from_arguments(result.tool_name, args)
-        if not diff and ("old_content" in diff_data or "new_content" in diff_data):
-            diff = _unified_diff_text(
-                str(diff_data.get("old_content", "") or ""),
-                str(diff_data.get("new_content", "") or ""),
-                path=target or str(diff_data.get("path") or "file"),
-            )
-        if not diff:
-            self._write(header)
-            return
-
-        diff_renderable = self._render_file_diff_preview(result.tool_name, diff_data, diff, path=target, collapsed=False)
-        file_preview = self._file_change_preview_info(result, args, preview)
-        if file_preview is not None:
-            self._app.register_file_preview(file_preview)
-            self._app.absorb_approval_entries_for_request(file_preview.request)
-        entry = self._app.write_collapsible(
-            header,
-            diff_renderable,
-            summary=_diff_summary(diff),
-            initially_expanded=False,
-            preview=self._render_file_diff_preview(result.tool_name, diff_data, diff, path=target, collapsed=True),
-        )
-        if file_preview is not None:
-            entry["file_preview"] = file_preview
-            entry["clickable_path"] = target
-
-    def _file_change_preview_info(
-        self,
-        result: ToolResult,
-        args: dict[str, Any],
-        preview: dict[str, Any],
-    ) -> _FileChangePreview | None:
-        if result.is_error or result.tool_name not in _MUTATING_FILE_TOOLS:
-            return None
-        target = self._tool_target(result.tool_name, args, result)
-        diff_data = _diff_data_from_preview(preview)
-        diff = _diff_text_from_data(diff_data) or _diff_from_arguments(result.tool_name, args)
-        if not diff and result.tool_name == "apply_patch":
-            diff = str(args.get("patch", "") or "")
-        if not diff and ("old_content" in diff_data or "new_content" in diff_data):
-            diff = _unified_diff_text(
-                str(diff_data.get("old_content", "") or ""),
-                str(diff_data.get("new_content", "") or ""),
-                path=target or str(diff_data.get("path") or "file"),
-            )
-        if not diff:
-            return None
-        request = ConfirmationRequest(
-            kind=ConfirmationKind.APPROVAL,
-            tool_name=result.tool_name,
-            prompt="",
-            reason="File change has already been applied.",
-            payload={"preview_only": True},
-            call_id=result.call_id,
-            arguments=dict(args),
-            preview=dict(preview),
-        )
-        return _FileChangePreview(request, actions_enabled=False)
-
-    def _render_diff_editor(self, diff_text: str, *, path: str = "") -> _ResponsiveDiff:
-        return self._render_diff_rows(_diff_rows_from_unified_diff(diff_text), path=path)
-
-    def _render_diff_editor_preview(self, diff_text: str, *, path: str = "") -> _ResponsiveDiff:
-        rows = _collapsed_diff_rows(_diff_rows_from_unified_diff(diff_text), limit=_COLLAPSED_PREVIEW_LINES)
-        return self._render_diff_rows(rows, path=path)
-
-    def _render_diff_rows(self, rows: list[_DiffRow], *, path: str = "") -> _ResponsiveDiff:
-        return _ResponsiveDiff(
-            rows=tuple(rows),
-            path=path,
-            language=self._guess_language(path),
-        )
-
-    def _render_file_diff_preview(
-        self,
-        tool_name: str,
-        diff_data: dict[str, Any],
-        diff_text: str,
-        *,
-        path: str = "",
-        collapsed: bool = False,
-    ) -> _ResponsiveDiff:
-        old_content = str(diff_data.get("old_content", "") or "")
-        new_content = str(diff_data.get("new_content", "") or "")
-        has_contents = "old_content" in diff_data or "new_content" in diff_data
-        if _should_render_as_new_file(tool_name, diff_data):
-            return _render_new_file_preview(
-                new_content,
-                path=path,
-                language=self._guess_language(path),
-                collapsed=collapsed,
-            )
-        if has_contents:
-            rows = _diff_rows_from_contents(old_content, new_content)
-        else:
-            rows = _diff_rows_from_unified_diff(diff_text)
-        if collapsed:
-            rows = _collapsed_diff_rows(rows, limit=_COLLAPSED_PREVIEW_LINES)
-        return self._render_diff_rows(rows, path=path)
-
-    def _render_file_change_editor_preview(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        preview: dict[str, Any],
-        *,
-        path: str = "",
-    ) -> RenderableType:
-        diff_data = _diff_data_from_preview(preview) or _diff_data_from_arguments(tool_name, args)
-        diff_text = _diff_text_from_data(diff_data) or _diff_from_arguments(tool_name, args)
-        if not diff_text and tool_name == "apply_patch":
-            diff_text = str(args.get("patch", "") or "")
-
-        old_content = str(diff_data.get("old_content", "") or "")
-        new_content = str(diff_data.get("new_content", "") or "")
-        if "old_content" in diff_data or "new_content" in diff_data:
-            rows = _diff_rows_from_contents(old_content, new_content)
-        else:
-            rows = _diff_rows_from_unified_diff(diff_text)
-        if not rows and (old_content or new_content):
-            rows = _diff_rows_from_contents(old_content, new_content, context=0)
-        if not rows:
-            return Text("(no file preview available)", style="dim")
-        return self._render_diff_rows(rows, path=path)
-
-    def _render_approval_detail(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        reason: str,
-        policy: str,
-    ) -> Table:
-        table = Table.grid(expand=True, padding=(0, 1))
-        table.add_column(style="dim", no_wrap=True, width=9)
-        table.add_column(ratio=1, overflow="fold")
-        visible_args = args
-        if tool_name == "bash":
-            visible_args = {key: value for key, value in args.items() if key != "command"}
-        if visible_args:
-            table.add_row("params", self._approval_params_summary(tool_name, visible_args))
-        table.add_row("reason", Text(reason, style="dim"))
-        table.add_row("approval", Text(self._approval_choices(policy).replace("Approval: ", ""), style="warning"))
-        return table
-
-    def _approval_params_summary(self, tool_name: str, args: dict[str, Any]) -> Text:
-        parts = [
-            f"{key}={self._compact_value(key, value)}"
-            for key, value in self._ordered_args(tool_name, args)
-        ]
-        return Text(
-            self._truncate_preview(", ".join(parts), limit=_MAX_TOOL_PARAM_SUMMARY_CHARS),
-            style="tool.args",
-        )
-
-    def _render_generic_complete(self, result: ToolResult, args: dict[str, Any]) -> None:
-        elapsed = self._elapsed_label(result.call_id, result)
-        label = self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error)
-        if result.is_error:
-            label = result.tool_name
-        detail = self._tool_target(result.tool_name, args, result)
-        header = self._inline_header(
-            "✗ " if result.is_error else "✓ ",
-            label,
-            detail,
-            style="error" if result.is_error else self._tool_border_style(result.tool_name),
-        )
-        self._append_elapsed(header, elapsed)
-        if not result.is_error and (not result.output or result.tool_name in {"read_file", "grep", "glob", "list_dir"}):
-            self._write(header)
-            return
-        output = f"{result.tool_name} failed: {_tool_failure_reason(result)}" if result.is_error else result.output
-        body = self._preview_block(output, path=str(result.metadata.get("path", "") if isinstance(result.metadata, dict) else ""))
-        if _should_collapse_text(result.output):
-            self._app.write_collapsible(
-                header,
-                body,
-                summary=f"{_line_count(result.output)} lines",
-                preview=_preview_text_block(output),
-            )
-        else:
-            self._write(Group(header, body))
-
-    def render_event(
-        self,
-        event: AgentEvent,
-        *,
-        stream_output: bool,
-        show_tool_calls: bool,
-        show_thinking_indicator: bool = True,
-    ) -> None:
-        del stream_output
-
-        if event.kind == AgentEventType.AGENT_START:
-            self._app.begin_turn_transcript()
-            return
-
-        if event.kind == AgentEventType.THINKING_STARTED and show_thinking_indicator:
-            self.end_assistant()
-            self.start_thinking(_thinking_label(event))
-            return
-
-        if event.kind == AgentEventType.TEXT_DELTA:
-            if event.payload:
-                self._app.append_assistant_delta(str(event.payload))
-            return
-
-        if event.kind == AgentEventType.TEXT_COMPLETE:
-            content = str(event.payload or "")
-            if content and not self._app.has_open_assistant_stream:
-                self.begin_assistant()
-                if _should_collapse_text(content):
-                    self._app.write_collapsible(
-                        Text("·", style="bold"),
-                        Markdown(content),
-                        summary=f"{_line_count(content)} lines",
-                        initially_expanded=True,
-                        preview=Markdown(_first_lines(content)),
-                    )
-                else:
-                    self._write(Markdown(content))
-            self._app.close_assistant_stream()
-            self.end_assistant()
-            return
-
-        if event.kind == AgentEventType.TOOL_CALL_START and show_tool_calls:
-            self.end_assistant()
-            payload = event.payload or {}
-            call_id = str(payload.get("call_id", ""))
-            tool_name = str(payload.get("name", "tool"))
-            actor = str(payload.get("actor", "") or "").strip()
-            arguments = payload.get("arguments", {}) if isinstance(payload.get("arguments", {}), dict) else {}
-            preview = payload.get("preview", {}) if isinstance(payload.get("preview", {}), dict) else {}
-            display = payload.get("display", {}) if isinstance(payload.get("display", {}), dict) else {}
-            self._store_tool_call_state(call_id, arguments, preview, actor, display)
-            if _is_subagent_tool(tool_name):
-                self._tool_started_at[call_id] = time.perf_counter()
-                self._app.begin_subagent_task(
-                    call_id,
-                    tool_name,
-                    arguments,
-                    header=self._render_subagent_header(tool_name, arguments),
-                )
-            elif _is_subagent_actor(actor) and self._app.has_subagent_task(actor):
-                self._tool_started_at[call_id] = time.perf_counter()
-                if _is_command_like_tool(tool_name, arguments):
-                    self._app.record_subagent_command_tool_start(actor, call_id, tool_name, arguments)
-                else:
-                    self._app.record_subagent_tool_row(
-                        actor,
-                        call_id,
-                        self._render_subagent_tool_row(call_id, tool_name, arguments),
-                    )
-            elif _is_supervisor_group_tool(tool_name, arguments):
-                self._tool_started_at[call_id] = time.perf_counter()
-                self._app._turn_had_tool_calls = True
-                if self._app._supervisor_entry is None:
-                    self._app.begin_supervisor_group(self._render_supervisor_header())
-                self._app.record_supervisor_row(
-                    call_id,
-                    self._render_supervisor_row(call_id, tool_name, arguments),
-                )
-            else:
-                self._app._turn_had_tool_calls = True
-                self._write_inline_tool_start(call_id, tool_name, actor, arguments, display)
-            self.start_tool_wait(f"{self._tool_display_name(tool_name, actor)} running")
-            return
-
-        if event.kind == AgentEventType.TOOL_CALL_COMPLETE and show_tool_calls:
-            self.end_assistant()
-            result = cast("ToolResult", event.payload)
-            if result is None:
-                return
-            if isinstance(result.metadata, dict) and result.metadata.get("tool_unavailable"):
-                self._app.finish_tool_output_stream(result.call_id)
-                self._clear_tool_call_state(result.call_id)
-                self._tool_started_at.pop(result.call_id, None)
-                return
-            preview = self._tool_preview_by_call_id.get(result.call_id, {})
-            actor = str(result.metadata.get("actor") or self._tool_actor_by_call_id.get(result.call_id, "")).strip()
-            display = self._tool_display_by_call_id.get(result.call_id, {})
-            del display
-            arguments = self._tool_args_by_call_id.get(result.call_id, {})
-            self._app.record_tool_completion(result)
-            self._app.finish_tool_output_stream(result.call_id)
-            if _is_subagent_tool(result.tool_name):
-                self._app.finish_subagent_task(
-                    result.call_id,
-                    result,
-                    elapsed=self._elapsed_label(result.call_id, result),
-                )
-            elif _is_subagent_actor(actor) and self._app.has_subagent_task(actor):
-                file_preview = self._file_change_preview_info(result, arguments, preview)
-                file_preview_call_id = ""
-                if file_preview is not None:
-                    self._app.register_file_preview(file_preview)
-                    self._app.absorb_approval_entries_for_request(file_preview.request)
-                    file_preview_call_id = result.call_id
-                if _is_command_like_tool(result.tool_name, arguments):
-                    approval_request = ConfirmationRequest(
-                        kind=ConfirmationKind.APPROVAL,
-                        tool_name=result.tool_name,
-                        prompt="",
-                        reason="Command has already run.",
-                        payload={"preview_only": True},
-                        call_id=result.call_id,
-                        arguments=dict(arguments),
-                        preview={"command": _command_for_tool(result.tool_name, arguments, result)},
-                    )
-                    self._app.absorb_approval_entries_for_request(approval_request)
-                    self._app.record_subagent_command_tool_complete(
-                        actor,
-                        result.call_id,
-                        result.tool_name,
-                        arguments,
-                        result,
-                    )
-                else:
-                    self._app.record_subagent_tool_row(
-                        actor,
-                        result.call_id,
-                        self._render_subagent_tool_row(
-                            result.call_id,
-                            result.tool_name,
-                            arguments,
-                            result,
-                            file_preview_call_id=file_preview_call_id,
-                        ),
-                    )
-            elif result.call_id in self._app._supervisor_entries_by_call_id:
-                self._app.update_supervisor_row(
-                    result.call_id,
-                    self._render_supervisor_row(result.call_id, result.tool_name, arguments, result),
-                )
-            elif self._app.has_command_tool_entry(result.call_id) or _is_command_like_tool(result.tool_name, arguments):
-                self._render_command_tool_complete(result, arguments)
-            elif result.tool_name in _MUTATING_FILE_TOOLS:
-                self._render_file_change_complete(result, arguments, preview)
-            else:
-                self._render_generic_complete(result, arguments)
-            self._clear_tool_call_state(result.call_id)
-            self._tool_started_at.pop(result.call_id, None)
-            self.start_thinking()
-            return
-
-        if event.kind == AgentEventType.TOOL_DENIED:
-            self.stop_tool_wait()
-            self.end_assistant()
-            reason = getattr(event.payload, "reason", str(event.payload))
-            self._write_alert("Tool denied", str(reason), title_style="bold red", body_style="red on #2a1717")
-            return
-
-        if event.kind == AgentEventType.CONFIRMATION_REQUESTED:
-            self.stop_tool_wait()
-            self.stop_thinking()
-            self.end_assistant()
-            req = cast("ConfirmationRequest", event.payload)
-            if req.kind is ConfirmationKind.APPROVAL:
-                actor = str(req.payload.get("actor", "") or "").strip()
-                self._store_tool_call_state(
-                    req.call_id,
-                    {str(key): value for key, value in req.arguments.items()},
-                    {str(key): value for key, value in req.preview.items()},
-                    actor,
-                    {"is_mutating": True},
-                )
-                if _is_subagent_actor(actor) and self._app.has_subagent_task(actor) and _is_command_like_tool(req.tool_name, req.arguments):
-                    self._app.record_subagent_command_tool_start(
-                        actor,
-                        req.call_id,
-                        req.tool_name,
-                        {str(key): value for key, value in req.arguments.items()},
-                        approval_required=True,
-                    )
-                    return
-                display_name = self._tool_display_name(req.tool_name, actor)
-                self._write_confirmation_request(
-                    req,
-                    actor=actor,
-                    display_name=display_name,
-                    policy=str(req.payload.get("approval_policy", "on-request")),
-                )
-            else:
-                if is_ask_user_confirmation(req):
-                    self._write(
-                        Group(
-                            self._inline_header(
-                                "? ",
-                                "Nexus needs clarification",
-                                f"#{req.call_id[:8] or 'pending'}",
-                                style="info",
-                            ),
-                            Text("\n".join(ask_user_display_lines(req))),
-                        )
-                    )
-                    return
-                actor = str(req.payload.get("actor", "") or "").strip()
-                display_name = self._tool_display_name(req.tool_name, actor)
-                self._write(
-                    Group(
-                        self._inline_header("? ", "Clarification needed", f"{display_name}  #{req.call_id[:8] or 'pending'}", style="info"),
-                        self._render_tool_argument_summary(req.tool_name, req.arguments),
-                        Text(req.prompt, style="info"),
-                        Text(req.reason, style="dim"),
-                    )
-                )
-            return
-
-        if event.kind == AgentEventType.AGENT_ERROR:
-            self.stop_thinking()
-            self.stop_tool_wait()
-            payload = event.payload or {}
-            error = payload.get("error") if isinstance(payload, dict) else str(payload)
-            self.print_error(str(error or "Unknown provider error."))
-            return
-
-        if event.kind in {
-            AgentEventType.MODEL_RESPONSE,
-            AgentEventType.TOOL_CALL_REQUESTED,
-            AgentEventType.TOOL_RESULT,
-        }:
-            return
-
-        if event.kind == AgentEventType.TURN_COMPLETED:
-            self.stop_thinking()
-            self.stop_tool_wait()
-            self._app.close_supervisor_group()
-            self._app.mark_turn_completed()
-            return
-
-        if event.kind == AgentEventType.AGENT_STOP:
-            self.stop_thinking()
-            self.stop_tool_wait()
-            self._app.close_supervisor_group()
-            self._app.write_turn_footer_if_completed()
-            return
-
-    def stream_tool_output(
-        self,
-        call_id: str,
-        tool_name: str,
-        stream_name: str,
-        chunk: str,
-    ) -> None:
-        if tool_name != "bash" or not chunk:
-            return
-        self._app.append_tool_output(call_id, stream_name, chunk)
-
-
-class PromptInput(Input):
-    """Input widget with terminal-style prompt history navigation."""
-
-    BINDINGS = [
-        ("up", "history_previous", "Previous prompt"),
-        ("down", "history_next", "Next prompt"),
-    ]
-
-    def action_history_previous(self) -> None:
-        app = cast("NexusTextualApp", self.app)
-        if app.move_slash_command_selection(-1):
-            return
-        app.action_prompt_history_previous()
-
-    def action_history_next(self) -> None:
-        app = cast("NexusTextualApp", self.app)
-        if app.move_slash_command_selection(1):
-            return
-        app.action_prompt_history_next()
-
-    def key_enter(self, event: events.Key) -> None:
-        if cast("NexusTextualApp", self.app).accept_slash_command_selection():
-            event.prevent_default()
-            event.stop()
-
-    def key_escape(self, event: events.Key) -> None:
-        if cast("NexusTextualApp", self.app).hide_slash_command_suggestions():
-            event.prevent_default()
-            event.stop()
-
-    def key_tab(self, event: events.Key) -> None:
-        # Let Tab bubble up to cycle focus to the transcript pane instead of
-        # inserting a literal tab character into the prompt.
-        event.prevent_default()
-
-    def render_line(self, y: int) -> Strip:
-        if y != 0:
-            return Strip.blank(self.size.width, self.rich_style)
-
-        console = self.app.console
-        console_options = self.app.console_options
-        max_content_width = self.scrollable_content_region.width
-        cursor_visible = self._cursor_visible if self.has_focus else True
-
-        if not self.value:
-            placeholder = Text(self.placeholder, justify="left", end="")
-            placeholder.stylize(self.get_component_rich_style("input--placeholder"))
-            if cursor_visible:
-                cursor_style = self.get_component_rich_style("input--cursor")
-                if len(placeholder) == 0:
-                    placeholder = Text(" ", end="")
-                placeholder.stylize(cursor_style, 0, 1)
-
-            strip = Strip(
-                console.render(
-                    placeholder, console_options.update_width(max_content_width + 1)
-                )
-            )
-        else:
-            result = self._value
-            value = self.value
-            value_length = len(value)
-            suggestion = self._suggestion
-            show_suggestion = len(suggestion) > value_length and self.has_focus
-            if show_suggestion:
-                result += Text(
-                    suggestion[value_length:],
-                    self.get_component_rich_style("input--suggestion"),
-                    end="",
-                )
-
-            if self.has_focus and not self.selection.is_empty:
-                start, end = self.selection
-                start, end = sorted((start, end))
-                selection_style = self.get_component_rich_style("input--selection")
-                result.stylize_before(selection_style, start, end)
-
-            if cursor_visible:
-                cursor_style = self.get_component_rich_style("input--cursor")
-                cursor = self.cursor_position
-                if not show_suggestion and self.cursor_at_end:
-                    result.pad_right(1)
-                result.stylize(cursor_style, cursor, cursor + 1)
-
-            segments = list(
-                console.render(result, console_options.update_width(self.content_width))
-            )
-
-            strip = Strip(segments)
-            scroll_x, _ = self.scroll_offset
-            strip = strip.crop(scroll_x, scroll_x + max_content_width + 1)
-            strip = strip.extend_cell_length(max_content_width + 1)
-
-        return strip.apply_style(self.rich_style)
-
-
-class TranscriptLog(RichLog):
-    """Focusable transcript view with keyboard scrolling."""
-
-    can_focus = True
-    ALLOW_SELECT = True
-    BINDINGS = [
-        ("ctrl+a", "select_all", "Select transcript"),
-        ("up", "scroll_line_up", "Scroll up"),
-        ("down", "scroll_line_down", "Scroll down"),
-        ("pageup", "scroll_page_up", "Scroll page up"),
-        ("pagedown", "scroll_page_down", "Scroll page down"),
-        ("home", "scroll_home_key", "Scroll home"),
-        ("end", "scroll_end_key", "Scroll end"),
-    ]
-
-    def on_click(self, event: events.Click) -> None:
-        if event.button == _RIGHT_MOUSE_BUTTON:
-            event.stop()
-            return
-        preview_call_id = _file_preview_call_id_from_click(event)
-        if preview_call_id:
-            cast("NexusTextualApp", self.app).open_file_change_preview_for_call(preview_call_id)
-            event.stop()
-            return
-        command_call_id = _subagent_command_call_id_from_click(event)
-        if command_call_id:
-            cast("NexusTextualApp", self.app).toggle_subagent_command_detail(command_call_id)
-            event.stop()
-            return
-        result_json_call_id = _subagent_result_json_call_id_from_click(event)
-        if result_json_call_id:
-            cast("NexusTextualApp", self.app).toggle_subagent_result_json(result_json_call_id)
-            event.stop()
-            return
-        toggle_id = _toggle_id_from_click(event)
-        if toggle_id:
-            cast("NexusTextualApp", self.app).toggle_collapsible(toggle_id)
-            event.stop()
-            return
-        del event
-        self.focus()
-
-    def on_mouse_down(self, event: events.MouseDown) -> None:
-        if event.button != _RIGHT_MOUSE_BUTTON:
-            return
-        event.stop()
-        event.prevent_default()
-        self.focus()
-        cast("NexusTextualApp", self.app).copy_selection_or_transcript()
-
-    def on_resize(self, event: events.Resize) -> None:
-        del event
-        app = cast("NexusTextualApp", self.app)
-        if app._transcript is self:
-            app.call_after_refresh(app._rerender_transcript)
-
-    def action_scroll_line_up(self) -> None:
-        self.scroll_up(animate=False)
-
-    def action_scroll_line_down(self) -> None:
-        self.scroll_down(animate=False)
-
-    def action_scroll_page_up(self) -> None:
-        self.scroll_page_up(animate=False)
-
-    def action_scroll_page_down(self) -> None:
-        self.scroll_page_down(animate=False)
-
-    def action_scroll_home_key(self) -> None:
-        self.scroll_home(animate=False)
-
-    def action_scroll_end_key(self) -> None:
-        self.scroll_end(animate=False)
-
-    def action_select_all(self) -> None:
-        self.text_select_all()
-
-    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
-        text = "\n".join(line.text.rstrip() for line in self.lines)
-        return selection.extract(text), "\n"
-
-    def selection_updated(self, selection: Selection | None) -> None:
-        self._line_cache.clear()
-        self.refresh()
-
-    def _render_line(self, y: int, scroll_x: int, width: int) -> Strip:
-        if y >= len(self.lines):
-            return Strip.blank(width, self.rich_style).apply_offsets(scroll_x, y)
-
-        key = (y + self._start_line, scroll_x, width, self._widest_line_width)
-        if key in self._line_cache:
-            line = self._line_cache[key]
-        else:
-            line = self.lines[y].crop_extend(scroll_x, scroll_x + width, self.rich_style)
-            self._line_cache[key] = line
-
-        selection = self.text_selection
-        if selection is not None:
-            line = self._apply_selection_style(line, selection, y, scroll_x, width)
-        return line.apply_offsets(scroll_x, y)
-
-    def _apply_selection_style(
-        self,
-        line: Strip,
-        selection: Selection,
-        y: int,
-        scroll_x: int,
-        width: int,
-    ) -> Strip:
-        span = selection.get_span(y)
-        if span is None:
-            return line
-        start, end = span
-        if end == -1:
-            end = self.lines[y].cell_length
-        visible_start = max(start, scroll_x)
-        visible_end = min(end, scroll_x + width)
-        if visible_end <= visible_start:
-            return line
-        selected_start = visible_start - scroll_x
-        selected_end = visible_end - scroll_x
-        selection_style = self.screen.get_component_rich_style("screen--selection")
-        return Strip.join(
-            [
-                line.crop(0, selected_start),
-                line.crop(selected_start, selected_end).apply_style(selection_style),
-                line.crop(selected_end),
-            ]
-        )
-
-
-class FileChangePreviewScreen(ModalScreen[None]):
-    """Read-only approval preview for a pending file change."""
-
-    CSS = """
-    FileChangePreviewScreen {
-        align: center middle;
-    }
-
-    #file-preview-shell {
-        width: 92%;
-        height: 90%;
-        border: round $accent;
-        background: #1f1f1f;
-        padding: 1 2;
-    }
-
-    #file-preview-title {
-        height: auto;
-        margin-bottom: 1;
-    }
-
-    #file-preview-body-scroll {
-        height: 1fr;
-        border: round #3f3f3f;
-        background: #272822;
-        padding: 0 1;
-    }
-
-    #file-preview-body {
-        width: 100%;
-        height: auto;
-    }
-
-    #file-preview-actions {
-        height: 3;
-        margin-top: 1;
-    }
-
-    #file-preview-actions Button {
-        margin-right: 1;
-    }
-    """
-
-    BINDINGS = [("escape", "close", "Close")]
-
-    def __init__(
-        self,
-        request: ConfirmationRequest,
-        *,
-        title: Text,
-        preview_renderable: RenderableType,
-        on_accept: Callable[[], None],
-        on_reject: Callable[[], None],
-        on_close: Callable[[], None],
-        actions_enabled: bool = True,
-    ) -> None:
-        super().__init__()
-        self.request = request
-        self.title_renderable = title
-        self.preview_renderable = preview_renderable
-        self._on_accept = on_accept
-        self._on_reject = on_reject
-        self._on_close = on_close
-        self._resolved = not actions_enabled
-        self._actions_enabled = actions_enabled
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="file-preview-shell"):
-            yield Static(self.title_renderable, id="file-preview-title")
-            with VerticalScroll(id="file-preview-body-scroll"):
-                yield Static(self.preview_renderable, id="file-preview-body")
-            with Horizontal(id="file-preview-actions"):
-                accept = Button("Accept", id="file-preview-accept", variant="success")
-                reject = Button("Reject", id="file-preview-reject", variant="error")
-                accept.disabled = not self._actions_enabled
-                reject.disabled = not self._actions_enabled
-                yield accept
-                yield reject
-                yield Button("Close", id="file-preview-close")
-
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        button_id = event.button.id or ""
-        if button_id == "file-preview-accept":
-            if not self._actions_enabled:
-                return
-            self._resolve(self._on_accept)
-            self.dismiss()
-            return
-        if button_id == "file-preview-reject":
-            if not self._actions_enabled:
-                return
-            self._resolve(self._on_reject)
-            self.dismiss()
-            return
-        if button_id == "file-preview-close":
-            self.dismiss()
-
-    def action_close(self) -> None:
-        self.dismiss()
-
-    def on_unmount(self) -> None:
-        self._on_close()
-
-    def mark_resolved(self) -> None:
-        self._actions_enabled = False
-        self._resolved = True
-        for selector in ("#file-preview-accept", "#file-preview-reject"):
-            with suppress(Exception):
-                self.query_one(selector, Button).disabled = True
-
-    def _resolve(self, callback: Callable[[], None]) -> None:
-        if self._resolved:
-            return
-        self.mark_resolved()
-        callback()
 
 
 class NexusTextualApp(App[None]):
@@ -1802,14 +348,24 @@ class NexusTextualApp(App[None]):
             for message in state.history
             if message.role == "user" and message.content.strip()
         ]
-        self._prompt_history_limit = max(1, int(getattr(state.config, "prompt_history_max_entries", 200)))
+        self._prompt_history_limit = max(
+            1, int(getattr(state.config, "prompt_history_max_entries", 200))
+        )
         self._prompt_history = self._prompt_history[-self._prompt_history_limit :]
         self._prompt_history_index = len(self._prompt_history)
         self._prompt_history_draft = ""
 
     def compose(self) -> ComposeResult:
-        max_lines = max(1, int(getattr(self.state.config, "textual_transcript_max_lines", 5000)))
-        yield TranscriptLog(id="transcript", wrap=True, highlight=False, markup=False, max_lines=max_lines)
+        max_lines = max(
+            1, int(getattr(self.state.config, "textual_transcript_max_lines", 5000))
+        )
+        yield TranscriptLog(
+            id="transcript",
+            wrap=True,
+            highlight=False,
+            markup=False,
+            max_lines=max_lines,
+        )
         yield Static("", id="status")
         with Horizontal(id="input-bar"):
             yield Static("|\n|\n|", id="prompt-marker")
@@ -1837,7 +393,9 @@ class NexusTextualApp(App[None]):
     def open_provider_settings(self) -> None:
         from nexus.ui.provider_settings import ProviderSettingsScreen
 
-        self.push_screen(ProviderSettingsScreen(self.state, on_reload=self._reload_provider_settings))
+        self.push_screen(
+            ProviderSettingsScreen(self.state, on_reload=self._reload_provider_settings)
+        )
 
     def _reload_provider_settings(self) -> None:
         from nexus.runtime.slash_commands import _reload_config
@@ -1913,7 +471,9 @@ class NexusTextualApp(App[None]):
             self.write(row)
             return
         order = cast("list[str]", entry.setdefault("subagent_tool_order", []))
-        rows = cast("dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {}))
+        rows = cast(
+            "dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {})
+        )
         if call_id not in rows:
             order.append(call_id)
         rows[call_id] = row
@@ -1946,7 +506,9 @@ class NexusTextualApp(App[None]):
         args: dict[str, Any],
         result: ToolResult,
     ) -> None:
-        self._record_subagent_command_tool(actor, call_id, tool_name, args, result=result)
+        self._record_subagent_command_tool(
+            actor, call_id, tool_name, args, result=result
+        )
 
     def _record_subagent_command_tool(
         self,
@@ -1971,7 +533,10 @@ class NexusTextualApp(App[None]):
                 )
             )
             return
-        details = cast("dict[str, dict[str, Any]]", entry.setdefault("subagent_command_details", {}))
+        details = cast(
+            "dict[str, dict[str, Any]]",
+            entry.setdefault("subagent_command_details", {}),
+        )
         previous = details.get(call_id, {})
         details[call_id] = {
             "tool_name": tool_name,
@@ -1979,10 +544,14 @@ class NexusTextualApp(App[None]):
             "result": result,
             "expanded": bool(previous.get("expanded", False)),
             "approval_required": approval_required if result is None else False,
-            "live_output": "" if result is not None else str(previous.get("live_output") or ""),
+            "live_output": ""
+            if result is not None
+            else str(previous.get("live_output") or ""),
         }
         self._subagent_command_entries_by_call_id[call_id] = entry
-        rows = cast("dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {}))
+        rows = cast(
+            "dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {})
+        )
         order = cast("list[str]", entry.setdefault("subagent_tool_order", []))
         if call_id not in rows:
             order.append(call_id)
@@ -1994,18 +563,26 @@ class NexusTextualApp(App[None]):
         entry = self._subagent_command_entries_by_call_id.get(call_id)
         if entry is None:
             return
-        details = cast("dict[str, dict[str, Any]]", entry.get("subagent_command_details", {}))
+        details = cast(
+            "dict[str, dict[str, Any]]", entry.get("subagent_command_details", {})
+        )
         detail = details.get(call_id)
         if detail is None:
             return
         detail["expanded"] = not bool(detail.get("expanded", False))
-        rows = cast("dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {}))
+        rows = cast(
+            "dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {})
+        )
         rows[call_id] = self._render_subagent_command_detail_row(entry, call_id)
         self._refresh_subagent_task_entry(entry)
         self._rerender_transcript()
 
-    def _render_subagent_command_detail_row(self, entry: dict[str, Any], call_id: str) -> RenderableType:
-        details = cast("dict[str, dict[str, Any]]", entry.get("subagent_command_details", {}))
+    def _render_subagent_command_detail_row(
+        self, entry: dict[str, Any], call_id: str
+    ) -> RenderableType:
+        details = cast(
+            "dict[str, dict[str, Any]]", entry.get("subagent_command_details", {})
+        )
         detail = details.get(call_id, {})
         return self.ui._render_subagent_command_tool_row(
             call_id,
@@ -2021,12 +598,16 @@ class NexusTextualApp(App[None]):
         entry = self._subagent_command_entries_by_call_id.get(call_id)
         if entry is None:
             return False
-        details = cast("dict[str, dict[str, Any]]", entry.get("subagent_command_details", {}))
+        details = cast(
+            "dict[str, dict[str, Any]]", entry.get("subagent_command_details", {})
+        )
         detail = details.get(call_id)
         if detail is None:
             return False
         detail["live_output"] = output
-        rows = cast("dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {}))
+        rows = cast(
+            "dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {})
+        )
         rows[call_id] = self._render_subagent_command_detail_row(entry, call_id)
         self._refresh_subagent_task_entry(entry)
         self._rerender_transcript()
@@ -2164,7 +745,9 @@ class NexusTextualApp(App[None]):
             self.write(row)
             return
         order = cast("list[str]", entry.setdefault("supervisor_tool_order", []))
-        rows = cast("dict[str, RenderableType]", entry.setdefault("supervisor_tool_rows", {}))
+        rows = cast(
+            "dict[str, RenderableType]", entry.setdefault("supervisor_tool_rows", {})
+        )
         if call_id not in rows:
             order.append(call_id)
             self._supervisor_entries_by_call_id[call_id] = entry
@@ -2197,9 +780,19 @@ class NexusTextualApp(App[None]):
         order = cast("list[str]", entry.get("supervisor_tool_order", []))
         rows = cast("dict[str, RenderableType]", entry.get("supervisor_tool_rows", {}))
         body_parts: list[RenderableType] = [rows[cid] for cid in order if cid in rows]
-        entry["expanded"] = Group(*body_parts) if body_parts else Text(f"{_TOOL_ROW_INDENT}Working...", style="dim")
-        preview_rows: list[RenderableType] = [rows[cid] for cid in order[:5] if cid in rows]
-        entry["preview"] = Group(*preview_rows) if preview_rows else Text(f"{_TOOL_ROW_INDENT}Working...", style="dim")
+        entry["expanded"] = (
+            Group(*body_parts)
+            if body_parts
+            else Text(f"{_TOOL_ROW_INDENT}Working...", style="dim")
+        )
+        preview_rows: list[RenderableType] = [
+            rows[cid] for cid in order[:5] if cid in rows
+        ]
+        entry["preview"] = (
+            Group(*preview_rows)
+            if preview_rows
+            else Text(f"{_TOOL_ROW_INDENT}Working...", style="dim")
+        )
 
     def finish_subagent_task(
         self,
@@ -2208,7 +801,9 @@ class NexusTextualApp(App[None]):
         *,
         elapsed: str = "",
     ) -> None:
-        entry = self._subagent_entries_by_call_id.get(call_id) or self._subagent_entries_by_actor.get(result.tool_name)
+        entry = self._subagent_entries_by_call_id.get(
+            call_id
+        ) or self._subagent_entries_by_actor.get(result.tool_name)
         if entry is None:
             payload = _parse_json_object(result.output)
             header = _subagent_completion_header(result, payload, elapsed=elapsed)
@@ -2216,7 +811,9 @@ class NexusTextualApp(App[None]):
             self.write_collapsible(
                 header,
                 body,
-                summary=_subagent_completion_summary(result, payload, elapsed=elapsed, tool_rows=0),
+                summary=_subagent_completion_summary(
+                    result, payload, elapsed=elapsed, tool_rows=0
+                ),
                 preview=_subagent_result_preview(result, payload),
             )
             return
@@ -2224,10 +821,16 @@ class NexusTextualApp(App[None]):
         payload = _parse_json_object(result.output)
         tool_rows = len(cast("list[str]", entry.get("subagent_tool_order", [])))
         entry["header"] = _subagent_completion_header(result, payload, elapsed=elapsed)
-        entry["summary"] = _subagent_completion_summary(result, payload, elapsed=elapsed, tool_rows=tool_rows)
+        entry["summary"] = _subagent_completion_summary(
+            result, payload, elapsed=elapsed, tool_rows=tool_rows
+        )
         entry["subagent_result_output"] = result.output
         entry["subagent_result_payload"] = payload
-        entry["subagent_result_status"] = str(payload.get("status") or result.metadata.get("status") or ("failed" if result.is_error else "completed"))
+        entry["subagent_result_status"] = str(
+            payload.get("status")
+            or result.metadata.get("status")
+            or ("failed" if result.is_error else "completed")
+        )
         entry["subagent_result_is_error"] = result.is_error
         entry["subagent_result_elapsed"] = elapsed
         entry["subagent_result_json_expanded"] = False
@@ -2242,14 +845,23 @@ class NexusTextualApp(App[None]):
         body_parts: list[RenderableType] = []
         payload = entry.get("subagent_result_payload")
         if isinstance(payload, dict):
-            body_parts.append(_subagent_result_summary_block(payload, str(entry.get("subagent_result_status", ""))))
+            body_parts.append(
+                _subagent_result_summary_block(
+                    payload, str(entry.get("subagent_result_status", ""))
+                )
+            )
         if order:
             body_parts.append(Text(f"{_TOOL_ROW_INDENT}Tool calls", style="dim"))
             body_parts.extend(rows[call_id] for call_id in order if call_id in rows)
         if isinstance(entry.get("subagent_result_output"), str):
             body_parts.append(_subagent_result_json_row(entry))
             if bool(entry.get("subagent_result_json_expanded")):
-                body_parts.append(_subagent_result_body(str(entry.get("subagent_result_output") or ""), payload if isinstance(payload, dict) else {}))
+                body_parts.append(
+                    _subagent_result_body(
+                        str(entry.get("subagent_result_output") or ""),
+                        payload if isinstance(payload, dict) else {},
+                    )
+                )
             entry["preview"] = _subagent_result_preview(
                 ToolResult(
                     call_id=str(entry.get("subagent_call_id", "")),
@@ -2260,16 +872,25 @@ class NexusTextualApp(App[None]):
                 payload if isinstance(payload, dict) else {},
             )
         elif order:
-            entry["preview"] = Group(Text(f"{_TOOL_ROW_INDENT}Running tool calls", style="dim"), *[rows[call_id] for call_id in order[:3] if call_id in rows])
+            entry["preview"] = Group(
+                Text(f"{_TOOL_ROW_INDENT}Running tool calls", style="dim"),
+                *[rows[call_id] for call_id in order[:3] if call_id in rows],
+            )
         else:
             entry["preview"] = Text(f"{_TOOL_ROW_INDENT}Running...", style="dim")
-        entry["expanded"] = Group(*body_parts) if body_parts else Text(f"{_TOOL_ROW_INDENT}Starting sub-agent...", style="dim")
+        entry["expanded"] = (
+            Group(*body_parts)
+            if body_parts
+            else Text(f"{_TOOL_ROW_INDENT}Starting sub-agent...", style="dim")
+        )
 
     def toggle_subagent_result_json(self, call_id: str) -> None:
         entry = self._subagent_entries_by_call_id.get(call_id)
         if entry is None:
             return
-        entry["subagent_result_json_expanded"] = not bool(entry.get("subagent_result_json_expanded"))
+        entry["subagent_result_json_expanded"] = not bool(
+            entry.get("subagent_result_json_expanded")
+        )
         self._refresh_subagent_task_entry(entry)
         self._rerender_transcript()
 
@@ -2284,9 +905,14 @@ class NexusTextualApp(App[None]):
                 self._rerender_transcript()
                 return
 
-    def open_file_change_preview(self, preview_info: _FileChangePreview | ConfirmationRequest) -> None:
+    def open_file_change_preview(
+        self, preview_info: _FileChangePreview | ConfirmationRequest
+    ) -> None:
         if isinstance(preview_info, ConfirmationRequest):
-            preview_info = _FileChangePreview(preview_info, actions_enabled=self._approval_actions_enabled(preview_info))
+            preview_info = _FileChangePreview(
+                preview_info,
+                actions_enabled=self._approval_actions_enabled(preview_info),
+            )
         request = preview_info.request
         args = {str(key): value for key, value in request.arguments.items()}
         preview = {str(key): value for key, value in request.preview.items()}
@@ -2308,7 +934,9 @@ class NexusTextualApp(App[None]):
                 request,
                 ConfirmationResponse(approved=True, scope="once"),
             ),
-            on_reject=lambda: self._resolve_file_preview_approval(request, ConfirmationResponse()),
+            on_reject=lambda: self._resolve_file_preview_approval(
+                request, ConfirmationResponse()
+            ),
             on_close=lambda: self._clear_active_file_preview_screen(screen),
             actions_enabled=preview_info.actions_enabled,
         )
@@ -2318,10 +946,16 @@ class NexusTextualApp(App[None]):
     def _approval_actions_enabled(self, request: ConfirmationRequest) -> bool:
         entry = self._file_preview_entry_for_request(request)
         if entry is None:
-            return request.kind is ConfirmationKind.APPROVAL and not bool(request.payload.get("preview_only"))
-        if bool(entry.get("approval_resolved")) or bool(request.payload.get("preview_only")):
+            return request.kind is ConfirmationKind.APPROVAL and not bool(
+                request.payload.get("preview_only")
+            )
+        if bool(entry.get("approval_resolved")) or bool(
+            request.payload.get("preview_only")
+        ):
             return False
-        return bool(entry.get("approval_pending", request.kind is ConfirmationKind.APPROVAL))
+        return bool(
+            entry.get("approval_pending", request.kind is ConfirmationKind.APPROVAL)
+        )
 
     def _file_preview_title(self, request: ConfirmationRequest, target: str) -> Text:
         action = self.ui._semantic_tool_label(request.tool_name)
@@ -2329,20 +963,28 @@ class NexusTextualApp(App[None]):
         title.append("File Preview", style="bold cyan")
         if action or target:
             title.append(" - ", style="dim")
-            title.append(" ".join(part for part in (action, target) if part), style="bold white")
+            title.append(
+                " ".join(part for part in (action, target) if part), style="bold white"
+            )
         if request.call_id:
             title.append(f"  #{request.call_id[:8]}", style="dim")
         title.append("\nRead-only preview", style="dim")
         return title
 
-    def _file_preview_entry_for_request(self, request: ConfirmationRequest) -> dict[str, Any] | None:
+    def _file_preview_entry_for_request(
+        self, request: ConfirmationRequest
+    ) -> dict[str, Any] | None:
         key = _approval_request_key(request)
         for entry in reversed(self._transcript_entries):
             file_preview = entry.get("file_preview")
             if not isinstance(file_preview, _FileChangePreview):
                 continue
             preview_request = file_preview.request
-            if preview_request.call_id and request.call_id and preview_request.call_id == request.call_id:
+            if (
+                preview_request.call_id
+                and request.call_id
+                and preview_request.call_id == request.call_id
+            ):
                 return entry
             if _approval_request_key(preview_request) == key:
                 return entry
@@ -2379,7 +1021,9 @@ class NexusTextualApp(App[None]):
         entry["header"] = self._resolved_approval_header(request, response)
         file_preview = entry.get("file_preview")
         if isinstance(file_preview, _FileChangePreview):
-            entry["file_preview"] = _FileChangePreview(file_preview.request, actions_enabled=False)
+            entry["file_preview"] = _FileChangePreview(
+                file_preview.request, actions_enabled=False
+            )
         self._mark_active_file_preview_resolved(request)
         self._rerender_transcript()
 
@@ -2391,7 +1035,11 @@ class NexusTextualApp(App[None]):
         args = {str(key): value for key, value in request.arguments.items()}
         target = self.ui._tool_target(request.tool_name, args)
         action = self.ui._semantic_tool_label(request.tool_name)
-        request_detail = f"{action} {target}".strip() if request.tool_name in _MUTATING_FILE_TOOLS else request.tool_name
+        request_detail = (
+            f"{action} {target}".strip()
+            if request.tool_name in _MUTATING_FILE_TOOLS
+            else request.tool_name
+        )
         status = _approval_resolution_summary(response)
         detail_parts = [part for part in (request_detail, status) if part]
         call_id = request.call_id[:8] if request.call_id else "pending"
@@ -2418,7 +1066,9 @@ class NexusTextualApp(App[None]):
         with suppress(Exception):
             screen.dismiss()
 
-    def _clear_active_file_preview_screen(self, screen: FileChangePreviewScreen) -> None:
+    def _clear_active_file_preview_screen(
+        self, screen: FileChangePreviewScreen
+    ) -> None:
         if self._active_file_preview_screen is screen:
             self._active_file_preview_screen = None
 
@@ -2463,14 +1113,21 @@ class NexusTextualApp(App[None]):
             path_start = line.plain.find(clickable_path)
             if path_start >= 0:
                 line.stylize(
-                    Style(color="bright_cyan", underline=True, meta={"nexus_toggle": toggle_id}),
+                    Style(
+                        color="bright_cyan",
+                        underline=True,
+                        meta={"nexus_toggle": toggle_id},
+                    ),
                     path_start,
                     path_start + len(clickable_path),
                 )
         if not expanded:
             preview = entry.get("preview")
             if preview is not None:
-                return Group(line, _with_inline_toggle(cast("RenderableType", preview), toggle_id))
+                return Group(
+                    line,
+                    _with_inline_toggle(cast("RenderableType", preview), toggle_id),
+                )
             return line
         return Group(line, cast("RenderableType", entry.get("expanded", Text(""))))
 
@@ -2526,7 +1183,10 @@ class NexusTextualApp(App[None]):
             self._turn_error_count += 1
             self._last_tool_failed = True
             return
-        if self._last_tool_failed and (result.tool_name in _MUTATING_FILE_TOOLS or result.tool_name in _VERIFY_TOOL_NAMES):
+        if self._last_tool_failed and (
+            result.tool_name in _MUTATING_FILE_TOOLS
+            or result.tool_name in _VERIFY_TOOL_NAMES
+        ):
             self._turn_recovery_count += 1
         self._last_tool_failed = False
 
@@ -2563,11 +1223,17 @@ class NexusTextualApp(App[None]):
         if self._footer is None:
             return
         estimator = TokenEstimator()
-        history_tokens = sum(estimator.estimate(message.content) for message in self.state.history)
+        history_tokens = sum(
+            estimator.estimate(message.content) for message in self.state.history
+        )
         system_tokens = estimator.estimate(self.state.current_system_prompt or "")
         total_tokens = history_tokens + system_tokens
         context_limit = usable_prompt_budget(self.state.config)
-        pct = min(100.0, round((total_tokens / context_limit * 100), 1)) if context_limit else 0.0
+        pct = (
+            min(100.0, round((total_tokens / context_limit * 100), 1))
+            if context_limit
+            else 0.0
+        )
         thinking_enabled = self.state.config.llm_thinking_mode != "disabled"
         workspace = _compact_workspace_label(self.state.config.workspace_root)
 
@@ -2581,13 +1247,20 @@ class NexusTextualApp(App[None]):
         text.append(self.state.mode.value, style="bold cyan")
         text.append("  ")
         text.append("agent ", style="dim")
-        text.append(str(getattr(self.state.config, "agent_mode", "basic")), style="bold magenta")
+        text.append(
+            str(getattr(self.state.config, "agent_mode", "basic")), style="bold magenta"
+        )
         text.append("  ")
         text.append("thinking ", style="dim")
-        text.append("True" if thinking_enabled else "False", style="bold green" if thinking_enabled else "bold red")
+        text.append(
+            "True" if thinking_enabled else "False",
+            style="bold green" if thinking_enabled else "bold red",
+        )
         text.append("  ")
         text.append("budget ", style="dim")
-        text.append(str(self.state.config.llm_reasoning_effort or "none"), style="bold yellow")
+        text.append(
+            str(self.state.config.llm_reasoning_effort or "none"), style="bold yellow"
+        )
         text.append("  ")
         text.append("model ", style="dim")
         text.append(self.state.config.model_name, style="bold white")
@@ -2626,13 +1299,17 @@ class NexusTextualApp(App[None]):
             self._hide_slash_command_suggestions()
             return
         self._slash_suggestion_commands = suggestions
-        self._slash_suggestions.set_options(_slash_command_suggestion_options(suggestions))
+        self._slash_suggestions.set_options(
+            _slash_command_suggestion_options(suggestions)
+        )
         self._slash_suggestions.styles.height = min(10, len(suggestions)) + 2
         self._slash_suggestions.highlighted = 0
         self._slash_suggestions.display = True
 
     def _slash_command_suggestions_visible(self) -> bool:
-        return self._slash_suggestions is not None and bool(self._slash_suggestions.display)
+        return self._slash_suggestions is not None and bool(
+            self._slash_suggestions.display
+        )
 
     def _hide_slash_command_suggestions(self) -> bool:
         if self._slash_suggestions is None:
@@ -2686,7 +1363,9 @@ class NexusTextualApp(App[None]):
         width = 100
         if self._transcript is not None:
             try:
-                width = max(width, int(self._transcript.scrollable_content_region.width or 0))
+                width = max(
+                    width, int(self._transcript.scrollable_content_region.width or 0)
+                )
             except Exception:  # noqa: BLE001
                 pass
         buffer = io.StringIO()
@@ -2792,12 +1471,16 @@ class NexusTextualApp(App[None]):
         self.has_open_assistant_stream = False
 
     def append_tool_output(self, call_id: str, stream_name: str, chunk: str) -> None:
-        max_chars = max(1, int(getattr(self.state.config, "tool_output_max_chars", 100 * 1024)))
+        max_chars = max(
+            1, int(getattr(self.state.config, "tool_output_max_chars", 100 * 1024))
+        )
         current_chars = self._streaming_tool_output_chars.get(call_id, 0)
         if current_chars >= max_chars:
             if call_id not in self._streaming_tool_output_capped:
                 self._streaming_tool_output_capped.add(call_id)
-                self._append_streaming_tool_output(call_id, f"\n[live output capped at {max_chars} chars]")
+                self._append_streaming_tool_output(
+                    call_id, f"\n[live output capped at {max_chars} chars]"
+                )
             return
         remaining = max_chars - current_chars
         capped_now = False
@@ -2811,7 +1494,9 @@ class NexusTextualApp(App[None]):
         self._append_streaming_tool_output(call_id, prefix + chunk)
         if capped_now and call_id not in self._streaming_tool_output_capped:
             self._streaming_tool_output_capped.add(call_id)
-            self._append_streaming_tool_output(call_id, f"\n[live output capped at {max_chars} chars]")
+            self._append_streaming_tool_output(
+                call_id, f"\n[live output capped at {max_chars} chars]"
+            )
 
     def _append_streaming_tool_output(self, call_id: str, chunk: str) -> None:
         output = self._streaming_tool_output_text.get(call_id, "") + chunk
@@ -2953,7 +1638,11 @@ class NexusTextualApp(App[None]):
                 try:
                     sel_result = self._transcript.get_selection(ts)
                     if sel_result:
-                        selected_text = sel_result[0] if isinstance(sel_result, tuple) else sel_result
+                        selected_text = (
+                            sel_result[0]
+                            if isinstance(sel_result, tuple)
+                            else sel_result
+                        )
                 except Exception:  # noqa: BLE001
                     pass
         if selected_text:
@@ -3029,7 +1718,9 @@ class NexusTextualApp(App[None]):
             return
         self._prompt_history.append(value)
         if len(self._prompt_history) > self._prompt_history_limit:
-            del self._prompt_history[: len(self._prompt_history) - self._prompt_history_limit]
+            del self._prompt_history[
+                : len(self._prompt_history) - self._prompt_history_limit
+            ]
         self._prompt_history_index = len(self._prompt_history)
         self._prompt_history_draft = ""
 
@@ -3066,11 +1757,20 @@ class NexusTextualApp(App[None]):
 
     def _render_startup(self) -> None:
         cfg = self.state.config
-        self.ui.print_banner(cfg.provider, cfg.model_name, self.state.mode.value, workspace=cfg.workspace_root)
+        self.ui.print_banner(
+            cfg.provider,
+            cfg.model_name,
+            self.state.mode.value,
+            workspace=cfg.workspace_root,
+        )
         if self.session_resumed:
-            self.ui.print_session_resumed(self.state.session.session_id, len(self.state.history))
+            self.ui.print_session_resumed(
+                self.state.session.session_id, len(self.state.history)
+            )
         if self.state.has_paused_turn():
-            self.ui.print_muted("A previous task was paused after hitting a turn limit. Type `continue` to resume it, or enter a new prompt to start something else.")
+            self.ui.print_muted(
+                "A previous task was paused after hitting a turn limit. Type `continue` to resume it, or enter a new prompt to start something else."
+            )
         self.ui.print_help_hint()
         self._print_provider_notice_or_warning()
 
@@ -3100,7 +1800,9 @@ class NexusTextualApp(App[None]):
                     await self.action_quit()
                 return
 
-            effective_prompt, resumed_paused_turn = self.state.consume_turn_prompt(raw_input)
+            effective_prompt, resumed_paused_turn = self.state.consume_turn_prompt(
+                raw_input
+            )
             if resumed_paused_turn:
                 self.ui.print_muted("Resuming paused task...")
             await self._emit_prompt_submit(
@@ -3122,9 +1824,18 @@ class NexusTextualApp(App[None]):
                     approval_callback=self._approval_callback(),
                 )
             except asyncio.CancelledError:
-                self.ui.print_warning("Turn aborted.")
-                if user_message_appended:
+                self.ui.print_warning("Turn aborted. Type `continue` to resume the interrupted task.")
+                if not self.state.has_paused_turn():
+                    self.state.mark_paused_turn(effective_prompt, reason="aborted")
+                if (
+                    user_message_appended
+                    and self.state.history
+                    and self.state.history[-1].role == "user"
+                    and self.state.history[-1].content == raw_input
+                ):
                     self.state.history.pop()
+                self.state.session.messages = list(self.state.history)
+                self.state.session_store.save(self.state.session)
                 return
             except Exception as exc:  # noqa: BLE001
                 from nexus.app import provider_error_message
@@ -3168,8 +1879,12 @@ class NexusTextualApp(App[None]):
             self._mark_approval_resolved(request, queued)
             return queued
 
-        approval_future: asyncio.Future[ConfirmationResponse] = asyncio.get_running_loop().create_future()
-        pending = _PendingApproval(request=request, policy=policy, future=approval_future)
+        approval_future: asyncio.Future[ConfirmationResponse] = (
+            asyncio.get_running_loop().create_future()
+        )
+        pending = _PendingApproval(
+            request=request, policy=policy, future=approval_future
+        )
         self._pending_approval = pending
         keyboard_task: asyncio.Task[str] | None = None
         try:
@@ -3199,7 +1914,9 @@ class NexusTextualApp(App[None]):
                 if response.approved or _is_explicit_denial_answer(answer):
                     self._mark_approval_resolved(request, response)
                     return response
-                self.ui.print_muted("Please answer with yes/y (or t/turn when offered), or no/n.")
+                self.ui.print_muted(
+                    "Please answer with yes/y (or t/turn when offered), or no/n."
+                )
         finally:
             if self._pending_approval is pending:
                 self._pending_approval = None
@@ -3210,7 +1927,9 @@ class NexusTextualApp(App[None]):
             self._close_active_file_preview()
 
     def _approval_callback(self) -> ConfirmationCallback:
-        async def ask_for_approval(request: ConfirmationRequest) -> ConfirmationResponse:
+        async def ask_for_approval(
+            request: ConfirmationRequest,
+        ) -> ConfirmationResponse:
             if request.kind is ConfirmationKind.CLARIFICATION:
                 if is_ask_user_confirmation(request):
                     while True:
@@ -3225,7 +1944,9 @@ class NexusTextualApp(App[None]):
                     clarified = answer.strip()
                     if clarified:
                         return ConfirmationResponse(clarification=clarified)
-                    self.ui.print_muted("A value is required. Provide input or cancel with Ctrl+C.")
+                    self.ui.print_muted(
+                        "A value is required. Provide input or cancel with Ctrl+C."
+                    )
 
             try:
                 policy = approval_policy_for_request(request)
@@ -3273,952 +1994,3 @@ class NexusTextualApp(App[None]):
                 "message_count": len(self.state.history),
             },
         )
-
-
-def _is_explicit_denial_answer(answer: str) -> bool:
-    normalized = " ".join(
-        answer.strip().lower().replace("(", " ").replace(")", " ").replace("-", " ").replace("_", " ").split()
-    )
-    return normalized in {"n", "no"}
-
-
-def _approval_resolution_summary(response: ConfirmationResponse) -> str:
-    if not response.approved:
-        return "rejected"
-    scope = str(response.scope or "").strip().lower()
-    if scope == "turn":
-        return "approved for turn"
-    if scope == "session":
-        return "approved for session"
-    return "approved once"
-
-
-def _approval_request_key(request: ConfirmationRequest) -> str:
-    if request.call_id:
-        return request.call_id
-    try:
-        arguments = json.dumps(request.arguments, sort_keys=True, default=str)
-    except TypeError:
-        arguments = str(request.arguments)
-    return f"{request.tool_name}:{arguments}"
-
-
-def _copy_to_system_clipboard(text: str) -> bool:
-    for command in _clipboard_commands():
-        try:
-            subprocess.run(
-                command,
-                input=text,
-                text=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=1,
-                check=True,
-            )
-            return True
-        except (FileNotFoundError, subprocess.SubprocessError, OSError):
-            continue
-    return False
-
-
-def _clipboard_commands() -> list[list[str]]:
-    if sys.platform == "darwin":
-        return [["pbcopy"]] if shutil.which("pbcopy") else []
-    if not sys.platform.startswith("linux"):
-        return []
-
-    commands: list[list[str]] = []
-    if shutil.which("wl-copy"):
-        commands.append(["wl-copy"])
-    if shutil.which("xclip"):
-        commands.append(["xclip", "-selection", "clipboard"])
-    if shutil.which("xsel"):
-        commands.append(["xsel", "--clipboard", "--input"])
-    return commands
-
-
-def _toggle_id_from_click(event: events.Click) -> str:
-    style = getattr(event, "style", None)
-    meta = getattr(style, "meta", None)
-    if not isinstance(meta, dict):
-        return ""
-    return str(meta.get("nexus_toggle") or "")
-
-
-def _file_preview_call_id_from_click(event: events.Click) -> str:
-    style = getattr(event, "style", None)
-    meta = getattr(style, "meta", None)
-    if not isinstance(meta, dict):
-        return ""
-    return str(meta.get("nexus_file_preview_call_id") or "")
-
-
-def _subagent_command_call_id_from_click(event: events.Click) -> str:
-    style = getattr(event, "style", None)
-    meta = getattr(style, "meta", None)
-    if not isinstance(meta, dict):
-        return ""
-    return str(meta.get("nexus_subagent_command_call_id") or "")
-
-
-def _subagent_result_json_call_id_from_click(event: events.Click) -> str:
-    style = getattr(event, "style", None)
-    meta = getattr(style, "meta", None)
-    if not isinstance(meta, dict):
-        return ""
-    return str(meta.get("nexus_subagent_result_json_call_id") or "")
-
-
-def _with_inline_toggle(renderable: RenderableType, toggle_id: str) -> RenderableType:
-    if isinstance(renderable, _ResponsiveDiff):
-        return replace(renderable, toggle_id=toggle_id)
-    if isinstance(renderable, _FencedCodeBlock):
-        return replace(renderable, toggle_id=toggle_id)
-    if isinstance(renderable, Group):
-        return Group(*(_with_inline_toggle(item, toggle_id) for item in renderable.renderables), fit=renderable.fit)
-    return renderable
-
-
-def _renderable_plain_text(renderable: RenderableType, *, width: int = 120) -> str:
-    buffer = io.StringIO()
-    console = Console(
-        file=buffer,
-        theme=NEXUS_THEME,
-        no_color=True,
-        force_terminal=False,
-        highlight=False,
-        width=width,
-    )
-    console.print(renderable)
-    return buffer.getvalue()
-
-
-def _assistant_header() -> Text:
-    header = Text()
-    header.append("Assistant", style="bold green")
-    header.append(":", style="green")
-    return header
-
-
-def _slash_command_suggestion_options(commands: tuple[Any, ...]) -> list[Text]:
-    options: list[Text] = []
-    for command in commands:
-        row = Text()
-        row.append(f"/{command.name}", style="bold bright_magenta")
-        row.append("  ")
-        row.append(str(command.description), style="dim")
-        options.append(row)
-    return options
-
-
-def _user_prompt_block(raw_input: str) -> Table:
-    text = Text()
-    text.append("You", style="bold green")
-    text.append(": ", style="green")
-    lines = str(raw_input or "").splitlines() or [""]
-    for index, line in enumerate(lines):
-        if index:
-            text.append("\n  ", style="dim")
-        text.append(line, style="white")
-    grid = Table.grid(expand=True, padding=(1, 1))
-    grid.add_column()
-    grid.add_row(text)
-    grid.style = Style(bgcolor="#1d2b3e")
-    return grid
-
-
-def _input_response_block(prompt: str, raw_input: str) -> Text:
-    is_approval = prompt.strip().lower().startswith("allow?")
-    title = "Approval response" if is_approval else "Input response"
-    text = Text()
-    text.append(title, style="bold dark_green")
-    text.append(": ", style="bold dark_green")
-    text.append(str(raw_input or ""), style="white on #252525")
-    return text
-
-
-def _is_subagent_tool(tool_name: str) -> bool:
-    return tool_name == "delegate_task" or tool_name.startswith("subagent_")
-
-
-def _is_subagent_actor(actor: str) -> bool:
-    return bool(actor) and _is_subagent_tool(actor)
-
-
-def _is_supervisor_group_tool(tool_name: str, args: dict[str, Any] | None = None) -> bool:
-    """Return True for tools that should be grouped in the supervisor collapsible block.
-
-    Bash, file-mutating tools, and sub-agent dispatches are excluded because they
-    need their own rich output or delegation UI.
-    """
-    return (
-        not _is_subagent_tool(tool_name)
-        and not _is_command_like_tool(tool_name, args or {})
-        and tool_name not in _MUTATING_FILE_TOOLS
-    )
-
-
-def _subagent_title(args: dict[str, Any]) -> str:
-    title = str(args.get("title") or args.get("task") or args.get("instructions") or "").strip()
-    return _single_line(title, limit=120)
-
-
-def _subagent_task_label(tool_name: str) -> str:
-    role = tool_name
-    if role.startswith("subagent_"):
-        role = role[len("subagent_") :]
-    elif role == "delegate_task":
-        role = "delegate"
-    labels = {
-        "explorer": "Explore Task",
-        "explore": "Explore Task",
-        "planning_analysis": "Planning Task",
-        "execution": "Execution Task",
-        "coding": "Coding Task",
-        "code_reviewer": "Review Task",
-        "review": "Review Task",
-        "impact_analyzer": "Impact Task",
-        "verification": "Verification Task",
-        "delegate": "Sub-agent Task",
-    }
-    if role in labels:
-        return labels[role]
-    pretty = role.replace("_", " ").replace("-", " ").strip().title()
-    return f"{pretty} Task" if pretty else "Sub-agent Task"
-
-
-def _parse_json_object(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _subagent_completion_header(result: ToolResult, payload: dict[str, Any], *, elapsed: str = "") -> Text:
-    del elapsed
-    title = _single_line(str(payload.get("title") or result.metadata.get("title") or result.tool_name), limit=120)
-    header = Text(_AGENT_BULLET, style="bold magenta")
-    header.append(_subagent_task_label(result.tool_name), style="bold magenta")
-    if title:
-        header.append(" - ", style="dim")
-        header.append(title, style="bold white")
-    return header
-
-
-def _subagent_completion_summary(
-    result: ToolResult,
-    payload: dict[str, Any],
-    *,
-    elapsed: str = "",
-    tool_rows: int = 0,
-) -> str:
-    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
-    count = context.get("tool_call_count") if isinstance(context, dict) else None
-    if not isinstance(count, int):
-        count = tool_rows
-    status = str(payload.get("status") or result.metadata.get("status") or ("failed" if result.is_error else "completed"))
-    parts = [status]
-    if elapsed:
-        parts.append(elapsed)
-    parts.append(f"{count} tool{'s' if count != 1 else ''}")
-    return " · ".join(parts)
-
-
-def _subagent_result_preview(result: ToolResult, payload: dict[str, Any]) -> Text:
-    status = str(payload.get("status") or result.metadata.get("status") or ("failed" if result.is_error else "completed"))
-    summary = _single_line(str(payload.get("summary") or payload.get("raw_result") or result.output or ""), limit=160)
-    text = Text(f"{_TOOL_ROW_INDENT}Status ", style="dim")
-    text.append(status, style=_subagent_status_style(status, is_error=result.is_error))
-    if summary:
-        text.append(f"\n{_TOOL_ROW_INDENT}Summary - ", style="dim")
-        text.append(summary, style="white")
-    text.append(f"\n{_TOOL_ROW_INDENT}Expand to view sub-agent tool calls and JSON.", style="dim")
-    return text
-
-
-def _subagent_result_summary_block(payload: dict[str, Any], status: str) -> Text:
-    summary = _single_line(str(payload.get("summary") or payload.get("raw_result") or ""), limit=180)
-    text = Text(f"{_TOOL_ROW_INDENT}Status ", style="dim")
-    rendered_status = status or str(payload.get("status") or "completed")
-    text.append(rendered_status, style=_subagent_status_style(rendered_status))
-    if summary:
-        text.append(f"\n{_TOOL_ROW_INDENT}Summary - ", style="dim")
-        text.append(summary, style="white")
-    next_action = _single_line(str(payload.get("recommended_next_action") or ""), limit=100)
-    if next_action:
-        text.append(f"\n{_TOOL_ROW_INDENT}Next - ", style="dim")
-        text.append(next_action, style="white")
-    return text
-
-
-def _subagent_result_body(output: str, payload: dict[str, Any]) -> RenderableType:
-    if payload:
-        return Syntax(output, "json", theme="monokai", word_wrap=True)
-    return _preview_text_block(output)
-
-
-def _subagent_result_json_row(entry: dict[str, Any]) -> Text:
-    call_id = str(entry.get("subagent_call_id", ""))
-    expanded = bool(entry.get("subagent_result_json_expanded"))
-    is_error = bool(entry.get("subagent_result_is_error"))
-    status = "failed" if is_error else "done"
-    marker = "[-]" if expanded else "[+]"
-    row = Text(_TOOL_ROW_INDENT, style="dim")
-    marker_start = len(row.plain)
-    row.append(f"{marker} ", style="cyan")
-    if call_id:
-        row.stylize(
-            Style(color="cyan", meta={"nexus_subagent_result_json_call_id": call_id}),
-            marker_start,
-            len(row.plain),
-        )
-    row.append("✗ " if is_error else "✓ ", style="bold red" if is_error else "bold green")
-    label_start = len(row.plain)
-    row.append("Result: Output JSON", style="bold cyan")
-    if call_id:
-        row.stylize(
-            Style(color="bright_cyan", underline=True, meta={"nexus_subagent_result_json_call_id": call_id}),
-            label_start,
-            len(row.plain),
-        )
-    row.append(" · ", style="dim")
-    row.append(status, style="bold red" if is_error else "dim")
-    elapsed = str(entry.get("subagent_result_elapsed") or "").strip()
-    if elapsed:
-        row.append(" · ", style="dim")
-        row.append(elapsed, style="bold bright_cyan")
-    return row
-
-
-def _subagent_status_style(status: str, *, is_error: bool = False) -> str:
-    normalized = status.strip().lower()
-    if is_error or normalized in {"failed", "needs_approval", "needs_clarification", "blocked", "failed_verification"}:
-        return "bold red"
-    if normalized in {"issues_found"}:
-        return "bold yellow"
-    return "bold green"
-
-
-def _single_line(value: str, *, limit: int) -> str:
-    compact = " ".join(str(value or "").split())
-    if len(compact) <= limit:
-        return compact
-    return compact[: max(0, limit - 1)].rstrip() + "…"
-
-
-def _first_lines(value: str, *, limit: int = _COLLAPSED_PREVIEW_LINES) -> str:
-    lines = str(value or "").splitlines()
-    return "\n".join(lines[:limit])
-
-
-def _bounded_command_preview(value: str) -> tuple[str, bool]:
-    lines = str(value or "").splitlines()
-    preview = "\n".join(lines[:_COLLAPSED_PREVIEW_LINES])
-    truncated = len(lines) > _COLLAPSED_PREVIEW_LINES
-    if len(preview) > _COMMAND_PREVIEW_CHARS:
-        preview = preview[:_COMMAND_PREVIEW_CHARS].rstrip()
-        truncated = True
-    return preview, truncated
-
-
-def _preview_text_block(value: str, *, style: str = "dim on #1f1f1f") -> Text:
-    preview = _first_lines(value)
-    if _line_count(value) > _COLLAPSED_PREVIEW_LINES:
-        preview = f"{preview}\n... click [+] to expand"
-    return Text(preview, style=style)
-
-
-def _line_count(value: str) -> int:
-    return len(str(value or "").splitlines()) or 1
-
-
-def _should_collapse_text(value: str) -> bool:
-    text = str(value or "")
-    return len(text) > _COLLAPSE_CHAR_LIMIT or _line_count(text) > min(_COLLAPSE_LINE_LIMIT, _COLLAPSED_PREVIEW_LINES)
-
-
-def _should_collapse_alert(value: str) -> bool:
-    text = str(value or "")
-    return len(text) > _ALERT_PREVIEW_CHARS or _line_count(text) > 3
-
-
-def _alert_preview(value: str) -> str:
-    compact = " ".join(str(value or "").split())
-    if len(compact) <= _ALERT_PREVIEW_CHARS:
-        return compact
-    return compact[: max(0, _ALERT_PREVIEW_CHARS - 3)].rstrip() + "..."
-
-
-def _diff_from_preview(preview: dict[str, Any]) -> str:
-    return _diff_text_from_data(_diff_data_from_preview(preview))
-
-
-def _diff_data_from_preview(preview: dict[str, Any]) -> dict[str, Any]:
-    diff = preview.get("diff") if isinstance(preview.get("diff"), dict) else {}
-    return {str(key): value for key, value in diff.items()}
-
-
-def _diff_text_from_data(diff: dict[str, Any]) -> str:
-    return str(diff.get("unified_diff", "") or "")
-
-
-def _diff_data_from_arguments(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-    if tool_name == "write_file":
-        return {
-            "old_content": "",
-            "new_content": str(args.get("content", "") or ""),
-            "is_new_file": True,
-        }
-    if tool_name == "edit":
-        return {
-            "old_content": str(args.get("old_string", "") or ""),
-            "new_content": str(args.get("new_string", "") or ""),
-        }
-    if tool_name == "insert_edit_into_file":
-        return {
-            "old_content": "",
-            "new_content": str(args.get("code", "") or ""),
-            "is_new_file": True,
-        }
-    return {}
-
-
-def _diff_from_arguments(tool_name: str, args: dict[str, Any]) -> str:
-    path = str(args.get("path") or "file").strip() or "file"
-    if tool_name == "write_file":
-        return _unified_diff_text("", str(args.get("content", "") or ""), path=path)
-    if tool_name == "edit":
-        return _unified_diff_text(
-            str(args.get("old_string", "") or ""),
-            str(args.get("new_string", "") or ""),
-            path=path,
-        )
-    if tool_name == "insert_edit_into_file":
-        return _unified_diff_text("", str(args.get("code", "") or ""), path=path)
-    return ""
-
-
-def _unified_diff_text(old: str, new: str, *, path: str) -> str:
-    old_lines = str(old or "").splitlines()
-    new_lines = str(new or "").splitlines()
-    if old_lines == new_lines:
-        return ""
-    lines = unified_diff(
-        old_lines,
-        new_lines,
-        fromfile=f"a/{path}",
-        tofile=f"b/{path}",
-        lineterm="",
-    )
-    return "\n".join(lines)
-
-
-def _diff_summary(diff_text: str) -> str:
-    added = 0
-    removed = 0
-    for line in diff_text.splitlines():
-        if line.startswith(("+++", "---")):
-            continue
-        if line.startswith("+"):
-            added += 1
-        elif line.startswith("-"):
-            removed += 1
-    parts = []
-    if removed:
-        parts.append(f"-{removed}")
-    if added:
-        parts.append(f"+{added}")
-    return " ".join(parts) if parts else "diff"
-
-
-def _diff_preview_block(diff_text: str, *, language: str = "text") -> Text:
-    del language
-    all_rows = _diff_rows_from_unified_diff(diff_text)
-    if not all_rows:
-        return Text("(no changed lines)", style="dim")
-    preview_lines: list[tuple[str, str]] = []
-    truncated = False
-    for row in all_rows:
-        if len(preview_lines) >= _COLLAPSED_PREVIEW_LINES:
-            truncated = True
-            break
-        if row.kind == "context":
-            preview_lines.append((f"  {row.before}", "default"))
-            continue
-        if row.before:
-            preview_lines.append((f"-{row.before}", "red on #2a1717"))
-        if row.after:
-            if len(preview_lines) >= _COLLAPSED_PREVIEW_LINES:
-                truncated = True
-                break
-            preview_lines.append((f"+{row.after}", "green on #162a1a"))
-    if truncated:
-        if len(preview_lines) >= _COLLAPSED_PREVIEW_LINES:
-            preview_lines = preview_lines[: max(0, _COLLAPSED_PREVIEW_LINES - 1)]
-        preview_lines.append(("... click [+] to expand", "dim"))
-    text = Text()
-    for value, style in preview_lines:
-        _append_text_line(text, value, style)
-    return text
-
-
-def _diff_rows_from_contents(old_content: str, new_content: str, *, context: int = 3) -> list[_DiffRow]:
-    old_lines = old_content.splitlines()
-    new_lines = new_content.splitlines()
-    matcher = SequenceMatcher(None, old_lines, new_lines)
-    groups = list(matcher.get_grouped_opcodes(context))
-    rows: list[_DiffRow] = []
-    for group_index, group in enumerate(groups):
-        if group_index:
-            rows.append(_DiffRow(None, None, "", "", "ellipsis"))
-        for tag, old_start, old_end, new_start, new_end in group:
-            if tag == "equal":
-                for offset, value in enumerate(old_lines[old_start:old_end]):
-                    line_number = old_start + offset + 1
-                    rows.append(_DiffRow(line_number, new_start + offset + 1, value, value, "context"))
-                continue
-            if tag == "delete":
-                for offset, value in enumerate(old_lines[old_start:old_end]):
-                    rows.append(_DiffRow(old_start + offset + 1, None, value, "", "delete"))
-                continue
-            if tag == "insert":
-                for offset, value in enumerate(new_lines[new_start:new_end]):
-                    rows.append(_DiffRow(None, new_start + offset + 1, "", value, "add"))
-                continue
-            replaced_old = old_lines[old_start:old_end]
-            replaced_new = new_lines[new_start:new_end]
-            max_len = max(len(replaced_old), len(replaced_new))
-            for offset in range(max_len):
-                before = replaced_old[offset] if offset < len(replaced_old) else ""
-                after = replaced_new[offset] if offset < len(replaced_new) else ""
-                before_number = old_start + offset + 1 if offset < len(replaced_old) else None
-                after_number = new_start + offset + 1 if offset < len(replaced_new) else None
-                kind = "change" if before and after else "delete" if before else "add"
-                rows.append(_DiffRow(before_number, after_number, before, after, kind))
-    return rows
-
-
-def _diff_rows_from_unified_diff(diff_text: str) -> list[_DiffRow]:
-    rows: list[_DiffRow] = []
-    pending_removed: list[tuple[int | None, str]] = []
-    before_line: int | None = None
-    after_line: int | None = None
-
-    def flush_removed() -> None:
-        nonlocal pending_removed
-        for line_number, value in pending_removed:
-            rows.append(_DiffRow(line_number, None, value, "", "delete"))
-        pending_removed = []
-
-    for raw_line in diff_text.splitlines():
-        if raw_line.startswith("@@"):
-            flush_removed()
-            before_line, after_line = _parse_unified_hunk_start(raw_line)
-            continue
-        if raw_line.startswith(("+++", "---")) or raw_line.startswith("\\"):
-            continue
-        if raw_line == "":
-            continue
-        marker = raw_line[0]
-        value = raw_line[1:]
-        if marker == "-":
-            pending_removed.append((before_line, value))
-            if before_line is not None:
-                before_line += 1
-            continue
-        if marker == "+":
-            if pending_removed:
-                removed_number, removed_value = pending_removed.pop(0)
-                rows.append(_DiffRow(removed_number, after_line, removed_value, value, "change"))
-            else:
-                rows.append(_DiffRow(None, after_line, "", value, "add"))
-            if after_line is not None:
-                after_line += 1
-            continue
-        flush_removed()
-        if marker == " ":
-            rows.append(_DiffRow(before_line, after_line, value, value, "context"))
-            if before_line is not None:
-                before_line += 1
-            if after_line is not None:
-                after_line += 1
-            continue
-        rows.append(_DiffRow(before_line, after_line, raw_line, raw_line, "context"))
-        if before_line is not None:
-            before_line += 1
-        if after_line is not None:
-            after_line += 1
-    flush_removed()
-    return rows
-
-
-def _parse_unified_hunk_start(line: str) -> tuple[int | None, int | None]:
-    match = re.search(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-    if match is None:
-        return None, None
-    return int(match.group(1)), int(match.group(2))
-
-
-def _collapsed_diff_rows(rows: list[_DiffRow], *, limit: int) -> list[_DiffRow]:
-    if len(rows) <= limit:
-        return rows
-    if limit <= 0:
-        return [_DiffRow(None, None, "", "click [+] to expand", "ellipsis")]
-    return [*rows[: max(0, limit - 1)], _DiffRow(None, None, "", "click [+] to expand", "ellipsis")]
-
-
-def _render_diff_layout(
-    rows: list[_DiffRow],
-    *,
-    path: str,
-    language: str,
-    width: int,
-    new_file: bool = False,
-    toggle_id: str = "",
-) -> Panel | Group | Table:
-    if new_file:
-        return _render_diff_side_panel(rows, side="after", title="New file", path=path, language=language, toggle_id=toggle_id)
-    if width < _SIDE_BY_SIDE_DIFF_WIDTH:
-        return Group(
-            _render_diff_side_panel(rows, side="before", title="Before", path=path, language=language, toggle_id=toggle_id),
-            _render_diff_side_panel(rows, side="after", title="After", path=path, language=language, toggle_id=toggle_id),
-        )
-    return _render_side_by_side_diff_table(rows, path=path, language=language, toggle_id=toggle_id)
-
-
-def _render_side_by_side_diff_table(rows: list[_DiffRow], *, path: str, language: str, toggle_id: str = "") -> Table:
-    table = Table(
-        box=box.SQUARE,
-        border_style="grey35",
-        collapse_padding=True,
-        expand=True,
-        padding=(0, 0),
-        style=f"on {_DIFF_EDITOR_BACKGROUND}",
-    )
-    table.add_column(_diff_panel_title("Before", path=path, title_style="bold red"), ratio=1, min_width=1, overflow="fold")
-    table.add_column(_diff_panel_title("After", path=path, title_style="bold green"), ratio=1, min_width=1, overflow="fold")
-    if not rows:
-        table.add_row(Text("(empty)", style="dim"), Text("(empty)", style="dim"))
-        return table
-    before_width = _line_number_width(rows, side="before")
-    after_width = _line_number_width(rows, side="after")
-    highlighter = Syntax("", language, theme="monokai")
-    for row in rows:
-        table.add_row(
-            _diff_side_line(row, side="before", width=before_width, highlighter=highlighter, toggle_id=toggle_id),
-            _diff_side_line(row, side="after", width=after_width, highlighter=highlighter, toggle_id=toggle_id),
-        )
-    return table
-
-
-def _render_diff_side_panel(
-    rows: list[_DiffRow],
-    *,
-    side: str,
-    title: str,
-    path: str,
-    language: str,
-    toggle_id: str = "",
-) -> Panel:
-    table = Table.grid(expand=True, padding=0)
-    table.add_column(ratio=1, min_width=1, overflow="fold")
-    if rows:
-        line_number_width = _line_number_width(rows, side=side)
-        highlighter = Syntax("", language, theme="monokai")
-        for row in rows:
-            table.add_row(_diff_side_line(row, side=side, width=line_number_width, highlighter=highlighter, toggle_id=toggle_id))
-    else:
-        table.add_row(Text("(empty)", style=f"dim on {_DIFF_EDITOR_BACKGROUND}"))
-    return Panel(
-        table,
-        title=_diff_panel_title(title, path=path),
-        title_align="left",
-        border_style="red" if side == "before" else "green",
-        box=box.SQUARE,
-        padding=(0, 0),
-        expand=True,
-        style=f"on {_DIFF_EDITOR_BACKGROUND}",
-    )
-
-
-def _diff_panel_title(title: str, *, path: str, title_style: str = "bold") -> Text:
-    text = Text(title, style=title_style)
-    clean_path = path.replace("\n", " ").strip()
-    if clean_path:
-        text.append(" | ", style="dim")
-        text.append(clean_path, style="dim")
-    return text
-
-
-def _diff_side_line(row: _DiffRow, *, side: str, width: int, highlighter: Syntax, toggle_id: str = "") -> Text:
-    if row.kind == "ellipsis":
-        text = Text(_diff_ellipsis_line(width), style=f"dim on {_DIFF_EDITOR_BACKGROUND}")
-        if toggle_id:
-            text.stylize(Style(meta={"nexus_toggle": toggle_id}))
-        return text
-
-    line_number = row.before_number if side == "before" else row.after_number
-    value = row.before if side == "before" else row.after
-    marker = _diff_marker(row, side=side)
-    text = Text(overflow="fold")
-    text.append(f"{_format_line_number(line_number, width)} | ", style="grey62")
-    text.append(marker, style=_diff_marker_style(marker))
-    if value:
-        text.append_text(_syntax_highlight_line(value, highlighter=highlighter))
-    background = _diff_row_background(row, side=side)
-    text.stylize(Style(bgcolor=background))
-    return text
-
-
-def _syntax_highlight_line(value: str, *, highlighter: Syntax) -> Text:
-    highlighted = highlighter.highlight(value)
-    highlighted.rstrip()
-    return highlighted
-
-
-def _diff_marker_style(marker: str) -> str:
-    if marker == "-":
-        return "bold bright_red"
-    if marker == "+":
-        return "bold bright_green"
-    return "default"
-
-
-def _should_render_as_new_file(tool_name: str, diff_data: dict[str, Any]) -> bool:
-    if tool_name != "write_file":
-        return False
-    if "old_content" not in diff_data and not diff_data.get("is_new_file"):
-        return False
-    old_content = str(diff_data.get("old_content", "") or "")
-    return bool(diff_data.get("is_new_file")) or old_content == ""
-
-
-def _render_new_file_preview(
-    content: str,
-    *,
-    path: str = "",
-    language: str = "text",
-    collapsed: bool = False,
-) -> _ResponsiveDiff:
-    lines = content.splitlines()
-    visible_lines = lines
-    if collapsed and len(lines) > _COLLAPSED_PREVIEW_LINES:
-        visible_lines = lines[: max(0, _COLLAPSED_PREVIEW_LINES - 1)]
-    rows: list[_DiffRow] = []
-    for index, line in enumerate(visible_lines, start=1):
-        rows.append(_DiffRow(None, index, "", line, "add"))
-    if len(visible_lines) < len(lines):
-        rows.append(_DiffRow(None, None, "", "click [+] to expand", "ellipsis"))
-    return _ResponsiveDiff(rows=tuple(rows), path=path, language=language, new_file=True)
-
-
-def _command_from_arguments(args: dict[str, Any]) -> str:
-    command = args.get("command")
-    return str(command or "").strip() if isinstance(command, str) else ""
-
-
-def _is_command_like_tool(tool_name: str, args: dict[str, Any] | None = None) -> bool:
-    if _command_from_arguments(args or {}):
-        return True
-    return tool_name in {
-        "bash",
-        "git_status",
-        "git_diff",
-        "run_tests",
-        "run_python_check",
-        "run_formatter",
-    }
-
-
-def _command_for_tool(tool_name: str, args: dict[str, Any], result: ToolResult | None = None) -> str:
-    command = _command_from_arguments(args)
-    if command:
-        return command
-    metadata = result.metadata if result is not None and isinstance(result.metadata, dict) else {}
-    raw_command = metadata.get("command")
-    if isinstance(raw_command, list) and raw_command:
-        return shlex.join(str(part) for part in raw_command)
-    if isinstance(raw_command, str) and raw_command.strip():
-        return raw_command.strip()
-    extra_args = args.get("args")
-    suffix = [str(arg) for arg in extra_args] if isinstance(extra_args, list) else []
-    if tool_name == "run_tests":
-        return shlex.join(["uv", "run", "pytest", *suffix])
-    if tool_name == "run_python_check":
-        return shlex.join(["python", "-m", "compileall", "-q", *suffix])
-    if tool_name == "run_formatter":
-        return shlex.join(["ruff", "format", ".", *suffix])
-    if tool_name == "git_status":
-        return "git status --porcelain=v1 -b"
-    if tool_name == "git_diff":
-        command_parts = ["git", "diff"]
-        if args.get("stat"):
-            command_parts.append("--stat")
-        raw_ref = str(args.get("ref", "") or "").strip()
-        target = str(args.get("target", "working") or "working").strip()
-        if raw_ref:
-            command_parts.append(raw_ref)
-        elif target == "staged":
-            command_parts.append("--staged")
-        elif target == "head":
-            command_parts.append("HEAD")
-        path = str(args.get("path", "") or "").strip()
-        if path:
-            command_parts.extend(["--", path])
-        return shlex.join(command_parts)
-    return tool_name
-
-
-def _command_from_preview_or_arguments(preview: dict[str, Any], args: dict[str, Any]) -> str:
-    command = preview.get("command")
-    if isinstance(command, str) and command.strip():
-        return command.strip()
-    return _command_from_arguments(args)
-
-
-def _markdown_code_fence(value: str, *, language: str) -> str:
-    longest_run = max((len(match.group(0)) for match in re.finditer(r"`+", value)), default=0)
-    fence = "`" * max(3, longest_run + 1)
-    return f"{fence}{language}\n{value}\n{fence}"
-
-
-def _bash_command_block(command: str, *, collapsed: bool = False) -> _FencedCodeBlock:
-    return _FencedCodeBlock(
-        command,
-        language="bash",
-        label="Command",
-        label_style="bold tool.shell",
-        collapsed=collapsed,
-    )
-
-
-def _bash_output_block(output: str, *, collapsed: bool = False) -> _FencedCodeBlock:
-    return _FencedCodeBlock(
-        output,
-        language="text",
-        label="Console output",
-        collapsed=collapsed,
-    )
-
-
-def _command_tool_body(
-    command: str,
-    output: str,
-    *,
-    running: bool = False,
-    collapsed: bool = False,
-) -> RenderableType:
-    parts: list[RenderableType] = []
-    if command:
-        parts.append(_bash_command_block(command, collapsed=collapsed))
-    if output:
-        parts.append(_bash_output_block(output, collapsed=collapsed))
-    elif running:
-        parts.append(Text("Running...", style="dim"))
-    elif not parts:
-        parts.append(Text("(no tool output)", style="dim"))
-    return Group(*parts)
-
-
-def _command_tool_title(tool_name: str) -> str:
-    labels = {
-        "bash": "Bash Run",
-        "run_tests": "Test Run",
-        "run_python_check": "Python Check",
-        "run_formatter": "Formatter Run",
-        "git_status": "Git Status",
-        "git_diff": "Git Diff",
-    }
-    return labels.get(tool_name, f"{tool_name} Run")
-
-
-def _command_tool_summary(result: ToolResult, output: str) -> str:
-    status = "failed" if result.is_error else "done"
-    if not output:
-        return status
-    lines = _line_count(output)
-    return f"{status} · {lines} line{'s' if lines != 1 else ''}"
-
-
-def _line_number_width(rows: list[_DiffRow], *, side: str) -> int:
-    numbers = [
-        row.before_number if side == "before" else row.after_number
-        for row in rows
-        if (row.before_number if side == "before" else row.after_number) is not None
-    ]
-    if not numbers:
-        return 1
-    return max(1, len(str(max(numbers))))
-
-
-def _format_line_number(line_number: int | None, width: int) -> str:
-    if line_number is None:
-        return " " * width
-    return f"{line_number:>{width}}"
-
-
-def _diff_marker(row: _DiffRow, *, side: str) -> str:
-    if side == "before" and row.kind in {"change", "delete"}:
-        return "-"
-    if side == "after" and row.kind in {"change", "add"}:
-        return "+"
-    return " "
-
-
-def _diff_row_background(row: _DiffRow, *, side: str) -> str:
-    if row.kind == "change":
-        return _DIFF_DELETE_BACKGROUND if side == "before" else _DIFF_ADD_BACKGROUND
-    if row.kind == "delete":
-        return _DIFF_DELETE_BACKGROUND if side == "before" else _DIFF_EDITOR_BACKGROUND
-    if row.kind == "add":
-        return _DIFF_ADD_BACKGROUND if side == "after" else _DIFF_EDITOR_BACKGROUND
-    return _DIFF_EDITOR_BACKGROUND
-
-
-def _diff_ellipsis_line(width: int) -> str:
-    return f"{' ' * width} | ... click [+] to expand"
-
-
-def _append_text_line(text: Text, value: str, style: str) -> None:
-    if text.plain:
-        text.append("\n")
-    text.append(value, style=style)
-
-
-def _context_style(percent: float) -> str:
-    if percent >= 85:
-        return "red"
-    if percent >= 65:
-        return "yellow"
-    return "green"
-
-
-def _context_pie_icon(percent: float) -> str:
-    clamped = max(0.0, min(100.0, float(percent)))
-    if clamped < 12.5:
-        return "○"
-    if clamped < 37.5:
-        return "◔"
-    if clamped < 62.5:
-        return "◑"
-    if clamped < 87.5:
-        return "◕"
-    return "●"
-
-
-def _compact_workspace_label(path: Path) -> str:
-    try:
-        resolved = path.resolve()
-    except Exception:  # noqa: BLE001
-        resolved = path
-    name = resolved.name or str(resolved)
-    parent = resolved.parent.name
-    return f"{parent}/{name}" if parent else name
-
-
-def _thinking_label(event: Any) -> str:
-    payload = getattr(event, "payload", None)
-    actor = payload.get("actor") if isinstance(payload, dict) else ""
-    actor = str(actor).strip() if actor else ""
-    return f"{actor} - Thinking" if actor else "Thinking"

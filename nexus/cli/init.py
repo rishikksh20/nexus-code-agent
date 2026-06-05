@@ -105,7 +105,7 @@ def _global_config_toml() -> str:
             '[models.default-mistral-compatible]',
             'provider = "openai-compatible"',
             'model_name = "mistral-medium-latest"',
-            'context_length = 32768',
+            'context_length = 200000',
             'max_output_tokens = 4096',
             'reserved_output_tokens = 4096',
             'temperature = 0.0',

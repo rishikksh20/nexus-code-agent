@@ -57,7 +57,9 @@ def test_config_synthesizes_legacy_current_profile_without_selection(tmp_path):
 
     assert config.active_model_profile == "legacy-current"
     assert config.active_model_profile_legacy is True
+    assert config.context_length == 200_000
     assert config.models["legacy-current"]["model_name"] == config.model_name
+    assert config.models["legacy-current"]["context_length"] == 200_000
 
 
 @pytest.mark.parametrize(

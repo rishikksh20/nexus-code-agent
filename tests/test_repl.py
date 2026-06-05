@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from io import StringIO
 
 import pytest
@@ -83,6 +84,26 @@ class _RecordingAgent:
         self.messages = list(messages)
         self.kwargs = kwargs
         yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="done")
+
+
+class _CancellingAgent:
+    async def run(self, messages, context, **kwargs):
+        del messages, context, kwargs
+        tool_call = ToolCall(
+            call_id="subagent-call",
+            tool_name="subagent_coding",
+            arguments={"title": "Implement map.rs", "instructions": "Create algorithms/rust/map.rs."},
+        )
+        yield AgentEvent(
+            kind=AgentEventType.MODEL_RESPONSE,
+            payload=RuntimeResponse(
+                message=Message(role="assistant", content="I'll implement the missing Rust map.", tool_calls=(tool_call,)),
+                tool_calls=(tool_call,),
+                finish_reason="tool_calls",
+            ),
+        )
+        yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+        raise asyncio.CancelledError
 
 
 class _ApprovalRetryAgent:
@@ -280,6 +301,23 @@ def test_continue_prompt_uses_previous_user_task_when_no_paused_turn(tmp_path):
     assert resumed_paused_turn is False
 
 
+def test_continue_prompt_renders_paused_turn_progress(tmp_path):
+    state = _build_state(tmp_path)
+    state.mark_paused_turn(
+        "implement the calculator",
+        reason="aborted",
+        progress=["Planned tool call: subagent_coding (title=Implement calculator)"],
+    )
+
+    effective_prompt, resumed_paused_turn = state.consume_turn_prompt("continue")
+
+    assert resumed_paused_turn is True
+    assert "Continue the interrupted Nexus task" in effective_prompt
+    assert "Original user request:\nimplement the calculator" in effective_prompt
+    assert "Pause reason: aborted" in effective_prompt
+    assert "subagent_coding" in effective_prompt
+
+
 def test_apply_events_persists_bounded_tool_output(tmp_path):
     state = _build_state(
         tmp_path,
@@ -390,6 +428,24 @@ async def test_collect_turn_events_marks_paused_turn_when_max_turns_is_reached(t
         event.kind == AgentEventType.TURN_COMPLETED and event.payload == "max_turns"
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_collect_turn_events_marks_cancelled_turn_for_continue(tmp_path):
+    state = _build_state(tmp_path)
+    state.history.append(Message(role="user", content="implement the missing Rust map"))
+    agent = _CancellingAgent()
+
+    with pytest.raises(asyncio.CancelledError):
+        await collect_turn_events(state, agent, prompt_text="implement the missing Rust map")
+
+    assert state.has_paused_turn()
+    assert state.paused_turn_prompt == "implement the missing Rust map"
+    effective_prompt, resumed_paused_turn = state.consume_turn_prompt("continue")
+    assert resumed_paused_turn is True
+    assert "Continue the interrupted Nexus task" in effective_prompt
+    assert "I'll implement the missing Rust map." in effective_prompt
+    assert "subagent_coding" in effective_prompt
 
 
 async def _read_only_tool_response(request: RuntimeRequest) -> RuntimeResponse:

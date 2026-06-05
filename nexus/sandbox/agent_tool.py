@@ -31,6 +31,7 @@ from nexus.security.policy import ApprovalPolicy
 from nexus.tools.base import ToolKind
 
 logger = logging.getLogger(__name__)
+_INNER_RESUMABLE_PAUSE_REASONS = frozenset({"tool_call_limit", "max_turns"})
 
 # ---------------------------------------------------------------------------
 # SubagentDefinition — pre-configured cognitive persona
@@ -350,6 +351,7 @@ class SubAgentTool:
         error = None
         failed_tool_outputs: list[dict[str, str]] = []
         modified_files: list[str] = []
+        max_subagent_turns = _subagent_max_turns(self._definition)
         deadline = asyncio.get_running_loop().time() + float(getattr(self._definition, "timeout_seconds", 600.0) or 600.0)
         logger.debug(
             "subagent.execute.start outer_session_id=%s sub_session_id=%s tool_name=%s call_id=%s title_chars=%s "
@@ -363,11 +365,11 @@ class SubAgentTool:
             len(allowed_tool_names),
             len(active_skill_names),
             len(allowed_mcp_servers),
-            int(getattr(self._definition, "max_turns", 20) or 20),
+            max_subagent_turns,
             float(getattr(self._definition, "timeout_seconds", 600.0) or 600.0),
         )
 
-        for _ in range(int(getattr(self._definition, "max_turns", 20) or 20)):
+        for _ in range(max_subagent_turns):
             try:
                 events = await _collect_inner_events(
                     agent.run(
@@ -381,7 +383,7 @@ class SubAgentTool:
                         auto_confirm_read_only=bool(outer_context.metadata.get("auto_confirm_read_only", True)),
                         temperature=float(getattr(self._config, "temperature", 0.0)),
                         max_output_tokens=getattr(self._config, "max_output_tokens", None),
-                        max_turns=1,
+                        max_turns=max_subagent_turns,
                         parallel_tools=bool(getattr(self._config, "parallel_tools", True)),
                         parallel_tool_window=int(getattr(self._config, "parallel_tool_window", 4) or 4),
                     ),
@@ -448,7 +450,7 @@ class SubAgentTool:
                                 auto_confirm_read_only=bool(outer_context.metadata.get("auto_confirm_read_only", True)),
                                 temperature=float(getattr(self._config, "temperature", 0.0)),
                                 max_output_tokens=getattr(self._config, "max_output_tokens", None),
-                                max_turns=1,
+                                max_turns=max_subagent_turns,
                                 parallel_tools=bool(getattr(self._config, "parallel_tools", True)),
                                 parallel_tool_window=int(getattr(self._config, "parallel_tool_window", 4) or 4),
                                 resume_tool_calls=(resume_call,),
@@ -507,10 +509,18 @@ class SubAgentTool:
                 final_response = confirmation.payload.prompt
                 break
 
+            pause_reason = _inner_pause_reason(events)
+            completed_tool_call_ids = _completed_tool_call_ids(events)
             for event in events:
                 if event.kind == AgentEventType.MODEL_RESPONSE:
                     message = event.payload.message
-                    history.append(message)
+                    safe_message = _history_safe_model_message(
+                        message,
+                        event.payload.tool_calls or message.tool_calls,
+                        completed_tool_call_ids,
+                    )
+                    if safe_message is not None:
+                        history.append(safe_message)
                     if message.content:
                         final_response = message.content
                 elif event.kind == AgentEventType.TOOL_RESULT:
@@ -534,6 +544,10 @@ class SubAgentTool:
                 elif event.kind == AgentEventType.AGENT_ERROR:
                     status = "failed"
                     error = str(event.payload)
+            if pause_reason:
+                status = "failed"
+                error = final_response or pause_reason
+                break
             if not any(event.kind == AgentEventType.TOOL_RESULT for event in events):
                 break
 
@@ -643,6 +657,54 @@ def _packet_summaries_from_context(
     return tuple(rendered)
 
 
+def _subagent_max_turns(definition: SubagentDefinition | None) -> int:
+    return max(2, int(getattr(definition, "max_turns", 20) or 20))
+
+
+def _inner_pause_reason(events: list) -> str:
+    for event in reversed(events):
+        if event.kind != AgentEventType.TURN_COMPLETED:
+            continue
+        reason = str(event.payload or "")
+        return reason if reason in _INNER_RESUMABLE_PAUSE_REASONS else ""
+    return ""
+
+
+def _completed_tool_call_ids(events: list) -> set[str]:
+    return {
+        str(event.payload.call_id)
+        for event in events
+        if event.kind == AgentEventType.TOOL_RESULT
+    }
+
+
+def _history_safe_model_message(
+    message: Message,
+    tool_calls: tuple[ToolCall, ...],
+    completed_tool_call_ids: set[str],
+) -> Message | None:
+    if not tool_calls:
+        return message if message.content else None
+
+    completed_calls = tuple(
+        tool_call
+        for tool_call in tool_calls
+        if tool_call.call_id in completed_tool_call_ids
+    )
+    if not completed_calls:
+        return None
+
+    return Message(
+        role=message.role,
+        content=message.content,
+        name=message.name,
+        reasoning_content=message.reasoning_content,
+        provider_state=message.provider_state,
+        tool_calls=completed_calls,
+        tool_call_id=message.tool_call_id,
+    )
+
+
 async def _collect_inner_events(agent_events, outer_context: ToolExecutionContext, *, deadline: float) -> list:
     events = []
     async def collect() -> list:
@@ -710,7 +772,9 @@ def _direct_subagent_system_prompt(
         "Operate goal-first: restate the objective internally, use the fewest tools needed to reach that objective, "
         "and stop when you can return a decision. Do not keep calling read/search tools just because more context "
         "might exist. Repeating the same kind of read/search without changing your next action is a stall; return "
-        "status `blocked` with what evidence is missing.\n\n"
+        "status `blocked` with what evidence is missing. For implementation tasks with known source and target "
+        "files, gather only minimal sufficient context before the first edit; after about three read/search calls "
+        "without a mutation, either edit or return `blocked` with the missing evidence.\n\n"
         f"Role instructions:\n{role_prompt}\n\n"
         f"Task title: {title}\n"
         f"Task instructions:\n{instructions}\n\n"

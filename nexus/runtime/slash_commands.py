@@ -204,7 +204,7 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
     for name, description in (
         ("/help", "Show command help."),
         ("/mcp [status|tools|available|activate|deactivate|refresh]", "Inspect and manage MCP server connections."),
-        ("/agent [status|tools|skills|mcp|allow|disallow]", "Inspect and scope supervisor resources."),
+        ("/agent [status|switch|tools|skills|mcp|allow|disallow]", "Inspect, switch, and scope supervisor resources."),
         ("/sub-agent [list|show|tools|skills|mcp|allow|disallow]", "Inspect and scope sub-agent resources."),
         ("/mode [plan|default|auto]", "Show or switch execution mode."),
         ("/provider [list|profiles|use|manage|set]", "Inspect provider cards, activate profiles, or update model/session parameters."),
@@ -285,9 +285,10 @@ async def handle_agent(state: ReplState, args: list[str]) -> None:
     subcommand = args[0].lower() if args else "status"
     if subcommand == "help":
         _print_subcommand_help(
-            state, "agent", "Inspect and scope supervisor tools, skills, and MCP servers.",
+            state, "agent", "Inspect, switch, and scope supervisor tools, skills, and MCP servers.",
             (
                 ("status", "Show supervisor mode and effective resource counts.", "/agent status"),
+                ("switch", "Cycle agent mode between basic and advanced, persist it, and reload tools.", "/agent switch"),
                 ("tools", "List registered tools and whether the supervisor can call them.", "/agent tools"),
                 ("skills", "List globally active skills and supervisor scoped state.", "/agent skills"),
                 ("mcp", "List active MCP servers and supervisor scoped state.", "/agent mcp"),
@@ -302,6 +303,21 @@ async def handle_agent(state: ReplState, args: list[str]) -> None:
         return
     if subcommand == "status":
         _print_agent_status(state)
+        return
+    if subcommand in {"switch", "toggle"}:
+        _switch_agent_mode(state)
+        return
+    if subcommand == "mode":
+        if len(args) < 2:
+            _print_agent_mode_usage(state)
+            return
+        if args[1].lower() in {"switch", "toggle"}:
+            _switch_agent_mode(state)
+            return
+        _set_agent_mode(state, args[1])
+        return
+    if subcommand in {"basic", "advanced"}:
+        _set_agent_mode(state, subcommand)
         return
     if subcommand == "tools":
         _print_agent_tools(state)
@@ -320,7 +336,7 @@ async def handle_agent(state: ReplState, args: list[str]) -> None:
             state.refresh_system_prompt()
             _print_agent_status(state)
         return
-    state.console.print("Usage: /agent [status|tools|skills|mcp|allow|disallow|help]")
+    state.console.print("Usage: /agent [status|switch|tools|skills|mcp|allow|disallow|help]")
 
 
 async def handle_sub_agent(state: ReplState, args: list[str]) -> None:
@@ -1340,6 +1356,32 @@ def _print_agent_status(state: ReplState) -> None:
     table.add_row("Configured allowed skills", ", ".join(allowed_skills) or "default")
     table.add_row("Configured allowed MCP servers", ", ".join(allowed_mcp_servers) or "default")
     state.console.print(table)
+
+
+def _print_agent_mode_usage(state: ReplState) -> None:
+    state.console.print(f"Agent mode: {state.config.agent_mode}")
+    state.console.print("Usage: /agent switch")
+
+
+def _switch_agent_mode(state: ReplState) -> None:
+    current = str(getattr(state.config, "agent_mode", "basic")).strip().lower()
+    next_mode = "basic" if current == "advanced" else "advanced"
+    _set_agent_mode(state, next_mode)
+
+
+def _set_agent_mode(state: ReplState, mode: str) -> None:
+    normalized = mode.strip().lower()
+    if normalized not in {"basic", "advanced"}:
+        state.console.print("Usage: /agent switch")
+        return
+    _update_toml_value(state.config.local_config_file, "agent_mode", normalized)
+    _reload_config(state)
+    count = _reload_tools(state)
+    state.refresh_system_prompt()
+    state.console.print(
+        f"[green]Agent mode set to {state.config.agent_mode} in {state.config.local_config_file}.[/green] "
+        f"Config reloaded and {count} tool(s) registered."
+    )
 
 
 def _print_agent_tools(state: ReplState) -> None:

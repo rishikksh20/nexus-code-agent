@@ -71,6 +71,7 @@ def supervisor_routing_guidance_lines() -> tuple[str, ...]:
     return (
         f"- Tiny read-only budget: do the work directly only when it fits about {TINY_READ_ONLY_TOOL_BUDGET} simple read-only tool calls or fewer.",
         "- Coding route: delegate any workspace mutation to `subagent_coding`; the supervisor should not directly edit files in advanced mode.",
+        "- Simple known-target implementation: route directly to `subagent_coding` with file hints and a minimal read budget; do not run a separate explorer first.",
         "- Explorer route: delegate bounded read-only exploration once the tiny budget is exceeded.",
         "- Impact route: call `subagent_impact_analyzer` when affected files, public interfaces, risk, or verification scope are unclear.",
         "- Review route: call `subagent_code_reviewer` for post-change review, scoped verification, and failure attribution.",

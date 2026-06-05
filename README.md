@@ -369,7 +369,7 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 | `/provider [list\|profiles\|use \<profile\>\|manage\|set \<param\> \<value\>]` | Inspect providers, activate reusable profiles, open Textual settings, or update live parameters |
 | `/config [show\|set\|reset\|reset-defaults\|reload\|upgrade\|reinit]` | Inspect or edit configuration; `reset-defaults` rewrites clean defaults |
 | `/skills [list\|show\|add\|remove\|reload]` | Manage session skills and skill-backed sub-agent tools |
-| `/agent [status\|tools\|skills\|mcp\|allow\|disallow]` | Inspect and scope supervisor tools, skills, and MCP servers |
+| `/agent [status\|switch\|tools\|skills\|mcp\|allow\|disallow]` | Inspect, switch, and scope supervisor tools, skills, and MCP servers |
 | `/sub-agent [list\|show\|tools\|skills\|mcp\|allow\|disallow]` | Inspect and scope cognitive sub-agent resources |
 | `/session [new\|list\|resume\|save\|export]` | Manage sessions |
 | `/memory [list\|search\|save\|show]` | Workspace memory entries |
@@ -589,6 +589,7 @@ Useful commands after editing `.nexus/config.toml`:
 /tools reload          # rebuild the live tool registry from the current config
 /tools                 # confirm which subagent_* tools are registered
 /skills reload         # rescan skills and register skill-backed sub-agent tools
+/agent switch          # cycle agent_mode in .nexus/config.toml and reload tools
 /agent tools           # inspect supervisor-scoped tool visibility
 /sub-agent show coding    # inspect one sub-agent's effective resources
 /context agents        # inspect sub-agent context isolation and handoffs
@@ -917,6 +918,7 @@ disabled_mcp_servers = []       # disable local or global MCP entries by name
 # Agent profile
 config_version = 4
 agent_mode = "basic" # basic | advanced
+# Switch interactively with /agent switch.
 # basic = single-LLM execution with no cognitive sub-agent tools.
 # advanced = supervisor LLM with cognitive sub-agent tools.
 # Built-in cognitive tools in advanced mode: subagent_explorer,

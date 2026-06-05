@@ -18,7 +18,7 @@ from nexus.runtime.repl_state import ReplState
 from nexus.runtime.sessions import SessionStore, new_snapshot
 from nexus.memory.store import MemoryStore
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool, ReadFileTool, WriteFileTool
+from nexus.tools.builtin import AskUserTool, GetTimeTool, ReadFileTool, WriteFileTool
 
 
 @pytest.mark.asyncio
@@ -162,7 +162,7 @@ async def test_headless_logging_records_prompt_tool_and_stop(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_agent_emits_clarification_notification(tool_context):
+async def test_agent_emits_ask_user_clarification_notification(tool_context):
     payloads: list[dict] = []
     hooks = HookExecutor()
 
@@ -174,13 +174,20 @@ async def test_agent_emits_clarification_notification(tool_context):
     model = FakeModelClient(
         scripted=[
             RuntimeResponse(
-                message=Message(role="assistant", content="Need a path."),
-                tool_calls=(ToolCall(call_id="clarify-1", tool_name="read_file", arguments={}),),
+                message=Message(role="assistant", content="Need a choice."),
+                tool_calls=(
+                    ToolCall(
+                        call_id="clarify-1",
+                        tool_name="ask_user",
+                        arguments={"question": "Which file should I read?"},
+                    ),
+                ),
+                finish_reason="tool_calls",
             )
         ]
     )
     registry = ToolRegistry()
-    registry.register(ReadFileTool())
+    registry.register(AskUserTool())
     agent = Agent(model_client=model, tool_registry=registry, hooks=hooks)
 
     events = [
@@ -190,7 +197,10 @@ async def test_agent_emits_clarification_notification(tool_context):
 
     clarification = next(event for event in events if event.kind == "confirmation_requested")
     assert clarification.payload.kind is ConfirmationKind.CLARIFICATION
-    assert any(payload["event"] == "clarification_requested" for payload in payloads)
+    assert any(
+        payload["event"] == "clarification_requested" and payload["interaction"] == "ask_user"
+        for payload in payloads
+    )
 
 
 @pytest.mark.asyncio

@@ -188,8 +188,11 @@ async def test_register_subagent_tools_registers_default_and_specialist_tools():
     assert registry.record("subagent_code_reviewer").origin == "code_reviewer"
     assert registry.record("subagent_impact_analyzer").origin == "impact_analyzer"
     coding_tools = registry.record("subagent_coding").tool._definition.allowed_tools
+    coding_prompt = registry.record("subagent_coding").tool._definition.goal_prompt
     reviewer_tools = registry.record("subagent_code_reviewer").tool._definition.allowed_tools
     assert "run_formatter" in coding_tools
+    assert "minimal sufficient context" in coding_prompt
+    assert "three read/search calls before the first mutation" in coding_prompt
     assert "run_tests" in reviewer_tools
 
 
@@ -528,7 +531,7 @@ async def test_subagent_tool_reports_missing_mutation_path_as_model_repair_error
 
 
 @pytest.mark.asyncio
-async def test_subagent_tool_continues_after_clarification_and_completes_write(tmp_path):
+async def test_subagent_tool_continues_after_missing_read_path_feedback_and_completes_write(tmp_path):
     registry = ToolRegistry()
     registry.register(ReadFileTool(), source="core", origin="builtin")
     registry.register(WriteFileTool(), source="core", origin="builtin")
@@ -563,16 +566,10 @@ async def test_subagent_tool_continues_after_clarification_and_completes_write(t
         config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
     )
 
-    async def approval_callback(request):
-        if request.kind is ConfirmationKind.CLARIFICATION:
-            return ConfirmationResponse(clarification="calculator.py")
-        return ConfirmationResponse(approved=True)
-
     context = ToolExecutionContext(
         session_id="test-session",
         working_directory=tmp_path,
         metadata={
-            "approval_callback": approval_callback,
             "auto_confirm": True,
             "execution_mode": "auto",
         },
@@ -589,10 +586,10 @@ async def test_subagent_tool_continues_after_clarification_and_completes_write(t
     assert payload["status"] == "completed"
     assert payload["runtime_status"] == "completed"
     assert (tmp_path / "subagent.txt").read_text(encoding="utf-8") == "done"
-    clarification_request = model.requests[1]
+    repair_request = model.requests[1]
     assert any(
-        message.role == "user" and "Clarification for read_file (path): calculator.py" in message.content
-        for message in clarification_request.messages
+        message.role == "tool" and "Missing required argument(s) for tool 'read_file': 'path'" in message.content
+        for message in repair_request.messages
     )
 
 

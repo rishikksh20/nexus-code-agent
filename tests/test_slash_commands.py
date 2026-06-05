@@ -29,7 +29,7 @@ from nexus.runtime.slash_commands import _write_toml, build_router
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.skills import get_skill_roots, load_skill_registry
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import GetTimeTool, ReadFileTool
+from nexus.tools.builtin import GetTimeTool, GlobTool, ReadFileTool
 
 
 def test_write_toml_preserves_nested_inline_tables(tmp_path):
@@ -317,6 +317,41 @@ async def test_agent_allow_tool_persists_and_updates_supervisor_scope(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_agent_mode_command_persists_and_reloads_tools(tmp_path):
+    global_root = tmp_path / "global"
+    config = load_config(tmp_path, global_root=global_root)
+    local_config = config.local_config_file
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    console = Console(record=True, no_color=True, width=200)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("agent-mode"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    router = build_router()
+    assert await router.dispatch(state, "/agent switch") is True
+
+    assert state.config.agent_mode == "advanced"
+    assert tomllib.loads(local_config.read_text(encoding="utf-8"))["agent_mode"] == "advanced"
+    assert any(record.name == "subagent_explorer" for record in state.tool_registry.records())
+
+    assert await router.dispatch(state, "/agent switch") is True
+
+    assert state.config.agent_mode == "basic"
+    assert tomllib.loads(local_config.read_text(encoding="utf-8"))["agent_mode"] == "basic"
+    assert all(record.name != "subagent_explorer" for record in state.tool_registry.records())
+    output = console.export_text()
+    assert "Agent mode set to advanced" in output
+    assert "Agent mode set to basic" in output
+
+
+@pytest.mark.asyncio
 async def test_config_reset_defaults_rewrites_local_config(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -579,6 +614,48 @@ async def test_subagent_profile_allowed_config_overrides_default_tools(tmp_path)
     ) == {"read_file"}
     output = console.export_text()
     assert "allowed" in output
+
+
+@pytest.mark.asyncio
+async def test_subagent_prompt_uses_effective_configured_tool_scope(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    config.subagent_profiles = [
+        {
+            "name": "execution",
+            "allowed_tools": ["read_file"],
+            "allowed_skills": [],
+            "allowed_mcp_servers": [],
+        }
+    ]
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(GlobTool(), source="core", origin="builtin")
+    definition = SubagentDefinition(
+        name="execution",
+        description="Execute focused work.",
+        goal_prompt="Do the task.",
+        allowed_tools=["read_file", "glob"],
+    )
+    registry.register(
+        SubAgentTool(definition, base_tool_registry=registry, config=config),
+        source="agent",
+        origin="execution",
+    )
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("subagent-prompt-scope"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True, width=200),
+    )
+
+    prompt = state.build_system_prompt("delegate this")
+
+    assert "Allowed tools: read_file." in prompt
+    assert "Allowed tools: read_file, glob." not in prompt
 
 
 @pytest.mark.asyncio
@@ -1736,7 +1813,7 @@ async def test_unknown_slash_command_returns_false(tmp_path):
 
 def test_get_model_context_limit_exact_match():
     from nexus.config.model_limits import get_model_context_limit
-    assert get_model_context_limit("mistral-medium-latest") == 32_768
+    assert get_model_context_limit("mistral-medium-latest") == 200_000
 
 
 def test_get_model_context_limit_prefix_match():

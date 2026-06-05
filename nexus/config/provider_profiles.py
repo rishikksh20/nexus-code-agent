@@ -88,7 +88,7 @@ class ModelProfile:
             name=name,
             provider=str(payload.get("provider", "") or ""),
             model_name=str(payload.get("model_name", "") or ""),
-            context_length=int(payload.get("context_length", 32_768)),
+            context_length=int(payload.get("context_length", 200_000)),
             max_output_tokens=max_output_tokens,
             reserved_output_tokens=int(payload.get("reserved_output_tokens", max_output_tokens)),
             temperature=float(payload.get("temperature", 0.0)),
@@ -166,7 +166,7 @@ def active_provider_config(config: Any) -> ProviderConfig:
 
 
 def legacy_model_profile(config: Any, *, name: str = "legacy-current") -> ModelProfile:
-    context_length = int(getattr(config, "context_length", 0) or 32_768)
+    context_length = int(getattr(config, "context_length", 0) or 200_000)
     max_output_tokens = int(getattr(config, "max_output_tokens", 4096) or 4096)
     return ModelProfile(
         name=name,

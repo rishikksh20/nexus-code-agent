@@ -57,6 +57,8 @@ def test_build_context_describes_cognitive_subagent_contract(tmp_path):
     assert "local conversation and tool history as isolated private context" in sections.base_instruction
     assert "Stay supervisor-local for tiny read-only work" in sections.base_instruction
     assert "If both a normal tool and a sub-agent could handle the task" in sections.base_instruction
+    assert "simple implementation tasks with an obvious target file" in sections.base_instruction
+    assert "minimal-context budget" in sections.base_instruction
     assert "Routing: use `subagent_explorer`" in sections.base_instruction
     assert "Delegation packet requirements" in sections.base_instruction
     assert "validation_category" in sections.base_instruction
