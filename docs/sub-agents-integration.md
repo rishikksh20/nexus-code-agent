@@ -196,7 +196,24 @@ The supervisor can now call `subagent_summarizer` autonomously. You can also ins
 > /sub-agent show summarizer
 ```
 
-### 6. Promote to global (share across workspaces)
+### 6. Resume after clarification
+
+Sub-agents do not talk to the user directly. If a sub-agent returns `status: needs_clarification`, the supervisor asks one focused question with `ask_user`, then calls the same `subagent_*` tool with the original `task_id`:
+
+```json
+{
+  "resume_task_id": "original-tool-call-id",
+  "clarification": {
+    "question": "Should config be global, project-specific, or both?",
+    "answer": "Both, with project overrides.",
+    "selected_option_id": "both"
+  }
+}
+```
+
+Nexus starts a fresh isolated sub-agent model call with a bounded continuation record: the original delegation, compact findings, related files, packet ids, and structured user answers. It does not replay the full private sub-agent transcript. The logical task remains inspectable through `/context task <id>`.
+
+### 7. Promote to global (share across workspaces)
 
 ```
 > /sub-agent agents promote summarizer

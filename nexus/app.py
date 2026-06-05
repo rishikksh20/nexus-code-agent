@@ -24,7 +24,7 @@ import click
 from nexus import __version__
 from nexus.cli.args import args_to_config_overrides
 from nexus.cli.doctor import build_doctor_report, exit_code_for_report
-from nexus.cli.headless import EXIT_NEEDS_CONFIRM, run_headless
+from nexus.cli.headless import EXIT_NEEDS_CONFIRM, EXIT_NEEDS_INPUT, run_headless
 from nexus.cli.init import init_workspace
 from nexus.cli.input import resolve_prompt
 from nexus.config import config_to_plain_dict, ensure_config_dirs, load_config
@@ -140,6 +140,8 @@ class NexusApp:
         )
         if result.exit_code == EXIT_NEEDS_CONFIRM:
             self.console.print_warning(f"Confirmation required: {result.error}")
+        elif result.exit_code == EXIT_NEEDS_INPUT:
+            self.console.print_warning(f"User input required: {result.error}")
         elif result.exit_code == 0:
             run_post_session_updates(
                 self.config,

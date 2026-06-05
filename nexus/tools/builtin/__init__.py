@@ -9,6 +9,7 @@ This ``__init__.py`` re-exports every tool class so that callers can do either:
 from __future__ import annotations
 
 from nexus.tools.builtin.edit_file import EditTool
+from nexus.tools.builtin.ask_user import AskUserTool
 from nexus.tools.builtin.code_search import CodeIndexTool, SemanticSearchTool
 from nexus.tools.builtin.git import GitDiffTool, GitStatusTool
 from nexus.tools.builtin.glob import GlobTool
@@ -28,6 +29,7 @@ from nexus.tools.builtin.write_file import WriteFileTool
 from nexus.tools.builtin.verification import RunFormatterTool, RunPythonCheckTool, RunTestsTool
 
 __all__ = [
+    "AskUserTool",
     "GetTimeTool",
     # File I/O
     "ReadFileTool",

@@ -183,6 +183,54 @@ class ToolExecutionContext:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+AskUserAnswerType = Literal["text", "choice", "yes_no"]
+
+
+@dataclass(slots=True, frozen=True)
+class AskUserOption:
+    id: str
+    label: str
+    description: str | None = None
+
+    def to_dict(self) -> dict[str, str]:
+        payload = {"id": self.id, "label": self.label}
+        if self.description:
+            payload["description"] = self.description
+        return payload
+
+
+@dataclass(slots=True, frozen=True)
+class AskUserRequest:
+    question: str
+    reason: str | None = None
+    answer_type: AskUserAnswerType = "text"
+    options: tuple[AskUserOption, ...] = ()
+    default_option_id: str | None = None
+    max_answer_length: int = 1000
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "question": self.question,
+            "reason": self.reason or "",
+            "answer_type": self.answer_type,
+            "options": [option.to_dict() for option in self.options],
+            "default_option_id": self.default_option_id,
+            "max_answer_length": self.max_answer_length,
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class AskUserAnswer:
+    answer: str
+    selected_option_id: str | None = None
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "answer": self.answer,
+            "selected_option_id": self.selected_option_id,
+        }
+
+
 class ConfirmationKind(str, Enum):
     APPROVAL = "approval"
     CLARIFICATION = "clarification"
@@ -207,6 +255,7 @@ class ConfirmationResponse:
     approved: bool = False
     scope: str = ""
     clarification: str = ""
+    selected_option_id: str | None = None
 
     @property
     def denied(self) -> bool:

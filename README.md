@@ -465,6 +465,7 @@ All tools pass through the permission system and lifecycle hooks. **Risk level**
 | Tool | Risk | Mutating | Description |
 |---|---|---|---|
 | `get_time` | — | No | Returns the current UTC timestamp |
+| `ask_user` | — | No | Pauses the supervisor for one focused text, choice, or yes/no clarification |
 | `read_file` | low | No | Reads a file or line range within the workspace |
 | `glob` | low | No | Finds files by glob pattern within the workspace |
 | `grep` | low | No | Searches file content by regex; returns path, line number, match |
@@ -510,8 +511,8 @@ allowed_tools = [
   "get_time", "read_file", "write_file", "edit", "insert_edit_into_file",
   "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff",
   "run_tests", "run_python_check", "bash",
-  "subagent_planning_analysis", "subagent_execution",
-  "subagent_review", "subagent_verification",
+  "subagent_explorer", "subagent_coding",
+  "subagent_code_reviewer", "subagent_impact_analyzer",
 ]
 ```
 
@@ -519,10 +520,10 @@ Built-in cognitive tools:
 
 | Tool | Purpose |
 |---|---|
-| `subagent_planning_analysis` | Read-only repo analysis and implementation planning |
-| `subagent_execution` | Focused implementation work using normal workspace tools |
-| `subagent_review` | Code review for bugs, regressions, and maintainability risks |
-| `subagent_verification` | Runs tests, lint/type checks, and summarizes failures |
+| `subagent_explorer` | Bounded read-only repo exploration, including status and diff inspection |
+| `subagent_coding` | Focused implementation work with edit tools and cheap local validation |
+| `subagent_code_reviewer` | Code review and scoped automated verification |
+| `subagent_impact_analyzer` | Read-only blast-radius analysis and verification planning |
 
 Custom workspace sub-agents are configured in `.nexus/config.toml` with `delegation_subagents`. Each entry becomes a tool named `subagent_<name>`:
 
@@ -549,18 +550,36 @@ Agent-scoped resources are layered on top of global activation. Use `/mcp activa
 
 ```toml
 [agents]
-allowed_tools = []          # empty = default supervisor behavior; "all" = every normal workspace tool
-allowed_skills = []         # empty = all globally active skills; "all" = every active skill
-allowed_mcps = []           # empty = default MCP behavior; "all" = every active MCP server
+allowed_skills = []
+allowed_mcp_servers = []
+allowed_tools = ["bash", "read_file", "ask_user"]
 
 [[sub-agents]]
-name = "execution"
-allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_tests", "run_python_check", "bash"]
-allowed_skills = []         # empty = no extra skill metadata by default; "all" = every active skill
-allowed_mcps = []           # empty = built-in sub-agent MCP inheritance/defaults; "all" = every active MCP server
+name = "explorer"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]
+
+[[sub-agents]]
+name = "coding"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_python_check", "run_formatter"]
+
+[[sub-agents]]
+name = "code_reviewer"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["git_diff", "read_file", "grep", "lsp", "git_status", "run_tests", "run_python_check"]
+
+[[sub-agents]]
+name = "impact_analyzer"
+allowed_mcps = []
+allowed_skills = []
+allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]
 ```
 
-In advanced mode, the supervisor sees cognitive `subagent_*` tools by default and only the direct normal tools, MCP servers, and skills allowed under `[agents]`; work outside that supervisor allowlist should be delegated to an appropriate sub-agent. In basic mode, direct tools remain available unless narrowed by config. Sub-agents start from their normal `allowed_tools`; a non-empty `[[sub-agents]].allowed_tools` list replaces that base. Set an `allowed_*` value to `"all"` to use every workspace-active tool, skill, or MCP server for that scope. Agent-scoped skills are shown as metadata only. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are still accepted as aliases; obsolete attach/detach keys are ignored.
+These are the generated workspace defaults. In advanced mode, the supervisor sees cognitive `subagent_*` tools plus the direct normal tools, MCP servers, and skills allowed under `[agents]`; work outside that supervisor allowlist should be delegated to an appropriate sub-agent. `ask_user` is supervisor-owned and always hidden from sub-agents. In basic mode, direct tools remain available unless narrowed by config. Sub-agents start from their normal `allowed_tools`; a non-empty `[[sub-agents]].allowed_tools` list replaces that base. Set an `allowed_*` value to `"all"` to use every workspace-active tool, skill, or MCP server for that scope. Agent-scoped skills are shown as metadata only. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are still accepted as aliases; obsolete attach/detach keys are ignored.
 
 Useful commands after editing `.nexus/config.toml`:
 
@@ -571,7 +590,7 @@ Useful commands after editing `.nexus/config.toml`:
 /tools                 # confirm which subagent_* tools are registered
 /skills reload         # rescan skills and register skill-backed sub-agent tools
 /agent tools           # inspect supervisor-scoped tool visibility
-/sub-agent show execution # inspect one sub-agent's effective resources
+/sub-agent show coding    # inspect one sub-agent's effective resources
 /context agents        # inspect sub-agent context isolation and handoffs
 ```
 
@@ -621,6 +640,10 @@ YAML agents participate in the same definition priority chain as built-in and co
 ### Approval Flow
 
 In `default` mode, mutating or risky tools emit a confirmation event before execution. The turn runner owns the user prompt for both interactive and headless flows. After approval, Nexus resumes `Agent.run()` with the exact pending tool call that was displayed in the confirmation panel; it does not ask the model to regenerate the call. This keeps approval behavior deterministic across providers.
+
+`ask_user` is a separate supervisor-owned clarification interrupt. Sub-agents return `clarifications_needed` to the supervisor instead of calling it directly. Answers are stored as matching structured tool results, and mixed batches discard calls after the question so the model can decide again with the answer. Non-TTY headless runs return exit code `4` with a JSON `needs_input` request and never auto-select defaults.
+
+When a sub-agent result has `status: needs_clarification`, Nexus retains a bounded logical-task record in session metadata. After asking the user, the supervisor calls the same `subagent_*` tool with `resume_task_id` and a structured `clarification` answer. Nexus starts a fresh sub-agent model call with the original delegation, compact prior findings, packet ids, and user decision; it does not retain or replay the full private sub-agent transcript.
 
 Approval policies:
 
@@ -825,6 +848,7 @@ max_loop_iterations = 8
 auto_confirm_read_only = true
 parallel_tools = true             # run eligible non-mutating tools in parallel within a single turn
 parallel_tool_window = 4          # max parallel non-mutating tool calls per window (1-8)
+ask_user_max_questions_per_turn = 3
 
 # Context and compaction
 compaction_soft_limit = 85197    # auto-tuned to 65% of model context window
@@ -872,6 +896,7 @@ project_description = ""
 - `parallel_tool_window = 4` sets the batch size for each parallel window. Valid values are `1` through `8`.
 - The scheduler still runs mutating tools sequentially. When a turn mixes reads and writes, Nexus drains the read-only parallel windows first and then executes the remaining sequential tools.
 - This applies to both the supervisor agent and sub-agents. Nested `subagent_*` tool calls themselves are still kept out of the parallel lane.
+- `ask_user` is supervisor-only and always stays out of the parallel lane.
 #
 # Git MCP (Python package — use uvx or pip install mcp-server-git):
 #   Command: ["uvx", "mcp-server-git", "--repository", "/absolute/git/repo/root"]
@@ -890,12 +915,12 @@ disabled_mcp_servers = []       # disable local or global MCP entries by name
 # Optional MCP fields: env, cwd, disabled, disabled_tools.
 
 # Agent profile
-config_version = 3
+config_version = 4
 agent_mode = "basic" # basic | advanced
 # basic = single-LLM execution with no cognitive sub-agent tools.
 # advanced = supervisor LLM with cognitive sub-agent tools.
-# Built-in cognitive tools in advanced mode: subagent_planning_analysis,
-# subagent_execution, subagent_review, subagent_verification
+# Built-in cognitive tools in advanced mode: subagent_explorer,
+# subagent_coding, subagent_code_reviewer, subagent_impact_analyzer
 delegation_subagents = []
 # Custom sub-agents become tools named subagent_<name>.
 # Example:

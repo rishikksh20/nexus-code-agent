@@ -124,7 +124,7 @@ async def test_headless_runner_returns_final_response(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_headless_resume_sends_original_paused_prompt_not_continue(tmp_path):
+async def test_headless_resume_records_continue_while_using_original_task_input(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
     model = RecordingFakeModelClient(
@@ -153,8 +153,9 @@ async def test_headless_resume_sends_original_paused_prompt_not_continue(tmp_pat
     )
 
     assert result.exit_code == EXIT_OK
-    assert state.history[0].content == "finish the original task"
-    assert model.requests[0].messages[-1].content == "finish the original task"
+    assert state.history[0].content == "continue"
+    assert model.requests[0].messages[-1].content == "continue"
+    assert "finish the original task" in model.requests[0].system_prompt
 
 
 @pytest.mark.asyncio

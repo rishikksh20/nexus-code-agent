@@ -550,6 +550,7 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         "compaction_keep_recent",
         "max_loop_iterations",
         "max_tool_calls_per_turn",
+        "ask_user_max_questions_per_turn",
         "parallel_tool_window",
         "textual_transcript_max_lines",
         "prompt_history_max_entries",
@@ -909,6 +910,7 @@ def _apply_agent_mode_profile(values: dict[str, Any]) -> dict[str, Any]:
 def _advanced_mode_required_tool_names() -> tuple[str, ...]:
     return (
         *_builtin_cognitive_tool_names(),
+        "ask_user",
         "read_file",
         "glob",
         "grep",

@@ -32,7 +32,7 @@ One runtime session is created through `RuntimeSession.create()`.
 4. `run_orchestrated_turn()` delegates directly to `turn_runner.run_agent_turn()`. When `agent_mode = "advanced"`, the supervisor can call registered cognitive sub-agent tools through the same tool/approval path.
 5. `run_agent_turn()` asks `ReplState.prepare_turn()` for model-ready messages, context metadata, and the system prompt.
 6. `Agent.run()` streams model output, emits assistant events, evaluates tool calls, and either executes allowed tools or emits a `CONFIRMATION_REQUESTED` event.
-7. `turn_runner.run_agent_turn()` is the single user-facing approval callback owner. It records approval/refusal/clarification and, on approval, resumes exact pending calls through `Agent.run(..., resume_tool_calls=...)`.
+7. `turn_runner.run_agent_turn()` is the single user-facing approval callback owner. It records approval/refusal/clarification, resumes approved calls through `Agent.run(..., resume_tool_calls=...)`, and commits `ask_user` answers as exact matching tool results.
 8. `ReplState.apply_events()` appends only model messages whose tool calls have matching tool results, accumulates usage, and saves the session.
 
 The important invariant is provider-safe message ordering: assistant messages with `tool_calls` must not be persisted unless the corresponding tool result messages are also present. This is why pending confirmation events are handled carefully before history is committed.
@@ -48,6 +48,9 @@ Approval is centralized at the turn-runner layer.
 - `Agent._execute_approved_tool_calls()` executes those exact calls without asking the provider to regenerate them.
 - One-time approvals are consumed after execution. Turn-wide approval excludes high or dangerous bash calls.
 - Refusals are recorded for the current turn so the model receives a denied tool result instead of repeatedly prompting for the same invocation.
+- `ask_user` is a supervisor-owned clarification interrupt backed by bounded session metadata. It supports `text`, `choice`, and `yes_no`; sub-agents return `clarifications_needed` envelopes instead of calling it.
+- Clarification-blocked sub-agent work is resumed as the same logical task. The supervisor calls the same `subagent_*` tool with `resume_task_id` and a structured `clarification`; Nexus creates a fresh isolated model call with a bounded continuation packet containing the original delegation, compact findings, packet ids, and prior answers.
+- Non-TTY headless execution returns exit code `4` and a structured `needs_input` JSON request without choosing defaults automatically.
 
 This design prevents the previous loop where approving a tool caused the model to regenerate a similar tool call and ask again.
 
@@ -58,6 +61,7 @@ The default core registry is built by `nexus/tools/registry.py`.
 Default first-party tools:
 
 - `get_time`
+- `ask_user`
 - `read_file`
 - `write_file`
 - `edit`
@@ -91,6 +95,7 @@ Tools expose:
 - `kind`
 - `execute()`
 - optional `get_confirmation()` preview data such as diffs, commands, and affected paths
+- optional `get_user_input_request()` data for runtime-owned clarification interrupts
 
 Tool metadata is used by permissions, hook payloads, terminal rendering, and prompts. Some security logic still uses explicit tool-name checks for special cases such as `write_file`, legacy write aliases, `memory`, and `bash`.
 

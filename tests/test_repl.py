@@ -265,6 +265,21 @@ def _build_state(tmp_path, **overrides) -> ReplState:
     )
 
 
+def test_continue_prompt_uses_previous_user_task_when_no_paused_turn(tmp_path):
+    state = _build_state(tmp_path)
+    state.history.extend(
+        [
+            Message(role="user", content="implement the calculator"),
+            Message(role="assistant", content="partly done"),
+        ]
+    )
+
+    effective_prompt, resumed_paused_turn = state.consume_turn_prompt("continue")
+
+    assert effective_prompt == "implement the calculator"
+    assert resumed_paused_turn is False
+
+
 def test_apply_events_persists_bounded_tool_output(tmp_path):
     state = _build_state(
         tmp_path,

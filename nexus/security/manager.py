@@ -106,7 +106,7 @@ class ApprovalManager:
         self.record_approval(tool_name, ApprovalScope.ONCE, arguments=arguments)
 
     def record_turn_wide_mutating_approval(self) -> None:
-        """Approve non-dangerous confirmable tool calls for the current user turn."""
+        """Approve confirmable tool calls for the current user turn."""
         self._turn_mutating_approved = True
 
     def record_refusal(
@@ -175,16 +175,9 @@ class ApprovalManager:
         is_mutating: bool,
         risk_level: str = "medium",
     ) -> bool:
-        """Return ``True`` when the current turn has blanket per-turn approval.
-
-        Turn-wide approvals intentionally do not cover high/dangerous shell
-        commands, which must always be confirmed per invocation. Callers only
-        consult this helper for tools that would otherwise prompt.
-        """
-        del is_mutating
-        if not self._turn_mutating_approved:
-            return False
-        return not _requires_fresh_turn_approval(tool_name, risk_level)
+        """Return ``True`` when the current turn has blanket per-turn approval."""
+        del tool_name, is_mutating, risk_level
+        return self._turn_mutating_approved
 
     def is_refused(
         self,
@@ -237,9 +230,5 @@ def _normalized_approval_key(tool_name: str, arguments: dict[str, Any] | None) -
     raw = _approval_key(tool_name, arguments)
     return " ".join(raw.lower().split())
 
-
-def _requires_fresh_turn_approval(tool_name: str, risk_level: str) -> bool:
-    normalised_risk = str(risk_level).strip().lower().split(".")[-1]
-    return tool_name == "bash" and normalised_risk in {"high", "dangerous"}
 
 

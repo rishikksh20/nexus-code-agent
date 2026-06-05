@@ -211,6 +211,17 @@ def register_default_runtime_hooks(
                 "field": payload.get("field"),
                 "call_id": payload.get("call_id"),
             }
+        elif event_name == "clarification_answered":
+            essentials = {
+                "event": event_name,
+                "session_id": payload.get("session_id"),
+                "turn_id": payload.get("turn_id"),
+                "tool_name": payload.get("tool_name"),
+                "call_id": payload.get("call_id"),
+                "answer_type": payload.get("answer_type"),
+                "selected_option_id": payload.get("selected_option_id"),
+                "answer_length": payload.get("answer_length"),
+            }
         elif event_name == "model_start":
             essentials = {
                 "event": event_name,

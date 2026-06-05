@@ -226,14 +226,14 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
 
     assert config.agent_mode == "basic"
     assert config.delegation_subagents == []
-    assert config.config_version == 3
+    assert config.config_version == 4
     assert config.textual_transcript_max_lines == 5000
     assert config.prompt_history_max_entries == 200
     assert config.tool_output_max_chars == 102400
     assert config.shell_inherit_environment is False
     assert config.parallel_tools is True
     assert config.parallel_tool_window == 4
-    assert config.agent_allowed_tools == ["bash"]
+    assert config.agent_allowed_tools == ["bash", "read_file", "ask_user"]
     assert config.agent_allowed_skills == []
     assert config.agent_allowed_mcp_servers == []
     assert not hasattr(config, "agent_attached_tools")
@@ -243,6 +243,16 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
         "coding",
         "code_reviewer",
         "impact_analyzer",
+    ]
+    explorer_profile = next(entry for entry in config.subagent_profiles if entry["name"] == "explorer")
+    assert explorer_profile["allowed_tools"] == [
+        "read_file",
+        "glob",
+        "grep",
+        "list_dir",
+        "lsp",
+        "git_diff",
+        "git_status",
     ]
     coding_profile = next(entry for entry in config.subagent_profiles if entry["name"] == "coding")
     assert coding_profile["allowed_tools"] == [
@@ -545,7 +555,7 @@ def test_config_upgrade_rehomes_config_version_before_existing_tables(tmp_path):
 
     assert content.count("# Added by Nexus config upgrade") == 1
     assert content.splitlines().count("[[sub-agents]]") == 4
-    assert parsed["config_version"] == 3
+    assert parsed["config_version"] == 4
     assert "config_version" not in parsed["agents"]
     assert after.needs_upgrade is False
 
