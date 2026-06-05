@@ -8,6 +8,7 @@ from difflib import SequenceMatcher, unified_diff
 import io
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -64,7 +65,13 @@ from nexus.runtime.turn_runner import (
     approval_response_from_answer,
 )
 from nexus.security.policy import ApprovalPolicy
-from nexus.ui.terminal import NEXUS_THEME, TerminalUI, _MAX_TOOL_PARAM_SUMMARY_CHARS, _solid_ascii_banner
+from nexus.ui.terminal import (
+    NEXUS_THEME,
+    TerminalUI,
+    _MAX_TOOL_PARAM_SUMMARY_CHARS,
+    _solid_ascii_banner,
+    _tool_failure_reason,
+)
 
 if TYPE_CHECKING:
     from rich.console import RenderableType
@@ -161,6 +168,12 @@ class _PendingApproval:
     future: asyncio.Future[ConfirmationResponse]
 
 
+@dataclass(frozen=True)
+class _FileChangePreview:
+    request: ConfirmationRequest
+    actions_enabled: bool = True
+
+
 def _strip_mouse_escape_sequences(value: str) -> str:
     """Remove leaked terminal mouse reports from input text."""
     return _MOUSE_ESCAPE_RE.sub("", value)
@@ -207,8 +220,8 @@ class TextualTerminalUI(TerminalUI):
         self._app = app
         self._tool_started_at: dict[str, float] = {}
 
-    def _write(self, renderable: RenderableType) -> None:
-        self._app.write(renderable)
+    def _write(self, renderable: RenderableType) -> dict[str, Any]:
+        return self._app.write(renderable)
 
     def print(self, *args: Any, **kwargs: Any) -> None:
         if not args:
@@ -391,6 +404,9 @@ class TextualTerminalUI(TerminalUI):
             "glob": "Found" if completed else "Find",
             "run_tests": "Tested" if completed else "Test",
             "run_python_check": "Checked" if completed else "Check",
+            "run_formatter": "Formatted" if completed else "Format",
+            "git_status": "Git status" if completed else "Git status",
+            "git_diff": "Git diff" if completed else "Git diff",
         }
         if tool_name.startswith("subagent_"):
             return "Delegated" if completed else "Delegate"
@@ -415,12 +431,19 @@ class TextualTerminalUI(TerminalUI):
         path = metadata.get("path") or args.get("path") or args.get("cwd")
         if isinstance(path, str) and path.strip():
             return self._relative_path(path)
-        if tool_name == "bash":
-            command = str(args.get("command", "") or "").strip()
+        command = _command_from_arguments(args)
+        if command:
             return self._truncate_preview(command, limit=100)
         if tool_name.startswith("subagent_"):
             return self._compact_tool_detail(tool_name, args)
         return self._compact_tool_detail(tool_name, args)
+
+    def _tool_label_style(self, tool_name: str, result: ToolResult | None = None) -> str:
+        if result is not None and result.is_error:
+            return "error"
+        if result is not None and tool_name == "write_file":
+            return "bold tool.write"
+        return self._tool_border_style(tool_name)
 
     def _block_text(self, *lines: str, style: str = "default") -> Text:
         text = Text()
@@ -448,6 +471,37 @@ class TextualTerminalUI(TerminalUI):
         text.append("Run Command :", style="bold tool.shell")
         text.append(f" #{call_id[:8]}", style="bold tool.shell")
         return text
+
+    def _command_tool_start_header(
+        self,
+        call_id: str,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> Text:
+        command = _command_for_tool(tool_name, args)
+        detail = self._tool_target(tool_name, args) or self._truncate_preview(command, limit=100)
+        label = _command_tool_title(tool_name)
+        return self._inline_header("· ", label, f"{detail}  #{call_id[:8]}", style=self._tool_border_style(tool_name))
+
+    def _command_tool_complete_header(
+        self,
+        result: ToolResult,
+        args: dict[str, Any],
+        command: str,
+    ) -> Text:
+        status = "failed" if result.is_error else "done"
+        target = self._tool_target(result.tool_name, args, result) or self._truncate_preview(command, limit=100)
+        detail_parts = [target, status]
+        if result.is_error:
+            detail_parts[-1] = f"failed: {_tool_failure_reason(result)}"
+        header = self._inline_header(
+            "✗ " if result.is_error else "✓ ",
+            _command_tool_title(result.tool_name),
+            " · ".join(part for part in detail_parts if part),
+            style="error" if result.is_error else self._tool_border_style(result.tool_name),
+        )
+        self._append_elapsed(header, self._elapsed_label(result.call_id, result))
+        return header
 
     def _render_inline_tool_start(
         self,
@@ -480,20 +534,13 @@ class TextualTerminalUI(TerminalUI):
         args: dict[str, Any],
         display: dict[str, Any],
     ) -> None:
-        command = _command_from_arguments(args)
-        if command:
+        if _is_command_like_tool(tool_name, args):
             self._tool_started_at[call_id] = time.perf_counter()
-            header = self._command_start_header(call_id)
-            if _should_collapse_text(command):
-                self._app.write_collapsible(
-                    header,
-                    _bash_command_block(command),
-                    summary=f"{_line_count(command)} lines",
-                    initially_expanded=False,
-                    preview=_bash_command_block(command, collapsed=True),
-                )
-                return
-            self._write(Group(header, _bash_command_block(command)))
+            self._app.begin_command_tool_entry(
+                call_id,
+                header=self._command_tool_start_header(call_id, tool_name, args),
+                command=_command_for_tool(tool_name, args),
+            )
             return
         self._write(self._render_inline_tool_start(call_id, tool_name, actor, args, display))
 
@@ -515,33 +562,111 @@ class TextualTerminalUI(TerminalUI):
         tool_name: str,
         args: dict[str, Any],
         result: ToolResult | None = None,
+        *,
+        file_preview_call_id: str = "",
     ) -> Text:
         label = self._semantic_tool_label(
             tool_name,
             completed=result is not None,
             failed=bool(result.is_error) if result is not None else False,
         )
+        if result is not None and result.is_error:
+            label = tool_name
         target = self._tool_target(tool_name, args, result)
-        style = "error" if result is not None and result.is_error else self._tool_border_style(tool_name)
+        style = self._tool_label_style(tool_name, result)
+        has_file_preview = bool(file_preview_call_id)
         if result is None:
             row = Text(f"{_TOOL_ROW_INDENT}· ", style="dim")
         elif result.is_error:
             row = Text(f"{_TOOL_ROW_INDENT}✗ ", style="bold red")
+        elif has_file_preview:
+            row = Text(f"{_TOOL_ROW_INDENT}", style="dim")
+            marker_start = len(row.plain)
+            row.append("[+] ", style="cyan")
+            row.stylize(
+                Style(color="cyan", meta={"nexus_file_preview_call_id": file_preview_call_id}),
+                marker_start,
+                len(row.plain),
+            )
+            row.append("✓ ", style="bold green")
         else:
             row = Text(f"{_TOOL_ROW_INDENT}✓ ", style="bold green")
         row.append(label, style=style)
         if target:
-            row.append(f" {target}", style="dim")
+            row.append(" ", style="dim")
+            target_start = len(row.plain)
+            row.append(target, style="dim")
+            if has_file_preview:
+                row.stylize(
+                    Style(color="bright_cyan", underline=True, meta={"nexus_file_preview_call_id": file_preview_call_id}),
+                    target_start,
+                    len(row.plain),
+                )
         row.append(f"  #{call_id[:8]}", style="dim")
         if result is None:
             row.append(" · running", style="dim")
             return row
         if result.is_error:
             row.append(" · failed", style="bold red")
+            reason = _tool_failure_reason(result)
+            if reason:
+                row.append(f": {self._truncate_preview(reason, limit=120)}", style="dim red")
         else:
             row.append(" · done", style="dim")
         self._append_elapsed(row, self._elapsed_label(call_id, result))
         return row
+
+    def _render_subagent_command_tool_row(
+        self,
+        call_id: str,
+        tool_name: str,
+        args: dict[str, Any],
+        result: ToolResult | None = None,
+        *,
+        expanded: bool = False,
+        approval_required: bool = False,
+        live_output: str = "",
+    ) -> RenderableType:
+        marker = "[-]" if expanded else "[+]"
+        marker_style = Style(color="cyan", meta={"nexus_subagent_command_call_id": call_id})
+        row = Text(f"{_TOOL_ROW_INDENT}", style="dim")
+        marker_start = len(row.plain)
+        row.append(f"{marker} ", style="cyan")
+        row.stylize(marker_style, marker_start, len(row.plain))
+        if result is None:
+            row.append("? " if approval_required else "· ", style="bold yellow" if approval_required else "dim")
+        elif result.is_error:
+            row.append("✗ ", style="bold red")
+        else:
+            row.append("✓ ", style="bold green")
+        label_start = len(row.plain)
+        row.append(_command_tool_title(tool_name), style="error" if result is not None and result.is_error else self._tool_border_style(tool_name))
+        row.stylize(
+            Style(color="bright_cyan", underline=True, meta={"nexus_subagent_command_call_id": call_id}),
+            label_start,
+            len(row.plain),
+        )
+        command = _command_for_tool(tool_name, args, result)
+        if command:
+            row.append(" ", style="dim")
+            row.append(self._truncate_preview(command, limit=100), style="dim")
+        row.append(f"  #{call_id[:8]}", style="dim")
+        if result is None:
+            row.append(" · approval required" if approval_required else " · running", style="warning" if approval_required else "dim")
+            if not expanded:
+                return row
+            return Group(row, Padding(_command_tool_body(command, live_output, running=True), (0, 0, 0, 6)))
+        if result.is_error:
+            row.append(f" · failed: {self._truncate_preview(_tool_failure_reason(result), limit=120)}", style="dim red")
+        else:
+            row.append(" · done", style="dim")
+        self._append_elapsed(row, self._elapsed_label(call_id, result))
+        if not expanded:
+            return row
+        output = _tool_failure_reason(result) if result.is_error else (result.output or "").strip()
+        if not output:
+            output = "(no output)"
+        return Group(row, Padding(_command_tool_body(command, output), (0, 0, 0, 6)))
 
     def _render_supervisor_row(
         self,
@@ -555,8 +680,10 @@ class TextualTerminalUI(TerminalUI):
             completed=result is not None,
             failed=bool(result.is_error) if result is not None else False,
         )
+        if result is not None and result.is_error:
+            label = tool_name
         target = self._tool_target(tool_name, args, result)
-        style = "error" if result is not None and result.is_error else self._tool_border_style(tool_name)
+        style = self._tool_label_style(tool_name, result)
         if result is None:
             row = Text(f"{_TOOL_ROW_INDENT}· ", style="dim")
         elif result.is_error:
@@ -570,33 +697,40 @@ class TextualTerminalUI(TerminalUI):
             return row
         if result.is_error:
             row.append(" · failed", style="bold red")
-            if result.output:
-                truncated = result.output[:200].strip()
-                row.append(f"\n{_TOOL_ROW_INDENT}  {truncated}", style="dim red")
+            reason = _tool_failure_reason(result)
+            if reason:
+                row.append(f": {self._truncate_preview(reason, limit=160)}", style="dim red")
         else:
             self._append_elapsed(row, self._elapsed_label(call_id, result))
         return row
 
     def _render_bash_complete(self, result: ToolResult, args: dict[str, Any]) -> None:
-        elapsed = self._elapsed_label(result.call_id, result)
-        status = "failed" if result.is_error else "done"
-        target = self._tool_target(result.tool_name, args, result)
-        header = self._inline_header(
-            "✗ " if result.is_error else "✓ ",
-            self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error),
-            " · ".join(part for part in (target, status) if part),
-            style="error" if result.is_error else "tool.shell",
+        self._render_command_tool_complete(result, args)
+
+    def _render_command_tool_complete(self, result: ToolResult, args: dict[str, Any]) -> None:
+        command = _command_for_tool(result.tool_name, args, result)
+        approval_request = ConfirmationRequest(
+            kind=ConfirmationKind.APPROVAL,
+            tool_name=result.tool_name,
+            prompt="",
+            reason="Command has already run.",
+            payload={"preview_only": True},
+            call_id=result.call_id,
+            arguments=dict(args),
+            preview={"command": command} if command else {},
         )
-        self._append_elapsed(header, elapsed)
-        output = (result.output or "").strip()
+        absorbed_approval = self._app.absorb_approval_entries_for_request(approval_request)
+        if absorbed_approval:
+            self._app.absorb_tool_start_entries(result.call_id)
+        output = _tool_failure_reason(result) if result.is_error else (result.output or "").strip()
         if not output:
-            self._write(header)
-            return
-        self._app.write_collapsible(
-            header,
-            _bash_output_block(output),
-            summary=f"{_line_count(output)} lines",
-            preview=_bash_output_block(output, collapsed=True),
+            output = "(no output)"
+        self._app.finish_command_tool_entry(
+            result.call_id,
+            header=self._command_tool_complete_header(result, args, command),
+            command=command,
+            output=output,
+            summary=_command_tool_summary(result, output),
         )
 
     def _render_confirmation_preview(
@@ -648,7 +782,9 @@ class TextualTerminalUI(TerminalUI):
         detail = self._render_approval_detail(req.tool_name, args, req.reason, policy)
         rendered_preview = self._render_confirmation_preview(req.tool_name, args, preview)
         if rendered_preview is None:
-            self._write(Group(header, detail))
+            entry = self._write(Group(header, detail))
+            if isinstance(entry, dict):
+                entry["approval_request_key"] = _approval_request_key(req)
             return
         expanded, collapsed_preview, summary = rendered_preview
         entry = self._app.write_collapsible(
@@ -658,8 +794,11 @@ class TextualTerminalUI(TerminalUI):
             initially_expanded=False,
             preview=Group(collapsed_preview, detail),
         )
+        entry["approval_request_key"] = _approval_request_key(req)
         if req.tool_name in _MUTATING_FILE_TOOLS:
-            entry["file_preview_request"] = req
+            entry["file_preview"] = _FileChangePreview(req, actions_enabled=True)
+            entry["approval_pending"] = True
+            entry["clickable_path"] = target
 
     def _render_file_change_complete(
         self,
@@ -670,16 +809,18 @@ class TextualTerminalUI(TerminalUI):
         elapsed = self._elapsed_label(result.call_id, result)
         target = self._tool_target(result.tool_name, args, result)
         label = self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error)
+        if result.is_error:
+            label = result.tool_name
         detail = " · ".join(part for part in (target, "failed" if result.is_error else "done") if part)
         header = self._inline_header(
             "✗ " if result.is_error else "✓ ",
             label,
             detail,
-            style="error" if result.is_error else "tool.write",
+            style=self._tool_label_style(result.tool_name, result),
         )
         self._append_elapsed(header, elapsed)
         if result.is_error:
-            body_text = result.output or "Tool failed."
+            body_text = f"{result.tool_name} failed: {_tool_failure_reason(result)}"
             body = self._block_text(body_text, style="red on #1f1f1f")
             if _should_collapse_text(result.output):
                 self._app.write_collapsible(
@@ -693,19 +834,65 @@ class TextualTerminalUI(TerminalUI):
             return
 
         diff_data = _diff_data_from_preview(preview)
-        diff = _diff_text_from_data(diff_data)
+        diff = _diff_text_from_data(diff_data) or _diff_from_arguments(result.tool_name, args)
+        if not diff and ("old_content" in diff_data or "new_content" in diff_data):
+            diff = _unified_diff_text(
+                str(diff_data.get("old_content", "") or ""),
+                str(diff_data.get("new_content", "") or ""),
+                path=target or str(diff_data.get("path") or "file"),
+            )
         if not diff:
             self._write(header)
             return
 
         diff_renderable = self._render_file_diff_preview(result.tool_name, diff_data, diff, path=target, collapsed=False)
-        self._app.write_collapsible(
+        file_preview = self._file_change_preview_info(result, args, preview)
+        if file_preview is not None:
+            self._app.register_file_preview(file_preview)
+            self._app.absorb_approval_entries_for_request(file_preview.request)
+        entry = self._app.write_collapsible(
             header,
             diff_renderable,
             summary=_diff_summary(diff),
             initially_expanded=False,
             preview=self._render_file_diff_preview(result.tool_name, diff_data, diff, path=target, collapsed=True),
         )
+        if file_preview is not None:
+            entry["file_preview"] = file_preview
+            entry["clickable_path"] = target
+
+    def _file_change_preview_info(
+        self,
+        result: ToolResult,
+        args: dict[str, Any],
+        preview: dict[str, Any],
+    ) -> _FileChangePreview | None:
+        if result.is_error or result.tool_name not in _MUTATING_FILE_TOOLS:
+            return None
+        target = self._tool_target(result.tool_name, args, result)
+        diff_data = _diff_data_from_preview(preview)
+        diff = _diff_text_from_data(diff_data) or _diff_from_arguments(result.tool_name, args)
+        if not diff and result.tool_name == "apply_patch":
+            diff = str(args.get("patch", "") or "")
+        if not diff and ("old_content" in diff_data or "new_content" in diff_data):
+            diff = _unified_diff_text(
+                str(diff_data.get("old_content", "") or ""),
+                str(diff_data.get("new_content", "") or ""),
+                path=target or str(diff_data.get("path") or "file"),
+            )
+        if not diff:
+            return None
+        request = ConfirmationRequest(
+            kind=ConfirmationKind.APPROVAL,
+            tool_name=result.tool_name,
+            prompt="",
+            reason="File change has already been applied.",
+            payload={"preview_only": True},
+            call_id=result.call_id,
+            arguments=dict(args),
+            preview=dict(preview),
+        )
+        return _FileChangePreview(request, actions_enabled=False)
 
     def _render_diff_editor(self, diff_text: str, *, path: str = "") -> _ResponsiveDiff:
         return self._render_diff_rows(_diff_rows_from_unified_diff(diff_text), path=path)
@@ -805,6 +992,8 @@ class TextualTerminalUI(TerminalUI):
     def _render_generic_complete(self, result: ToolResult, args: dict[str, Any]) -> None:
         elapsed = self._elapsed_label(result.call_id, result)
         label = self._semantic_tool_label(result.tool_name, completed=True, failed=result.is_error)
+        if result.is_error:
+            label = result.tool_name
         detail = self._tool_target(result.tool_name, args, result)
         header = self._inline_header(
             "✗ " if result.is_error else "✓ ",
@@ -813,16 +1002,17 @@ class TextualTerminalUI(TerminalUI):
             style="error" if result.is_error else self._tool_border_style(result.tool_name),
         )
         self._append_elapsed(header, elapsed)
-        if not result.output or (not result.is_error and result.tool_name in {"read_file", "grep", "glob", "list_dir"}):
+        if not result.is_error and (not result.output or result.tool_name in {"read_file", "grep", "glob", "list_dir"}):
             self._write(header)
             return
-        body = self._preview_block(result.output, path=str(result.metadata.get("path", "") if isinstance(result.metadata, dict) else ""))
+        output = f"{result.tool_name} failed: {_tool_failure_reason(result)}" if result.is_error else result.output
+        body = self._preview_block(output, path=str(result.metadata.get("path", "") if isinstance(result.metadata, dict) else ""))
         if _should_collapse_text(result.output):
             self._app.write_collapsible(
                 header,
                 body,
                 summary=f"{_line_count(result.output)} lines",
-                preview=_preview_text_block(result.output),
+                preview=_preview_text_block(output),
             )
         else:
             self._write(Group(header, body))
@@ -889,11 +1079,14 @@ class TextualTerminalUI(TerminalUI):
                 )
             elif _is_subagent_actor(actor) and self._app.has_subagent_task(actor):
                 self._tool_started_at[call_id] = time.perf_counter()
-                self._app.record_subagent_tool_row(
-                    actor,
-                    call_id,
-                    self._render_subagent_tool_row(call_id, tool_name, arguments),
-                )
+                if _is_command_like_tool(tool_name, arguments):
+                    self._app.record_subagent_command_tool_start(actor, call_id, tool_name, arguments)
+                else:
+                    self._app.record_subagent_tool_row(
+                        actor,
+                        call_id,
+                        self._render_subagent_tool_row(call_id, tool_name, arguments),
+                    )
             elif _is_supervisor_group_tool(tool_name, arguments):
                 self._tool_started_at[call_id] = time.perf_counter()
                 self._app._turn_had_tool_calls = True
@@ -933,18 +1126,50 @@ class TextualTerminalUI(TerminalUI):
                     elapsed=self._elapsed_label(result.call_id, result),
                 )
             elif _is_subagent_actor(actor) and self._app.has_subagent_task(actor):
-                self._app.record_subagent_tool_row(
-                    actor,
-                    result.call_id,
-                    self._render_subagent_tool_row(result.call_id, result.tool_name, arguments, result),
-                )
+                file_preview = self._file_change_preview_info(result, arguments, preview)
+                file_preview_call_id = ""
+                if file_preview is not None:
+                    self._app.register_file_preview(file_preview)
+                    self._app.absorb_approval_entries_for_request(file_preview.request)
+                    file_preview_call_id = result.call_id
+                if _is_command_like_tool(result.tool_name, arguments):
+                    approval_request = ConfirmationRequest(
+                        kind=ConfirmationKind.APPROVAL,
+                        tool_name=result.tool_name,
+                        prompt="",
+                        reason="Command has already run.",
+                        payload={"preview_only": True},
+                        call_id=result.call_id,
+                        arguments=dict(arguments),
+                        preview={"command": _command_for_tool(result.tool_name, arguments, result)},
+                    )
+                    self._app.absorb_approval_entries_for_request(approval_request)
+                    self._app.record_subagent_command_tool_complete(
+                        actor,
+                        result.call_id,
+                        result.tool_name,
+                        arguments,
+                        result,
+                    )
+                else:
+                    self._app.record_subagent_tool_row(
+                        actor,
+                        result.call_id,
+                        self._render_subagent_tool_row(
+                            result.call_id,
+                            result.tool_name,
+                            arguments,
+                            result,
+                            file_preview_call_id=file_preview_call_id,
+                        ),
+                    )
             elif result.call_id in self._app._supervisor_entries_by_call_id:
                 self._app.update_supervisor_row(
                     result.call_id,
                     self._render_supervisor_row(result.call_id, result.tool_name, arguments, result),
                 )
-            elif result.tool_name == "bash":
-                self._render_bash_complete(result, arguments)
+            elif self._app.has_command_tool_entry(result.call_id) or _is_command_like_tool(result.tool_name, arguments):
+                self._render_command_tool_complete(result, arguments)
             elif result.tool_name in _MUTATING_FILE_TOOLS:
                 self._render_file_change_complete(result, arguments, preview)
             else:
@@ -975,6 +1200,15 @@ class TextualTerminalUI(TerminalUI):
                     actor,
                     {"is_mutating": True},
                 )
+                if _is_subagent_actor(actor) and self._app.has_subagent_task(actor) and _is_command_like_tool(req.tool_name, req.arguments):
+                    self._app.record_subagent_command_tool_start(
+                        actor,
+                        req.call_id,
+                        req.tool_name,
+                        {str(key): value for key, value in req.arguments.items()},
+                        approval_required=True,
+                    )
+                    return
                 display_name = self._tool_display_name(req.tool_name, actor)
                 self._write_confirmation_request(
                     req,
@@ -1023,12 +1257,18 @@ class TextualTerminalUI(TerminalUI):
         }:
             return
 
-        if event.kind in {AgentEventType.TURN_COMPLETED, AgentEventType.AGENT_STOP}:
+        if event.kind == AgentEventType.TURN_COMPLETED:
             self.stop_thinking()
             self.stop_tool_wait()
             self._app.close_supervisor_group()
-            if event.kind == AgentEventType.AGENT_STOP:
-                self._app.write_turn_footer()
+            self._app.mark_turn_completed()
+            return
+
+        if event.kind == AgentEventType.AGENT_STOP:
+            self.stop_thinking()
+            self.stop_tool_wait()
+            self._app.close_supervisor_group()
+            self._app.write_turn_footer_if_completed()
             return
 
     def stream_tool_output(
@@ -1156,6 +1396,21 @@ class TranscriptLog(RichLog):
 
     def on_click(self, event: events.Click) -> None:
         if event.button == _RIGHT_MOUSE_BUTTON:
+            event.stop()
+            return
+        preview_call_id = _file_preview_call_id_from_click(event)
+        if preview_call_id:
+            cast("NexusTextualApp", self.app).open_file_change_preview_for_call(preview_call_id)
+            event.stop()
+            return
+        command_call_id = _subagent_command_call_id_from_click(event)
+        if command_call_id:
+            cast("NexusTextualApp", self.app).toggle_subagent_command_detail(command_call_id)
+            event.stop()
+            return
+        result_json_call_id = _subagent_result_json_call_id_from_click(event)
+        if result_json_call_id:
+            cast("NexusTextualApp", self.app).toggle_subagent_result_json(result_json_call_id)
             event.stop()
             return
         toggle_id = _toggle_id_from_click(event)
@@ -1309,6 +1564,7 @@ class FileChangePreviewScreen(ModalScreen[None]):
         on_accept: Callable[[], None],
         on_reject: Callable[[], None],
         on_close: Callable[[], None],
+        actions_enabled: bool = True,
     ) -> None:
         super().__init__()
         self.request = request
@@ -1317,7 +1573,8 @@ class FileChangePreviewScreen(ModalScreen[None]):
         self._on_accept = on_accept
         self._on_reject = on_reject
         self._on_close = on_close
-        self._resolved = False
+        self._resolved = not actions_enabled
+        self._actions_enabled = actions_enabled
 
     def compose(self) -> ComposeResult:
         with Vertical(id="file-preview-shell"):
@@ -1325,17 +1582,25 @@ class FileChangePreviewScreen(ModalScreen[None]):
             with VerticalScroll(id="file-preview-body-scroll"):
                 yield Static(self.preview_renderable, id="file-preview-body")
             with Horizontal(id="file-preview-actions"):
-                yield Button("Accept", id="file-preview-accept", variant="success")
-                yield Button("Reject", id="file-preview-reject", variant="error")
+                accept = Button("Accept", id="file-preview-accept", variant="success")
+                reject = Button("Reject", id="file-preview-reject", variant="error")
+                accept.disabled = not self._actions_enabled
+                reject.disabled = not self._actions_enabled
+                yield accept
+                yield reject
                 yield Button("Close", id="file-preview-close")
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
         if button_id == "file-preview-accept":
+            if not self._actions_enabled:
+                return
             self._resolve(self._on_accept)
             self.dismiss()
             return
         if button_id == "file-preview-reject":
+            if not self._actions_enabled:
+                return
             self._resolve(self._on_reject)
             self.dismiss()
             return
@@ -1348,13 +1613,17 @@ class FileChangePreviewScreen(ModalScreen[None]):
     def on_unmount(self) -> None:
         self._on_close()
 
+    def mark_resolved(self) -> None:
+        self._actions_enabled = False
+        self._resolved = True
+        for selector in ("#file-preview-accept", "#file-preview-reject"):
+            with suppress(Exception):
+                self.query_one(selector, Button).disabled = True
+
     def _resolve(self, callback: Callable[[], None]) -> None:
         if self._resolved:
             return
-        self._resolved = True
-        for selector in ("#file-preview-accept", "#file-preview-reject", "#file-preview-close"):
-            with suppress(Exception):
-                self.query_one(selector, Button).disabled = True
+        self.mark_resolved()
         callback()
 
 
@@ -1501,10 +1770,13 @@ class NexusTextualApp(App[None]):
         self._streaming_tool_output_capped: set[str] = set()
         self._streaming_tool_output_text: dict[str, str] = {}
         self._streaming_tool_output_entries: dict[str, dict[str, Any]] = {}
+        self._command_tool_entries: dict[str, dict[str, Any]] = {}
         self._transcript_entries: list[dict[str, Any]] = []
         self._transcript_plain_parts: list[str] = []
+        self._file_previews_by_call_id: dict[str, _FileChangePreview] = {}
         self._subagent_entries_by_actor: dict[str, dict[str, Any]] = {}
         self._subagent_entries_by_call_id: dict[str, dict[str, Any]] = {}
+        self._subagent_command_entries_by_call_id: dict[str, dict[str, Any]] = {}
         self._supervisor_entry: dict[str, Any] | None = None
         self._supervisor_entries_by_call_id: dict[str, dict[str, Any]] = {}
         self._turn_had_tool_calls = False
@@ -1523,6 +1795,7 @@ class NexusTextualApp(App[None]):
         self._turn_recovery_count = 0
         self._last_tool_failed = False
         self._turn_footer_written = False
+        self._turn_completed_seen = False
         self._prompt_turn_index = 0
         self._prompt_history = [
             message.content
@@ -1572,9 +1845,11 @@ class NexusTextualApp(App[None]):
         _reload_config(self.state)
         self.refresh_footer()
 
-    def write(self, renderable: RenderableType) -> None:
-        self._transcript_entries.append({"type": "renderable", "renderable": renderable})
-        self._render_transcript_entry(self._transcript_entries[-1])
+    def write(self, renderable: RenderableType) -> dict[str, Any]:
+        entry = {"type": "renderable", "renderable": renderable}
+        self._transcript_entries.append(entry)
+        self._render_transcript_entry(entry)
+        return entry
 
     def write_collapsible(
         self,
@@ -1619,6 +1894,7 @@ class NexusTextualApp(App[None]):
             "subagent_title": _subagent_title(args),
             "subagent_tool_order": [],
             "subagent_tool_rows": {},
+            "subagent_command_details": {},
         }
         self._refresh_subagent_task_entry(entry)
         self._transcript_entries.append(entry)
@@ -1642,6 +1918,221 @@ class NexusTextualApp(App[None]):
             order.append(call_id)
         rows[call_id] = row
         self._refresh_subagent_task_entry(entry)
+        self._rerender_transcript()
+
+    def record_subagent_command_tool_start(
+        self,
+        actor: str,
+        call_id: str,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        approval_required: bool = False,
+    ) -> None:
+        self._record_subagent_command_tool(
+            actor,
+            call_id,
+            tool_name,
+            args,
+            result=None,
+            approval_required=approval_required,
+        )
+
+    def record_subagent_command_tool_complete(
+        self,
+        actor: str,
+        call_id: str,
+        tool_name: str,
+        args: dict[str, Any],
+        result: ToolResult,
+    ) -> None:
+        self._record_subagent_command_tool(actor, call_id, tool_name, args, result=result)
+
+    def _record_subagent_command_tool(
+        self,
+        actor: str,
+        call_id: str,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        result: ToolResult | None,
+        approval_required: bool = False,
+    ) -> None:
+        entry = self._subagent_entries_by_actor.get(actor)
+        if entry is None:
+            self.write(
+                self.ui._render_subagent_command_tool_row(
+                    call_id,
+                    tool_name,
+                    args,
+                    result,
+                    expanded=False,
+                    approval_required=approval_required,
+                )
+            )
+            return
+        details = cast("dict[str, dict[str, Any]]", entry.setdefault("subagent_command_details", {}))
+        previous = details.get(call_id, {})
+        details[call_id] = {
+            "tool_name": tool_name,
+            "args": dict(args),
+            "result": result,
+            "expanded": bool(previous.get("expanded", False)),
+            "approval_required": approval_required if result is None else False,
+            "live_output": "" if result is not None else str(previous.get("live_output") or ""),
+        }
+        self._subagent_command_entries_by_call_id[call_id] = entry
+        rows = cast("dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {}))
+        order = cast("list[str]", entry.setdefault("subagent_tool_order", []))
+        if call_id not in rows:
+            order.append(call_id)
+        rows[call_id] = self._render_subagent_command_detail_row(entry, call_id)
+        self._refresh_subagent_task_entry(entry)
+        self._rerender_transcript()
+
+    def toggle_subagent_command_detail(self, call_id: str) -> None:
+        entry = self._subagent_command_entries_by_call_id.get(call_id)
+        if entry is None:
+            return
+        details = cast("dict[str, dict[str, Any]]", entry.get("subagent_command_details", {}))
+        detail = details.get(call_id)
+        if detail is None:
+            return
+        detail["expanded"] = not bool(detail.get("expanded", False))
+        rows = cast("dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {}))
+        rows[call_id] = self._render_subagent_command_detail_row(entry, call_id)
+        self._refresh_subagent_task_entry(entry)
+        self._rerender_transcript()
+
+    def _render_subagent_command_detail_row(self, entry: dict[str, Any], call_id: str) -> RenderableType:
+        details = cast("dict[str, dict[str, Any]]", entry.get("subagent_command_details", {}))
+        detail = details.get(call_id, {})
+        return self.ui._render_subagent_command_tool_row(
+            call_id,
+            str(detail.get("tool_name") or "bash"),
+            cast("dict[str, Any]", detail.get("args") or {}),
+            cast("ToolResult | None", detail.get("result")),
+            expanded=bool(detail.get("expanded", False)),
+            approval_required=bool(detail.get("approval_required", False)),
+            live_output=str(detail.get("live_output") or ""),
+        )
+
+    def update_subagent_command_live_output(self, call_id: str, output: str) -> bool:
+        entry = self._subagent_command_entries_by_call_id.get(call_id)
+        if entry is None:
+            return False
+        details = cast("dict[str, dict[str, Any]]", entry.get("subagent_command_details", {}))
+        detail = details.get(call_id)
+        if detail is None:
+            return False
+        detail["live_output"] = output
+        rows = cast("dict[str, RenderableType]", entry.setdefault("subagent_tool_rows", {}))
+        rows[call_id] = self._render_subagent_command_detail_row(entry, call_id)
+        self._refresh_subagent_task_entry(entry)
+        self._rerender_transcript()
+        return True
+
+    def register_file_preview(self, preview: _FileChangePreview) -> None:
+        call_id = preview.request.call_id
+        if call_id:
+            self._file_previews_by_call_id[call_id] = preview
+
+    def has_file_preview(self, call_id: str) -> bool:
+        return call_id in self._file_previews_by_call_id
+
+    def open_file_change_preview_for_call(self, call_id: str) -> None:
+        preview = self._file_previews_by_call_id.get(call_id)
+        if preview is None:
+            return
+        self.open_file_change_preview(preview)
+
+    def absorb_approval_entries_for_request(self, request: ConfirmationRequest) -> bool:
+        key = _approval_request_key(request)
+        kept_entries = [
+            entry
+            for entry in self._transcript_entries
+            if str(entry.get("approval_request_key") or "") != key
+        ]
+        if len(kept_entries) == len(self._transcript_entries):
+            return False
+        self._transcript_entries = kept_entries
+        self._rerender_transcript()
+        return True
+
+    def absorb_tool_start_entries(self, call_id: str) -> None:
+        kept_entries = [
+            entry
+            for entry in self._transcript_entries
+            if str(entry.get("tool_start_call_id") or "") != call_id
+        ]
+        if len(kept_entries) == len(self._transcript_entries):
+            return
+        self._transcript_entries = kept_entries
+        self._rerender_transcript()
+
+    def begin_command_tool_entry(
+        self,
+        call_id: str,
+        *,
+        header: RenderableType,
+        command: str,
+    ) -> None:
+        if call_id in self._command_tool_entries:
+            return
+        body = _command_tool_body(command, "", running=True)
+        entry = self.write_collapsible(
+            header,
+            body,
+            summary="running",
+            initially_expanded=False,
+            preview=None,
+        )
+        entry["command_tool_call_id"] = call_id
+        entry["command_tool_command"] = command
+        self._command_tool_entries[call_id] = entry
+
+    def has_command_tool_entry(self, call_id: str) -> bool:
+        return call_id in self._command_tool_entries
+
+    def update_command_tool_live_output(self, call_id: str, output: str) -> bool:
+        entry = self._command_tool_entries.get(call_id)
+        if entry is None:
+            return False
+        command = str(entry.get("command_tool_command") or "")
+        entry["expanded"] = _command_tool_body(command, output, running=True)
+        entry["preview"] = None
+        entry["summary"] = f"running · {_line_count(output)} lines"
+        self._rerender_transcript()
+        return True
+
+    def finish_command_tool_entry(
+        self,
+        call_id: str,
+        *,
+        header: RenderableType,
+        command: str,
+        output: str,
+        summary: str,
+    ) -> None:
+        entry = self._command_tool_entries.get(call_id)
+        expanded = _command_tool_body(command, output)
+        if entry is None:
+            entry = self.write_collapsible(
+                header,
+                expanded,
+                summary=summary,
+                initially_expanded=False,
+                preview=None,
+            )
+            entry["command_tool_call_id"] = call_id
+            self._command_tool_entries[call_id] = entry
+            return
+        entry["header"] = header
+        entry["expanded"] = expanded
+        entry["preview"] = None
+        entry["summary"] = summary
+        entry["expanded_state"] = False
+        entry["command_tool_command"] = command
         self._rerender_transcript()
 
     def has_subagent_task(self, actor: str) -> bool:
@@ -1738,6 +2229,8 @@ class NexusTextualApp(App[None]):
         entry["subagent_result_payload"] = payload
         entry["subagent_result_status"] = str(payload.get("status") or result.metadata.get("status") or ("failed" if result.is_error else "completed"))
         entry["subagent_result_is_error"] = result.is_error
+        entry["subagent_result_elapsed"] = elapsed
+        entry["subagent_result_json_expanded"] = False
         entry["expanded_state"] = False
         self._refresh_subagent_task_entry(entry)
         self._subagent_entries_by_actor.pop(str(entry.get("subagent_actor", "")), None)
@@ -1754,8 +2247,9 @@ class NexusTextualApp(App[None]):
             body_parts.append(Text(f"{_TOOL_ROW_INDENT}Tool calls", style="dim"))
             body_parts.extend(rows[call_id] for call_id in order if call_id in rows)
         if isinstance(entry.get("subagent_result_output"), str):
-            body_parts.append(Text(f"{_TOOL_ROW_INDENT}Result JSON", style="dim"))
-            body_parts.append(_subagent_result_body(str(entry.get("subagent_result_output") or ""), payload if isinstance(payload, dict) else {}))
+            body_parts.append(_subagent_result_json_row(entry))
+            if bool(entry.get("subagent_result_json_expanded")):
+                body_parts.append(_subagent_result_body(str(entry.get("subagent_result_output") or ""), payload if isinstance(payload, dict) else {}))
             entry["preview"] = _subagent_result_preview(
                 ToolResult(
                     call_id=str(entry.get("subagent_call_id", "")),
@@ -1771,18 +2265,29 @@ class NexusTextualApp(App[None]):
             entry["preview"] = Text(f"{_TOOL_ROW_INDENT}Running...", style="dim")
         entry["expanded"] = Group(*body_parts) if body_parts else Text(f"{_TOOL_ROW_INDENT}Starting sub-agent...", style="dim")
 
+    def toggle_subagent_result_json(self, call_id: str) -> None:
+        entry = self._subagent_entries_by_call_id.get(call_id)
+        if entry is None:
+            return
+        entry["subagent_result_json_expanded"] = not bool(entry.get("subagent_result_json_expanded"))
+        self._refresh_subagent_task_entry(entry)
+        self._rerender_transcript()
+
     def toggle_collapsible(self, toggle_id: str) -> None:
         for entry in self._transcript_entries:
             if entry.get("type") == "collapsible" and entry.get("id") == toggle_id:
-                request = entry.get("file_preview_request")
-                if isinstance(request, ConfirmationRequest):
-                    self.open_file_change_preview(request)
+                file_preview = entry.get("file_preview")
+                if isinstance(file_preview, _FileChangePreview):
+                    self.open_file_change_preview(file_preview)
                     return
                 entry["expanded_state"] = not bool(entry.get("expanded_state"))
                 self._rerender_transcript()
                 return
 
-    def open_file_change_preview(self, request: ConfirmationRequest) -> None:
+    def open_file_change_preview(self, preview_info: _FileChangePreview | ConfirmationRequest) -> None:
+        if isinstance(preview_info, ConfirmationRequest):
+            preview_info = _FileChangePreview(preview_info, actions_enabled=self._approval_actions_enabled(preview_info))
+        request = preview_info.request
         args = {str(key): value for key, value in request.arguments.items()}
         preview = {str(key): value for key, value in request.preview.items()}
         target = self.ui._tool_target(request.tool_name, args)
@@ -1805,9 +2310,18 @@ class NexusTextualApp(App[None]):
             ),
             on_reject=lambda: self._resolve_file_preview_approval(request, ConfirmationResponse()),
             on_close=lambda: self._clear_active_file_preview_screen(screen),
+            actions_enabled=preview_info.actions_enabled,
         )
         self._active_file_preview_screen = screen
         self.push_screen(screen)
+
+    def _approval_actions_enabled(self, request: ConfirmationRequest) -> bool:
+        entry = self._file_preview_entry_for_request(request)
+        if entry is None:
+            return request.kind is ConfirmationKind.APPROVAL and not bool(request.payload.get("preview_only"))
+        if bool(entry.get("approval_resolved")) or bool(request.payload.get("preview_only")):
+            return False
+        return bool(entry.get("approval_pending", request.kind is ConfirmationKind.APPROVAL))
 
     def _file_preview_title(self, request: ConfirmationRequest, target: str) -> Text:
         action = self.ui._semantic_tool_label(request.tool_name)
@@ -1821,11 +2335,25 @@ class NexusTextualApp(App[None]):
         title.append("\nRead-only preview", style="dim")
         return title
 
+    def _file_preview_entry_for_request(self, request: ConfirmationRequest) -> dict[str, Any] | None:
+        key = _approval_request_key(request)
+        for entry in reversed(self._transcript_entries):
+            file_preview = entry.get("file_preview")
+            if not isinstance(file_preview, _FileChangePreview):
+                continue
+            preview_request = file_preview.request
+            if preview_request.call_id and request.call_id and preview_request.call_id == request.call_id:
+                return entry
+            if _approval_request_key(preview_request) == key:
+                return entry
+        return None
+
     def _resolve_file_preview_approval(
         self,
         request: ConfirmationRequest,
         response: ConfirmationResponse,
     ) -> None:
+        self._mark_approval_resolved(request, response)
         key = _approval_request_key(request)
         pending = self._pending_approval
         if pending is not None and _approval_request_key(pending.request) == key:
@@ -1833,6 +2361,54 @@ class NexusTextualApp(App[None]):
                 pending.future.set_result(response)
             return
         self._queued_preview_approvals[key] = response
+
+    def _mark_approval_resolved(
+        self,
+        request: ConfirmationRequest,
+        response: ConfirmationResponse,
+    ) -> None:
+        entry = self._file_preview_entry_for_request(request)
+        if entry is None:
+            return
+        entry["approval_pending"] = False
+        entry["approval_resolved"] = True
+        entry["approval_response"] = response
+        entry["expanded_state"] = False
+        entry["preview"] = None
+        entry["summary"] = _approval_resolution_summary(response)
+        entry["header"] = self._resolved_approval_header(request, response)
+        file_preview = entry.get("file_preview")
+        if isinstance(file_preview, _FileChangePreview):
+            entry["file_preview"] = _FileChangePreview(file_preview.request, actions_enabled=False)
+        self._mark_active_file_preview_resolved(request)
+        self._rerender_transcript()
+
+    def _resolved_approval_header(
+        self,
+        request: ConfirmationRequest,
+        response: ConfirmationResponse,
+    ) -> Text:
+        args = {str(key): value for key, value in request.arguments.items()}
+        target = self.ui._tool_target(request.tool_name, args)
+        action = self.ui._semantic_tool_label(request.tool_name)
+        request_detail = f"{action} {target}".strip() if request.tool_name in _MUTATING_FILE_TOOLS else request.tool_name
+        status = _approval_resolution_summary(response)
+        detail_parts = [part for part in (request_detail, status) if part]
+        call_id = request.call_id[:8] if request.call_id else "pending"
+        return self.ui._inline_header(
+            "✓ " if response.approved else "✗ ",
+            "Approval Request",
+            f"{' · '.join(detail_parts)}  #{call_id}",
+            style="success" if response.approved else "error",
+        )
+
+    def _mark_active_file_preview_resolved(self, request: ConfirmationRequest) -> None:
+        screen = self._active_file_preview_screen
+        if screen is None:
+            return
+        if _approval_request_key(screen.request) != _approval_request_key(request):
+            return
+        screen.mark_resolved()
 
     def _close_active_file_preview(self) -> None:
         screen = self._active_file_preview_screen
@@ -1863,6 +2439,7 @@ class NexusTextualApp(App[None]):
         plain_text = self._render_transcript_plain_text(renderable)
         if plain_text:
             self._transcript_plain_parts.append(plain_text)
+        self._scroll_transcript_to_end()
 
     def _entry_renderable(self, entry: dict[str, Any]) -> RenderableType:
         if entry.get("type") != "collapsible":
@@ -1879,7 +2456,17 @@ class NexusTextualApp(App[None]):
             line.append(_renderable_plain_text(header).strip(), style="default")
         if summary:
             line.append(f" ({summary})", style="dim")
-        line.stylize(Style(color="cyan", meta={"nexus_toggle": toggle_id}), 0, min(3, len(line.plain)))
+        toggle_style = Style(color="cyan", meta={"nexus_toggle": toggle_id})
+        line.stylize(toggle_style, 0, min(3, len(line.plain)))
+        clickable_path = str(entry.get("clickable_path") or "").strip()
+        if clickable_path:
+            path_start = line.plain.find(clickable_path)
+            if path_start >= 0:
+                line.stylize(
+                    Style(color="bright_cyan", underline=True, meta={"nexus_toggle": toggle_id}),
+                    path_start,
+                    path_start + len(clickable_path),
+                )
         if not expanded:
             preview = entry.get("preview")
             if preview is not None:
@@ -1894,6 +2481,13 @@ class NexusTextualApp(App[None]):
         self._transcript_plain_parts.clear()
         for entry in self._transcript_entries:
             self._render_transcript_entry(entry)
+        self._scroll_transcript_to_end()
+
+    def _scroll_transcript_to_end(self) -> None:
+        if self._transcript is None:
+            return
+        with suppress(Exception):
+            self._transcript.scroll_end(animate=False)
 
     def begin_turn_transcript(self) -> None:
         turn_id = str(self.state.current_turn_id or "")
@@ -1907,8 +2501,11 @@ class NexusTextualApp(App[None]):
         self._turn_recovery_count = 0
         self._last_tool_failed = False
         self._turn_footer_written = False
+        self._turn_completed_seen = False
         self._supervisor_entry = None
         self._supervisor_entries_by_call_id.clear()
+        self._command_tool_entries.clear()
+        self._subagent_command_entries_by_call_id.clear()
         self._turn_had_tool_calls = False
         self._queued_preview_approvals.clear()
         self._close_active_file_preview()
@@ -1932,6 +2529,14 @@ class NexusTextualApp(App[None]):
         if self._last_tool_failed and (result.tool_name in _MUTATING_FILE_TOOLS or result.tool_name in _VERIFY_TOOL_NAMES):
             self._turn_recovery_count += 1
         self._last_tool_failed = False
+
+    def mark_turn_completed(self) -> None:
+        self._turn_completed_seen = True
+
+    def write_turn_footer_if_completed(self) -> None:
+        if not self._turn_completed_seen:
+            return
+        self.write_turn_footer()
 
     def write_turn_footer(self) -> None:
         if self._turn_footer_written or self._turn_started_at <= 0:
@@ -2158,7 +2763,8 @@ class NexusTextualApp(App[None]):
         label = prompt.strip()
         if not label:
             return
-        self.write(Text(f"Input required: {label}", style="warning"))
+        entry = self.write(Text(f"Input required: {label}", style="warning"))
+        self._tag_pending_approval_entry(entry, prompt)
 
     def append_assistant_delta(self, content: str) -> None:
         if not self.has_open_assistant_stream:
@@ -2210,6 +2816,10 @@ class NexusTextualApp(App[None]):
     def _append_streaming_tool_output(self, call_id: str, chunk: str) -> None:
         output = self._streaming_tool_output_text.get(call_id, "") + chunk
         self._streaming_tool_output_text[call_id] = output
+        if self.update_subagent_command_live_output(call_id, output):
+            return
+        if self.update_command_tool_live_output(call_id, output):
+            return
         entry = self._streaming_tool_output_entries.get(call_id)
         if entry is None:
             entry = self.write_collapsible(
@@ -2248,7 +2858,8 @@ class NexusTextualApp(App[None]):
             pending_prompt = self._pending_input_prompt
             self._pending_input = None
             if not pending.done():
-                self.write(_input_response_block(pending_prompt, raw))
+                entry = self.write(_input_response_block(pending_prompt, raw))
+                self._tag_pending_approval_entry(entry, pending_prompt)
                 pending.set_result(raw)
             self.clear_status()
             return
@@ -2359,6 +2970,14 @@ class NexusTextualApp(App[None]):
     def _copy_text_to_clipboard(self, text: str) -> None:
         self.copy_to_clipboard(text)
         _copy_to_system_clipboard(text)
+
+    def _tag_pending_approval_entry(self, entry: dict[str, Any], prompt: str) -> None:
+        if not prompt.strip().lower().startswith("allow?"):
+            return
+        pending = self._pending_approval
+        if pending is None:
+            return
+        entry["approval_request_key"] = _approval_request_key(pending.request)
 
     def _focused_input_selected_text(self) -> str:
         if self._input is None:
@@ -2489,7 +3108,7 @@ class NexusTextualApp(App[None]):
                 effective_prompt=effective_prompt,
                 resumed_paused_turn=resumed_paused_turn,
             )
-            self.state.history.append(Message(role="user", content=effective_prompt if resumed_paused_turn else raw_input))
+            self.state.history.append(Message(role="user", content=raw_input))
             user_message_appended = True
             if not resumed_paused_turn:
                 self.state.approval_manager.begin_turn()
@@ -2546,6 +3165,7 @@ class NexusTextualApp(App[None]):
         key = _approval_request_key(request)
         queued = self._queued_preview_approvals.pop(key, None)
         if queued is not None:
+            self._mark_approval_resolved(request, queued)
             return queued
 
         approval_future: asyncio.Future[ConfirmationResponse] = asyncio.get_running_loop().create_future()
@@ -2556,6 +3176,7 @@ class NexusTextualApp(App[None]):
             while True:
                 queued = self._queued_preview_approvals.pop(key, None)
                 if queued is not None:
+                    self._mark_approval_resolved(request, queued)
                     return queued
                 keyboard_task = asyncio.create_task(
                     self.ask(f"Allow? {approval_prompt_label(policy)}")
@@ -2569,11 +3190,14 @@ class NexusTextualApp(App[None]):
                         keyboard_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await keyboard_task
-                    return approval_future.result()
+                    response = approval_future.result()
+                    self._mark_approval_resolved(request, response)
+                    return response
 
                 answer = keyboard_task.result().strip().lower()
                 response = approval_response_from_answer(answer, policy)
                 if response.approved or _is_explicit_denial_answer(answer):
+                    self._mark_approval_resolved(request, response)
                     return response
                 self.ui.print_muted("Please answer with yes/y (or t/turn when offered), or no/n.")
         finally:
@@ -2658,6 +3282,17 @@ def _is_explicit_denial_answer(answer: str) -> bool:
     return normalized in {"n", "no"}
 
 
+def _approval_resolution_summary(response: ConfirmationResponse) -> str:
+    if not response.approved:
+        return "rejected"
+    scope = str(response.scope or "").strip().lower()
+    if scope == "turn":
+        return "approved for turn"
+    if scope == "session":
+        return "approved for session"
+    return "approved once"
+
+
 def _approval_request_key(request: ConfirmationRequest) -> str:
     if request.call_id:
         return request.call_id
@@ -2708,6 +3343,30 @@ def _toggle_id_from_click(event: events.Click) -> str:
     if not isinstance(meta, dict):
         return ""
     return str(meta.get("nexus_toggle") or "")
+
+
+def _file_preview_call_id_from_click(event: events.Click) -> str:
+    style = getattr(event, "style", None)
+    meta = getattr(style, "meta", None)
+    if not isinstance(meta, dict):
+        return ""
+    return str(meta.get("nexus_file_preview_call_id") or "")
+
+
+def _subagent_command_call_id_from_click(event: events.Click) -> str:
+    style = getattr(event, "style", None)
+    meta = getattr(style, "meta", None)
+    if not isinstance(meta, dict):
+        return ""
+    return str(meta.get("nexus_subagent_command_call_id") or "")
+
+
+def _subagent_result_json_call_id_from_click(event: events.Click) -> str:
+    style = getattr(event, "style", None)
+    meta = getattr(style, "meta", None)
+    if not isinstance(meta, dict):
+        return ""
+    return str(meta.get("nexus_subagent_result_json_call_id") or "")
 
 
 def _with_inline_toggle(renderable: RenderableType, toggle_id: str) -> RenderableType:
@@ -2794,9 +3453,8 @@ def _is_supervisor_group_tool(tool_name: str, args: dict[str, Any] | None = None
     """
     return (
         not _is_subagent_tool(tool_name)
-        and tool_name != "bash"
+        and not _is_command_like_tool(tool_name, args or {})
         and tool_name not in _MUTATING_FILE_TOOLS
-        and not _command_from_arguments(args or {})
     )
 
 
@@ -2898,6 +3556,39 @@ def _subagent_result_body(output: str, payload: dict[str, Any]) -> RenderableTyp
     if payload:
         return Syntax(output, "json", theme="monokai", word_wrap=True)
     return _preview_text_block(output)
+
+
+def _subagent_result_json_row(entry: dict[str, Any]) -> Text:
+    call_id = str(entry.get("subagent_call_id", ""))
+    expanded = bool(entry.get("subagent_result_json_expanded"))
+    is_error = bool(entry.get("subagent_result_is_error"))
+    status = "failed" if is_error else "done"
+    marker = "[-]" if expanded else "[+]"
+    row = Text(_TOOL_ROW_INDENT, style="dim")
+    marker_start = len(row.plain)
+    row.append(f"{marker} ", style="cyan")
+    if call_id:
+        row.stylize(
+            Style(color="cyan", meta={"nexus_subagent_result_json_call_id": call_id}),
+            marker_start,
+            len(row.plain),
+        )
+    row.append("✗ " if is_error else "✓ ", style="bold red" if is_error else "bold green")
+    label_start = len(row.plain)
+    row.append("Result: Output JSON", style="bold cyan")
+    if call_id:
+        row.stylize(
+            Style(color="bright_cyan", underline=True, meta={"nexus_subagent_result_json_call_id": call_id}),
+            label_start,
+            len(row.plain),
+        )
+    row.append(" · ", style="dim")
+    row.append(status, style="bold red" if is_error else "dim")
+    elapsed = str(entry.get("subagent_result_elapsed") or "").strip()
+    if elapsed:
+        row.append(" · ", style="dim")
+        row.append(elapsed, style="bold bright_cyan")
+    return row
 
 
 def _subagent_status_style(status: str, *, is_error: bool = False) -> str:
@@ -3327,6 +4018,58 @@ def _command_from_arguments(args: dict[str, Any]) -> str:
     return str(command or "").strip() if isinstance(command, str) else ""
 
 
+def _is_command_like_tool(tool_name: str, args: dict[str, Any] | None = None) -> bool:
+    if _command_from_arguments(args or {}):
+        return True
+    return tool_name in {
+        "bash",
+        "git_status",
+        "git_diff",
+        "run_tests",
+        "run_python_check",
+        "run_formatter",
+    }
+
+
+def _command_for_tool(tool_name: str, args: dict[str, Any], result: ToolResult | None = None) -> str:
+    command = _command_from_arguments(args)
+    if command:
+        return command
+    metadata = result.metadata if result is not None and isinstance(result.metadata, dict) else {}
+    raw_command = metadata.get("command")
+    if isinstance(raw_command, list) and raw_command:
+        return shlex.join(str(part) for part in raw_command)
+    if isinstance(raw_command, str) and raw_command.strip():
+        return raw_command.strip()
+    extra_args = args.get("args")
+    suffix = [str(arg) for arg in extra_args] if isinstance(extra_args, list) else []
+    if tool_name == "run_tests":
+        return shlex.join(["uv", "run", "pytest", *suffix])
+    if tool_name == "run_python_check":
+        return shlex.join(["python", "-m", "compileall", "-q", *suffix])
+    if tool_name == "run_formatter":
+        return shlex.join(["ruff", "format", ".", *suffix])
+    if tool_name == "git_status":
+        return "git status --porcelain=v1 -b"
+    if tool_name == "git_diff":
+        command_parts = ["git", "diff"]
+        if args.get("stat"):
+            command_parts.append("--stat")
+        raw_ref = str(args.get("ref", "") or "").strip()
+        target = str(args.get("target", "working") or "working").strip()
+        if raw_ref:
+            command_parts.append(raw_ref)
+        elif target == "staged":
+            command_parts.append("--staged")
+        elif target == "head":
+            command_parts.append("HEAD")
+        path = str(args.get("path", "") or "").strip()
+        if path:
+            command_parts.extend(["--", path])
+        return shlex.join(command_parts)
+    return tool_name
+
+
 def _command_from_preview_or_arguments(preview: dict[str, Any], args: dict[str, Any]) -> str:
     command = preview.get("command")
     if isinstance(command, str) and command.strip():
@@ -3357,6 +4100,45 @@ def _bash_output_block(output: str, *, collapsed: bool = False) -> _FencedCodeBl
         label="Console output",
         collapsed=collapsed,
     )
+
+
+def _command_tool_body(
+    command: str,
+    output: str,
+    *,
+    running: bool = False,
+    collapsed: bool = False,
+) -> RenderableType:
+    parts: list[RenderableType] = []
+    if command:
+        parts.append(_bash_command_block(command, collapsed=collapsed))
+    if output:
+        parts.append(_bash_output_block(output, collapsed=collapsed))
+    elif running:
+        parts.append(Text("Running...", style="dim"))
+    elif not parts:
+        parts.append(Text("(no tool output)", style="dim"))
+    return Group(*parts)
+
+
+def _command_tool_title(tool_name: str) -> str:
+    labels = {
+        "bash": "Bash Run",
+        "run_tests": "Test Run",
+        "run_python_check": "Python Check",
+        "run_formatter": "Formatter Run",
+        "git_status": "Git Status",
+        "git_diff": "Git Diff",
+    }
+    return labels.get(tool_name, f"{tool_name} Run")
+
+
+def _command_tool_summary(result: ToolResult, output: str) -> str:
+    status = "failed" if result.is_error else "done"
+    if not output:
+        return status
+    lines = _line_count(output)
+    return f"{status} · {lines} line{'s' if lines != 1 else ''}"
 
 
 def _line_number_width(rows: list[_DiffRow], *, side: str) -> int:
@@ -3413,13 +4195,14 @@ def _context_style(percent: float) -> str:
 
 
 def _context_pie_icon(percent: float) -> str:
-    if percent <= 0:
+    clamped = max(0.0, min(100.0, float(percent)))
+    if clamped < 12.5:
         return "○"
-    if percent < 25:
+    if clamped < 37.5:
         return "◔"
-    if percent < 50:
+    if clamped < 62.5:
         return "◑"
-    if percent < 75:
+    if clamped < 87.5:
         return "◕"
     return "●"
 

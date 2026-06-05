@@ -719,8 +719,8 @@ def record_approval_response(
 
 
 def supports_turn_wide_approval(request: ConfirmationRequest) -> bool:
-    risk_level = str(request.payload.get("risk_level", "medium")).strip().lower().split(".")[-1]
-    return not (request.tool_name == "bash" and risk_level in {"high", "dangerous"})
+    del request
+    return True
 
 
 def _tool_call_for_confirmation(

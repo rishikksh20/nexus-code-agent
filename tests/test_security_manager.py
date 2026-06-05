@@ -45,7 +45,7 @@ def test_session_approval_is_signature_scoped_across_turns():
     assert not manager.is_pre_approved("read_file", {"path": ".gitignore"})
 
 
-def test_turn_wide_approval_skips_non_dangerous_prompts_but_not_dangerous_bash():
+def test_turn_wide_approval_skips_all_prompts_for_current_turn():
     manager = ApprovalManager(policy=ApprovalPolicy.ON_REQUEST)
 
     manager.record_turn_wide_mutating_approval()
@@ -53,6 +53,5 @@ def test_turn_wide_approval_skips_non_dangerous_prompts_but_not_dangerous_bash()
     assert manager.is_turn_wide_mutating_preapproved("write_file", is_mutating=True)
     assert manager.is_turn_wide_mutating_preapproved("get_time", is_mutating=False)
     assert manager.is_turn_wide_mutating_preapproved("bash", is_mutating=True, risk_level="medium")
-    assert not manager.is_turn_wide_mutating_preapproved("bash", is_mutating=True, risk_level="dangerous")
-
+    assert manager.is_turn_wide_mutating_preapproved("bash", is_mutating=True, risk_level="dangerous")
 

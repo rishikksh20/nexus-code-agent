@@ -94,6 +94,61 @@ def _solid_ascii_banner() -> Text:
     return banner
 
 
+def _tool_failure_reason(result: ToolResult) -> str:
+    """Return a concise, human-readable failure reason for a tool result."""
+    output = str(result.output or "").strip()
+    parsed = _parse_json_object(output)
+    reason = _failure_reason_from_mapping(parsed) if parsed else ""
+    if not reason:
+        reason = _failure_reason_from_mapping(result.metadata or {})
+    if not reason:
+        reason = output or "Tool failed."
+    return _truncate_plain(reason, limit=240)
+
+
+def _parse_json_object(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _failure_reason_from_mapping(payload: dict[str, Any]) -> str:
+    for key in ("error", "reason", "message", "detail", "details"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if payload.get("timed_out"):
+        return "Command timed out."
+    stderr = _string_tail(payload.get("stderr_tail") or payload.get("stderr"))
+    stdout = _string_tail(payload.get("stdout_tail") or payload.get("stdout"))
+    exit_code = payload.get("exit_code")
+    parts: list[str] = []
+    if exit_code not in (None, ""):
+        parts.append(f"exit {exit_code}")
+    if stderr:
+        parts.append(stderr)
+    elif stdout:
+        parts.append(stdout)
+    return ": ".join(parts)
+
+
+def _string_tail(value: Any) -> str:
+    if isinstance(value, list):
+        value = "\n".join(str(item) for item in value if str(item).strip())
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _truncate_plain(value: str, *, limit: int) -> str:
+    compact = " ".join(str(value or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)].rstrip() + "…"
+
+
 class TerminalUI:
     """Centralised terminal output layer built on Rich."""
 
@@ -490,7 +545,7 @@ class TerminalUI:
             return "tool.read"
         if tool_name in {"write_file", "edit", "insert_edit_into_file", "apply_patch"}:
             return "tool.write"
-        if tool_name == "bash":
+        if tool_name in {"bash", "run_tests", "run_python_check", "run_formatter", "git_status", "git_diff"}:
             return "tool.shell"
         if tool_name.startswith("web_"):
             return "tool.network"
@@ -609,10 +664,7 @@ class TerminalUI:
         prefix = "    x " if actor else "> x "
         line = Text(prefix, style="muted")
         line.append(self._compact_tool_label(result.tool_name), style="error")
-        line.append(
-            f" failed: {self._truncate_preview(result.output or 'Tool failed.', limit=120)}",
-            style="error",
-        )
+        line.append(f" failed: {_tool_failure_reason(result)}", style="error")
         line.append(f"  #{result.call_id[:8]}", style="muted")
         return line
 
@@ -692,7 +744,7 @@ class TerminalUI:
             blocks.append(summary)
         blocks.append(self._render_tool_argument_summary(result.tool_name, self._tool_args_by_call_id.get(result.call_id, {})))
         if result.is_error:
-            blocks.append(Text(result.output or "Tool failed.", style="error"))
+            blocks.append(Text(f"{result.tool_name} failed: {_tool_failure_reason(result)}", style="error"))
         elif suppress_output_preview:
             blocks.append(Text("Changes applied.", style="success"))
         else:
