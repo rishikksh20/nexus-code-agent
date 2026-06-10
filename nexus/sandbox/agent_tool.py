@@ -25,7 +25,12 @@ from nexus.runtime.context_state import (
     save_subagent_continuation,
 )
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.agent_scope import render_skill_metadata, subagent_skill_names, subagent_tool_names
+from nexus.runtime.agent_scope import (
+    builtin_subagent_context_packet_key,
+    render_skill_metadata,
+    subagent_skill_names,
+    subagent_tool_names,
+)
 from nexus.security.manager import ApprovalScope
 from nexus.security.policy import ApprovalPolicy
 from nexus.tools.base import ToolKind
@@ -970,13 +975,12 @@ def _packet_type_for_subagent(role: str, payload: dict[str, Any]) -> str:
     status = str(payload.get("status") or "").lower()
     if status == "failed" or payload.get("failure_analysis"):
         return "failure_analysis"
-    if role == "explorer":
-        return "exploration_summary"
-    if role == "coding":
-        return "coding_summary"
-    if role == "impact_analyzer":
-        return "impact_analysis"
-    if role == "code_reviewer":
+    packet_type = builtin_subagent_context_packet_key(role)
+    if packet_type != "subagent_summary":
+        if packet_type == "review_findings" and (payload.get("tests_run") or payload.get("candidate_tests")):
+            return "verification_result"
+        return packet_type
+    if role == "review":
         if payload.get("tests_run") or payload.get("candidate_tests"):
             return "verification_result"
         return "review_findings"

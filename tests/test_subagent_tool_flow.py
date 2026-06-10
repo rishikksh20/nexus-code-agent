@@ -201,7 +201,7 @@ async def test_supervisor_tool_schemas_prefer_subagents_when_direct_tools_are_av
     registry.register(
         SubAgentTool(
             SubagentDefinition(
-                name="coding",
+                name="execution",
                 description="Implement focused work.",
                 goal_prompt="Use normal tools to implement the assigned change.",
                 allowed_tools=["write_file"],
@@ -209,13 +209,13 @@ async def test_supervisor_tool_schemas_prefer_subagents_when_direct_tools_are_av
             base_tool_registry=registry,
         ),
         source="agent",
-        origin="coding",
+        origin="execution",
     )
     model = _RecordingModel()
     context = ToolExecutionContext(
         session_id="test-session",
         working_directory=tmp_path,
-        metadata={"supervisor_available_tools": ["write_file", "subagent_coding"]},
+        metadata={"supervisor_available_tools": ["write_file", "subagent_execution"]},
     )
     agent = Agent(model_client=model, tool_registry=registry)
 
@@ -223,7 +223,7 @@ async def test_supervisor_tool_schemas_prefer_subagents_when_direct_tools_are_av
 
     assert model.requests
     schemas = list(model.requests[0].tool_schemas)
-    assert schemas[0]["function"]["name"] == "subagent_coding"
+    assert schemas[0]["function"]["name"] == "subagent_execution"
     subagent_description = schemas[0]["function"]["description"]
     direct_description = next(
         schema["function"]["description"]
@@ -241,7 +241,7 @@ async def test_supervisor_repairs_subagent_call_missing_title_and_instructions(t
     registry.register(
         SubAgentTool(
             SubagentDefinition(
-                name="coding",
+                name="execution",
                 description="Implement focused work.",
                 goal_prompt="Use normal tools to implement the assigned change.",
                 allowed_tools=[],
@@ -249,13 +249,13 @@ async def test_supervisor_repairs_subagent_call_missing_title_and_instructions(t
             base_tool_registry=registry,
         ),
         source="agent",
-        origin="coding",
+        origin="execution",
     )
     model = FakeModelClient(
         scripted=[
             RuntimeResponse(
                 message=Message(role="assistant", content="Delegating without args."),
-                tool_calls=(ToolCall(call_id="bad-subagent", tool_name="subagent_coding", arguments={}),),
+                tool_calls=(ToolCall(call_id="bad-subagent", tool_name="subagent_execution", arguments={}),),
                 finish_reason="tool_calls",
             ),
             RuntimeResponse(message=Message(role="assistant", content="Recovered.")),
@@ -264,7 +264,7 @@ async def test_supervisor_repairs_subagent_call_missing_title_and_instructions(t
     context = ToolExecutionContext(
         session_id="test-session",
         working_directory=tmp_path,
-        metadata={"supervisor_available_tools": ["subagent_coding"]},
+        metadata={"supervisor_available_tools": ["subagent_execution"]},
     )
     agent = Agent(model_client=model, tool_registry=registry)
 
@@ -279,7 +279,7 @@ async def test_supervisor_repairs_subagent_call_missing_title_and_instructions(t
 
     result = next(event.payload for event in events if event.kind == AgentEventType.TOOL_RESULT)
     assert result.is_error is True
-    assert "Missing required argument(s) for tool 'subagent_coding': 'title', 'instructions'" in result.output
+    assert "Missing required argument(s) for tool 'subagent_execution': 'title', 'instructions'" in result.output
     assert "For a new sub-agent task, supply both 'title' and 'instructions'" in result.output
     assert "Both 'title' and 'instructions' are required" not in result.output
 
@@ -396,7 +396,7 @@ async def test_subagent_tool_call_limit_does_not_persist_unmatched_tool_calls(tm
     )
     tool = SubAgentTool(
         SubagentDefinition(
-            name="explorer",
+            name="planning_analysis",
             description="Explore focused context.",
             goal_prompt="Use normal tools to inspect the assigned files.",
             allowed_tools=["read_file"],
@@ -596,7 +596,7 @@ async def test_impact_analyzer_subagent_persists_structured_handoff_packet(tmp_p
     )
     tool = SubAgentTool(
         SubagentDefinition(
-            name="impact_analyzer",
+            name="verification",
             description="Analyze impact.",
             goal_prompt="Return impact JSON.",
             allowed_tools=[],
@@ -643,7 +643,7 @@ async def test_subagent_packets_persist_to_durable_session_metadata(tmp_path):
     )
     tool = SubAgentTool(
         SubagentDefinition(
-            name="explorer",
+            name="planning_analysis",
             description="Explore focused work.",
             goal_prompt="Inspect and summarize.",
             allowed_tools=[],
@@ -699,7 +699,7 @@ async def test_subagent_resume_rehydrates_compact_logical_task_context(tmp_path)
     models = iter((first_model, resumed_model))
     tool = SubAgentTool(
         SubagentDefinition(
-            name="explorer",
+            name="planning_analysis",
             description="Explore focused work.",
             goal_prompt="Inspect and summarize.",
             allowed_tools=[],
@@ -718,14 +718,14 @@ async def test_subagent_resume_rehydrates_compact_logical_task_context(tmp_path)
     )
 
     first_result = await tool.execute(
-        "explore-call",
+        "planning-call",
         {"title": "Explore auth", "instructions": "Inspect existing auth patterns and propose a plan."},
         context,
     )
     resumed_result = await tool.execute(
         "resume-call",
         {
-            "resume_task_id": "explore-call",
+            "resume_task_id": "planning-call",
             "clarification": {
                 "question": "Should Nexus use JWT or session auth?",
                 "answer": "Use JWT auth.",
@@ -736,16 +736,16 @@ async def test_subagent_resume_rehydrates_compact_logical_task_context(tmp_path)
     )
 
     payload = json.loads(resumed_result.output)
-    continuation = load_subagent_continuation(durable_metadata, "explore-call")
+    continuation = load_subagent_continuation(durable_metadata, "planning-call")
     state = load_multi_agent_state(durable_metadata)
     assert json.loads(first_result.output)["status"] == "needs_clarification"
-    assert payload["task_id"] == "explore-call"
-    assert resumed_result.metadata["task_id"] == "explore-call"
+    assert payload["task_id"] == "planning-call"
+    assert resumed_result.metadata["task_id"] == "planning-call"
     assert continuation is not None
     assert continuation.status == "completed"
-    assert state.tasks["explore-call"].status == "completed"
-    assert state.tasks["explore-call"].assigned_agent_id == "subagent_explorer"
-    assert state.agents["subagent_explorer"].task_id == "explore-call"
+    assert state.tasks["planning-call"].status == "completed"
+    assert state.tasks["planning-call"].assigned_agent_id == "subagent_planning_analysis"
+    assert state.agents["subagent_planning_analysis"].task_id == "planning-call"
     assert continuation.clarification_answers[-1].selected_option_id == "jwt"
     assert "No existing auth implementation was found." in continuation.findings
     assert "Use JWT auth." in continuation.findings
@@ -785,7 +785,7 @@ async def test_code_reviewer_subagent_persists_failure_analysis_packet(tmp_path)
     )
     tool = SubAgentTool(
         SubagentDefinition(
-            name="code_reviewer",
+            name="review",
             description="Review and verify.",
             goal_prompt="Classify failures.",
             allowed_tools=[],

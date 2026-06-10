@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from nexus.tools.base import ToolRegistry
@@ -20,14 +21,143 @@ SUBAGENT_PROFILE_FIELDS: tuple[str, ...] = (
     "allowed_mcp_servers",
 )
 
-BUILTIN_SUBAGENT_NAMES: frozenset[str] = frozenset(
-    {
-        "explorer",
-        "coding",
-        "code_reviewer",
-        "impact_analyzer",
-    }
+@dataclass(frozen=True, slots=True)
+class BuiltinSubagentSpec:
+    name: str
+    description: str
+    goal_prompt: str
+    allowed_tools: tuple[str, ...]
+    max_turns: int
+    timeout_seconds: float
+    route_label: str
+    preference_description: str
+    priority: int
+    context_packet_key: str
+
+
+BUILTIN_SUBAGENT_SPECS: tuple[BuiltinSubagentSpec, ...] = (
+    BuiltinSubagentSpec(
+        name="planning_analysis",
+        description="Explore a bounded codebase slice and return a concise read-only summary.",
+        goal_prompt=(
+            "You are a read-only Nexus planning-analysis agent. Inspect only the requested codebase slice, "
+            "use a small number of focused read-only tools, and prefer packet summaries before rereading files. "
+            "Your goal is to answer the delegated question, not to map the whole repository. Start with the "
+            "named path or symbol, then read only the README, entrypoint, or closest owner file needed to "
+            "ground the answer. Stop once you have enough evidence to summarize the requested slice; do not "
+            "keep searching for completeness. If the target cannot be found within the requested slice, return "
+            "status `blocked` with the paths or patterns you tried. Return status `completed` only when your "
+            "summary directly answers the objective. Do not modify files or invent implementation plans unless "
+            "the instructions ask for one."
+        ),
+        allowed_tools=("read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"),
+        max_turns=20,
+        timeout_seconds=300,
+        route_label="planning",
+        preference_description="Preferred for bounded read-only exploration, planning context, and codebase scans.",
+        priority=0,
+        context_packet_key="exploration_summary",
+    ),
+    BuiltinSubagentSpec(
+        name="execution",
+        description="Implement a focused coding task using the workspace edit tools and cheap local validation.",
+        goal_prompt=(
+            "You are a Nexus execution agent. Implement only the assigned change, follow existing project "
+            "patterns, keep edits focused, and use only cheap local validation that directly supports your "
+            "change. Your success condition is a real workspace edit for the requested code change. For a "
+            "coding request, do not return status `completed` unless you used a mutating tool and can list "
+            "changed_files. If you cannot identify the target file after a small focused search, return "
+            "status `blocked` with clarifications_needed or recommended_next_action instead of reading more. "
+            "Use minimal sufficient context: for a create-file, missing-file, or direct port task with known "
+            "source and target paths, read the source/spec plus at most one or two local style references, then "
+            "write the file. Before each read/search, know which edit decision it will unlock. Prefer packet "
+            "summaries and targeted snippets before full-file rereads. Do not reread the same file in one task. "
+            "Do not call exploration-style tools after you know the file to edit; edit it. If you reach three "
+            "read/search calls before the first mutation and still cannot edit, return status `blocked` with "
+            "the missing evidence instead of continuing to browse. Do not choose broad verification "
+            "scope yourself; leave review and scoped test selection to the supervisor and the review agent. "
+            "Return changed files, validation you ran, open risks, and any suggested follow-up context for "
+            "downstream review.\n\n"
+            "Validation rules:\n"
+            "- run_python_check is a COMPILE/SYNTAX checker only (python -m compileall). It does NOT "
+            "run or execute code. Only call it on .py files you just wrote or edited to verify they "
+            "parse without syntax errors. Pass the file path(s) as args, e.g. args=['my_file.py'].\n"
+            "- Do NOT pass -c, -u, or any flag that attempts code execution to run_python_check.\n"
+            "- If run_python_check fails once, report the failure in your result and stop. Do NOT "
+            "retry with different argument styles or creative workarounds.\n"
+            "- Do NOT attempt to verify runtime behaviour (running the code, importing it, executing "
+            "tests). Runtime verification belongs to subagent_review or the supervisor.\n"
+            "- Limit file reads: read each file at most once. If you already saw a file's content "
+            "in the current task, do not read it again."
+        ),
+        allowed_tools=(
+            "read_file",
+            "write_file",
+            "edit",
+            "insert_edit_into_file",
+            "apply_patch",
+            "glob",
+            "grep",
+            "list_dir",
+            "lsp",
+            "git_status",
+            "git_diff",
+            "run_python_check",
+            "run_formatter",
+        ),
+        max_turns=14,
+        timeout_seconds=600,
+        route_label="execution",
+        preference_description="Preferred for file edits, implementation, and cheap local validation tied to those edits.",
+        priority=1,
+        context_packet_key="coding_summary",
+    ),
+    BuiltinSubagentSpec(
+        name="verification",
+        description="Analyze change impact, blast radius, and scoped review or verification targets.",
+        goal_prompt=(
+            "You are a read-only Nexus verification agent. Determine the likely blast radius of the task or "
+            "recent code changes, identify affected files and interfaces, recommend scoped verification and "
+            "review targets, and call out where manual validation is still required. Your goal is to produce "
+            "a verification plan, not to inspect every caller. Use git_diff or the named task/files first, "
+            "then read only the smallest source slices needed to justify risk and tests. Stop once risk_level "
+            "and candidate_tests are justified. Return changed_files, "
+            "affected_modules, public_interfaces_changed, risk_level, validation_category, "
+            "candidate_review_targets, candidate_tests, verification_policy, and failure_attribution_hints. "
+            "Use repository evidence rather than generic assumptions, and do not modify files."
+        ),
+        allowed_tools=("read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"),
+        max_turns=10,
+        timeout_seconds=300,
+        route_label="verification",
+        preference_description="Preferred when blast radius, affected interfaces, or scoped verification targets are unclear.",
+        priority=3,
+        context_packet_key="impact_analysis",
+    ),
+    BuiltinSubagentSpec(
+        name="review",
+        description="Review code changes and run scoped automated verification after impact analysis.",
+        goal_prompt=(
+            "You are a senior Nexus review agent. Inspect the diff and the targeted source files, "
+            "prioritize concrete bugs, regressions, and maintainability risks, and run only the scoped "
+            "verification justified by the provided impact analysis or task context. Your goal is a decision: "
+            "approved, issues_found, failed_verification, or blocked. Stop after you have enough evidence for "
+            "that decision. Distinguish failures that are likely related to the task from likely pre-existing, "
+            "flaky, environment, or unclear failures. Prefer focused run_tests args; broad pytest is allowed "
+            "only for medium/high-risk shared infrastructure, config, tool runtime, provider integration, or "
+            "cross-cutting changes. Do not modify files."
+        ),
+        allowed_tools=("git_diff", "read_file", "grep", "lsp", "git_status", "run_tests", "run_python_check"),
+        max_turns=8,
+        timeout_seconds=300,
+        route_label="review",
+        preference_description="Preferred for post-change review, scoped automated verification, and failure attribution.",
+        priority=2,
+        context_packet_key="review_findings",
+    ),
 )
+
+BUILTIN_SUBAGENT_NAMES: frozenset[str] = frozenset(spec.name for spec in BUILTIN_SUBAGENT_SPECS)
 
 
 ALL_SCOPE_SENTINEL = "all"
@@ -62,6 +192,34 @@ def normalize_subagent_name(name: str) -> str:
 def subagent_tool_name(name: str) -> str:
     normalized = normalize_subagent_name(name)
     return normalized if normalized.startswith("subagent_") else f"subagent_{normalized}"
+
+
+def builtin_subagent_tool_names() -> tuple[str, ...]:
+    return tuple(subagent_tool_name(spec.name) for spec in sorted(BUILTIN_SUBAGENT_SPECS, key=lambda item: item.priority))
+
+
+def builtin_subagent_priority(tool_name: str) -> int:
+    normalized = normalize_subagent_name(tool_name)
+    for spec in BUILTIN_SUBAGENT_SPECS:
+        if spec.name == normalized:
+            return spec.priority
+    return 50
+
+
+def builtin_subagent_preference(tool_name: str) -> str | None:
+    normalized = normalize_subagent_name(tool_name)
+    for spec in BUILTIN_SUBAGENT_SPECS:
+        if spec.name == normalized:
+            return spec.preference_description
+    return None
+
+
+def builtin_subagent_context_packet_key(role: str) -> str:
+    normalized = normalize_subagent_name(role)
+    for spec in BUILTIN_SUBAGENT_SPECS:
+        if spec.name == normalized:
+            return spec.context_packet_key
+    return "subagent_summary"
 
 
 def subagent_profile(config: Any, name: str) -> dict[str, Any]:
@@ -215,12 +373,11 @@ def subagent_tool_names(
     else:
         allowed = set(clean_string_list(list(base_allowed_tools))) & normal_candidate_names
 
-    normalized_name = normalize_subagent_name(name)
     if is_all_scope(configured_mcp_scope):
         allowed |= all_mcp_tool_names(registry)
     elif configured_mcp:
         allowed |= mcp_tool_names_for_servers(registry, configured_mcp)
-    elif base_allowed_mcps is None or normalized_name in BUILTIN_SUBAGENT_NAMES:
+    elif base_allowed_mcps is None:
         allowed |= all_mcp_tool_names(registry)
     elif base_allowed_mcps != ():
         allowed |= mcp_tool_names_for_servers(registry, clean_string_list(list(base_allowed_mcps)))

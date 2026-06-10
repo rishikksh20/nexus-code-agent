@@ -159,7 +159,7 @@ class TaskContext:
     def from_dict(cls, payload: dict[str, Any]) -> "TaskContext":
         return cls(
             task_id=str(payload.get("task_id") or payload.get("id") or ""),
-            role=str(payload.get("role") or "coding"),
+            role=str(payload.get("role") or "execution"),
             objective=str(payload.get("objective") or ""),
             status=str(payload.get("status") or "pending"),
             dependencies=_tuple_of_str(payload.get("dependencies") or payload.get("depends_on")),

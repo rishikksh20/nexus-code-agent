@@ -511,8 +511,8 @@ allowed_tools = [
   "get_time", "read_file", "write_file", "edit", "insert_edit_into_file",
   "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff",
   "run_tests", "run_python_check", "bash",
-  "subagent_explorer", "subagent_coding",
-  "subagent_code_reviewer", "subagent_impact_analyzer",
+  "subagent_planning_analysis", "subagent_execution",
+  "subagent_review", "subagent_verification",
 ]
 ```
 
@@ -520,10 +520,10 @@ Built-in cognitive tools:
 
 | Tool | Purpose |
 |---|---|
-| `subagent_explorer` | Bounded read-only repo exploration, including status and diff inspection |
-| `subagent_coding` | Focused implementation work with edit tools and cheap local validation |
-| `subagent_code_reviewer` | Code review and scoped automated verification |
-| `subagent_impact_analyzer` | Read-only blast-radius analysis and verification planning |
+| `subagent_planning_analysis` | Bounded read-only repo exploration, including status and diff inspection |
+| `subagent_execution` | Focused implementation work with edit tools and cheap local validation |
+| `subagent_review` | Code review and scoped automated verification |
+| `subagent_verification` | Read-only blast-radius analysis and verification planning |
 
 Custom workspace sub-agents are configured in `.nexus/config.toml` with `delegation_subagents`. Each entry becomes a tool named `subagent_<name>`:
 
@@ -555,25 +555,25 @@ allowed_mcp_servers = []
 allowed_tools = ["bash", "read_file", "ask_user"]
 
 [[sub-agents]]
-name = "explorer"
+name = "planning_analysis"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]
 
 [[sub-agents]]
-name = "coding"
+name = "execution"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_python_check", "run_formatter"]
 
 [[sub-agents]]
-name = "code_reviewer"
+name = "review"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["git_diff", "read_file", "grep", "lsp", "git_status", "run_tests", "run_python_check"]
 
 [[sub-agents]]
-name = "impact_analyzer"
+name = "verification"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]
@@ -591,7 +591,7 @@ Useful commands after editing `.nexus/config.toml`:
 /skills reload         # rescan skills and register skill-backed sub-agent tools
 /agent switch          # cycle agent_mode in .nexus/config.toml and reload tools
 /agent tools           # inspect supervisor-scoped tool visibility
-/sub-agent show coding    # inspect one sub-agent's effective resources
+/sub-agent show execution # inspect one sub-agent's effective resources
 /context agents        # inspect sub-agent context isolation and handoffs
 ```
 
@@ -921,8 +921,8 @@ agent_mode = "basic" # basic | advanced
 # Switch interactively with /agent switch.
 # basic = single-LLM execution with no cognitive sub-agent tools.
 # advanced = supervisor LLM with cognitive sub-agent tools.
-# Built-in cognitive tools in advanced mode: subagent_explorer,
-# subagent_coding, subagent_code_reviewer, subagent_impact_analyzer
+# Built-in cognitive tools in advanced mode: subagent_planning_analysis,
+# subagent_execution, subagent_review, subagent_verification
 delegation_subagents = []
 # Custom sub-agents become tools named subagent_<name>.
 # Example:

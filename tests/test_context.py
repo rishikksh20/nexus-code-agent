@@ -147,6 +147,24 @@ def test_load_all_memory_uses_single_store_read_path():
     assert store.load_all_calls == 1
 
 
+def test_load_all_memory_bounds_entries_and_marks_truncation():
+    class Store:
+        def load_all(self):
+            return [
+                MemoryEntry(key="alpha", content="a" * 8),
+                MemoryEntry(key="beta", content="keep me"),
+                MemoryEntry(key="gamma", content="hidden by entry limit"),
+            ]
+
+    entries = _load_all_memory(Store(), max_entries=2, max_entry_chars=4)
+
+    assert entries == [
+        "alpha: aaaa\n[Memory entry truncated to 4 chars]",
+        "beta: keep\n[Memory entry truncated to 4 chars]",
+        "[Memory truncated: showing 2 of 3 entries. Use /memory list, /memory search, or /memory show to inspect more.]",
+    ]
+
+
 def test_multi_agent_state_helpers_create_stable_packet_ids_and_records():
     metadata = {}
 

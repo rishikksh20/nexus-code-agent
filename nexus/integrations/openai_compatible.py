@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import threading
 from collections.abc import AsyncGenerator
 from os import environ
 from typing import Any
 from urllib import error, request as urllib_request
+import warnings
 
 from nexus.integrations.cohere import (
     _cohere_strict_reason_tool_names,
@@ -244,26 +246,34 @@ class OpenAICompatibleModelClient:
             wire_payload["stream"] = True
             last_error: str | None = None
             for attempt in range(self.retries):
-                events: list[StreamEvent] = []
                 got_retryable_error = False
-                async for event in self._stream_sse(wire_payload):
-                    if event.type == StreamEventType.ERROR:
-                        error_msg = event.error or ""
-                        if any(marker in error_msg.lower() for marker in _RETRYABLE_ERROR_MARKERS):
-                            last_error = error_msg
-                            got_retryable_error = True
-                            break
-                        # Non-retryable: pass through immediately.
-                        yield event
-                        return
-                    events.append(event)
-                if not got_retryable_error:
-                    if not _stream_events_have_assistant_output(events):
-                        async for event in self._non_stream_events(wire_payload):
+                emitted_output = False
+                stream_events = self._stream_sse(wire_payload)
+                try:
+                    async for event in stream_events:
+                        if event.type == StreamEventType.ERROR:
+                            error_msg = event.error or ""
+                            if not emitted_output and _is_retryable_stream_error(error_msg):
+                                last_error = error_msg
+                                got_retryable_error = True
+                                break
                             yield event
-                        return
-                    for ev in events:
-                        yield ev
+                            return
+                        if _stream_event_has_assistant_output(event):
+                            emitted_output = True
+                            yield event
+                            continue
+                        if event.type == StreamEventType.MESSAGE_COMPLETE:
+                            if not emitted_output:
+                                async for fallback_event in self._non_stream_events(wire_payload):
+                                    yield fallback_event
+                                return
+                            yield event
+                            return
+                        yield event
+                finally:
+                    await stream_events.aclose()
+                if not got_retryable_error:
                     return
                 if attempt < self.retries - 1:
                     delay = retry_delay(
@@ -312,7 +322,34 @@ class OpenAICompatibleModelClient:
         """Read an SSE stream in a background thread and yield parsed StreamEvents."""
         loop = asyncio.get_running_loop()
         # Queue carries parsed JSON dicts, Exception instances, or None sentinel.
-        queue: asyncio.Queue[dict[str, Any] | Exception | None] = asyncio.Queue()
+        queue: asyncio.Queue[dict[str, Any] | Exception | None] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+        cancelled = threading.Event()
+        response_lock = threading.Lock()
+        response_holder: dict[str, Any] = {}
+
+        def _put_threadsafe(item: dict[str, Any] | Exception | None) -> bool:
+            if cancelled.is_set():
+                return False
+            future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+            while not cancelled.is_set():
+                try:
+                    future.result(timeout=0.1)
+                    return True
+                except concurrent.futures.TimeoutError:
+                    continue
+                except Exception:
+                    return False
+            future.cancel()
+            return False
+
+        def _close_response() -> None:
+            with response_lock:
+                resp = response_holder.get("response")
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
 
         def _reader() -> None:
             try:
@@ -324,7 +361,11 @@ class OpenAICompatibleModelClient:
                     method="POST",
                 )
                 with urllib_request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                    with response_lock:
+                        response_holder["response"] = resp
                     for raw in resp:
+                        if cancelled.is_set():
+                            break
                         line = raw.decode("utf-8").strip()
                         if not line.startswith("data:"):
                             continue
@@ -332,14 +373,14 @@ class OpenAICompatibleModelClient:
                         if data_str == "[DONE]":
                             break
                         try:
-                            loop.call_soon_threadsafe(queue.put_nowait, json.loads(data_str))
+                            if not _put_threadsafe(json.loads(data_str)):
+                                break
                         except json.JSONDecodeError:
                             pass
             except error.HTTPError as exc:
                 details = _http_error_details(exc)
                 if exc.code in {408, 409, 429, 500, 502, 503, 504}:
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait,
+                    _put_threadsafe(
                         RetryableProviderError(
                             details,
                             status_code=exc.code,
@@ -347,21 +388,21 @@ class OpenAICompatibleModelClient:
                         ),
                     )
                 else:
-                    loop.call_soon_threadsafe(queue.put_nowait, RuntimeError(details))
+                    _put_threadsafe(RuntimeError(details))
             except error.URLError as exc:
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
+                _put_threadsafe(
                     RetryableProviderError(f"Provider connection failed: {exc.reason}"),
                 )
             except TimeoutError as exc:
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
+                _put_threadsafe(
                     RetryableProviderError(f"Provider request timed out: {exc}"),
                 )
             except Exception as exc:  # noqa: BLE001
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
+                _put_threadsafe(exc)
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+                with response_lock:
+                    response_holder.pop("response", None)
+                _put_threadsafe(None)
 
         thread = threading.Thread(target=_reader, daemon=True)
         thread.start()
@@ -372,76 +413,80 @@ class OpenAICompatibleModelClient:
         finish_reason: str | None = None
         reasoning_content = ""
 
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            if isinstance(item, Exception):
-                yield StreamEvent(type=StreamEventType.ERROR, error=str(item))
-                return
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    yield StreamEvent(type=StreamEventType.ERROR, error=str(item))
+                    return
 
-            chunk: dict[str, Any] = item
+                chunk: dict[str, Any] = item
 
-            # Usage block (sometimes sent as a standalone chunk or in the last one).
-            if chunk.get("usage"):
-                u = chunk["usage"]
-                usage = UsageSnapshot(
-                    prompt_tokens=u.get("prompt_tokens", 0),
-                    completion_tokens=u.get("completion_tokens", 0),
-                    total_tokens=u.get("total_tokens", 0),
-                    provider=self.provider_name,
-                    model=str(chunk.get("model", "")),
-                )
+                # Usage block (sometimes sent as a standalone chunk or in the last one).
+                if chunk.get("usage"):
+                    u = chunk["usage"]
+                    usage = UsageSnapshot(
+                        prompt_tokens=u.get("prompt_tokens", 0),
+                        completion_tokens=u.get("completion_tokens", 0),
+                        total_tokens=u.get("total_tokens", 0),
+                        provider=self.provider_name,
+                        model=str(chunk.get("model", "")),
+                    )
 
-            choices = chunk.get("choices") or []
-            if not choices:
-                continue
-
-            choice = choices[0]
-            delta = choice.get("delta") or {}
-            message = choice.get("message") or {}
-
-            if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
-
-            if delta.get("content"):
-                yield StreamEvent(
-                    type=StreamEventType.TEXT_DELTA,
-                    text_delta=TextDelta(content=delta["content"]),
-                )
-            elif message.get("content"):
-                yield StreamEvent(
-                    type=StreamEventType.TEXT_DELTA,
-                    text_delta=TextDelta(content=message["content"]),
-                )
-            reasoning_content += _extract_reasoning_text(delta)
-            reasoning_content += _extract_reasoning_text(message)
-
-            # Accumulate tool-call argument fragments.
-            for tc_delta in delta.get("tool_calls") or []:
-                idx: int = tc_delta.get("index", 0)
-                if idx not in tool_calls_acc:
-                    tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
-                if tc_delta.get("id"):
-                    tool_calls_acc[idx]["id"] = tc_delta["id"]
-                fn = tc_delta.get("function") or {}
-                if fn.get("name"):
-                    tool_calls_acc[idx]["name"] += fn["name"]
-                if fn.get("arguments"):
-                    tool_calls_acc[idx]["arguments"] += fn["arguments"]
-
-            for idx, tool_call in enumerate(message.get("tool_calls") or []):
-                if not isinstance(tool_call, dict):
+                choices = chunk.get("choices") or []
+                if not choices:
                     continue
-                try:
-                    parsed = _tool_call_from_openai_payload(tool_call)
-                except (KeyError, TypeError, json.JSONDecodeError):
-                    continue
-                tool_calls_acc[idx] = {
-                    "id": parsed.call_id,
-                    "name": parsed.tool_name,
-                    "arguments": json.dumps(parsed.arguments),
-                }
+
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                message = choice.get("message") or {}
+
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+
+                if delta.get("content"):
+                    yield StreamEvent(
+                        type=StreamEventType.TEXT_DELTA,
+                        text_delta=TextDelta(content=delta["content"]),
+                    )
+                elif message.get("content"):
+                    yield StreamEvent(
+                        type=StreamEventType.TEXT_DELTA,
+                        text_delta=TextDelta(content=message["content"]),
+                    )
+                reasoning_content += _extract_reasoning_text(delta)
+                reasoning_content += _extract_reasoning_text(message)
+
+                # Accumulate tool-call argument fragments.
+                for tc_delta in delta.get("tool_calls") or []:
+                    idx: int = tc_delta.get("index", 0)
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                    if tc_delta.get("id"):
+                        tool_calls_acc[idx]["id"] = tc_delta["id"]
+                    fn = tc_delta.get("function") or {}
+                    if fn.get("name"):
+                        tool_calls_acc[idx]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        tool_calls_acc[idx]["arguments"] += fn["arguments"]
+
+                for idx, tool_call in enumerate(message.get("tool_calls") or []):
+                    if not isinstance(tool_call, dict):
+                        continue
+                    try:
+                        parsed = _tool_call_from_openai_payload(tool_call)
+                    except (KeyError, TypeError, json.JSONDecodeError):
+                        continue
+                    tool_calls_acc[idx] = {
+                        "id": parsed.call_id,
+                        "name": parsed.tool_name,
+                        "arguments": json.dumps(parsed.arguments),
+                    }
+        finally:
+            cancelled.set()
+            _close_response()
 
         # Emit completed tool calls once the stream ends.
         for idx in sorted(tool_calls_acc):
@@ -505,6 +550,8 @@ _RETRYABLE_ERROR_MARKERS = (
     "timeout",
 )
 
+_STREAM_QUEUE_MAXSIZE = 64
+
 
 def _request_headers(api_key: str | None) -> dict[str, str]:
     headers = {
@@ -517,12 +564,20 @@ def _request_headers(api_key: str | None) -> dict[str, str]:
 
 
 def _stream_events_have_assistant_output(events: list[StreamEvent]) -> bool:
-    for event in events:
-        if event.type == StreamEventType.TEXT_DELTA and event.text_delta and event.text_delta.content:
-            return True
-        if event.type == StreamEventType.TOOL_CALL_COMPLETE and event.tool_call:
-            return True
+    return any(_stream_event_has_assistant_output(event) for event in events)
+
+
+def _stream_event_has_assistant_output(event: StreamEvent) -> bool:
+    if event.type == StreamEventType.TEXT_DELTA and event.text_delta and event.text_delta.content:
+        return True
+    if event.type == StreamEventType.TOOL_CALL_COMPLETE and event.tool_call:
+        return True
     return False
+
+
+def _is_retryable_stream_error(error_msg: str) -> bool:
+    lowered = error_msg.lower()
+    return any(marker in lowered for marker in _RETRYABLE_ERROR_MARKERS)
 
 
 def _extract_reasoning_text(payload: dict[str, Any]) -> str:
@@ -611,6 +666,13 @@ def resolve_provider_api_key(provider_name: str, explicit_api_key: str | None = 
     for key in candidates:
         value = environ.get(key)
         if value:
+            if key == "API_KEY":
+                warnings.warn(
+                    f"Using generic API_KEY for provider '{provider_name}'. "
+                    "Prefer a provider-specific environment variable to avoid sending the wrong secret.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             return value
     return None
 

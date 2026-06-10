@@ -241,12 +241,12 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
     assert not hasattr(config, "agent_attached_tools")
     assert not hasattr(config, "agent_detached_tools")
     assert [entry["name"] for entry in config.subagent_profiles] == [
-        "explorer",
-        "coding",
-        "code_reviewer",
-        "impact_analyzer",
+        "planning_analysis",
+        "execution",
+        "review",
+        "verification",
     ]
-    explorer_profile = next(entry for entry in config.subagent_profiles if entry["name"] == "explorer")
+    explorer_profile = next(entry for entry in config.subagent_profiles if entry["name"] == "planning_analysis")
     assert explorer_profile["allowed_tools"] == [
         "read_file",
         "glob",
@@ -256,7 +256,7 @@ def test_config_accepts_advanced_agent_defaults(tmp_path):
         "git_diff",
         "git_status",
     ]
-    coding_profile = next(entry for entry in config.subagent_profiles if entry["name"] == "coding")
+    coding_profile = next(entry for entry in config.subagent_profiles if entry["name"] == "execution")
     assert coding_profile["allowed_tools"] == [
         "read_file",
         "write_file",
@@ -308,7 +308,7 @@ def test_config_accepts_agent_scope_fields(tmp_path):
 
     config = load_config(workspace, global_root=global_root)
 
-    assert config.agent_allowed_tools == ["subagent_coding"]
+    assert config.agent_allowed_tools == ["subagent_execution"]
     assert config.agent_allowed_skills == ["nexus-agent"]
     assert config.agent_allowed_mcp_servers == ["search"]
     assert not hasattr(config, "agent_attached_tools")
@@ -346,7 +346,7 @@ def test_config_accepts_agents_and_sub_agents_sections(tmp_path):
 
     config = load_config(workspace, global_root=global_root)
 
-    assert config.agent_allowed_tools == ["subagent_coding"]
+    assert config.agent_allowed_tools == ["subagent_execution"]
     assert config.agent_allowed_skills == ["nexus-agent"]
     assert config.agent_allowed_mcp_servers == ["search"]
     assert config.subagent_profiles[0]["name"] == "execution"
@@ -429,15 +429,15 @@ def test_config_upgrade_migrates_legacy_agent_scope_to_new_tables(tmp_path):
     assert report.agent_scope_migrated is True
     assert report.subagent_scope_migrated is True
     assert "[agents]" in content
-    assert 'allowed_tools = ["subagent_coding"]' in content
+    assert 'allowed_tools = ["subagent_execution"]' in content
     assert 'attached_tools = ["read_file"]' not in content
     assert 'detached_mcp_servers = ["git"]' not in content
     assert "[[sub-agents]]" in content
-    assert 'name = "coding"' in content
+    assert 'name = "execution"' in content
     assert 'allowed_mcps = ["filesystem"]' in content
     assert "agent_allowed_tools" not in content
     assert "subagent_profiles" not in content
-    assert config.agent_allowed_tools == ["subagent_coding"]
+    assert config.agent_allowed_tools == ["subagent_execution"]
     assert config.subagent_profiles[0]["allowed_tools"] == ["grep"]
     assert config.subagent_profiles[0]["allowed_mcp_servers"] == ["filesystem"]
     assert "attached_tools" not in config.subagent_profiles[0]
@@ -471,7 +471,7 @@ def test_config_upgrade_merges_legacy_agent_scope_into_existing_agents_table(tmp
     assert report.agent_scope_migrated is True
     assert content.count("[agents]") == 1
     assert "agent_attached_tools" not in content
-    assert config.agent_allowed_tools == ["subagent_coding"]
+    assert config.agent_allowed_tools == ["subagent_execution"]
     assert not hasattr(config, "agent_attached_tools")
 
 
@@ -507,15 +507,15 @@ def test_config_upgrade_normalizes_existing_sub_agents_and_delegation_names(tmp_
     config = load_config(workspace, global_root=global_root)
 
     assert report.legacy_subagent_names_migrated is True
-    assert 'allowed_tools = ["subagent_coding"]' in content
-    assert 'name = "coding"' in content
+    assert 'allowed_tools = ["subagent_execution"]' in content
+    assert 'name = "execution"' in content
     assert 'allowed_mcps = ["filesystem"]' in content
-    assert 'name = "code_reviewer"' in content
-    assert 'subagent_code_reviewer' in content
-    assert config.agent_allowed_tools == ["subagent_coding"]
-    assert config.subagent_profiles[0]["name"] == "coding"
-    assert config.delegation_subagents[0]["name"] == "code_reviewer"
-    assert config.delegation_subagents[0]["allowed_tools"] == ["subagent_code_reviewer"]
+    assert 'name = "verification"' in content
+    assert 'subagent_review' in content
+    assert config.agent_allowed_tools == ["subagent_execution"]
+    assert config.subagent_profiles[0]["name"] == "execution"
+    assert config.delegation_subagents[0]["name"] == "verification"
+    assert config.delegation_subagents[0]["allowed_tools"] == ["subagent_review"]
 
 
 def test_config_upgrade_rehomes_config_version_before_existing_tables(tmp_path):
@@ -573,11 +573,11 @@ def test_config_upgrade_repairs_exact_duplicate_sub_agent_tables(tmp_path):
         "config_version = 3\n"
         "\n"
         "[[sub-agents]]\n"
-        'name = "explorer"\n'
+        'name = "planning_analysis"\n'
         'allowed_tools = ["read_file", "grep"]\n'
         "\n"
         "[[sub-agents]]\n"
-        'name = "explorer"\n'
+        'name = "planning_analysis"\n'
         'allowed_tools = ["read_file", "grep"]\n',
         encoding="utf-8",
     )
@@ -598,7 +598,7 @@ def test_config_upgrade_repairs_exact_duplicate_sub_agent_tables(tmp_path):
 
     assert content.splitlines().count("[[sub-agents]]") == 1
     assert config.subagent_profiles == [
-        {"name": "explorer", "allowed_tools": ["read_file", "grep"]}
+        {"name": "planning_analysis", "allowed_tools": ["read_file", "grep"]}
     ]
 
 
@@ -721,12 +721,11 @@ def test_config_normalizes_legacy_subagent_tool_names(tmp_path):
     config = load_config(workspace, global_root=global_root)
 
     assert "subagent_research" not in config.allowed_tools
-    assert "subagent_review" not in config.allowed_tools
     assert "subagent_test" not in config.allowed_tools
-    assert "subagent_explorer" in config.allowed_tools
-    assert "subagent_coding" in config.allowed_tools
-    assert "subagent_code_reviewer" in config.allowed_tools
-    assert "subagent_impact_analyzer" in config.allowed_tools
+    assert "subagent_planning_analysis" in config.allowed_tools
+    assert "subagent_execution" in config.allowed_tools
+    assert "subagent_review" in config.allowed_tools
+    assert "subagent_verification" in config.allowed_tools
     assert "run_tests" in config.allowed_tools
     assert "run_python_check" in config.allowed_tools
     assert "run_formatter" in config.allowed_tools
@@ -761,10 +760,10 @@ def test_config_agent_mode_advanced_adds_cognitive_tools_to_legacy_allowlist(tmp
 
     assert "get_time" in config.allowed_tools
     assert "read_file" in config.allowed_tools
-    assert "subagent_explorer" in config.allowed_tools
-    assert "subagent_coding" in config.allowed_tools
-    assert "subagent_code_reviewer" in config.allowed_tools
-    assert "subagent_impact_analyzer" in config.allowed_tools
+    assert "subagent_planning_analysis" in config.allowed_tools
+    assert "subagent_execution" in config.allowed_tools
+    assert "subagent_review" in config.allowed_tools
+    assert "subagent_verification" in config.allowed_tools
 
 
 def test_config_agent_mode_basic_keeps_single_agent_profile(tmp_path):
@@ -1010,7 +1009,8 @@ def test_config_accepts_extended_mcp_server_fields(tmp_path):
         "mcp_servers = [{ "
         'name = "filesystem", transport = "stdio", command = ["uvx", "mcp-server-filesystem", "."], '
         'prefix = "fs_", env = { TOKEN = "abc" }, cwd = ".", startup_timeout_seconds = 2.5, '
-        'tool_timeout_seconds = 10, disabled = false, disabled_tools = ["write_file"]'
+        'tool_timeout_seconds = 10, disabled = false, disabled_tools = ["write_file"], '
+        'read_only_tools = ["read_file"], mutating_tools = ["write_file"]'
         " }]\n"
         'enabled_mcp_servers = ["filesystem"]\n',
         encoding="utf-8",
@@ -1020,10 +1020,12 @@ def test_config_accepts_extended_mcp_server_fields(tmp_path):
 
     assert config.mcp_servers[0]["env"] == {"TOKEN": "abc"}
     assert config.mcp_servers[0]["disabled_tools"] == ["write_file"]
+    assert config.mcp_servers[0]["read_only_tools"] == ["read_file"]
+    assert config.mcp_servers[0]["mutating_tools"] == ["write_file"]
     assert config.mcp_servers[0]["startup_timeout_seconds"] == 2.5
 
 
-def test_config_accepts_disabled_mcp_http_server(tmp_path):
+def test_config_rejects_unsupported_mcp_transport(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     global_root = tmp_path / "global"
@@ -1034,10 +1036,8 @@ def test_config_accepts_disabled_mcp_http_server(tmp_path):
         encoding="utf-8",
     )
 
-    config = load_config(workspace, global_root=global_root)
-
-    assert config.mcp_servers[0]["disabled"] is True
-    assert config.mcp_servers[0]["url"] == "http://localhost:3333/mcp"
+    with pytest.raises(ConfigError, match="remote.*streamable_http.*Only stdio is supported"):
+        load_config(workspace, global_root=global_root)
 
 
 def test_config_activates_global_mcp_servers_by_workspace_name(tmp_path):

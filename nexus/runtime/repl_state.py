@@ -143,7 +143,11 @@ class ReplState:
             skill_registry=self.skill_registry,
             active_skills=scoped_active_skills,
             carry_over=self.carry_over,
-            memory_entries=_load_all_memory(self.memory_store),
+            memory_entries=_load_all_memory(
+                self.memory_store,
+                max_entries=self.config.memory_prompt_max_entries,
+                max_entry_chars=self.config.memory_prompt_max_entry_chars,
+            ),
         )
         sections.carry_over.extend(multi_agent_carry_over_lines(self.session.metadata))
         self.current_system_prompt = ContextBuilder().build(sections)
@@ -411,18 +415,34 @@ def _previous_user_task_prompt(history: list[Message]) -> str:
     return ""
 
 
-def _load_all_memory(store: MemoryStore) -> list[str]:
+def _load_all_memory(
+    store: MemoryStore,
+    *,
+    max_entries: int = 50,
+    max_entry_chars: int = 4000,
+) -> list[str]:
     """Return all entries from *store* as pre-formatted ``"key: content"`` strings.
 
-    Called once per system-prompt build so the agent always sees the full
-    persistent memory regardless of which session it is in.  Multi-line values
-    are preserved; the caller (ContextBuilder) wraps each item in a list bullet.
+    Called once per system-prompt build. Memory is bounded so long-running
+    stores do not grow every prompt without limit. Multi-line values are
+    preserved; the caller (ContextBuilder) wraps each item in a list bullet.
     """
+    all_entries = store.load_all()
     entries: list[str] = []
-    for entry in store.load_all():
+    for entry in all_entries[:max_entries]:
         content = entry.content.strip()
         if content:
+            if len(content) > max_entry_chars:
+                content = (
+                    content[:max_entry_chars].rstrip()
+                    + f"\n[Memory entry truncated to {max_entry_chars} chars]"
+                )
             entries.append(f"{entry.key}: {content}")
+    if len(all_entries) > max_entries:
+        entries.append(
+            f"[Memory truncated: showing {max_entries} of {len(all_entries)} entries. "
+            "Use /memory list, /memory search, or /memory show to inspect more.]"
+        )
     return entries
 
 

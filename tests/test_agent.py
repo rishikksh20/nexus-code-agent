@@ -226,6 +226,42 @@ async def test_agent_runs_parallel_read_only_tools_before_sequential_mutations(t
 
 
 @pytest.mark.asyncio
+async def test_agent_parallel_tool_execution_honors_context_policy(tool_context):
+    timings: dict[str, float] = {}
+    tool_context.metadata["parallel_tools"] = False
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Inspect sequentially."),
+                tool_calls=(
+                    ToolCall(call_id="read-1", tool_name="parallel_read_one", arguments={}),
+                    ToolCall(call_id="read-2", tool_name="parallel_read_two", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Done.")),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(DelayReadTool("parallel_read_one", timings))
+    registry.register(DelayReadTool("parallel_read_two", timings))
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event async for event in agent.run(
+            [Message(role="user", content="inspect")],
+            tool_context,
+            parallel_tools=True,
+            parallel_tool_window=2,
+        )
+    ]
+
+    starts = [event.payload for event in events if event.kind == "TOOL_CALL_START"]
+    assert timings["parallel_read_two_start"] >= timings["parallel_read_one_end"]
+    assert all("parallel_group_size" not in (payload.get("display") or {}) for payload in starts)
+
+
+@pytest.mark.asyncio
 async def test_agent_skips_duplicate_read_calls_in_same_sequential_batch(tool_context):
     target = tool_context.working_directory / "README.md"
     target.write_text("hello nexus\n", encoding="utf-8")

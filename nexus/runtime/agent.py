@@ -31,6 +31,8 @@ from nexus.models import (
 from nexus.observability import capture_exception_from_hooks, sentry_monitor_from_hooks
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.clarifications import ClarificationManager, is_ask_user_confirmation
+from nexus.runtime.agent_scope import builtin_subagent_preference, builtin_subagent_priority
+from nexus.runtime.tool_execution_policy import parallel_tool_execution_enabled, tool_call_can_run_in_parallel
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
@@ -840,7 +842,7 @@ class Agent:
             # ----------------------------------------------------------------
             # Tool execution
             # ----------------------------------------------------------------
-            if parallel_tools and _parallel_tool_execution_enabled(context):
+            if parallel_tools and parallel_tool_execution_enabled(context):
                 batch_state = _ToolBatchState()
                 async for event in self._execute_parallel_first_tool_batch(
                     tool_calls,
@@ -1837,11 +1839,6 @@ class Agent:
         )
 
 
-def _parallel_tool_execution_enabled(context: ToolExecutionContext) -> bool:
-    del context
-    return True
-
-
 def _tool_display_metadata(
     *,
     is_mutating: bool | None = None,
@@ -1861,7 +1858,7 @@ def _tool_display_metadata(
 def _prepared_tool_prefers_parallel(prepared: _PreparedToolCall, context: ToolExecutionContext) -> bool:
     if prepared.record is None:
         return False
-    return _tool_call_can_run_in_parallel(prepared.record, context)
+    return tool_call_can_run_in_parallel(prepared.record, context)
 
 
 def _prepared_read_result_cache_key(prepared: _PreparedToolCall) -> str | None:
@@ -1873,18 +1870,6 @@ def _prepared_read_result_cache_key(prepared: _PreparedToolCall) -> str | None:
     ):
         return None
     return _read_result_cache_key(prepared.record, prepared.tool, prepared.tool_call)
-
-
-def _tool_call_can_run_in_parallel(record: Any, context: ToolExecutionContext) -> bool:
-    if not _parallel_tool_execution_enabled(context):
-        return False
-    tool = getattr(record, "tool", None)
-    if tool is None or getattr(tool, "is_mutating", False):
-        return False
-    name = str(getattr(record, "name", ""))
-    if name == "delegate_task" or name.startswith("subagent_"):
-        return False
-    return getattr(tool, "kind", None) not in {ToolKind.AGENT, ToolKind.USER_INPUT}
 
 
 def _prepare_user_input_interrupt(
@@ -2338,14 +2323,8 @@ def _supervisor_preferred_tool_records(records: list[Any]) -> list[Any]:
 
 def _supervisor_tool_priority(record: Any) -> tuple[int, int, str]:
     name = str(getattr(record, "name", ""))
-    subagent_order = {
-        "subagent_explorer": 0,
-        "subagent_coding": 1,
-        "subagent_impact_analyzer": 2,
-        "subagent_code_reviewer": 3,
-    }
     if name.startswith("subagent_"):
-        return (0, subagent_order.get(name, 50), name)
+        return (0, builtin_subagent_priority(name), name)
     if getattr(record, "source", "") == "mcp":
         return (2, 0, name)
     return (1, 0, name)
@@ -2369,13 +2348,7 @@ def _supervisor_tool_schema(record: Any, records: list[Any]) -> dict[str, Any]:
 
 
 def _subagent_preference_description(name: str, description: str) -> str:
-    routing = {
-        "subagent_explorer": "Preferred for bounded read-only exploration, directory summaries, and codebase scans.",
-        "subagent_coding": "Preferred for file edits, implementation, and cheap local validation tied to those edits.",
-        "subagent_impact_analyzer": "Preferred when blast radius, affected interfaces, or scoped verification targets are unclear.",
-        "subagent_code_reviewer": "Preferred for post-change review, scoped automated verification, and failure attribution.",
-    }
-    prefix = routing.get(name, "Preferred delegation route for focused cognitive work.")
+    prefix = builtin_subagent_preference(name) or "Preferred delegation route for focused cognitive work."
     call_contract = (
         "For new delegated work, provide both title and instructions; do not call this tool with empty arguments. "
         "Use resume_task_id with clarification only when resuming an existing clarification-blocked task."

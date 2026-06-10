@@ -17,6 +17,7 @@ from nexus.tools.mcp import (
     register_discovered_mcp_tools,
 )
 from nexus.models import ToolExecutionContext
+from nexus.runtime.agent_scope import subagent_tool_names
 from nexus.sandbox.agent_tool import SubagentDefinition
 from nexus.tools import MCPServerConfig as ExportedMCPServerConfig
 from nexus.tools.base import ToolKind, ToolRegistry
@@ -241,9 +242,56 @@ async def test_mcp_tool_adapter_registers_and_executes(tmp_path):
         assert result.metadata["remote_tool"] == "echo"
         assert result.metadata["transport"] == "stdio"
         assert adapter.kind is ToolKind.MCP
+        assert adapter.is_mutating is True
         assert registry.record("fs_echo").source == "mcp"
     finally:
         await client.close()
+
+
+def test_mcp_tool_adapter_uses_annotations_and_mutability_overrides():
+    read_server = MCPServerConfig(name="fake", command=("fake-mcp",))
+    read_spec = MCPToolSpec(
+        name="read_file",
+        description="Read file.",
+        input_schema={"type": "object", "properties": {}},
+        annotations={"readOnlyHint": True},
+    )
+    destructive_spec = MCPToolSpec(
+        name="delete_file",
+        description="Delete file.",
+        input_schema={"type": "object", "properties": {}},
+        annotations={"readOnlyHint": True, "destructiveHint": True},
+    )
+    override_server = MCPServerConfig(
+        name="fake",
+        command=("fake-mcp",),
+        read_only_tools=("remote_write", "fs_remote_write"),
+        mutating_tools=("remote_read",),
+    )
+
+    assert MCPToolAdapter(MCPClient(read_server), read_spec, display_name="fs_read_file").is_mutating is False
+    assert MCPToolAdapter(MCPClient(read_server), destructive_spec, display_name="fs_delete_file").is_mutating is True
+    assert MCPToolAdapter(
+        MCPClient(override_server),
+        MCPToolSpec(name="remote_write", description="", input_schema={}),
+        display_name="fs_remote_write",
+    ).is_mutating is False
+    assert MCPToolAdapter(
+        MCPClient(override_server),
+        MCPToolSpec(name="remote_read", description="", input_schema={}, annotations={"readOnlyHint": True}),
+        display_name="fs_remote_read",
+    ).is_mutating is True
+
+
+def test_mcp_server_config_rejects_unsupported_transport():
+    with pytest.raises(ValueError, match="remote.*http.*Only stdio is supported"):
+        MCPServerConfig.from_dict(
+            {
+                "name": "remote",
+                "transport": "http",
+                "url": "http://localhost:3333/mcp",
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -370,8 +418,15 @@ def test_builtin_subagent_allowlists_ingest_registered_mcp_tools():
     )
 
     assert count == 5
-    assert "fs_echo" in registry.record("subagent_coding").tool._definition.allowed_tools
-    assert "fs_echo" in registry.record("subagent_explorer").tool._definition.allowed_tools
+    assert registry.record("subagent_execution").tool._definition.allowed_mcps == []
+    assert "fs_echo" not in registry.record("subagent_execution").tool._definition.allowed_tools
+    assert "fs_echo" not in subagent_tool_names(
+        config,
+        registry,
+        "execution",
+        base_allowed_tools=registry.record("subagent_execution").tool._definition.allowed_tools,
+        base_allowed_mcps=registry.record("subagent_execution").tool._definition.allowed_mcps,
+    )
     assert registry.record("subagent_custom").tool._definition.allowed_tools == ["get_time"]
 
 

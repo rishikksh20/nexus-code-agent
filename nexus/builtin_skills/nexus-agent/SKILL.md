@@ -120,25 +120,25 @@ allowed_mcp_servers = []
 allowed_tools = ["bash", "read_file", "ask_user"]
 
 [[sub-agents]]
-name = "explorer"
+name = "planning_analysis"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]
 
 [[sub-agents]]
-name = "coding"
+name = "execution"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_python_check", "run_formatter"]
 
 [[sub-agents]]
-name = "code_reviewer"
+name = "review"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["git_diff", "read_file", "grep", "lsp", "git_status", "run_tests", "run_python_check"]
 
 [[sub-agents]]
-name = "impact_analyzer"
+name = "verification"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]

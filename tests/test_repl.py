@@ -91,7 +91,7 @@ class _CancellingAgent:
         del messages, context, kwargs
         tool_call = ToolCall(
             call_id="subagent-call",
-            tool_name="subagent_coding",
+            tool_name="subagent_execution",
             arguments={"title": "Implement map.rs", "instructions": "Create algorithms/rust/map.rs."},
         )
         yield AgentEvent(
@@ -306,7 +306,7 @@ def test_continue_prompt_renders_paused_turn_progress(tmp_path):
     state.mark_paused_turn(
         "implement the calculator",
         reason="aborted",
-        progress=["Planned tool call: subagent_coding (title=Implement calculator)"],
+        progress=["Planned tool call: subagent_execution (title=Implement calculator)"],
     )
 
     effective_prompt, resumed_paused_turn = state.consume_turn_prompt("continue")
@@ -315,7 +315,7 @@ def test_continue_prompt_renders_paused_turn_progress(tmp_path):
     assert "Continue the interrupted Nexus task" in effective_prompt
     assert "Original user request:\nimplement the calculator" in effective_prompt
     assert "Pause reason: aborted" in effective_prompt
-    assert "subagent_coding" in effective_prompt
+    assert "subagent_execution" in effective_prompt
 
 
 def test_apply_events_persists_bounded_tool_output(tmp_path):
@@ -445,7 +445,7 @@ async def test_collect_turn_events_marks_cancelled_turn_for_continue(tmp_path):
     assert resumed_paused_turn is True
     assert "Continue the interrupted Nexus task" in effective_prompt
     assert "I'll implement the missing Rust map." in effective_prompt
-    assert "subagent_coding" in effective_prompt
+    assert "subagent_execution" in effective_prompt
 
 
 async def _read_only_tool_response(request: RuntimeRequest) -> RuntimeResponse:

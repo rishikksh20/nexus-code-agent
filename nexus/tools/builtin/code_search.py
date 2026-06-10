@@ -1,18 +1,16 @@
 """Repository indexing and concept-search helpers."""
 from __future__ import annotations
 
-import ast
 import json
 import re
-from pathlib import Path
 from typing import Any
 
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import Tool, ToolKind
-from nexus.tools.utils import allow_hidden_reads, root_walk
+from nexus.tools.builtin.python_index import get_python_workspace_index
+from nexus.tools.utils import allow_hidden_reads
 
 
-_SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "venv", "__pycache__", "node_modules", ".nexus", "reference_code"})
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -41,18 +39,25 @@ class CodeIndexTool(Tool):
         files: list[dict[str, Any]] = []
         symbols: list[dict[str, Any]] = []
         imports: dict[str, list[str]] = {}
-        for file_path in _iter_python_files(workspace, allow_hidden=allow_hidden):
-            if len(files) >= max_files:
-                break
-            rel = str(file_path.relative_to(workspace))
-            try:
-                tree = ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
-            except (OSError, SyntaxError):
-                continue
-            file_symbols, file_imports = _index_tree(tree, rel)
-            files.append({"path": rel, "symbols": len(file_symbols), "imports": len(file_imports)})
+        index = get_python_workspace_index(workspace, allow_hidden=allow_hidden, max_files=max_files)
+        for file_index in index.files:
+            file_symbols = [
+                {
+                    "name": symbol.name,
+                    "kind": symbol.syntax_kind or _legacy_symbol_kind(symbol.kind),
+                    "path": file_index.relative_path,
+                    "line": symbol.line,
+                }
+                for symbol in file_index.symbols
+                if symbol.kind in {"class", "function"}
+            ]
+            files.append({
+                "path": file_index.relative_path,
+                "symbols": len(file_symbols),
+                "imports": len(file_index.imports),
+            })
             symbols.extend(file_symbols)
-            imports[rel] = file_imports
+            imports[file_index.relative_path] = list(file_index.imports)
         payload = {
             "files": files,
             "symbols": symbols[:1000],
@@ -97,18 +102,19 @@ class SemanticSearchTool(Tool):
         workspace = context.working_directory.resolve()
         allow_hidden = allow_hidden_reads(context.metadata)
         results: list[dict[str, Any]] = []
-        for file_path in _iter_python_files(workspace, allow_hidden=allow_hidden):
-            rel = str(file_path.relative_to(workspace))
-            try:
-                lines = file_path.read_text(encoding="utf-8").splitlines()
-            except OSError:
-                continue
-            for index, line in enumerate(lines, start=1):
+        index = get_python_workspace_index(workspace, allow_hidden=allow_hidden)
+        for file_index in index.files:
+            for line_index, line in enumerate(file_index.lines, start=1):
                 haystack = line.lower()
                 score = sum(1 for term in terms if term in haystack)
                 if score == 0:
                     continue
-                results.append({"path": rel, "line": index, "score": score, "text": line.strip()[:240]})
+                results.append({
+                    "path": file_index.relative_path,
+                    "line": line_index,
+                    "score": score,
+                    "text": line.strip()[:240],
+                })
                 if len(results) >= max_results:
                     break
             if len(results) >= max_results:
@@ -123,37 +129,8 @@ class SemanticSearchTool(Tool):
         )
 
 
-def _iter_python_files(root: Path, *, allow_hidden: bool) -> list[Path]:
-    files: list[Path] = []
-    for dirpath, dirnames, filenames in root_walk(root):
-        current_dir = Path(dirpath)
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if name not in _SKIP_DIRS and (allow_hidden or not name.startswith("."))
-        ]
-        for filename in filenames:
-            path = current_dir / filename
-            if path.suffix != ".py":
-                continue
-            relative_parts = path.relative_to(root).parts
-            if any(part in _SKIP_DIRS for part in relative_parts):
-                continue
-            if not allow_hidden and any(part.startswith(".") for part in relative_parts):
-                continue
-            files.append(path)
-    return sorted(files)
-
-
-def _index_tree(tree: ast.AST, path: str) -> tuple[list[dict[str, Any]], list[str]]:
-    symbols: list[dict[str, Any]] = []
-    imports: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            symbols.append({"name": node.name, "kind": node.__class__.__name__, "path": path, "line": node.lineno})
-        elif isinstance(node, ast.Import):
-            imports.extend(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            imports.extend(f"{module}.{alias.name}".strip(".") for alias in node.names)
-    return symbols, sorted(set(imports))
+def _legacy_symbol_kind(kind: str) -> str:
+    return {
+        "class": "ClassDef",
+        "function": "FunctionDef",
+    }.get(kind, kind)

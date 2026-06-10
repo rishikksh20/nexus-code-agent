@@ -1471,14 +1471,9 @@ def _subagent_task_label(tool_name: str) -> str:
     elif role == "delegate_task":
         role = "delegate"
     labels = {
-        "explorer": "Explore Task",
-        "explore": "Explore Task",
         "planning_analysis": "Planning Task",
         "execution": "Execution Task",
-        "coding": "Coding Task",
-        "code_reviewer": "Review Task",
         "review": "Review Task",
-        "impact_analyzer": "Impact Task",
         "verification": "Verification Task",
         "delegate": "Sub-agent Task",
     }

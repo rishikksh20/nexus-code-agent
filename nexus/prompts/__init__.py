@@ -18,6 +18,7 @@ from nexus.config.defaults import AgentConfig
 from nexus.context.builder import ContextSections
 from nexus.context.compactor import CarryOverState
 from nexus.prompts.system import build_base_instruction
+from nexus.runtime.supervisor_routing import supervisor_routing_hint_line
 from nexus.tools.base import ToolRegistry
 
 if TYPE_CHECKING:
@@ -103,6 +104,11 @@ def build_context_sections(
     cwd = (current_working_directory or Path.cwd()).resolve()
     _ui = user_instructions or config.user_instructions
 
+    task_focus = []
+    if str(config.agent_mode).strip().lower() == "advanced":
+        task_focus.append(supervisor_routing_hint_line(task_input))
+    task_focus.append(task_input)
+
     return ContextSections(
         base_instruction=build_base_instruction(
             config,
@@ -123,7 +129,7 @@ def build_context_sections(
         project_notes=project_notes,
         memory=list(memory_entries) if memory_entries else [],
         carry_over=carry_over_notes,
-        task_focus=[task_input],
+        task_focus=task_focus,
     )
 
 

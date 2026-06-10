@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 
 from nexus.memory.workspace import AgentDirs, bootstrap_workspace_knowledge
+from nexus.runtime.agent_scope import BUILTIN_SUBAGENT_SPECS, builtin_subagent_tool_names
 from nexus.skills import BUILTIN_SKILLS_DIR
 from nexus.tools.mcp import mcp_server_example_for_workspace
 from nexus.config.upgrade import CURRENT_CONFIG_VERSION
@@ -69,10 +70,11 @@ def _global_config_toml() -> str:
             '#   PROVIDER=mistral',
             '#   MODEL=mistral-medium-latest',
             '# API key and base URL are also loaded from the workspace .env file:',
-            '#   API_KEY=your_key_here',
+            '#   MISTRAL_API_KEY=your_key_here',
             '#   BASE_URL=https://api.mistral.ai/v1',
-            '# You can also use provider-specific env vars:',
-            '#   MISTRAL_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, COHERE_API_KEY, GEMINI_API_KEY, NEXUS_API_KEY',
+            '# Prefer provider-specific env vars such as:',
+            '#   MISTRAL_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, COHERE_API_KEY, GEMINI_API_KEY',
+            '# Generic API_KEY is still accepted as a fallback but emits a warning for live providers.',
             '# Or override any value directly in this file.',
             '# Switch to provider = "fake" for local offline use (no API key required).',
             '# Thinking-mode controls for compatible providers: auto, enabled, disabled.',
@@ -97,7 +99,7 @@ def _global_config_toml() -> str:
             '',
             '[providers.openai-compatible]',
             'enabled = true',
-            'api_key_env = "API_KEY"',
+            'api_key_env = "MISTRAL_API_KEY"',
             'base_url = "https://api.mistral.ai/v1"',
             'timeout_seconds = 120',
             'max_retries = 3',
@@ -123,6 +125,33 @@ def _global_config_toml() -> str:
 
 
 def _local_config_toml(*, workspace_root: Path, project_name: str, project_description: str) -> str:
+    cognitive_tool_names = ", ".join(builtin_subagent_tool_names())
+    allowed_tool_names = [
+        "get_time",
+        "read_file",
+        "write_file",
+        "edit",
+        "insert_edit_into_file",
+        "apply_patch",
+        "glob",
+        "grep",
+        "list_dir",
+        "lsp",
+        "code_index",
+        "semantic_search",
+        "git_status",
+        "git_diff",
+        "run_tests",
+        "run_python_check",
+        "run_formatter",
+        "bash",
+        "memory",
+        "todos",
+        "web_fetch",
+        "web_search",
+        "ask_user",
+        *builtin_subagent_tool_names(),
+    ]
     return "\n".join(
         [
             f'project_name = "{project_name}"',
@@ -137,12 +166,11 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             '#   list_dir, lsp, code_index, semantic_search,',
             '#   git_status, git_diff, run_tests, run_python_check,',
             '#   run_formatter, bash, memory, todos, web_fetch, web_search, ask_user',
-            '# Advanced cognitive tool names: subagent_explorer,',
-            '#   subagent_coding, subagent_code_reviewer, subagent_impact_analyzer',
+            f'# Advanced cognitive tool names: {cognitive_tool_names}',
             '# Add plugin or sandboxed command tool names here when enabling them.',
             '# MCP tool names are discovered dynamically from active MCP servers;',
             '# activate/deactivate MCP servers by name instead of adding MCP tool names here.',
-            'allowed_tools = ["get_time", "read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "code_index", "semantic_search", "git_status", "git_diff", "run_tests", "run_python_check", "run_formatter", "bash", "memory", "todos", "web_fetch", "web_search", "ask_user", "subagent_explorer", "subagent_coding", "subagent_code_reviewer", "subagent_impact_analyzer"]',
+            f'allowed_tools = {_toml_string_list(allowed_tool_names)}',
             'denied_tools = []',
             'ask_user_max_questions_per_turn = 3',
             '# Hidden/private dot-path reads are blocked by default. .agents/skills and',
@@ -213,8 +241,8 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             'delegation_subagents = [] # Custom cognitive sub-agent definitions.',
             '# Optional specialists for advanced mode:',
             '# delegation_subagents = [',
-            '#   { name = "explorer", description = "Summarize a bounded codebase slice.", goal_prompt = "Read-only explorer. Stop once you have enough evidence to answer.", allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"] },',
-            '#   { name = "impact_analyzer", description = "Scope blast radius and verification targets.", goal_prompt = "Read-only impact analyzer. Return affected files, risks, and candidate tests.", allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"] },',
+            '#   { name = "planning_analysis", description = "Summarize a bounded codebase slice.", goal_prompt = "Read-only planning analysis. Stop once you have enough evidence to answer.", allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"] },',
+            '#   { name = "verification", description = "Scope blast radius and verification targets.", goal_prompt = "Read-only verification. Return affected files, risks, and candidate tests.", allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"] },',
             '# ]',
             '# Example: delegation_subagents = [{ name = "explore", description = "Investigate a focused codebase question.", goal_prompt = "Read the relevant code and summarize the answer.", allowed_tools = ["read_file", "glob", "grep"], max_turns = 12, timeout_seconds = 300 }]',
             'sandbox_commands = false',
@@ -231,29 +259,28 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             'allowed_mcp_servers = []',
             '',
             '# Optional per-sub-agent resource scopes.',
-            '[[sub-agents]]',
-            'name = "explorer"',
-            'allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]',
-            'allowed_mcps = []',
-            'allowed_skills = []',
-            '',
-            '[[sub-agents]]',
-            'name = "coding"',
-            'allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_python_check", "run_formatter"]',
-            'allowed_mcps = []',
-            'allowed_skills = []',
-            '',
-            '[[sub-agents]]',
-            'name = "code_reviewer"',
-            'allowed_tools = ["git_diff", "read_file", "grep", "lsp", "git_status", "run_tests", "run_python_check"]',
-            'allowed_mcps = []',
-            'allowed_skills = []',
-            '',
-            '[[sub-agents]]',
-            'name = "impact_analyzer"',
-            'allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]',
-            'allowed_mcps = []',
-            'allowed_skills = []',
+            *_builtin_subagent_profile_lines(),
             '',
         ]
     )
+
+
+def _builtin_subagent_profile_lines() -> list[str]:
+    lines: list[str] = []
+    for index, spec in enumerate(sorted(BUILTIN_SUBAGENT_SPECS, key=lambda item: item.priority)):
+        if index:
+            lines.append("")
+        lines.extend(
+            [
+                '[[sub-agents]]',
+                f'name = "{spec.name}"',
+                f"allowed_tools = {_toml_string_list(spec.allowed_tools)}",
+                "allowed_mcps = []",
+                "allowed_skills = []",
+            ]
+        )
+    return lines
+
+
+def _toml_string_list(values: list[str] | tuple[str, ...]) -> str:
+    return "[" + ", ".join(f'"{value}"' for value in values) + "]"

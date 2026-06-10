@@ -143,6 +143,8 @@ async def run_agent_turn(
                 prepared_turn.context.metadata["hooks"] = state.hooks
                 prepared_turn.context.metadata["stream_output"] = state.config.stream_output
                 prepared_turn.context.metadata["show_tool_calls"] = state.config.show_tool_calls
+                prepared_turn.context.metadata["parallel_tools"] = state.config.parallel_tools
+                prepared_turn.context.metadata["parallel_tool_window"] = state.config.parallel_tool_window
                 prepared_turn.context.metadata["supervisor_cognitive_tools_only"] = (
                     str(getattr(state.config, "agent_mode", "basic")).strip().lower() == "advanced"
                 )

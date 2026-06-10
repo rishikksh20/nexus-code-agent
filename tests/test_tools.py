@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from nexus.integrations.fake_model import FakeModelClient
+from nexus.memory.store import MemoryEntry, MemoryStore, MemoryStoreWarning
 from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message, RuntimeResponse, ToolCall, ToolExecutionContext, ToolResult
 from nexus.security import ApprovalManager, ApprovalPolicy, ApprovalScope, PermissionChecker, PermissionDecision
 from nexus.runtime.execution import ExecutionMode
@@ -83,6 +85,7 @@ def test_core_tools_register_canonical_tool_surface(tmp_path):
     assert "lsp" in tool_names
     assert "run_python_check" in tool_names
     assert "modify_file" not in tool_names
+    assert "replace_text" not in tool_names
     assert edit_tool.is_mutating is True
     assert edit_tool.kind is ToolKind.WRITE
     assert len(tool_names) == len(set(tool_names))
@@ -112,6 +115,25 @@ async def test_memory_tool_persists_entries_as_dictionary(tmp_path, tool_context
 
     assert result.is_error is False
     assert payload == {"entries": {"user_name": "rishikesh"}}
+
+
+def test_memory_store_quarantines_corrupt_json_before_writing_fresh_memory(tmp_path):
+    memory_dir = tmp_path / ".nexus" / "memory"
+    memory_dir.mkdir(parents=True)
+    memory_file = memory_dir / "user_memory.json"
+    memory_file.write_text("{", encoding="utf-8")
+
+    store = MemoryStore(memory_dir)
+
+    with pytest.warns(MemoryStoreWarning, match="could not be loaded"):
+        store.save(MemoryEntry(key="user_name", content="rishikesh"))
+
+    backups = sorted(memory_dir.glob("user_memory.json.corrupt*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{"
+    assert json.loads(memory_file.read_text(encoding="utf-8")) == {
+        "entries": {"user_name": "rishikesh"}
+    }
 
 
 def test_permission_checker_denies_direct_nexus_memory_file_writes_with_memory_hint(tmp_path, tool_context):
@@ -183,13 +205,13 @@ async def test_register_subagent_tools_registers_default_and_specialist_tools():
     assert specialist.source == "agent"
     assert specialist.origin == "explore"
     assert specialist.tool.is_mutating is False
-    assert registry.record("subagent_explorer").origin == "explorer"
-    assert registry.record("subagent_coding").origin == "coding"
-    assert registry.record("subagent_code_reviewer").origin == "code_reviewer"
-    assert registry.record("subagent_impact_analyzer").origin == "impact_analyzer"
-    coding_tools = registry.record("subagent_coding").tool._definition.allowed_tools
-    coding_prompt = registry.record("subagent_coding").tool._definition.goal_prompt
-    reviewer_tools = registry.record("subagent_code_reviewer").tool._definition.allowed_tools
+    assert registry.record("subagent_planning_analysis").origin == "planning_analysis"
+    assert registry.record("subagent_execution").origin == "execution"
+    assert registry.record("subagent_review").origin == "review"
+    assert registry.record("subagent_verification").origin == "verification"
+    coding_tools = registry.record("subagent_execution").tool._definition.allowed_tools
+    coding_prompt = registry.record("subagent_execution").tool._definition.goal_prompt
+    reviewer_tools = registry.record("subagent_review").tool._definition.allowed_tools
     assert "run_formatter" in coding_tools
     assert "minimal sufficient context" in coding_prompt
     assert "three read/search calls before the first mutation" in coding_prompt
@@ -710,10 +732,10 @@ async def test_register_subagent_tools_advanced_mode_does_not_require_delegation
 
     assert count == 4
     assert {record.name for record in registry.records()} == {
-        "subagent_explorer",
-        "subagent_coding",
-        "subagent_code_reviewer",
-        "subagent_impact_analyzer",
+        "subagent_planning_analysis",
+        "subagent_execution",
+        "subagent_review",
+        "subagent_verification",
     }
 
 
@@ -735,15 +757,15 @@ def test_register_subagent_tools_loads_configured_subagents_in_basic_mode():
         allowed_tools=[],
         denied_tools=[],
         subagent_profiles=[
-            {"name": "coding", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
-            {"name": "code_reviewer", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
+            {"name": "execution", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
+            {"name": "review", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
         ],
     )
 
     count = register_subagent_tools(registry, config)
 
     assert count == 2
-    assert {record.name for record in registry.records()} == {"subagent_coding", "subagent_code_reviewer"}
+    assert {record.name for record in registry.records()} == {"subagent_execution", "subagent_review"}
 
 
 def test_load_subagent_definitions_builds_definition_objects():
@@ -907,6 +929,41 @@ async def test_python_lsp_workspace_definition_and_references(tool_context):
     assert references.is_error is False
     assert "lib.py:1:def helper(value):" in references.output
     assert "main.py:3:result = helper(41)" in references.output
+
+
+@pytest.mark.asyncio
+async def test_python_lsp_reuses_workspace_index_between_operations(tmp_path):
+    (tmp_path / "lib.py").write_text(
+        "def helper(value):\n"
+        "    return value + 1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "main.py").write_text(
+        "from lib import helper\n"
+        "result = helper(41)\n",
+        encoding="utf-8",
+    )
+    context = ToolExecutionContext(session_id="test", working_directory=tmp_path)
+    tool = PythonLspTool()
+
+    import nexus.tools.builtin.python_index as python_index
+
+    original_parse = python_index.ast.parse
+    with patch.object(python_index.ast, "parse", wraps=original_parse) as parse:
+        definition = await tool.execute(
+            "call-lsp-cache-1",
+            {"operation": "go_to_definition", "file_path": "main.py", "symbol": "helper"},
+            context,
+        )
+        references = await tool.execute(
+            "call-lsp-cache-2",
+            {"operation": "find_references", "file_path": "main.py", "symbol": "helper"},
+            context,
+        )
+
+        assert definition.is_error is False
+        assert references.is_error is False
+        assert parse.call_count == 2
 
 
 @pytest.mark.asyncio

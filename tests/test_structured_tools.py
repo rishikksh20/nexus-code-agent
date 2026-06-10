@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -163,3 +164,29 @@ async def test_code_index_and_semantic_search_return_counts(tmp_path):
     assert index.metadata["symbol_count"] == 2
     assert not search.is_error
     assert search.metadata["count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_code_index_reuses_cached_workspace_parse_until_file_changes(tmp_path):
+    source = tmp_path / "app.py"
+    source.write_text("def first():\n    return 1\n", encoding="utf-8")
+    context = ToolExecutionContext(session_id="test", working_directory=tmp_path)
+    tool = CodeIndexTool()
+
+    import nexus.tools.builtin.python_index as python_index
+
+    original_parse = python_index.ast.parse
+    with patch.object(python_index.ast, "parse", wraps=original_parse) as parse:
+        first = await tool.execute("index-1", {}, context)
+        second = await tool.execute("index-2", {}, context)
+
+        assert first.metadata["symbol_count"] == 1
+        assert second.metadata["symbol_count"] == 1
+        assert parse.call_count == 1
+
+        source.write_text("def second():\n    return 2\n", encoding="utf-8")
+        third = await tool.execute("index-3", {}, context)
+
+        assert third.metadata["symbol_count"] == 1
+        assert parse.call_count == 2
+        assert "second" in third.output

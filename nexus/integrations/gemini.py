@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from os import environ
 from typing import Any
+import warnings
 
 from nexus.models import (
     Message,
@@ -318,7 +319,22 @@ def _gemini_schema(schema: Any) -> Any:
 
 
 def resolve_gemini_api_key(explicit: str | None = None) -> str | None:
-    return explicit or environ.get("GEMINI_API_KEY") or environ.get("GOOGLE_API_KEY") or environ.get("API_KEY")
+    if explicit:
+        return explicit
+    for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        value = environ.get(key)
+        if value:
+            return value
+    generic_key = environ.get("API_KEY")
+    if generic_key:
+        warnings.warn(
+            "Using generic API_KEY for provider 'gemini'. "
+            "Prefer GEMINI_API_KEY or GOOGLE_API_KEY to avoid sending the wrong secret.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return generic_key
+    return None
 
 
 def resolve_gemini_api_version(explicit: str | None = None) -> str | None:

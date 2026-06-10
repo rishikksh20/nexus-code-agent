@@ -339,13 +339,13 @@ async def test_agent_mode_command_persists_and_reloads_tools(tmp_path):
 
     assert state.config.agent_mode == "advanced"
     assert tomllib.loads(local_config.read_text(encoding="utf-8"))["agent_mode"] == "advanced"
-    assert any(record.name == "subagent_explorer" for record in state.tool_registry.records())
+    assert any(record.name == "subagent_planning_analysis" for record in state.tool_registry.records())
 
     assert await router.dispatch(state, "/agent switch") is True
 
     assert state.config.agent_mode == "basic"
     assert tomllib.loads(local_config.read_text(encoding="utf-8"))["agent_mode"] == "basic"
-    assert all(record.name != "subagent_explorer" for record in state.tool_registry.records())
+    assert all(record.name != "subagent_planning_analysis" for record in state.tool_registry.records())
     output = console.export_text()
     assert "Agent mode set to advanced" in output
     assert "Agent mode set to basic" in output
@@ -1420,7 +1420,7 @@ async def test_config_upgrade_updates_allowed_tools_and_live_registry(tmp_path):
     assert '"write_file"' in content
     assert "write_file" in state.config.allowed_tools
     assert state.tool_registry.record("write_file").source == "core"
-    assert state.tool_registry.record("subagent_explorer").source == "agent"
+    assert state.tool_registry.record("subagent_planning_analysis").source == "agent"
     assert "allowed_tools: write_file" in console.export_text()
 
 

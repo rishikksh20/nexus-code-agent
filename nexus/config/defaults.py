@@ -52,6 +52,8 @@ class AgentConfig:
     skill_paths: list[Path] = field(default_factory=list)
     plugins_dir: Path = field(default_factory=Path)
     memory_dir: Path = field(default_factory=Path)
+    memory_prompt_max_entries: int = 50
+    memory_prompt_max_entry_chars: int = 4000
     session_dir: Path = field(default_factory=Path)
     knowledge_file: Path = field(default_factory=Path)
     log_level: str = "WARNING"

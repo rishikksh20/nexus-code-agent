@@ -24,20 +24,20 @@ DEPRECATED_CONFIG_KEYS: dict[str, str] = {
 }
 LEGACY_TOOL_NAME_ALIASES: dict[str, tuple[str, ...]] = {
     "delegate_task": (),
-    "subagent_research": ("subagent_explorer",),
-    "subagent_test": ("subagent_code_reviewer",),
-    "subagent_planning_analysis": ("subagent_explorer",),
-    "subagent_execution": ("subagent_coding",),
-    "subagent_review": ("subagent_code_reviewer",),
-    "subagent_verification": ("subagent_code_reviewer",),
+    "subagent_research": ("subagent_planning_analysis",),
+    "subagent_test": ("subagent_review",),
+    "subagent_explorer": ("subagent_planning_analysis",),
+    "subagent_coding": ("subagent_execution",),
+    "subagent_code_reviewer": ("subagent_review",),
+    "subagent_impact_analyzer": ("subagent_verification",),
 }
 LEGACY_SUBAGENT_NAME_ALIASES: dict[str, str] = {
-    "research": "explorer",
-    "test": "code_reviewer",
-    "planning_analysis": "explorer",
-    "execution": "coding",
-    "review": "code_reviewer",
-    "verification": "code_reviewer",
+    "research": "planning_analysis",
+    "test": "review",
+    "explorer": "planning_analysis",
+    "coding": "execution",
+    "code_reviewer": "review",
+    "impact_analyzer": "verification",
 }
 LEGACY_AGENT_SCOPE_KEYS: dict[str, str] = {
     "agent_allowed_tools": "allowed_tools",
@@ -198,8 +198,8 @@ def _normalize_legacy_tool_names(tool_names: list[Any]) -> list[str]:
         for candidate in candidates:
             if candidate not in normalized:
                 normalized.append(candidate)
-    if "subagent_explorer" in normalized and "subagent_coding" not in normalized:
-        normalized.append("subagent_coding")
+    if "subagent_planning_analysis" in normalized and "subagent_execution" not in normalized:
+        normalized.append("subagent_execution")
     return normalized
 
 
