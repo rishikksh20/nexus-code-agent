@@ -575,6 +575,38 @@ class TestGrepTool:
         assert "no matches" in result.output.lower()
 
     @pytest.mark.asyncio
+    async def test_truncates_by_max_results(self, tool_context):
+        (tool_context.working_directory / "f.txt").write_text("\n".join(f"needle {i}" for i in range(5)) + "\n")
+
+        result = await GrepTool().execute("c4-results", {"pattern": "needle", "max_results": 2}, tool_context)
+
+        assert not result.is_error
+        assert "1:needle 0" in result.output
+        assert "2:needle 1" in result.output
+        assert "3:needle 2" not in result.output
+        assert "Truncated grep results" in result.output
+        assert result.metadata["matches"] == 2
+        assert result.metadata["matches_seen"] == 3
+        assert result.metadata["truncated"] is True
+        assert result.metadata["truncated_by_results"] is True
+
+    @pytest.mark.asyncio
+    async def test_truncates_by_max_output_chars(self, tool_context):
+        (tool_context.working_directory / "f.txt").write_text("needle " + ("x" * 300) + "\n", encoding="utf-8")
+
+        result = await GrepTool().execute(
+            "c4-chars",
+            {"pattern": "needle", "max_output_chars": 100},
+            tool_context,
+        )
+
+        assert not result.is_error
+        assert "Truncated grep results" in result.output
+        assert len(result.output) <= 100
+        assert result.metadata["truncated"] is True
+        assert result.metadata["truncated_by_chars"] is True
+
+    @pytest.mark.asyncio
     async def test_invalid_regex_is_error(self, tool_context):
         result = await GrepTool().execute("c5", {"pattern": "["}, tool_context)
         assert result.is_error

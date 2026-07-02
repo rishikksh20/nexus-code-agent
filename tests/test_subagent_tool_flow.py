@@ -45,6 +45,17 @@ class _RecordingModel(FakeModelClient):
         return await super().complete(request)
 
 
+class _StrictHistoryModel(FakeModelClient):
+    def __init__(self, scripted) -> None:
+        super().__init__(scripted=scripted)
+        self.requests = []
+
+    async def complete(self, request):
+        self.requests.append(request)
+        _assert_provider_safe_tool_history(request.messages)
+        return await super().complete(request)
+
+
 class _StartAwareReadTool(Tool):
     name = "read_file"
     description = "Test read tool."
@@ -120,6 +131,20 @@ class _NamedDelayReadTool(Tool):
         return ToolResult(call_id=self.name, tool_name=self.name, output=f"done:{self.name}")
 
 
+def _assert_provider_safe_tool_history(messages) -> None:
+    for index, message in enumerate(messages):
+        if message.role != "assistant" or not message.tool_calls:
+            continue
+        expected = {tool_call.call_id for tool_call in message.tool_calls}
+        actual: set[str] = set()
+        for following in messages[index + 1 :]:
+            if following.role != "tool":
+                break
+            if following.tool_call_id:
+                actual.add(following.tool_call_id)
+        assert actual == expected
+
+
 @pytest.mark.asyncio
 async def test_advanced_supervisor_cannot_execute_normal_write_tool_directly(tmp_path):
     registry = ToolRegistry()
@@ -176,7 +201,7 @@ async def test_supervisor_tool_schemas_prefer_subagents_when_direct_tools_are_av
     registry.register(
         SubAgentTool(
             SubagentDefinition(
-                name="coding",
+                name="execution",
                 description="Implement focused work.",
                 goal_prompt="Use normal tools to implement the assigned change.",
                 allowed_tools=["write_file"],
@@ -184,13 +209,13 @@ async def test_supervisor_tool_schemas_prefer_subagents_when_direct_tools_are_av
             base_tool_registry=registry,
         ),
         source="agent",
-        origin="coding",
+        origin="execution",
     )
     model = _RecordingModel()
     context = ToolExecutionContext(
         session_id="test-session",
         working_directory=tmp_path,
-        metadata={"supervisor_available_tools": ["write_file", "subagent_coding"]},
+        metadata={"supervisor_available_tools": ["write_file", "subagent_execution"]},
     )
     agent = Agent(model_client=model, tool_registry=registry)
 
@@ -198,7 +223,7 @@ async def test_supervisor_tool_schemas_prefer_subagents_when_direct_tools_are_av
 
     assert model.requests
     schemas = list(model.requests[0].tool_schemas)
-    assert schemas[0]["function"]["name"] == "subagent_coding"
+    assert schemas[0]["function"]["name"] == "subagent_execution"
     subagent_description = schemas[0]["function"]["description"]
     direct_description = next(
         schema["function"]["description"]
@@ -206,14 +231,64 @@ async def test_supervisor_tool_schemas_prefer_subagents_when_direct_tools_are_av
         if schema["function"]["name"] == "write_file"
     )
     assert "Preferred for file edits, implementation, and cheap local validation" in subagent_description
+    assert "provide both title and instructions" in subagent_description
     assert "Supervisor direct-use path" in direct_description
+
+
+@pytest.mark.asyncio
+async def test_supervisor_repairs_subagent_call_missing_title_and_instructions(tmp_path):
+    registry = ToolRegistry()
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Implement focused work.",
+                goal_prompt="Use normal tools to implement the assigned change.",
+                allowed_tools=[],
+            ),
+            base_tool_registry=registry,
+        ),
+        source="agent",
+        origin="execution",
+    )
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Delegating without args."),
+                tool_calls=(ToolCall(call_id="bad-subagent", tool_name="subagent_execution", arguments={}),),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Recovered.")),
+        ]
+    )
+    context = ToolExecutionContext(
+        session_id="test-session",
+        working_directory=tmp_path,
+        metadata={"supervisor_available_tools": ["subagent_execution"]},
+    )
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="write a file")],
+            context,
+            max_turns=3,
+        )
+    ]
+
+    result = next(event.payload for event in events if event.kind == AgentEventType.TOOL_RESULT)
+    assert result.is_error is True
+    assert "Missing required argument(s) for tool 'subagent_execution': 'title', 'instructions'" in result.output
+    assert "For a new sub-agent task, supply both 'title' and 'instructions'" in result.output
+    assert "Both 'title' and 'instructions' are required" not in result.output
 
 
 @pytest.mark.asyncio
 async def test_execution_subagent_can_execute_allowed_write_tool(tmp_path):
     registry = ToolRegistry()
     registry.register(WriteFileTool(), source="core", origin="builtin")
-    model = FakeModelClient(
+    model = _StrictHistoryModel(
         scripted=[
             RuntimeResponse(
                 message=Message(role="assistant", content="Writing through the execution sub-agent."),
@@ -256,6 +331,136 @@ async def test_execution_subagent_can_execute_allowed_write_tool(tmp_path):
     assert result.is_error is False
     assert payload["status"] == "completed"
     assert (tmp_path / "subagent.txt").read_text(encoding="utf-8") == "done"
+    assert len(model.requests) == 2
+    assert model.requests[0].messages[0].content.startswith("Begin delegated task: Write file.")
+    assert "Create subagent.txt with the requested content." not in model.requests[0].messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_subagent_request_context_truncates_oversized_instructions(tmp_path):
+    registry = ToolRegistry()
+    long_instructions = "inspect this carefully\n" + ("context-line\n" * 2_000)
+    model = _RecordingModel()
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="explorer",
+            description="Explore focused context.",
+            goal_prompt="Return a concise summary.",
+            allowed_tools=[],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+    context = ToolExecutionContext(session_id="test-session", working_directory=tmp_path)
+
+    result = await tool.execute(
+        "sub-call",
+        {"title": "Large context", "instructions": long_instructions},
+        context,
+    )
+
+    assert result.is_error is False
+    assert len(model.requests) == 1
+    request = model.requests[0]
+    assert len(request.messages[0].content) < 320
+    assert "context-line" not in request.messages[0].content
+    assert "task instructions truncated by Nexus" in request.system_prompt
+    assert len(request.system_prompt) < len(long_instructions)
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_turn_does_not_surface_inner_max_loop_pause(tmp_path):
+    registry = ToolRegistry()
+    registry.register(_PlainReadTool(), source="core", origin="builtin")
+    model = FakeModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Reading the file."),
+                tool_calls=(ToolCall(call_id="sub-read", tool_name="read_file", arguments={"path": "README.md"}),),
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="execution",
+            description="Read focused context.",
+            goal_prompt="Use normal tools to inspect the assigned file.",
+            allowed_tools=["read_file"],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+    context = ToolExecutionContext(session_id="test-session", working_directory=tmp_path)
+
+    result = await tool.execute(
+        "sub-call",
+        {"title": "Read file", "instructions": "Read README.md and report what happened."},
+        context,
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["context"]["tool_call_count"] == 1
+    assert "Single-query turn limit reached" not in payload["raw_result"]
+    assert "max_loop_iterations" not in payload["raw_result"]
+    assert "Completed read_file: read ok" in payload["raw_result"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_call_limit_does_not_persist_unmatched_tool_calls(tmp_path):
+    registry = ToolRegistry()
+    registry.register(_PlainReadTool(), source="core", origin="builtin")
+    tool_calls = tuple(
+        ToolCall(
+            call_id=f"read-{index}",
+            tool_name="read_file",
+            arguments={"path": f"file-{index}.txt"},
+        )
+        for index in range(31)
+    )
+    model = _StrictHistoryModel(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Reading many files."),
+                tool_calls=tool_calls,
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="planning_analysis",
+            description="Explore focused context.",
+            goal_prompt="Use normal tools to inspect the assigned files.",
+            allowed_tools=["read_file"],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(
+            model_name="fake",
+            temperature=0.0,
+            max_output_tokens=4096,
+            parallel_tools=False,
+            parallel_tool_window=4,
+        ),
+    )
+    context = ToolExecutionContext(session_id="test-session", working_directory=tmp_path)
+
+    result = await tool.execute(
+        "sub-call",
+        {"title": "Explore many files", "instructions": "Read every file in the target set."},
+        context,
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is True
+    assert payload["status"] == "failed"
+    assert payload["context"]["tool_call_count"] == 30
+    assert "Tool call limit reached" in payload["raw_result"]
+    assert len(model.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -427,7 +632,7 @@ async def test_impact_analyzer_subagent_persists_structured_handoff_packet(tmp_p
     )
     tool = SubAgentTool(
         SubagentDefinition(
-            name="impact_analyzer",
+            name="verification",
             description="Analyze impact.",
             goal_prompt="Return impact JSON.",
             allowed_tools=[],
@@ -474,7 +679,7 @@ async def test_subagent_packets_persist_to_durable_session_metadata(tmp_path):
     )
     tool = SubAgentTool(
         SubagentDefinition(
-            name="explorer",
+            name="planning_analysis",
             description="Explore focused work.",
             goal_prompt="Inspect and summarize.",
             allowed_tools=[],
@@ -530,7 +735,7 @@ async def test_subagent_resume_rehydrates_compact_logical_task_context(tmp_path)
     models = iter((first_model, resumed_model))
     tool = SubAgentTool(
         SubagentDefinition(
-            name="explorer",
+            name="planning_analysis",
             description="Explore focused work.",
             goal_prompt="Inspect and summarize.",
             allowed_tools=[],
@@ -549,14 +754,14 @@ async def test_subagent_resume_rehydrates_compact_logical_task_context(tmp_path)
     )
 
     first_result = await tool.execute(
-        "explore-call",
+        "planning-call",
         {"title": "Explore auth", "instructions": "Inspect existing auth patterns and propose a plan."},
         context,
     )
     resumed_result = await tool.execute(
         "resume-call",
         {
-            "resume_task_id": "explore-call",
+            "resume_task_id": "planning-call",
             "clarification": {
                 "question": "Should Nexus use JWT or session auth?",
                 "answer": "Use JWT auth.",
@@ -567,16 +772,16 @@ async def test_subagent_resume_rehydrates_compact_logical_task_context(tmp_path)
     )
 
     payload = json.loads(resumed_result.output)
-    continuation = load_subagent_continuation(durable_metadata, "explore-call")
+    continuation = load_subagent_continuation(durable_metadata, "planning-call")
     state = load_multi_agent_state(durable_metadata)
     assert json.loads(first_result.output)["status"] == "needs_clarification"
-    assert payload["task_id"] == "explore-call"
-    assert resumed_result.metadata["task_id"] == "explore-call"
+    assert payload["task_id"] == "planning-call"
+    assert resumed_result.metadata["task_id"] == "planning-call"
     assert continuation is not None
     assert continuation.status == "completed"
-    assert state.tasks["explore-call"].status == "completed"
-    assert state.tasks["explore-call"].assigned_agent_id == "subagent_explorer"
-    assert state.agents["subagent_explorer"].task_id == "explore-call"
+    assert state.tasks["planning-call"].status == "completed"
+    assert state.tasks["planning-call"].assigned_agent_id == "subagent_planning_analysis"
+    assert state.agents["subagent_planning_analysis"].task_id == "planning-call"
     assert continuation.clarification_answers[-1].selected_option_id == "jwt"
     assert "No existing auth implementation was found." in continuation.findings
     assert "Use JWT auth." in continuation.findings
@@ -616,7 +821,7 @@ async def test_code_reviewer_subagent_persists_failure_analysis_packet(tmp_path)
     )
     tool = SubAgentTool(
         SubagentDefinition(
-            name="code_reviewer",
+            name="review",
             description="Review and verify.",
             goal_prompt="Classify failures.",
             allowed_tools=[],

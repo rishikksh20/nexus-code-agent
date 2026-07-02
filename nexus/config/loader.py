@@ -10,7 +10,12 @@ from nexus.config.defaults import AgentConfig, build_default_config, config_to_p
 from nexus.config.provider_profiles import ModelProfile, deep_merge_named_tables
 from nexus.config.upgrade import normalize_legacy_config_values
 from nexus.integrations.registry import PROVIDER_DEFINITIONS, provider_defaults
-from nexus.runtime.agent_scope import SUBAGENT_PROFILE_FIELDS, SUPERVISOR_SCOPE_FIELDS
+from nexus.runtime.agent_scope import (
+    SUBAGENT_PROFILE_FIELDS,
+    SUPERVISOR_DELTA_SCOPE_FIELDS,
+    SUPERVISOR_SCOPE_FIELDS,
+    builtin_subagent_tool_names,
+)
 
 
 PATH_FIELDS = {
@@ -65,7 +70,8 @@ def load_config(
         defaults.global_config_file = (global_config_path or defaults.global_config_file).expanduser()
         defaults.local_config_file = local_config_path or defaults.local_config_file
         defaults.config_warnings.append(
-            f"Config could not be loaded; using defaults for this run: {exc}"
+            "Config could not be loaded; using defaults for this run. "
+            f"Local config: {defaults.local_config_file}. Global config: {defaults.global_config_file}. Error: {exc}"
         )
         return defaults
 
@@ -330,6 +336,14 @@ def _merge_agent_section(target: dict[str, Any], agents: dict[str, Any]) -> None
         "allowed_skills": "agent_allowed_skills",
         "allowed_mcp_servers": "agent_allowed_mcp_servers",
         "allowed_mcps": "agent_allowed_mcp_servers",
+        "add_tools": "agent_add_tools",
+        "remove_tools": "agent_remove_tools",
+        "add_skills": "agent_add_skills",
+        "remove_skills": "agent_remove_skills",
+        "add_mcp_servers": "agent_add_mcp_servers",
+        "remove_mcp_servers": "agent_remove_mcp_servers",
+        "add_mcps": "agent_add_mcp_servers",
+        "remove_mcps": "agent_remove_mcp_servers",
     }
     for source, destination in key_map.items():
         if source in agents:
@@ -357,6 +371,8 @@ def _normalize_subagent_profile_aliases(entry: dict[str, Any]) -> dict[str, Any]
     normalized = dict(entry)
     alias_map = {
         "allowed_mcps": "allowed_mcp_servers",
+        "add_mcps": "add_mcp_servers",
+        "remove_mcps": "remove_mcp_servers",
     }
     for alias, canonical in alias_map.items():
         if alias in normalized and canonical not in normalized:
@@ -556,6 +572,8 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         "prompt_history_max_entries",
         "tool_output_max_chars",
         "max_sessions_retained",
+        "memory_prompt_max_entries",
+        "memory_prompt_max_entry_chars",
         "sandbox_timeout_seconds",
         "context_prune_protect_tokens",
         "context_prune_minimum_tokens",
@@ -607,21 +625,23 @@ def _validate_config_values(values: dict[str, Any]) -> None:
         transport = str(entry.get("transport", "stdio")).strip().lower() or "stdio"
         if transport == "streamable-http":
             transport = "streamable_http"
-        if transport not in {"stdio", "http", "streamable_http"}:
-            raise ConfigError(f"mcp_servers entry '{name}' has unsupported transport '{transport}'.")
+        if transport != "stdio":
+            raise ConfigError(
+                f"mcp_servers entry '{name}' has unsupported transport '{transport}'. "
+                "Only stdio is supported."
+            )
         command = entry.get("command")
-        url = str(entry.get("url", "")).strip()
-        if transport == "stdio":
-            if not isinstance(command, list) or not command:
-                raise ConfigError(f"mcp_servers entry '{name}' must define a non-empty command list.")
-        elif not url:
-            raise ConfigError(f"mcp_servers entry '{name}' must define a non-empty url.")
+        if not isinstance(command, list) or not command:
+            raise ConfigError(f"mcp_servers entry '{name}' must define a non-empty command list.")
         env = entry.get("env")
         if env is not None and not isinstance(env, dict):
             raise ConfigError(f"mcp_servers entry '{name}' env must be a table.")
-        disabled_tools = entry.get("disabled_tools", [])
-        if disabled_tools is not None and not isinstance(disabled_tools, list):
-            raise ConfigError(f"mcp_servers entry '{name}' disabled_tools must be a list.")
+        for list_field in ("disabled_tools", "read_only_tools", "mutating_tools"):
+            value = entry.get(list_field, [])
+            if value is not None and not isinstance(value, list):
+                raise ConfigError(f"mcp_servers entry '{name}' {list_field} must be a list.")
+            if isinstance(value, list) and any(not str(item).strip() for item in value):
+                raise ConfigError(f"mcp_servers entry '{name}' {list_field} must only contain non-empty strings.")
         for field_name in ("startup_timeout_seconds", "tool_timeout_seconds"):
             if field_name in entry and float(entry[field_name]) <= 0:
                 raise ConfigError(f"mcp_servers entry '{name}' {field_name} must be greater than 0.")
@@ -664,7 +684,7 @@ def _validate_config_values(values: dict[str, Any]) -> None:
     if overlap:
         raise ConfigError("allowed_tools and denied_tools must not overlap: " + ", ".join(overlap))
 
-    for field_name in ("enabled_skills", "disabled_skills", *SUPERVISOR_SCOPE_FIELDS):
+    for field_name in ("enabled_skills", "disabled_skills", *SUPERVISOR_SCOPE_FIELDS, *SUPERVISOR_DELTA_SCOPE_FIELDS):
         if not isinstance(values[field_name], list):
             raise ConfigError(f"{field_name} must be a list of names or patterns.")
         if any(not str(item).strip() for item in values[field_name]):
@@ -930,9 +950,4 @@ def _advanced_mode_required_tool_names() -> tuple[str, ...]:
 
 
 def _builtin_cognitive_tool_names() -> tuple[str, ...]:
-    return (
-        "subagent_explorer",
-        "subagent_coding",
-        "subagent_code_reviewer",
-        "subagent_impact_analyzer",
-    )
+    return builtin_subagent_tool_names()

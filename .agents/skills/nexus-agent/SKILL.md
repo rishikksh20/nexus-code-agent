@@ -40,7 +40,7 @@ tell the user to run `/help` for the full command list.
 ## Basic Slash Commands
 
 - `/abort`: abort the currently running agent turn.
-- `/agent`: inspect, switch, and scope supervisor tools, skills, and MCP.
+- `/agent`: inspect and scope supervisor tools, skills, and MCP.
 - `/config`: show merged, local, or global config; reload or upgrade config.
 - `/context`: show the system prompt, context usage, agent snapshots, task context, or session summary.
 - `/exit`: save and exit the REPL; alias for `/quit`.
@@ -85,7 +85,6 @@ tell the user to run `/help` for the full command list.
 - `/mcp status`: inspect MCP server state.
 - `/mcp tools <server>`: show tools from an MCP server.
 - `/mcp reload`: reload MCP servers from config.
-- `/agent switch`: cycle workspace `agent_mode` between basic and advanced, reload config, and rebuild tools.
 - `/agent tools`, `/agent skills`, `/agent mcp`: inspect supervisor-scoped resources.
 - `/agent allow tool|skill|mcp <name>` and `/agent disallow tool|skill|mcp <name>`: persist supervisor allowlists.
 - `/sub-agent list`, `/sub-agent show <name>`, `/sub-agent tools <name>`: inspect cognitive sub-agent resources.
@@ -101,7 +100,6 @@ tell the user to run `/help` for the full command list.
 - Project custom-tool plugins live under readable `.agents/tools/`; global plugins live under `~/.nexus/plugins/`.
 - MCP server activation is maintained by MCP config; MCP tool names should not be hand-added to `allowed_tools`.
 - MCP definitions stay in protected `.nexus/config.toml` or `~/.nexus/config.toml` because they may contain credentials.
-- `/agent switch` persists the next `agent_mode` to workspace config and refreshes the live tool registry.
 - `/agent` and `/sub-agent` allow or disallow only resources that are already globally active through `/skills` or `/mcp`.
 - Agent-scoped config lives under `[agents]` and `[[sub-agents]]`; sub-agent entries use `name`, `allowed_tools`, `allowed_mcps`, and `allowed_skills`. In advanced mode, empty supervisor `allowed_*` lists mean delegate through sub-agents by default; add `[agents]` allowlist entries for direct supervisor tools, skills, or MCP servers. The generated config lists the four built-in sub-agents with their code allowlists. Older top-level `agent_*`, `subagent_profiles`, and `allowed_mcp_servers` keys are accepted as aliases; obsolete attach/detach keys are ignored. Empty sub-agent `allowed_*` lists preserve sub-agent defaults; `allowed_* = "all"` means every normal workspace tool, active skill, or active MCP server for that scope.
 - Built-in and sub-agent tools may be listed in config tool filters.
@@ -120,25 +118,25 @@ allowed_mcp_servers = []
 allowed_tools = ["bash", "read_file", "ask_user"]
 
 [[sub-agents]]
-name = "planning_analysis"
+name = "explorer"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]
 
 [[sub-agents]]
-name = "execution"
+name = "coding"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["read_file", "write_file", "edit", "insert_edit_into_file", "apply_patch", "glob", "grep", "list_dir", "lsp", "git_status", "git_diff", "run_python_check", "run_formatter"]
 
 [[sub-agents]]
-name = "review"
+name = "code_reviewer"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["git_diff", "read_file", "grep", "lsp", "git_status", "run_tests", "run_python_check"]
 
 [[sub-agents]]
-name = "verification"
+name = "impact_analyzer"
 allowed_mcps = []
 allowed_skills = []
 allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]

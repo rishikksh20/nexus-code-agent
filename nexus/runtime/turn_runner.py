@@ -39,6 +39,7 @@ from nexus.ui import TerminalUI
 
 ConfirmationCallback = Callable[[ConfirmationRequest], Awaitable[ConfirmationResponse]]
 logger = logging.getLogger(__name__)
+_CANCELLED_BATCH_EVENTS_KEY = "cancelled_batch_events"
 
 
 def prompt_for_confirmation(
@@ -89,6 +90,7 @@ async def run_agent_turn(
     committed_events: list[AgentEvent] = []
     working_history = list(state.history)
     initial_prompt_text = prompt_text
+    last_context: ToolExecutionContext | None = None
     turn_id = state.current_turn_id or uuid4().hex[:12]
     trace_id = state.current_trace_id or uuid4().hex
     clarification_manager = ClarificationManager(
@@ -130,6 +132,7 @@ async def run_agent_turn(
                     compactor_factory=ContextCompactor,
                     estimator_factory=TokenEstimator,
                 )
+                last_context = prepared_turn.context
                 prepared_turn.context.metadata["approval_callback"] = approval_callback
                 prepared_turn.context.metadata["approval_manager"] = state.approval_manager
                 prepared_turn.context.metadata["clarification_manager"] = clarification_manager
@@ -140,6 +143,8 @@ async def run_agent_turn(
                 prepared_turn.context.metadata["hooks"] = state.hooks
                 prepared_turn.context.metadata["stream_output"] = state.config.stream_output
                 prepared_turn.context.metadata["show_tool_calls"] = state.config.show_tool_calls
+                prepared_turn.context.metadata["parallel_tools"] = state.config.parallel_tools
+                prepared_turn.context.metadata["parallel_tool_window"] = state.config.parallel_tool_window
                 prepared_turn.context.metadata["supervisor_cognitive_tools_only"] = (
                     str(getattr(state.config, "agent_mode", "basic")).strip().lower() == "advanced"
                 )
@@ -299,9 +304,15 @@ async def run_agent_turn(
                 )
                 return pending_events
     except asyncio.CancelledError:
+        cancelled_events = _cancelled_turn_events(committed_events, last_context)
+        state.mark_paused_turn(
+            initial_prompt_text,
+            reason="aborted",
+            progress=_turn_progress_lines(cancelled_events),
+        )
         await _emit_turn_end(
             state,
-            events=committed_events,
+            events=cancelled_events,
             turn_id=turn_id,
             trace_id=trace_id,
             started_at=started_at,
@@ -376,6 +387,9 @@ async def _run_model_batch(
         ):
             _render_event(ui, state, event)
             batch.append(event)
+    except asyncio.CancelledError:
+        context.metadata[_CANCELLED_BATCH_EVENTS_KEY] = list(batch)
+        raise
     except Exception as exc:  # noqa: BLE001
         error_area = str(getattr(exc, "_nexus_error_area", "model"))
         if not getattr(exc, "_nexus_sentry_captured", False):
@@ -826,21 +840,90 @@ def _pending_model_response_usage_was_committed(
 
 
 def _sync_paused_turn_state(state: ReplState, events: list[AgentEvent], *, prompt_text: str) -> None:
-    if _turn_finished_with_resumable_pause(events):
-        state.mark_paused_turn(prompt_text)
+    pause_reason = _resumable_pause_reason(events)
+    if pause_reason:
+        state.mark_paused_turn(
+            prompt_text,
+            reason=pause_reason,
+            progress=_turn_progress_lines(events),
+        )
         return
     state.clear_paused_turn()
 
 
 def _turn_finished_with_resumable_pause(events: list[AgentEvent]) -> bool:
+    return bool(_resumable_pause_reason(events))
+
+
+def _resumable_pause_reason(events: list[AgentEvent]) -> str:
     turn_completed = next(
         (event for event in reversed(events) if event.kind == AgentEventType.TURN_COMPLETED),
         None,
     )
-    return bool(
-        turn_completed
-        and turn_completed.payload in {TOOL_CALL_LIMIT_FINISH_REASON, MAX_TURNS_FINISH_REASON}
-    )
+    if not turn_completed or turn_completed.payload not in {TOOL_CALL_LIMIT_FINISH_REASON, MAX_TURNS_FINISH_REASON}:
+        return ""
+    return str(turn_completed.payload)
+
+
+def _cancelled_turn_events(
+    committed_events: list[AgentEvent],
+    context: ToolExecutionContext | None,
+) -> list[AgentEvent]:
+    events = list(committed_events)
+    if context is None:
+        return events
+    raw_batch = context.metadata.get(_CANCELLED_BATCH_EVENTS_KEY)
+    if isinstance(raw_batch, list):
+        events.extend(event for event in raw_batch if isinstance(event, AgentEvent))
+    return events
+
+
+def _turn_progress_lines(events: list[AgentEvent]) -> list[str]:
+    lines: list[str] = []
+    seen_tool_calls: set[str] = set()
+    for event in events:
+        if event.kind == AgentEventType.MODEL_RESPONSE:
+            payload = cast(RuntimeResponse, event.payload)
+            if payload.message.content:
+                lines.append(f"Assistant response: {_compact_progress_text(payload.message.content)}")
+            for tool_call in payload.tool_calls or payload.message.tool_calls:
+                if tool_call.call_id in seen_tool_calls:
+                    continue
+                seen_tool_calls.add(tool_call.call_id)
+                lines.append(f"Planned tool call: {_tool_call_progress_text(tool_call)}")
+            continue
+        if event.kind == AgentEventType.TOOL_CALL_REQUESTED:
+            tool_call = cast(ToolCall, event.payload)
+            if tool_call.call_id in seen_tool_calls:
+                continue
+            seen_tool_calls.add(tool_call.call_id)
+            lines.append(f"Started tool call: {_tool_call_progress_text(tool_call)}")
+            continue
+        if event.kind == AgentEventType.TOOL_RESULT:
+            result = cast(ToolResult, event.payload)
+            prefix = "Failed" if result.is_error else "Completed"
+            lines.append(f"{prefix} {result.tool_name}: {_compact_progress_text(result.output)}")
+    return lines[-12:]
+
+
+def _tool_call_progress_text(tool_call: ToolCall) -> str:
+    args = tool_call.arguments or {}
+    details: list[str] = []
+    for key in ("title", "path", "query", "pattern", "target", "cwd"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            details.append(f"{key}={_compact_progress_text(value, limit=160)}")
+    if not details and isinstance(args.get("command"), str):
+        details.append(f"command={_compact_progress_text(str(args['command']), limit=160)}")
+    suffix = f" ({', '.join(details)})" if details else ""
+    return f"{tool_call.tool_name}{suffix}"
+
+
+def _compact_progress_text(value: str, *, limit: int = 300) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "..."
 
 
 async def _emit_turn_end(

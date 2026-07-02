@@ -126,14 +126,14 @@ def test_ask_user_is_supervisor_only_even_for_all_subagent_scope():
         agent_mode="advanced",
         agent_allowed_tools=[],
         agent_allowed_mcp_servers=[],
-        subagent_profiles=[{"name": "coding", "allowed_tools": "all"}],
+        subagent_profiles=[{"name": "execution", "allowed_tools": "all"}],
     )
 
     assert supervisor_tool_names(config, registry) == {"ask_user"}
     assert subagent_tool_names(
         config,
         registry,
-        "coding",
+        "execution",
         base_allowed_tools=None,
     ) == {"get_time"}
 

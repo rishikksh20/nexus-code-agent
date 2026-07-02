@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
+import warnings as py_warnings
 from io import BytesIO
 from urllib import error
 
@@ -10,7 +13,7 @@ import pytest
 from nexus.app import _build_model_client
 from nexus.config import load_config
 from nexus.config.provider_profiles import ThinkingConfig
-from nexus.integrations.anthropic import AnthropicAdapter, AnthropicModelClient
+from nexus.integrations.anthropic import AnthropicAdapter, AnthropicModelClient, resolve_anthropic_api_key
 from nexus.integrations.cohere import (
     CohereAdapter,
     CohereModelClient,
@@ -19,9 +22,13 @@ from nexus.integrations.cohere import (
     _chat_url as cohere_chat_url,
 )
 from nexus.integrations.fake_model import FakeModelClient
-from nexus.integrations.gemini import GeminiAdapter, GeminiModelClient
+from nexus.integrations.gemini import GeminiAdapter, GeminiModelClient, resolve_gemini_api_key
 from nexus.integrations.ollama import OllamaAdapter, OllamaModelClient
-from nexus.integrations.openai_compatible import OpenAICompatibleAdapter, OpenAICompatibleModelClient
+from nexus.integrations.openai_compatible import (
+    OpenAICompatibleAdapter,
+    OpenAICompatibleModelClient,
+    resolve_provider_api_key,
+)
 from nexus.models import Message, RuntimeRequest, StreamEventType, ToolCall
 
 
@@ -50,6 +57,26 @@ class _FakeStreamingHTTPResponse:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _BlockingStreamingHTTPResponse:
+    def __init__(self, first_line: str) -> None:
+        self._first_line = first_line
+        self.closed = threading.Event()
+
+    def __iter__(self):
+        yield self._first_line.encode("utf-8")
+        self.closed.wait(5)
+
+    def close(self) -> None:
+        self.closed.set()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
         return False
 
 
@@ -103,6 +130,38 @@ async def test_openai_compatible_client_posts_chat_completions(monkeypatch):
     assert response.usage is not None
     assert response.usage.provider == "openai-compatible"
     assert response.usage.model == "demo-model"
+
+
+def test_provider_api_key_generic_fallback_warns(monkeypatch):
+    for key in (
+        "API_KEY",
+        "NEXUS_API_KEY",
+        "OPENAI_API_KEY",
+        "MISTRAL_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("API_KEY", "generic-secret")
+
+    with pytest.warns(RuntimeWarning, match="generic API_KEY"):
+        assert resolve_provider_api_key("mistral") == "generic-secret"
+    with pytest.warns(RuntimeWarning, match="generic API_KEY"):
+        assert resolve_anthropic_api_key() == "generic-secret"
+    with pytest.warns(RuntimeWarning, match="generic API_KEY"):
+        assert resolve_gemini_api_key() == "generic-secret"
+
+
+def test_provider_specific_api_key_takes_precedence_without_generic_warning(monkeypatch):
+    monkeypatch.setenv("API_KEY", "generic-secret")
+    monkeypatch.setenv("MISTRAL_API_KEY", "mistral-secret")
+
+    with py_warnings.catch_warnings(record=True) as warnings:
+        py_warnings.simplefilter("always")
+        assert resolve_provider_api_key("mistral") == "mistral-secret"
+
+    assert not warnings
 
 
 @pytest.mark.asyncio
@@ -288,6 +347,42 @@ async def test_openai_compatible_stream_accumulates_partial_tool_calls_without_u
     assert events[1].tool_call == ToolCall("call-1", "read_file", {"path": "README.md"})
     assert events[2].finish_reason == "tool_calls"
     assert events[2].usage is None
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_stream_yields_first_delta_before_response_finishes(monkeypatch):
+    response = _BlockingStreamingHTTPResponse(
+        'data: {"model":"demo-model","choices":[{"delta":{"content":"hello"}}]}\n'
+    )
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return response
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = OpenAICompatibleModelClient(
+        api_base_url="https://example.test/v1",
+        api_key="secret",
+        provider_name="openai-compatible",
+    )
+
+    stream = client.chat_completion(
+        RuntimeRequest(
+            model_name="demo-model",
+            system_prompt="system",
+            messages=(Message(role="user", content="hello"),),
+        ),
+        stream=True,
+    )
+
+    event = await asyncio.wait_for(stream.__anext__(), timeout=1)
+    assert event.type == StreamEventType.TEXT_DELTA
+    assert event.text_delta is not None
+    assert event.text_delta.content == "hello"
+
+    await stream.aclose()
+    assert response.closed.wait(1)
 
 
 @pytest.mark.asyncio
@@ -1848,6 +1943,37 @@ def test_gemini_response_events_allow_mixed_text_tool_calls_without_usage():
     assert events[1].tool_call == ToolCall("gemini-0001", "grep", {"pattern": "needle"})
     assert events[2].finish_reason == "stop"
     assert events[2].usage is None
+
+
+@pytest.mark.asyncio
+async def test_ollama_stream_yields_first_delta_before_response_finishes(monkeypatch):
+    response = _BlockingStreamingHTTPResponse(
+        '{"message":{"content":"hello"},"done":false}\n'
+    )
+
+    def _fake_urlopen(req, timeout):
+        del req, timeout
+        return response
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    client = OllamaModelClient(base_url="http://localhost:11434", model_name="demo")
+    stream = client.chat_completion(
+        RuntimeRequest(
+            model_name="demo",
+            system_prompt="system",
+            messages=(Message(role="user", content="hello"),),
+        ),
+        stream=True,
+    )
+
+    event = await asyncio.wait_for(stream.__anext__(), timeout=1)
+    assert event.type == StreamEventType.TEXT_DELTA
+    assert event.text_delta is not None
+    assert event.text_delta.content == "hello"
+
+    await stream.aclose()
+    assert response.closed.wait(1)
 
 
 def test_ollama_parse_tool_call_preserves_malformed_arguments_as_raw():

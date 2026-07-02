@@ -192,7 +192,7 @@ class ProviderSettingsScreen(Screen):
     def _new_profile(self) -> None:
         self._input("#profile-name", "")
         self._input("#profile-model-name", "")
-        self._input("#profile-context", 32768)
+        self._input("#profile-context", 200000)
         self._input("#profile-max-output", 4096)
         self._input("#profile-reserved-output", 4096)
         self._input("#profile-temperature", 0.0)

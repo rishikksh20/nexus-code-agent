@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from os import environ
 from typing import Any
+import warnings
 
 from nexus.models import (
     Message,
@@ -311,4 +312,18 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
 
 
 def resolve_anthropic_api_key(explicit: str | None = None) -> str | None:
-    return explicit or environ.get("ANTHROPIC_API_KEY") or environ.get("API_KEY")
+    if explicit:
+        return explicit
+    provider_key = environ.get("ANTHROPIC_API_KEY")
+    if provider_key:
+        return provider_key
+    generic_key = environ.get("API_KEY")
+    if generic_key:
+        warnings.warn(
+            "Using generic API_KEY for provider 'anthropic'. "
+            "Prefer ANTHROPIC_API_KEY to avoid sending the wrong secret.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return generic_key
+    return None

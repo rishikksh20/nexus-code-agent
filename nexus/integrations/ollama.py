@@ -23,6 +23,7 @@ Usage (config.toml / .env)::
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import random
 import threading
@@ -201,21 +202,25 @@ class OllamaModelClient:
         if stream:
             last_error: str | None = None
             for attempt in range(self.retries):
-                events: list[StreamEvent] = []
                 got_retry = False
-                async for event in self._stream_ndjson(request):
-                    if event.type == StreamEventType.ERROR:
-                        err = event.error or ""
-                        if _is_transient(err):
-                            last_error = err
-                            got_retry = True
-                            break
+                emitted_output = False
+                stream_events = self._stream_ndjson(request)
+                try:
+                    async for event in stream_events:
+                        if event.type == StreamEventType.ERROR:
+                            err = event.error or ""
+                            if not emitted_output and _is_transient(err):
+                                last_error = err
+                                got_retry = True
+                                break
+                            yield event
+                            return
+                        if _stream_event_has_assistant_output(event):
+                            emitted_output = True
                         yield event
-                        return
-                    events.append(event)
+                finally:
+                    await stream_events.aclose()
                 if not got_retry:
-                    for ev in events:
-                        yield ev
                     return
                 if attempt < self.retries - 1:
                     delay = self.base_delay * (2 ** attempt) + random.uniform(0, self.jitter)
@@ -273,7 +278,34 @@ class OllamaModelClient:
         """Read Ollama's NDJSON stream and emit :class:`StreamEvent` objects."""
         wire_payload = self.adapter.to_wire_request(request, stream=True)
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[dict[str, Any] | Exception | None] = asyncio.Queue()
+        queue: asyncio.Queue[dict[str, Any] | Exception | None] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+        cancelled = threading.Event()
+        response_lock = threading.Lock()
+        response_holder: dict[str, Any] = {}
+
+        def _put_threadsafe(item: dict[str, Any] | Exception | None) -> bool:
+            if cancelled.is_set():
+                return False
+            future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+            while not cancelled.is_set():
+                try:
+                    future.result(timeout=0.1)
+                    return True
+                except concurrent.futures.TimeoutError:
+                    continue
+                except Exception:
+                    return False
+            future.cancel()
+            return False
+
+        def _close_response() -> None:
+            with response_lock:
+                resp = response_holder.get("response")
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
 
         def _reader() -> None:
             try:
@@ -285,29 +317,35 @@ class OllamaModelClient:
                     method="POST",
                 )
                 with urllib_request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                    with response_lock:
+                        response_holder["response"] = resp
                     for raw_line in resp:
+                        if cancelled.is_set():
+                            break
                         line = raw_line.decode("utf-8").strip()
                         if not line:
                             continue
                         try:
-                            loop.call_soon_threadsafe(queue.put_nowait, json.loads(line))
+                            if not _put_threadsafe(json.loads(line)):
+                                break
                         except json.JSONDecodeError:
                             pass
             except error.HTTPError as exc:
                 details = _http_error_details(exc)
                 if exc.code in {408, 409, 429, 500, 502, 503, 504}:
-                    loop.call_soon_threadsafe(queue.put_nowait, _RetryableOllamaError(details))
+                    _put_threadsafe(_RetryableOllamaError(details))
                 else:
-                    loop.call_soon_threadsafe(queue.put_nowait, RuntimeError(details))
+                    _put_threadsafe(RuntimeError(details))
             except error.URLError as exc:
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
+                _put_threadsafe(
                     _RetryableOllamaError(f"Ollama connection failed: {exc.reason}"),
                 )
             except Exception as exc:  # noqa: BLE001
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
+                _put_threadsafe(exc)
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+                with response_lock:
+                    response_holder.pop("response", None)
+                _put_threadsafe(None)
 
         thread = threading.Thread(target=_reader, daemon=True)
         thread.start()
@@ -319,37 +357,41 @@ class OllamaModelClient:
         pending_tool_calls: list[dict[str, Any]] = []
         thinking_content = ""
 
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            if isinstance(item, Exception):
-                yield StreamEvent(type=StreamEventType.ERROR, error=str(item))
-                return
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    yield StreamEvent(type=StreamEventType.ERROR, error=str(item))
+                    return
 
-            chunk: dict[str, Any] = item
-            msg = chunk.get("message") or {}
-            content: str = msg.get("content") or ""
-            thinking_chunk: str = msg.get("thinking") or ""
-            raw_tool_calls: list[dict[str, Any]] = msg.get("tool_calls") or []
+                chunk: dict[str, Any] = item
+                msg = chunk.get("message") or {}
+                content: str = msg.get("content") or ""
+                thinking_chunk: str = msg.get("thinking") or ""
+                raw_tool_calls: list[dict[str, Any]] = msg.get("tool_calls") or []
 
-            if content:
-                yield StreamEvent(
-                    type=StreamEventType.TEXT_DELTA,
-                    text_delta=TextDelta(content=content),
-                )
-            if thinking_chunk:
-                thinking_content += thinking_chunk
+                if content:
+                    yield StreamEvent(
+                        type=StreamEventType.TEXT_DELTA,
+                        text_delta=TextDelta(content=content),
+                    )
+                if thinking_chunk:
+                    thinking_content += thinking_chunk
 
-            if raw_tool_calls:
-                pending_tool_calls.extend(raw_tool_calls)
+                if raw_tool_calls:
+                    pending_tool_calls.extend(raw_tool_calls)
 
-            if chunk.get("done"):
-                usage = self.adapter.parse_usage(chunk, request.model_name)
-                done_reason = chunk.get("done_reason") or (
-                    "tool_calls" if pending_tool_calls else "stop"
-                )
-                finish_reason = done_reason
+                if chunk.get("done"):
+                    usage = self.adapter.parse_usage(chunk, request.model_name)
+                    done_reason = chunk.get("done_reason") or (
+                        "tool_calls" if pending_tool_calls else "stop"
+                    )
+                    finish_reason = done_reason
+        finally:
+            cancelled.set()
+            _close_response()
 
         # Emit tool calls after stream ends (Ollama delivers them all at once).
         for raw_tc in pending_tool_calls:
@@ -423,6 +465,17 @@ def _is_transient(error_msg: str) -> bool:
         marker in error_msg
         for marker in ("503", "502", "504", "429", "500", "408", "409", "connection failed")
     )
+
+
+def _stream_event_has_assistant_output(event: StreamEvent) -> bool:
+    if event.type == StreamEventType.TEXT_DELTA and event.text_delta and event.text_delta.content:
+        return True
+    if event.type == StreamEventType.TOOL_CALL_COMPLETE and event.tool_call:
+        return True
+    return False
+
+
+_STREAM_QUEUE_MAXSIZE = 64
 
 
 def resolve_ollama_base_url(explicit: str | None = None) -> str:

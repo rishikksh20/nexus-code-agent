@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
 _MEMORY_FILE = "user_memory.json"
 _LEGACY_MEMORY_FILE = "agent_memory.json"
+
+
+class MemoryStoreWarning(RuntimeWarning):
+    """Warning emitted when memory storage needs operator attention."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -102,19 +107,40 @@ class MemoryStore:
             return None
         try:
             raw_data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {"entries": {}}
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            self._quarantine_corrupt_file(path, exc)
+            return None
         if not isinstance(raw_data, dict):
-            return {"entries": {}}
+            self._quarantine_corrupt_file(path, ValueError("memory JSON root must be an object"))
+            return None
         entries = raw_data.get("entries") if isinstance(raw_data.get("entries"), dict) else raw_data
         if not isinstance(entries, dict):
-            return {"entries": {}}
+            self._quarantine_corrupt_file(path, ValueError("memory entries must be an object"))
+            return None
         return {
             "entries": {
                 str(key): str(value)
                 for key, value in entries.items()
             }
         }
+
+    def _quarantine_corrupt_file(self, path: Path, exc: Exception) -> None:
+        backup = self._corrupt_backup_path(path)
+        path.rename(backup)
+        warnings.warn(
+            f"Memory file {path} could not be loaded and was moved to {backup}: {exc}",
+            MemoryStoreWarning,
+            stacklevel=3,
+        )
+
+    @staticmethod
+    def _corrupt_backup_path(path: Path) -> Path:
+        candidate = path.with_name(f"{path.name}.corrupt")
+        index = 1
+        while candidate.exists():
+            candidate = path.with_name(f"{path.name}.corrupt.{index}")
+            index += 1
+        return candidate
 
     def _load_markdown_entries(self) -> dict[str, str]:
         entries: dict[str, str] = {}

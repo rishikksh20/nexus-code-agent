@@ -12,6 +12,7 @@ def test_builtin_four_agent_defaults_match_supervisor_first_contract():
     impact_analyzer = definitions["impact_analyzer"]
 
     assert explorer.allowed_tools == ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"]
+    assert explorer.allowed_mcps == []
     assert explorer.max_turns == 20
 
     coding_prompt = coding.goal_prompt.lower()
@@ -20,6 +21,7 @@ def test_builtin_four_agent_defaults_match_supervisor_first_contract():
     assert "run_formatter" in coding.allowed_tools
     assert "run_tests" not in coding.allowed_tools
     assert "bash" not in coding.allowed_tools
+    assert coding.allowed_mcps == []
     assert coding.max_turns == 14
 
     reviewer_prompt = code_reviewer.goal_prompt.lower()
@@ -27,9 +29,11 @@ def test_builtin_four_agent_defaults_match_supervisor_first_contract():
     assert "likely related to the task" in reviewer_prompt
     assert "run_tests" in code_reviewer.allowed_tools
     assert "run_python_check" in code_reviewer.allowed_tools
+    assert code_reviewer.allowed_mcps == []
     assert code_reviewer.max_turns == 8
 
     impact_prompt = impact_analyzer.goal_prompt.lower()
     assert "blast radius" in impact_prompt
     assert "manual validation" in impact_prompt
+    assert impact_analyzer.allowed_mcps == []
     assert impact_analyzer.max_turns == 10

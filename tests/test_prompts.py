@@ -5,7 +5,7 @@ from pathlib import Path
 from nexus.config import load_config
 from nexus.prompts import build_context_sections
 from nexus.context import CarryOverState
-from nexus.runtime.supervisor_routing import SupervisorRoute, classify_supervisor_route
+from nexus.runtime.supervisor_routing import SupervisorRoute, classify_supervisor_route, supervisor_routing_hint_line
 from nexus.sandbox.agent_tool import SubAgentTool, SubagentDefinition
 from nexus.skills import load_skill_registry
 from nexus.tools.base import ToolRegistry
@@ -38,38 +38,75 @@ def test_build_context_describes_cognitive_subagent_contract(tmp_path):
     registry.register(
         SubAgentTool(
             definition=SubagentDefinition(
-                name="explorer",
+                name="planning_analysis",
                 description="Explore the repo and summarize it.",
                 goal_prompt="Read only.",
                 allowed_tools=["read_file", "grep"],
             ),
         ),
         source="agent",
-        origin="explorer",
+        origin="planning_analysis",
     )
 
     sections = build_context_sections(config, registry, task_input="plan this")
 
     assert "Cognitive Sub-Agent Contract" in sections.base_instruction
-    assert "`subagent_explorer`" in sections.base_instruction
+    assert "`subagent_planning_analysis`" in sections.base_instruction
     assert '"input_packet_ids"' in sections.base_instruction
     assert "status: needs_clarification" in sections.base_instruction
     assert "local conversation and tool history as isolated private context" in sections.base_instruction
     assert "Stay supervisor-local for tiny read-only work" in sections.base_instruction
     assert "If both a normal tool and a sub-agent could handle the task" in sections.base_instruction
-    assert "Routing: use `subagent_explorer`" in sections.base_instruction
+    assert "simple implementation tasks with an obvious target file" in sections.base_instruction
+    assert "minimal-context budget" in sections.base_instruction
+    assert "Routing: use `subagent_planning_analysis`" in sections.base_instruction
     assert "Delegation packet requirements" in sections.base_instruction
     assert "validation_category" in sections.base_instruction
     assert "manual-validation notes" in sections.base_instruction
-    assert "`subagent_coding`" in sections.base_instruction
+    assert "`subagent_execution`" in sections.base_instruction
 
 
 def test_supervisor_routing_helper_classifies_default_task_shapes():
     assert classify_supervisor_route("read README", estimated_tool_calls=1).route is SupervisorRoute.DIRECT_READ_ONLY
-    assert classify_supervisor_route("summarize the runtime package", estimated_tool_calls=8).route is SupervisorRoute.EXPLORER
-    assert classify_supervisor_route("implement the routing helper").route is SupervisorRoute.CODING
-    assert classify_supervisor_route("do impact analysis for this diff").route is SupervisorRoute.IMPACT_ANALYZER
-    assert classify_supervisor_route("review this change").route is SupervisorRoute.CODE_REVIEWER
+    assert classify_supervisor_route("summarize the runtime package", estimated_tool_calls=8).route is SupervisorRoute.PLANNING_ANALYSIS
+    assert classify_supervisor_route("implement the routing helper").route is SupervisorRoute.EXECUTION
+    assert classify_supervisor_route("do impact analysis for this diff").route is SupervisorRoute.VERIFICATION
+    assert classify_supervisor_route("review this change").route is SupervisorRoute.REVIEW
+
+
+def test_supervisor_routing_hint_is_advisory():
+    hint = supervisor_routing_hint_line("implement the routing helper")
+
+    assert "advisory, not an execution scheduler" in hint
+    assert "execution route" in hint
+
+
+def test_advanced_context_includes_advisory_supervisor_route_hint(tmp_path):
+    config = load_config(
+        tmp_path,
+        global_root=tmp_path / "global",
+        cli_overrides={"agent_mode": "advanced"},
+    )
+    sections = build_context_sections(
+        config,
+        ToolRegistry(),
+        task_input="implement the routing helper",
+    )
+
+    assert sections.task_focus[0].startswith("Supervisor routing hint (advisory")
+    assert "execution route" in sections.task_focus[0]
+    assert sections.task_focus[1] == "implement the routing helper"
+
+
+def test_basic_context_omits_supervisor_route_hint(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    sections = build_context_sections(
+        config,
+        ToolRegistry(),
+        task_input="implement the routing helper",
+    )
+
+    assert sections.task_focus == ["implement the routing helper"]
 
 
 def test_build_context_includes_current_time_and_working_directory(tmp_path, monkeypatch):

@@ -98,8 +98,13 @@ async def run_repl(state: ReplState, agent: Agent, router, *, session_resumed: b
                 approval_callback=approval_callback,
             )
         except asyncio.CancelledError:
-            ui.print_warning("Turn aborted.")
-            state.history.pop()
+            ui.print_warning("Turn aborted. Type `continue` to resume the interrupted task.")
+            if not state.has_paused_turn():
+                state.mark_paused_turn(effective_prompt, reason="aborted")
+            if state.history and state.history[-1].role == "user" and state.history[-1].content == raw_input:
+                state.history.pop()
+            state.session.messages = list(state.history)
+            state.session_store.save(state.session)
             continue
         except Exception as exc:  # noqa: BLE001
             from nexus.app import provider_error_message

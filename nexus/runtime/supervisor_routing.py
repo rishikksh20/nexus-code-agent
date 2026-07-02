@@ -1,3 +1,10 @@
+"""Advisory supervisor-route helpers used by prompts and tests.
+
+This module intentionally does not schedule sub-agents. It gives the runtime a
+deterministic, inspectable hint that the supervisor prompt can use while the
+agent loop remains event-driven.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,10 +16,10 @@ TINY_READ_ONLY_TOOL_BUDGET = 3
 
 class SupervisorRoute(str, Enum):
     DIRECT_READ_ONLY = "direct_read_only"
-    EXPLORER = "explorer"
-    CODING = "coding"
-    IMPACT_ANALYZER = "impact_analyzer"
-    CODE_REVIEWER = "code_reviewer"
+    PLANNING_ANALYSIS = "planning_analysis"
+    EXECUTION = "execution"
+    VERIFICATION = "verification"
+    REVIEW = "review"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,21 +64,31 @@ def classify_supervisor_route(task_text: str, *, estimated_tool_calls: int | Non
     estimated = estimated_tool_calls if estimated_tool_calls is not None else TINY_READ_ONLY_TOOL_BUDGET + 1
 
     if any(word in text for word in _REVIEW_WORDS):
-        return SupervisorRoutingDecision(SupervisorRoute.CODE_REVIEWER, "Task asks for review or bug-finding.")
+        return SupervisorRoutingDecision(SupervisorRoute.REVIEW, "Task asks for review or bug-finding.")
     if any(word in text for word in _IMPACT_WORDS):
-        return SupervisorRoutingDecision(SupervisorRoute.IMPACT_ANALYZER, "Task asks for impact or verification scope.")
+        return SupervisorRoutingDecision(SupervisorRoute.VERIFICATION, "Task asks for impact or verification scope.")
     if any(word in text.split() for word in _MUTATION_WORDS):
-        return SupervisorRoutingDecision(SupervisorRoute.CODING, "Task appears to require workspace mutation.")
+        return SupervisorRoutingDecision(SupervisorRoute.EXECUTION, "Task appears to require workspace mutation.")
     if any(word in text.split() for word in _READ_ONLY_WORDS) and estimated <= TINY_READ_ONLY_TOOL_BUDGET:
         return SupervisorRoutingDecision(SupervisorRoute.DIRECT_READ_ONLY, "Tiny read-only task fits supervisor budget.")
-    return SupervisorRoutingDecision(SupervisorRoute.EXPLORER, "Read-only task exceeds tiny supervisor budget.")
+    return SupervisorRoutingDecision(SupervisorRoute.PLANNING_ANALYSIS, "Read-only task exceeds tiny supervisor budget.")
 
 
 def supervisor_routing_guidance_lines() -> tuple[str, ...]:
     return (
         f"- Tiny read-only budget: do the work directly only when it fits about {TINY_READ_ONLY_TOOL_BUDGET} simple read-only tool calls or fewer.",
-        "- Coding route: delegate any workspace mutation to `subagent_coding`; the supervisor should not directly edit files in advanced mode.",
-        "- Explorer route: delegate bounded read-only exploration once the tiny budget is exceeded.",
-        "- Impact route: call `subagent_impact_analyzer` when affected files, public interfaces, risk, or verification scope are unclear.",
-        "- Review route: call `subagent_code_reviewer` for post-change review, scoped verification, and failure attribution.",
+        "- Execution route: delegate any workspace mutation to `subagent_execution`; the supervisor should not directly edit files in advanced mode.",
+        "- Simple known-target implementation: route directly to `subagent_execution` with file hints and a minimal read budget; do not run separate planning first.",
+        "- Planning-analysis route: delegate bounded read-only exploration once the tiny budget is exceeded.",
+        "- Verification route: call `subagent_verification` when affected files, public interfaces, risk, or verification scope are unclear.",
+        "- Review route: call `subagent_review` for post-change review, scoped verification, and failure attribution.",
+    )
+
+
+def supervisor_routing_hint_line(task_text: str, *, estimated_tool_calls: int | None = None) -> str:
+    decision = classify_supervisor_route(task_text, estimated_tool_calls=estimated_tool_calls)
+    return (
+        "Supervisor routing hint (advisory, not an execution scheduler): "
+        f"{decision.route.value} route. {decision.reason} "
+        f"Direct read-only budget: {decision.direct_tool_budget}."
     )

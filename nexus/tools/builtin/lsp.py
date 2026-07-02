@@ -1,7 +1,6 @@
 """Read-only Python code intelligence helpers."""
 from __future__ import annotations
 
-import ast
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,7 +8,14 @@ from typing import Any, Literal
 
 from nexus.models import ToolExecutionContext, ToolResult
 from nexus.tools.base import Tool, ToolKind
-from nexus.tools.utils import allow_hidden_reads, read_path_policy_error, resolve_path, root_walk
+from nexus.tools.builtin.python_index import (
+    PYTHON_GLOB_SUFFIX,
+    IndexedSymbol,
+    get_document_index,
+    get_python_workspace_index,
+    iter_python_files as indexed_python_files,
+)
+from nexus.tools.utils import allow_hidden_reads, read_path_policy_error, resolve_path
 
 PythonLspOperation = Literal[
     "document_symbol",
@@ -19,18 +25,6 @@ PythonLspOperation = Literal[
     "hover",
 ]
 
-_PYTHON_GLOB_SUFFIX = ".py"
-_SKIP_DIRS = frozenset({
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "venv",
-    "__pycache__",
-    "node_modules",
-    ".nexus",
-    "reference_code",
-})
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _MAX_RESULTS = 200
 _MAX_PYTHON_FILES = 2_000
@@ -217,10 +211,7 @@ class PythonLspTool(Tool):
 
 def list_document_symbols(path: Path) -> list[SymbolLocation]:
     """Return top-level and nested Python symbols from one source file."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    symbols: list[SymbolLocation] = []
-    _collect_symbols(tree, path, symbols, parent=None)
-    return symbols
+    return [_to_symbol_location(symbol) for symbol in get_document_index(path).symbols]
 
 
 def workspace_symbol_search(root: Path, query: str, *, allow_hidden: bool = False) -> list[SymbolLocation]:
@@ -229,14 +220,11 @@ def workspace_symbol_search(root: Path, query: str, *, allow_hidden: bool = Fals
     if not needle:
         return []
     matches: list[SymbolLocation] = []
-    for file_path in iter_python_files(root, allow_hidden=allow_hidden):
-        try:
-            symbols = list_document_symbols(file_path)
-        except (OSError, SyntaxError):
-            continue
-        for symbol in symbols:
+    index = get_python_workspace_index(root, allow_hidden=allow_hidden, max_files=_MAX_PYTHON_FILES)
+    for file_index in index.files:
+        for symbol in file_index.symbols:
             if needle in symbol.name.lower():
-                matches.append(symbol)
+                matches.append(_to_symbol_location(symbol))
                 if len(matches) >= _MAX_RESULTS:
                     return matches
     return matches
@@ -256,14 +244,11 @@ def go_to_definition(
     if not target:
         return []
     matches: list[SymbolLocation] = []
-    for candidate in iter_python_files(root, allow_hidden=allow_hidden):
-        try:
-            symbols = list_document_symbols(candidate)
-        except (OSError, SyntaxError):
-            continue
-        for item in symbols:
+    index = get_python_workspace_index(root, allow_hidden=allow_hidden, max_files=_MAX_PYTHON_FILES)
+    for file_index in index.files:
+        for item in file_index.symbols:
             if _symbol_matches(item.name, target):
-                matches.append(item)
+                matches.append(_to_symbol_location(item))
                 if len(matches) >= _MAX_RESULTS:
                     return matches
     return matches
@@ -284,14 +269,11 @@ def find_references(
         return []
     pattern = re.compile(rf"\b{re.escape(target)}\b")
     matches: list[tuple[Path, int, str]] = []
-    for candidate in iter_python_files(root, allow_hidden=allow_hidden):
-        try:
-            lines = candidate.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeDecodeError):
-            continue
-        for lineno, raw_line in enumerate(lines, start=1):
+    index = get_python_workspace_index(root, allow_hidden=allow_hidden, max_files=_MAX_PYTHON_FILES)
+    for file_index in index.files:
+        for lineno, raw_line in enumerate(file_index.lines, start=1):
             if pattern.search(raw_line):
-                matches.append((candidate, lineno, raw_line.strip()))
+                matches.append((file_index.path, lineno, raw_line.strip()))
                 if len(matches) >= _MAX_RESULTS:
                     return matches
     return matches
@@ -306,7 +288,7 @@ def extract_symbol_at_position(
     """Extract a probable identifier from a 1-based line/character position."""
     if line is None:
         return None
-    lines = file_path.read_text(encoding="utf-8").splitlines()
+    lines = list(get_document_index(file_path).lines)
     if line < 1 or line > len(lines):
         return None
     text = lines[line - 1]
@@ -323,105 +305,7 @@ def extract_symbol_at_position(
 
 def iter_python_files(root: Path, *, allow_hidden: bool = False) -> list[Path]:
     """Return Python source files in stable workspace order."""
-    files: list[Path] = []
-    for dirpath, dirnames, filenames in root_walk(root):
-        current_dir = Path(dirpath)
-        dirnames[:] = [
-            name for name in dirnames
-            if name not in _SKIP_DIRS
-            and read_path_policy_error(current_dir / name, root, allow_hidden=allow_hidden) is None
-        ]
-        for filename in filenames:
-            if not filename.endswith(_PYTHON_GLOB_SUFFIX):
-                continue
-            path = current_dir / filename
-            if read_path_policy_error(path, root, allow_hidden=allow_hidden) is not None:
-                continue
-            if path.is_file():
-                files.append(path)
-                if len(files) >= _MAX_PYTHON_FILES:
-                    return sorted(files)
-    return sorted(files)
-
-
-def _collect_symbols(
-    node: ast.AST,
-    path: Path,
-    bucket: list[SymbolLocation],
-    *,
-    parent: str | None,
-) -> None:
-    for child in ast.iter_child_nodes(node):
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            name = f"{parent}.{child.name}" if parent else child.name
-            bucket.append(
-                SymbolLocation(
-                    name=name,
-                    kind="function",
-                    path=path,
-                    line=child.lineno,
-                    character=child.col_offset + 1,
-                    signature=_function_signature(child),
-                    docstring=ast.get_docstring(child) or "",
-                )
-            )
-            _collect_symbols(child, path, bucket, parent=name)
-        elif isinstance(child, ast.ClassDef):
-            name = f"{parent}.{child.name}" if parent else child.name
-            bucket.append(
-                SymbolLocation(
-                    name=name,
-                    kind="class",
-                    path=path,
-                    line=child.lineno,
-                    character=child.col_offset + 1,
-                    signature=f"class {child.name}",
-                    docstring=ast.get_docstring(child) or "",
-                )
-            )
-            _collect_symbols(child, path, bucket, parent=name)
-        elif isinstance(child, ast.Assign):
-            for target in child.targets:
-                _collect_assignment_target(target, path, bucket, parent=parent)
-            _collect_symbols(child, path, bucket, parent=parent)
-        elif isinstance(child, ast.AnnAssign):
-            _collect_assignment_target(child.target, path, bucket, parent=parent)
-            _collect_symbols(child, path, bucket, parent=parent)
-        else:
-            _collect_symbols(child, path, bucket, parent=parent)
-
-
-def _collect_assignment_target(
-    target: ast.AST,
-    path: Path,
-    bucket: list[SymbolLocation],
-    *,
-    parent: str | None,
-) -> None:
-    if not isinstance(target, ast.Name):
-        return
-    name = f"{parent}.{target.id}" if parent else target.id
-    bucket.append(
-        SymbolLocation(
-            name=name,
-            kind="variable",
-            path=path,
-            line=target.lineno,
-            character=target.col_offset + 1,
-            signature=f"{target.id} = ...",
-        )
-    )
-
-
-def _function_signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-    args = [arg.arg for arg in node.args.posonlyargs + node.args.args]
-    if node.args.vararg is not None:
-        args.append(f"*{node.args.vararg.arg}")
-    args.extend(arg.arg for arg in node.args.kwonlyargs)
-    if node.args.kwarg is not None:
-        args.append(f"**{node.args.kwarg.arg}")
-    prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-    return f"{prefix} {node.name}({', '.join(args)})"
+    return list(indexed_python_files(root, allow_hidden=allow_hidden, max_files=_MAX_PYTHON_FILES))
 
 
 def _validate_python_file(path: Path, workspace: Path, raw_path: str, *, allow_hidden: bool) -> str | None:
@@ -436,7 +320,7 @@ def _validate_python_file(path: Path, workspace: Path, raw_path: str, *, allow_h
         return f"File not found: {raw_path}"
     if not path.is_file():
         return f"Path is not a file: {raw_path}"
-    if path.suffix != _PYTHON_GLOB_SUFFIX:
+    if path.suffix != PYTHON_GLOB_SUFFIX:
         return "The lsp tool currently supports Python files only."
     return None
 
@@ -453,6 +337,18 @@ def _optional_int(value: Any) -> int | None:
 
 def _symbol_matches(candidate: str, target: str) -> bool:
     return candidate == target or candidate.rsplit(".", 1)[-1] == target
+
+
+def _to_symbol_location(symbol: IndexedSymbol) -> SymbolLocation:
+    return SymbolLocation(
+        name=symbol.name,
+        kind=symbol.kind,
+        path=symbol.path,
+        line=symbol.line,
+        character=symbol.character,
+        signature=symbol.signature,
+        docstring=symbol.docstring,
+    )
 
 
 def _display_path(path: Path, root: Path) -> str:

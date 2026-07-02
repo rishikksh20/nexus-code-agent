@@ -56,7 +56,7 @@ MODEL_CONTEXT_LIMITS: dict[str, int] = {
     "fake-model": 8_192,
 }
 
-_DEFAULT_CONTEXT_LIMIT = 32_768
+_DEFAULT_CONTEXT_LIMIT = 200_000
 
 
 def get_model_context_limit(model_name: str) -> int:
@@ -65,7 +65,7 @@ def get_model_context_limit(model_name: str) -> int:
     Matching order:
     1. Exact name lookup.
     2. Prefix lookup (e.g. ``"mistral-large-2407"`` matches ``"mistral-large"``).
-    3. Fall back to ``_DEFAULT_CONTEXT_LIMIT`` (32 768 tokens).
+    3. Fall back to ``_DEFAULT_CONTEXT_LIMIT`` (200 000 tokens).
     """
     if model_name in MODEL_CONTEXT_LIMITS:
         return MODEL_CONTEXT_LIMITS[model_name]

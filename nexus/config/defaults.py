@@ -7,7 +7,7 @@ from typing import Any
 
 @dataclass(slots=True)
 class AgentConfig:
-    config_version: int = 4
+    config_version: int = 5
     provider: str = "openai-compatible"
     model_name: str = "mistral-medium-latest"
     api_base_url: str = "https://api.mistral.ai/v1"
@@ -52,6 +52,8 @@ class AgentConfig:
     skill_paths: list[Path] = field(default_factory=list)
     plugins_dir: Path = field(default_factory=Path)
     memory_dir: Path = field(default_factory=Path)
+    memory_prompt_max_entries: int = 50
+    memory_prompt_max_entry_chars: int = 4000
     session_dir: Path = field(default_factory=Path)
     knowledge_file: Path = field(default_factory=Path)
     log_level: str = "WARNING"
@@ -111,6 +113,12 @@ class AgentConfig:
     agent_allowed_tools: list[str] = field(default_factory=list)
     agent_allowed_skills: list[str] = field(default_factory=list)
     agent_allowed_mcp_servers: list[str] = field(default_factory=list)
+    agent_add_tools: list[str] = field(default_factory=list)
+    agent_remove_tools: list[str] = field(default_factory=list)
+    agent_add_skills: list[str] = field(default_factory=list)
+    agent_remove_skills: list[str] = field(default_factory=list)
+    agent_add_mcp_servers: list[str] = field(default_factory=list)
+    agent_remove_mcp_servers: list[str] = field(default_factory=list)
     approval_policy: str = "on-request"
     allow_hidden_paths: bool = False
     developer_instructions: str = ""

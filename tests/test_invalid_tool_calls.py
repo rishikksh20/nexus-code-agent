@@ -6,7 +6,7 @@ from nexus.integrations.fake_model import FakeModelClient
 from nexus.models import Message, RuntimeResponse, ToolCall
 from nexus.runtime.agent import Agent
 from nexus.tools.base import ToolRegistry
-from nexus.tools.builtin import EditTool, WriteFileTool
+from nexus.tools.builtin import EditTool, ReadFileTool, ShellTool, WriteFileTool
 
 
 class RecordingModelClient(FakeModelClient):
@@ -179,6 +179,83 @@ async def test_agent_asks_model_to_repair_edit_argument_names_instead_of_user(to
     assert "You supplied 'new_text'; use 'new_string'" in repair_result.output
     assert "The edit tool requires 'path', 'old_string', and 'new_string'" in repair_result.output
     assert target.read_text(encoding="utf-8") == "Hi, World!\n"
+
+
+@pytest.mark.asyncio
+async def test_agent_asks_model_to_repair_missing_bash_command_instead_of_user(tool_context):
+    model = RecordingModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Running a shell command."),
+                tool_calls=(ToolCall(call_id="bad-bash", tool_name="bash", arguments={}),),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Recovered.")),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(ShellTool())
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="run a command")],
+            tool_context,
+            max_turns=3,
+        )
+    ]
+
+    assert not any(event.kind == "confirmation_requested" for event in events)
+    repair_result = next(
+        event.payload
+        for event in events
+        if event.kind == "tool_result" and event.payload.call_id == "bad-bash"
+    )
+    assert repair_result.is_error is True
+    assert "Missing required argument(s) for tool 'bash': 'command'" in repair_result.output
+
+    second_request_messages = model.requests[1].messages
+    assert second_request_messages[-2].role == "assistant"
+    assert second_request_messages[-2].tool_calls[0].call_id == "bad-bash"
+    assert second_request_messages[-1].role == "tool"
+    assert second_request_messages[-1].tool_call_id == "bad-bash"
+    assert "Missing required argument(s) for tool 'bash': 'command'" in second_request_messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_agent_asks_model_to_repair_missing_read_path_instead_of_user(tool_context):
+    model = RecordingModelClient(
+        scripted=[
+            RuntimeResponse(
+                message=Message(role="assistant", content="Reading a file."),
+                tool_calls=(ToolCall(call_id="bad-read", tool_name="read_file", arguments={}),),
+                finish_reason="tool_calls",
+            ),
+            RuntimeResponse(message=Message(role="assistant", content="Recovered.")),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(ReadFileTool())
+    agent = Agent(model_client=model, tool_registry=registry)
+
+    events = [
+        event
+        async for event in agent.run(
+            [Message(role="user", content="read a file")],
+            tool_context,
+            max_turns=3,
+        )
+    ]
+
+    assert not any(event.kind == "confirmation_requested" for event in events)
+    repair_result = next(
+        event.payload
+        for event in events
+        if event.kind == "tool_result" and event.payload.call_id == "bad-read"
+    )
+    assert repair_result.is_error is True
+    assert "Missing required argument(s) for tool 'read_file': 'path'" in repair_result.output
 
 
 @pytest.mark.asyncio

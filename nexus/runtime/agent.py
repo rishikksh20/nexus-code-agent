@@ -31,6 +31,8 @@ from nexus.models import (
 from nexus.observability import capture_exception_from_hooks, sentry_monitor_from_hooks
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.clarifications import ClarificationManager, is_ask_user_confirmation
+from nexus.runtime.agent_scope import builtin_subagent_preference, builtin_subagent_priority
+from nexus.runtime.tool_execution_policy import parallel_tool_execution_enabled, tool_call_can_run_in_parallel
 from nexus.hooks import HookEvent, HookExecutor
 from nexus.security import PermissionChecker, PermissionDecision
 from nexus.context import LoopDetector, prune_tool_outputs
@@ -840,7 +842,7 @@ class Agent:
             # ----------------------------------------------------------------
             # Tool execution
             # ----------------------------------------------------------------
-            if parallel_tools and _parallel_tool_execution_enabled(context):
+            if parallel_tools and parallel_tool_execution_enabled(context):
                 batch_state = _ToolBatchState()
                 async for event in self._execute_parallel_first_tool_batch(
                     tool_calls,
@@ -1005,76 +1007,44 @@ class Agent:
                     read_keys_this_batch[read_cache_key] = tool_call.call_id
                 missing_fields = _missing_required_fields(tool.input_schema, tool_call.arguments)
                 if missing_fields:
-                    if _missing_fields_should_be_repaired_by_model(tool.name, missing_fields):
-                        retry_key = (tool.name, tuple(missing_fields))
-                        retry_count = invalid_argument_retries.get(retry_key, 0) + 1
-                        invalid_argument_retries[retry_key] = retry_count
-                        invalid_result = _missing_required_argument_result(
-                            tool_call,
-                            tool.name,
-                            missing_fields,
-                            retry_count=retry_count,
-                            retry_limit=INVALID_TOOL_CALL_RETRY_LIMIT,
+                    retry_key = (tool.name, tuple(missing_fields))
+                    retry_count = invalid_argument_retries.get(retry_key, 0) + 1
+                    invalid_argument_retries[retry_key] = retry_count
+                    invalid_result = _missing_required_argument_result(
+                        tool_call,
+                        tool.name,
+                        missing_fields,
+                        retry_count=retry_count,
+                        retry_limit=INVALID_TOOL_CALL_RETRY_LIMIT,
+                    )
+                    tool_calls_executed += 1
+                    tool_result_messages.append(_tool_result_message(invalid_result))
+                    yield AgentEvent.tool_call_start(
+                        tool_call.call_id,
+                        tool.name,
+                        tool_call.arguments,
+                        actor=_tool_actor(context),
+                        display=_tool_display_metadata(is_mutating=tool.is_mutating),
+                    )
+                    yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
+                    yield AgentEvent.tool_call_complete(invalid_result)
+                    yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=invalid_result)
+                    loop_detector.record_action("tool_call", tool_name=tool.name, result="missing_argument")
+                    if retry_count > INVALID_TOOL_CALL_RETRY_LIMIT:
+                        for msg in tool_result_messages:
+                            history.append(msg)
+                        stop_message = _invalid_tool_call_stop_message(tool.name, "missing required arguments")
+                        yield AgentEvent.text_complete(stop_message)
+                        yield AgentEvent(
+                            kind=AgentEventType.MODEL_RESPONSE,
+                            payload=RuntimeResponse(
+                                message=Message(role="assistant", content=stop_message),
+                                finish_reason="invalid_tool_call",
+                            ),
                         )
-                        tool_calls_executed += 1
-                        tool_result_messages.append(_tool_result_message(invalid_result))
-                        yield AgentEvent.tool_call_start(
-                            tool_call.call_id,
-                            tool.name,
-                            tool_call.arguments,
-                            actor=_tool_actor(context),
-                            display=_tool_display_metadata(is_mutating=tool.is_mutating),
-                        )
-                        yield AgentEvent(kind=AgentEventType.TOOL_CALL_REQUESTED, payload=tool_call)
-                        yield AgentEvent.tool_call_complete(invalid_result)
-                        yield AgentEvent(kind=AgentEventType.TOOL_RESULT, payload=invalid_result)
-                        loop_detector.record_action("tool_call", tool_name=tool.name, result="missing_argument")
-                        if retry_count > INVALID_TOOL_CALL_RETRY_LIMIT:
-                            for msg in tool_result_messages:
-                                history.append(msg)
-                            stop_message = _invalid_tool_call_stop_message(tool.name, "missing required arguments")
-                            yield AgentEvent.text_complete(stop_message)
-                            yield AgentEvent(
-                                kind=AgentEventType.MODEL_RESPONSE,
-                                payload=RuntimeResponse(
-                                    message=Message(role="assistant", content=stop_message),
-                                    finish_reason="invalid_tool_call",
-                                ),
-                            )
-                            yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="invalid_tool_call")
-                            return
-                        continue
-
-                    missing_field = missing_fields[0]
-                    confirmation_preview: dict[str, Any] = {}
-                    await self.hooks.emit(
-                        HookEvent.NOTIFICATION,
-                        {
-                            "event": "clarification_requested",
-                            "tool_name": tool.name,
-                            "tool_source": record.source,
-                            "tool_origin": record.origin,
-                            "field": missing_field,
-                            "session_id": context.session_id,
-                            "call_id": tool_call.call_id,
-                            **_correlation_payload(context, tool_call_id=tool_call.call_id),
-                        },
-                    )
-                    clarification_request = ConfirmationRequest(
-                        kind=ConfirmationKind.CLARIFICATION,
-                        tool_name=tool.name,
-                        prompt=f"Provide a value for '{missing_field}' before running '{tool.name}'.",
-                        reason="Required tool argument is missing.",
-                        call_id=tool_call.call_id,
-                        payload={"tool_name": tool.name, "field": missing_field, "actor": _tool_actor(context)},
-                        arguments=tool_call.arguments,
-                        preview=confirmation_preview,
-                    )
-                    yield AgentEvent(
-                        kind=AgentEventType.CONFIRMATION_REQUESTED,
-                        payload=clarification_request,
-                    )
-                    return
+                        yield AgentEvent(kind=AgentEventType.TURN_COMPLETED, payload="invalid_tool_call")
+                        return
+                    continue
 
                 user_input = _prepare_user_input_interrupt(record, tool_call, context)
                 if isinstance(user_input, ToolResult):
@@ -1677,23 +1647,6 @@ class Agent:
 
         missing_fields = _missing_required_fields(record.tool.input_schema, tool_call.arguments)
         if missing_fields:
-            read_without_clarification_callback = (
-                getattr(record.tool, "kind", None) is ToolKind.READ
-                and context.metadata.get("approval_callback") is None
-            )
-            if not _missing_fields_should_be_repaired_by_model(record.tool.name, missing_fields) and not read_without_clarification_callback:
-                missing_field = missing_fields[0]
-                prepared.confirmation_request = ConfirmationRequest(
-                    kind=ConfirmationKind.CLARIFICATION,
-                    tool_name=record.tool.name,
-                    prompt=f"Provide a value for '{missing_field}' before running '{record.tool.name}'.",
-                    reason="Required tool argument is missing.",
-                    call_id=tool_call.call_id,
-                    payload={"tool_name": record.tool.name, "field": missing_field, "actor": _tool_actor(context)},
-                    arguments=tool_call.arguments,
-                    preview={},
-                )
-                return prepared
             retry_key = (record.tool.name, tuple(missing_fields))
             retry_count = invalid_argument_retries.get(retry_key, 0) + 1
             invalid_argument_retries[retry_key] = retry_count
@@ -1886,11 +1839,6 @@ class Agent:
         )
 
 
-def _parallel_tool_execution_enabled(context: ToolExecutionContext) -> bool:
-    del context
-    return True
-
-
 def _tool_display_metadata(
     *,
     is_mutating: bool | None = None,
@@ -1910,7 +1858,7 @@ def _tool_display_metadata(
 def _prepared_tool_prefers_parallel(prepared: _PreparedToolCall, context: ToolExecutionContext) -> bool:
     if prepared.record is None:
         return False
-    return _tool_call_can_run_in_parallel(prepared.record, context)
+    return tool_call_can_run_in_parallel(prepared.record, context)
 
 
 def _prepared_read_result_cache_key(prepared: _PreparedToolCall) -> str | None:
@@ -1922,18 +1870,6 @@ def _prepared_read_result_cache_key(prepared: _PreparedToolCall) -> str | None:
     ):
         return None
     return _read_result_cache_key(prepared.record, prepared.tool, prepared.tool_call)
-
-
-def _tool_call_can_run_in_parallel(record: Any, context: ToolExecutionContext) -> bool:
-    if not _parallel_tool_execution_enabled(context):
-        return False
-    tool = getattr(record, "tool", None)
-    if tool is None or getattr(tool, "is_mutating", False):
-        return False
-    name = str(getattr(record, "name", ""))
-    if name == "delegate_task" or name.startswith("subagent_"):
-        return False
-    return getattr(tool, "kind", None) not in {ToolKind.AGENT, ToolKind.USER_INPUT}
 
 
 def _prepare_user_input_interrupt(
@@ -1973,10 +1909,38 @@ def _prepare_user_input_interrupt(
 
 
 def _missing_required_fields(schema: dict[str, Any], arguments: dict[str, Any]) -> list[str]:
-    required = schema.get("required", [])
     properties = schema.get("properties", {})
+    missing = _missing_required_names(schema.get("required", []), properties, arguments)
+    if missing:
+        return missing
+
+    any_of = schema.get("anyOf")
+    if not isinstance(any_of, list):
+        return []
+
+    candidates: list[tuple[int, int, int, list[str]]] = []
+    for index, branch in enumerate(any_of):
+        if not isinstance(branch, dict):
+            continue
+        required = branch.get("required", [])
+        if not required:
+            continue
+        branch_properties = {**properties, **dict(branch.get("properties", {}))}
+        branch_missing = _missing_required_names(required, branch_properties, arguments)
+        if not branch_missing:
+            return []
+        required_names = _required_field_names(required)
+        present_count = len(required_names) - len(branch_missing)
+        candidates.append((len(branch_missing), -present_count, index, branch_missing))
+
+    if not candidates:
+        return []
+    return min(candidates)[3]
+
+
+def _missing_required_names(required: Any, properties: dict[str, Any], arguments: dict[str, Any]) -> list[str]:
     missing: list[str] = []
-    for field_name in required:
+    for field_name in _required_field_names(required):
         if field_name not in arguments or arguments[field_name] is None:
             missing.append(field_name)
             continue
@@ -1986,6 +1950,12 @@ def _missing_required_fields(schema: dict[str, Any], arguments: dict[str, Any]) 
             if min_length > 0 and not value.strip():
                 missing.append(field_name)
     return missing
+
+
+def _required_field_names(required: Any) -> list[str]:
+    if not isinstance(required, list):
+        return []
+    return [str(field_name).strip() for field_name in required if str(field_name).strip()]
 
 
 def _tool_result_message(result: ToolResult) -> Message:
@@ -2175,28 +2145,6 @@ def _duplicate_read_result(
     )
 
 
-def _missing_fields_should_be_repaired_by_model(tool_name: str, missing_fields: list[str]) -> bool:
-    model_owned_fields = {
-        "content",
-        "new_content",
-        "old_content",
-        "new_string",
-        "old_string",
-        "code",
-        "patch",
-    }
-    model_owned_path_tools = {
-        "edit",
-        "insert_edit_into_file",
-        "write_file",
-    }
-    return tool_name == "ask_user" or any(
-        field in model_owned_fields
-        or (field == "path" and tool_name in model_owned_path_tools)
-        for field in missing_fields
-    )
-
-
 def _missing_required_argument_result(
     tool_call: ToolCall,
     tool_name: str,
@@ -2218,6 +2166,11 @@ def _missing_required_argument_result(
         if any(field in missing_fields for field in {"old_string", "new_string"}):
             alias_hints.append(
                 "The edit tool requires 'path', 'old_string', and 'new_string'. old_string must be the current snippet from disk, preferably with a few surrounding lines so the match is unique. Use write_file only for new files or true full-file rewrites."
+            )
+    if tool_name.startswith("subagent_"):
+        if any(field in missing_fields for field in {"title", "instructions"}):
+            alias_hints.append(
+                "For a new sub-agent task, supply both 'title' and 'instructions'. Use 'resume_task_id' with 'clarification' only when resuming a clarification-blocked task."
             )
     alias_hint = f" {' '.join(alias_hints)}" if alias_hints else ""
     if retry_count > retry_limit:
@@ -2370,14 +2323,8 @@ def _supervisor_preferred_tool_records(records: list[Any]) -> list[Any]:
 
 def _supervisor_tool_priority(record: Any) -> tuple[int, int, str]:
     name = str(getattr(record, "name", ""))
-    subagent_order = {
-        "subagent_explorer": 0,
-        "subagent_coding": 1,
-        "subagent_impact_analyzer": 2,
-        "subagent_code_reviewer": 3,
-    }
     if name.startswith("subagent_"):
-        return (0, subagent_order.get(name, 50), name)
+        return (0, builtin_subagent_priority(name), name)
     if getattr(record, "source", "") == "mcp":
         return (2, 0, name)
     return (1, 0, name)
@@ -2401,14 +2348,12 @@ def _supervisor_tool_schema(record: Any, records: list[Any]) -> dict[str, Any]:
 
 
 def _subagent_preference_description(name: str, description: str) -> str:
-    routing = {
-        "subagent_explorer": "Preferred for bounded read-only exploration, directory summaries, and codebase scans.",
-        "subagent_coding": "Preferred for file edits, implementation, and cheap local validation tied to those edits.",
-        "subagent_impact_analyzer": "Preferred when blast radius, affected interfaces, or scoped verification targets are unclear.",
-        "subagent_code_reviewer": "Preferred for post-change review, scoped automated verification, and failure attribution.",
-    }
-    prefix = routing.get(name, "Preferred delegation route for focused cognitive work.")
-    return f"{prefix} {description}".strip()
+    prefix = builtin_subagent_preference(name) or "Preferred delegation route for focused cognitive work."
+    call_contract = (
+        "For new delegated work, provide both title and instructions; do not call this tool with empty arguments. "
+        "Use resume_task_id with clarification only when resuming an existing clarification-blocked task."
+    )
+    return f"{prefix} {description} {call_contract}".strip()
 
 
 def _tool_available_in_context(record: Any, context: ToolExecutionContext) -> bool:

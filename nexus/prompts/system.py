@@ -201,12 +201,13 @@ def _subagent_guidance_lines(records) -> list[str]:
         "",
         "## Cognitive Sub-Agent Contract",
         "",
-        "- Pick one active route for the user request before calling tools: direct read-only, explorer, coding, impact, or review. Every tool call must move that route toward the final user-visible answer.",
+        "- Pick one active route for the user request before calling tools: direct read-only, planning analysis, execution, verification, or review. Every tool call must move that route toward the final user-visible answer.",
         "- Stay supervisor-local for tiny read-only work. If you can answer with about 3 simple read-only tool calls or fewer, do it directly instead of delegating.",
         "- Delegate when the task needs isolated mutation, more than a small direct-tool budget, explicit impact analysis, or post-change review and scoped verification.",
+        "- For simple implementation tasks with an obvious target file, missing file, or direct port from a known source file, skip `subagent_planning_analysis`; call `subagent_execution` once with the target path, source path, style reference, and a small pre-edit tool budget.",
         "- If both a normal tool and a sub-agent could handle the task, keep it local when it is tiny and read-only; otherwise delegate once with bounded instructions and integrate the structured result. Do not delegate the same objective twice unless the prior result names a concrete blocker or missing file.",
-        "- Routing: use `subagent_explorer` for bounded read-only exploration and summaries; `subagent_coding` for code edits and cheap local validation; `subagent_impact_analyzer` when blast radius or verification scope is unclear; `subagent_code_reviewer` for post-change review and scoped automated verification.",
-        "- For implementation requests, do brief supervisor planning first, then route edits to `subagent_coding`. Call `subagent_explorer` or `subagent_impact_analyzer` first only when the exact target files or blast radius are unclear. If `subagent_coding` returns no changed_files for a requested code change, treat it as blocked or failed; do not continue with more read-only delegation.",
+        "- Routing: use `subagent_planning_analysis` for bounded read-only exploration and summaries; `subagent_execution` for code edits and cheap local validation; `subagent_verification` when blast radius or verification scope is unclear; `subagent_review` for post-change review and scoped automated verification.",
+        "- For implementation requests, do brief supervisor planning first, then route edits to `subagent_execution`. Call `subagent_planning_analysis` or `subagent_verification` first only when the exact target files or blast radius are unclear. If `subagent_execution` returns no changed_files for a requested code change, treat it as blocked or failed; do not continue with more read-only delegation.",
         "- After each sub-agent result, decide immediately: answer the user, request one missing clarification, or run the next required route. Repeated read/search results without changed files are not progress for an implementation request.",
         "",
         "Supervisor routing policy:",
@@ -214,6 +215,7 @@ def _subagent_guidance_lines(records) -> list[str]:
         "",
         "Delegation packet requirements:",
         "- Include objective, exact files/symbols if known, constraints, expected JSON fields, stop condition, and tool budget. State what counts as success and what counts as blocked.",
+        "- For coding, include a minimal-context budget: read only the source/spec file and at most one or two local style references before editing when the target is already known.",
         "- For coding, require status, summary, changed_files, tests_run, risks, clarifications_needed, and recommended_next_action. Tell the coding agent to return `blocked` instead of `completed` if it cannot make the requested edit.",
         "- For impact analysis, request changed_files, affected_modules, public_interfaces_changed, risk_level, validation_category, candidate_review_targets, candidate_tests, verification_policy, and failure_attribution_hints.",
         "- For review/verification, provide impact-analysis packet ids when available and require focused checks unless broad regression is explicitly justified.",
@@ -223,6 +225,7 @@ def _subagent_guidance_lines(records) -> list[str]:
         "- Treat sub-agent local conversation and tool history as isolated private context. Nexus resumes clarification-blocked work with a compact logical-task record, not the full hidden transcript.",
         "- Share context with sub-agents only through focused `instructions`, relevant `input_packet_ids`, and the resume fields below; do not copy the full conversation.",
         "- Keep each delegation bounded: include the role, exact files/symbols if known, constraints, expected output, and stop condition.",
+        "- New `subagent_*` tool calls must include both `title` and `instructions`; never call a sub-agent with empty arguments or only the tool name.",
         "- Prefer packet ids over pasted summaries when packet ids are available in context.",
         "- A sub-agent result is a JSON envelope with `status`, `agent`, `task_id`, `summary`, `raw_result`, `context`, and `recommended_next_action`.",
         "- If a sub-agent reports `status: needs_clarification`, ask the user yourself with `ask_user`, then call the same `subagent_*` tool with its returned `task_id` as `resume_task_id` and the structured user answer as `clarification`. Do not start a disconnected replacement task with only the answer.",
@@ -242,12 +245,28 @@ def _subagent_guidance_lines(records) -> list[str]:
     for record in subagents:
         tool = record.tool
         definition = getattr(tool, "_definition", None)
-        allowed_tools = getattr(definition, "allowed_tools", None)
+        allowed_tools = getattr(tool, "_prompt_allowed_tools", None)
+        if allowed_tools is None:
+            allowed_tools = getattr(definition, "allowed_tools", None)
         allowed_skills = getattr(definition, "allowed_skills", ())
-        allowed_mcps = getattr(definition, "allowed_mcps", ())
-        allowed_text = ", ".join(allowed_tools) if allowed_tools else "task-scoped registry"
+        allowed_mcps = getattr(tool, "_prompt_allowed_mcps", None)
+        if allowed_mcps is None:
+            allowed_mcps = getattr(definition, "allowed_mcps", ())
+        allowed_text = (
+            ", ".join(allowed_tools)
+            if allowed_tools
+            else "none"
+            if allowed_tools == ()
+            else "task-scoped registry"
+        )
         skills_text = ", ".join(allowed_skills) if allowed_skills else "active skill scope"
-        mcps_text = ", ".join(allowed_mcps) if allowed_mcps else "active MCP scope"
+        mcps_text = (
+            ", ".join(allowed_mcps)
+            if allowed_mcps
+            else "none"
+            if allowed_mcps == ()
+            else "active MCP scope"
+        )
         origin = f" ({record.origin})" if record.origin else ""
         lines.append(
             f"- `{record.name}`{origin}: {tool.description} "

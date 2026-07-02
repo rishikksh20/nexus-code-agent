@@ -35,6 +35,7 @@ from nexus.runtime.context_state import (
 )
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.agent_scope import (
+    canonical_builtin_subagent_name,
     clean_string_list,
     is_all_scope,
     mcp_tool_names_for_servers,
@@ -204,7 +205,7 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
     for name, description in (
         ("/help", "Show command help."),
         ("/mcp [status|tools|available|activate|deactivate|refresh]", "Inspect and manage MCP server connections."),
-        ("/agent [status|tools|skills|mcp|allow|disallow]", "Inspect and scope supervisor resources."),
+        ("/agent [status|switch|tools|skills|mcp|allow|disallow]", "Inspect, switch, and scope supervisor resources."),
         ("/sub-agent [list|show|tools|skills|mcp|allow|disallow]", "Inspect and scope sub-agent resources."),
         ("/mode [plan|default|auto]", "Show or switch execution mode."),
         ("/provider [list|profiles|use|manage|set]", "Inspect provider cards, activate profiles, or update model/session parameters."),
@@ -285,9 +286,10 @@ async def handle_agent(state: ReplState, args: list[str]) -> None:
     subcommand = args[0].lower() if args else "status"
     if subcommand == "help":
         _print_subcommand_help(
-            state, "agent", "Inspect and scope supervisor tools, skills, and MCP servers.",
+            state, "agent", "Inspect, switch, and scope supervisor tools, skills, and MCP servers.",
             (
                 ("status", "Show supervisor mode and effective resource counts.", "/agent status"),
+                ("switch", "Cycle agent mode between basic and advanced, persist it, and reload tools.", "/agent switch"),
                 ("tools", "List registered tools and whether the supervisor can call them.", "/agent tools"),
                 ("skills", "List globally active skills and supervisor scoped state.", "/agent skills"),
                 ("mcp", "List active MCP servers and supervisor scoped state.", "/agent mcp"),
@@ -302,6 +304,21 @@ async def handle_agent(state: ReplState, args: list[str]) -> None:
         return
     if subcommand == "status":
         _print_agent_status(state)
+        return
+    if subcommand in {"switch", "toggle"}:
+        _switch_agent_mode(state)
+        return
+    if subcommand == "mode":
+        if len(args) < 2:
+            _print_agent_mode_usage(state)
+            return
+        if args[1].lower() in {"switch", "toggle"}:
+            _switch_agent_mode(state)
+            return
+        _set_agent_mode(state, args[1])
+        return
+    if subcommand in {"basic", "advanced"}:
+        _set_agent_mode(state, subcommand)
         return
     if subcommand == "tools":
         _print_agent_tools(state)
@@ -320,7 +337,7 @@ async def handle_agent(state: ReplState, args: list[str]) -> None:
             state.refresh_system_prompt()
             _print_agent_status(state)
         return
-    state.console.print("Usage: /agent [status|tools|skills|mcp|allow|disallow|help]")
+    state.console.print("Usage: /agent [status|switch|tools|skills|mcp|allow|disallow|help]")
 
 
 async def handle_sub_agent(state: ReplState, args: list[str]) -> None:
@@ -330,12 +347,12 @@ async def handle_sub_agent(state: ReplState, args: list[str]) -> None:
             state, "sub-agent", "Inspect and scope cognitive sub-agent resources.",
             (
                 ("list", "List registered cognitive sub-agent tools.", "/sub-agent list"),
-                ("show <name>", "Show one sub-agent description and effective resources.", "/sub-agent show coding"),
-                ("tools <name>", "List effective tools for one sub-agent.", "/sub-agent tools coding"),
-                ("skills <name>", "List allowed skill metadata for one sub-agent.", "/sub-agent skills coding"),
-                ("mcp <name>", "List active MCP servers and sub-agent scoped state.", "/sub-agent mcp coding"),
-                ("allow <name> tool|skill|mcp <id>", "Add a resource to a sub-agent allowlist.", "/sub-agent allow coding tool read_file"),
-                ("disallow <name> tool|skill|mcp <id>", "Remove a resource from a sub-agent allowlist.", "/sub-agent disallow coding mcp filesystem"),
+                ("show <name>", "Show one sub-agent description and effective resources.", "/sub-agent show execution"),
+                ("tools <name>", "List effective tools for one sub-agent.", "/sub-agent tools execution"),
+                ("skills <name>", "List allowed skill metadata for one sub-agent.", "/sub-agent skills execution"),
+                ("mcp <name>", "List active MCP servers and sub-agent scoped state.", "/sub-agent mcp execution"),
+                ("allow <name> tool|skill|mcp <id>", "Add a resource to a sub-agent allowlist.", "/sub-agent allow execution tool read_file"),
+                ("disallow <name> tool|skill|mcp <id>", "Remove a resource from a sub-agent allowlist.", "/sub-agent disallow execution mcp filesystem"),
                 ("agents list", "List YAML sub-agents in local and global agent directories.", "/sub-agent agents list"),
                 ("agents new <name> [local|global]", "Scaffold a new YAML sub-agent file.", "/sub-agent agents new explore"),
                 ("agents promote <name>", "Move a local YAML sub-agent to the global directory.", "/sub-agent agents promote explore"),
@@ -1342,6 +1359,32 @@ def _print_agent_status(state: ReplState) -> None:
     state.console.print(table)
 
 
+def _print_agent_mode_usage(state: ReplState) -> None:
+    state.console.print(f"Agent mode: {state.config.agent_mode}")
+    state.console.print("Usage: /agent switch")
+
+
+def _switch_agent_mode(state: ReplState) -> None:
+    current = str(getattr(state.config, "agent_mode", "basic")).strip().lower()
+    next_mode = "basic" if current == "advanced" else "advanced"
+    _set_agent_mode(state, next_mode)
+
+
+def _set_agent_mode(state: ReplState, mode: str) -> None:
+    normalized = mode.strip().lower()
+    if normalized not in {"basic", "advanced"}:
+        state.console.print("Usage: /agent switch")
+        return
+    _update_toml_value(state.config.local_config_file, "agent_mode", normalized)
+    _reload_config(state)
+    count = _reload_tools(state)
+    state.refresh_system_prompt()
+    state.console.print(
+        f"[green]Agent mode set to {state.config.agent_mode} in {state.config.local_config_file}.[/green] "
+        f"Config reloaded and {count} tool(s) registered."
+    )
+
+
 def _print_agent_tools(state: ReplState) -> None:
     available = supervisor_tool_names(state.config, state.tool_registry)
     configured_scope = getattr(state.config, "agent_allowed_tools", [])
@@ -1415,23 +1458,17 @@ def _set_agent_resource_allowed(state: ReplState, kind: str, name: str, *, allow
     normalized = _normalize_resource_name(state, kind, name, require_active=allowed)
     if normalized is None:
         return False
-    field_name = {
-        "tool": "allowed_tools",
-        "skill": "allowed_skills",
-        "mcp": "allowed_mcp_servers",
+    field_names = {
+        "tool": ("add_tools", "remove_tools"),
+        "skill": ("add_skills", "remove_skills"),
+        "mcp": ("add_mcp_servers", "remove_mcp_servers"),
     }.get(kind)
-    if field_name is None:
+    if field_names is None:
         state.console.print("Resource kind must be one of: tool, skill, mcp")
         return False
     payload = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8")) if state.config.local_config_file.exists() else {}
     agent_scope = _payload_agent_scope(payload)
-    _set_allowed_list_value(
-        agent_scope,
-        field_name,
-        normalized,
-        allowed=allowed,
-        current_values=_current_supervisor_resource_names(state, kind),
-    )
+    _set_delta_list_value(agent_scope, field_names[0], field_names[1], normalized, allowed=allowed)
     _write_toml(state.config.local_config_file, payload)
     _reload_config(state)
     action = "Allowed" if allowed else "Disallowed"
@@ -1554,24 +1591,18 @@ def _set_subagent_resource_allowed(state: ReplState, record, kind: str, name: st
         return False
     definition = getattr(record.tool, "_definition", None)
     subagent_name = normalize_subagent_name(getattr(definition, "name", record.name))
-    field_name = {
-        "tool": "allowed_tools",
-        "skill": "allowed_skills",
-        "mcp": "allowed_mcps",
+    field_names = {
+        "tool": ("add_tools", "remove_tools"),
+        "skill": ("add_skills", "remove_skills"),
+        "mcp": ("add_mcps", "remove_mcps"),
     }
-    target_field = field_name.get(kind)
-    if target_field is None:
+    target_fields = field_names.get(kind)
+    if target_fields is None:
         state.console.print("Resource kind must be one of: tool, skill, mcp")
         return False
     payload = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8")) if state.config.local_config_file.exists() else {}
     profile = _payload_subagent_profile(payload, subagent_name)
-    _set_allowed_list_value(
-        profile,
-        target_field,
-        normalized_resource,
-        allowed=allowed,
-        current_values=_current_subagent_resource_names(state, record, kind),
-    )
+    _set_delta_list_value(profile, target_fields[0], target_fields[1], normalized_resource, allowed=allowed)
     _write_toml(state.config.local_config_file, payload)
     _reload_config(state)
     action = "Allowed" if allowed else "Disallowed"
@@ -1612,12 +1643,16 @@ def _subagent_records(state: ReplState) -> list:
 def _subagent_record(state: ReplState, name: str):
     target_tool = subagent_tool_name(name)
     target_name = normalize_subagent_name(name)
+    target_canonical_name = canonical_builtin_subagent_name(name)
+    fallback = None
     for record in _subagent_records(state):
         definition = getattr(record.tool, "_definition", None)
         definition_name = normalize_subagent_name(getattr(definition, "name", record.name))
         if record.name == target_tool or definition_name == target_name:
             return record
-    return None
+        if canonical_builtin_subagent_name(definition_name) == target_canonical_name:
+            fallback = record
+    return fallback
 
 
 def _effective_subagent_tools(state: ReplState, record) -> list[str]:
@@ -1697,26 +1732,32 @@ def _current_subagent_resource_names(state: ReplState, record, kind: str) -> lis
     return []
 
 
-def _set_allowed_list_value(
+def _set_delta_list_value(
     payload: dict[str, object],
-    field_name: str,
+    add_key: str,
+    remove_key: str,
     value: str,
     *,
     allowed: bool,
-    current_values: list[str],
 ) -> None:
-    existing = clean_string_list(payload.get(field_name, []))
-    if is_all_scope(existing):
-        values = [item for item in current_values if item != value]
-    elif existing:
-        values = list(existing)
+    additions = clean_string_list(payload.get(add_key, []))
+    removals = clean_string_list(payload.get(remove_key, []))
+    if allowed:
+        removals = [item for item in removals if item != value]
+        if value not in additions:
+            additions.append(value)
     else:
-        values = list(current_values)
-    if allowed and value not in values:
-        values.append(value)
-    if not allowed:
-        values = [item for item in values if item != value]
-    payload[field_name] = values
+        additions = [item for item in additions if item != value]
+        if value not in removals:
+            removals.append(value)
+    if additions:
+        payload[add_key] = additions
+    else:
+        payload.pop(add_key, None)
+    if removals:
+        payload[remove_key] = removals
+    else:
+        payload.pop(remove_key, None)
 
 
 def _payload_subagent_profile(payload: dict[str, object], name: str) -> dict[str, object]:
@@ -1732,12 +1773,8 @@ def _payload_subagent_profile(payload: dict[str, object], name: str) -> dict[str
         if not isinstance(entry, dict):
             continue
         if normalize_subagent_name(str(entry.get("name", ""))) == name:
-            for field_name in ("allowed_tools", "allowed_skills", "allowed_mcps"):
-                entry.setdefault(field_name, [])
             return entry
     entry: dict[str, object] = {"name": name}
-    for field_name in ("allowed_tools", "allowed_skills", "allowed_mcps"):
-        entry[field_name] = []
     profiles.append(entry)
     return entry
 

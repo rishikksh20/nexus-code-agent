@@ -19,6 +19,7 @@ class MCPToolSpec:
     name: str
     description: str
     input_schema: dict[str, Any]
+    annotations: dict[str, Any] | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -34,6 +35,8 @@ class MCPServerConfig:
     tool_timeout_seconds: float = 60.0
     disabled: bool = False
     disabled_tools: tuple[str, ...] = ()
+    read_only_tools: tuple[str, ...] = ()
+    mutating_tools: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "MCPServerConfig":
@@ -48,12 +51,10 @@ class MCPServerConfig:
                 raise ValueError(f"MCP server '{name}' command must be a list.")
             command = tuple(str(part).strip() for part in raw_command if str(part).strip())
         url = str(payload.get("url", "")).strip()
+        if transport != "stdio":
+            raise ValueError(f"MCP server '{name}' has unsupported transport '{transport}'. Only stdio is supported.")
         if transport == "stdio" and not command:
             raise ValueError(f"MCP server '{name}' requires a non-empty command list.")
-        if transport in {"http", "streamable_http", "streamable-http"} and not url:
-            raise ValueError(f"MCP server '{name}' requires a non-empty url.")
-        if transport not in {"stdio", "http", "streamable_http", "streamable-http"}:
-            raise ValueError(f"MCP server '{name}' has unsupported transport '{transport}'.")
         prefix = str(payload.get("prefix", "")).strip()
         raw_env = payload.get("env")
         env = None
@@ -63,6 +64,14 @@ class MCPServerConfig:
         disabled_tools: tuple[str, ...] = ()
         if isinstance(raw_disabled_tools, list):
             disabled_tools = tuple(str(item).strip() for item in raw_disabled_tools if str(item).strip())
+        raw_read_only_tools = payload.get("read_only_tools", [])
+        read_only_tools: tuple[str, ...] = ()
+        if isinstance(raw_read_only_tools, list):
+            read_only_tools = tuple(str(item).strip() for item in raw_read_only_tools if str(item).strip())
+        raw_mutating_tools = payload.get("mutating_tools", [])
+        mutating_tools: tuple[str, ...] = ()
+        if isinstance(raw_mutating_tools, list):
+            mutating_tools = tuple(str(item).strip() for item in raw_mutating_tools if str(item).strip())
         return cls(
             name=name,
             command=command,
@@ -75,6 +84,8 @@ class MCPServerConfig:
             tool_timeout_seconds=float(payload.get("tool_timeout_seconds", 60.0)),
             disabled=bool(payload.get("disabled", False)),
             disabled_tools=disabled_tools,
+            read_only_tools=read_only_tools,
+            mutating_tools=mutating_tools,
         )
 
 
@@ -165,6 +176,7 @@ class MCPClient:
                     name=str(item.get("name", "")).strip(),
                     description=str(item.get("description", "")).strip(),
                     input_schema=dict(item.get("inputSchema", {"type": "object", "properties": {}})),
+                    annotations=dict(item.get("annotations", {})) if isinstance(item.get("annotations"), dict) else None,
                 )
             )
         return [spec for spec in specs if spec.name]
@@ -441,7 +453,6 @@ class MCPServerRuntime:
 
 
 class MCPToolAdapter:
-    is_mutating = True
     kind = ToolKind.MCP
 
     def __init__(self, client: MCPClient, spec: MCPToolSpec, *, display_name: str) -> None:
@@ -450,6 +461,7 @@ class MCPToolAdapter:
         self.name = display_name
         self.description = spec.description or f"MCP tool from {client.server.name}."
         self.input_schema = spec.input_schema
+        self.is_mutating = _mcp_tool_is_mutating(client.server, spec, display_name)
 
     async def execute(
         self,
@@ -538,6 +550,25 @@ def _register_runtime_tools(runtime: MCPServerRuntime, registry: ToolRegistry, c
         registered.append(display_name)
     runtime.registered_tools = tuple(registered)
     return runtime.registered_tools
+
+
+def _mcp_tool_is_mutating(server: MCPServerConfig, spec: MCPToolSpec, display_name: str) -> bool:
+    mutating_overrides = set(server.mutating_tools)
+    read_only_overrides = set(server.read_only_tools)
+    candidates = {spec.name, display_name}
+    if candidates & mutating_overrides:
+        return True
+    if candidates & read_only_overrides:
+        return False
+
+    annotations = spec.annotations or {}
+    destructive = annotations.get("destructiveHint")
+    read_only = annotations.get("readOnlyHint")
+    if destructive is True:
+        return True
+    if read_only is True and destructive is not True:
+        return False
+    return True
 
 
 def mcp_server_example_for_workspace(workspace_root: Path) -> str:

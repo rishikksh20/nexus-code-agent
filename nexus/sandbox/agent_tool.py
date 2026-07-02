@@ -25,12 +25,22 @@ from nexus.runtime.context_state import (
     save_subagent_continuation,
 )
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.agent_scope import render_skill_metadata, subagent_skill_names, subagent_tool_names
+from nexus.runtime.agent_scope import (
+    builtin_subagent_context_packet_key,
+    render_skill_metadata,
+    subagent_skill_names,
+    subagent_tool_names,
+)
 from nexus.security.manager import ApprovalScope
 from nexus.security.policy import ApprovalPolicy
 from nexus.tools.base import ToolKind
 
 logger = logging.getLogger(__name__)
+_INNER_RESUMABLE_PAUSE_REASONS = frozenset({"tool_call_limit", "max_turns"})
+_SUBAGENT_INSTRUCTIONS_MAX_CHARS = 12_000
+_SUBAGENT_RESUME_CONTEXT_MAX_CHARS = 6_000
+_SUBAGENT_SHARED_CONTEXT_MAX_CHARS = 8_000
+_SUBAGENT_SHARED_CONTEXT_ITEM_MAX_CHARS = 3_000
 
 # ---------------------------------------------------------------------------
 # SubagentDefinition — pre-configured cognitive persona
@@ -293,6 +303,16 @@ class SubAgentTool:
             hooks=outer_context.metadata.get("hooks"),
         )
         shared_context = _packet_summaries_from_context(outer_context, input_packet_ids)
+        prompt_instructions = _bounded_text(
+            instructions,
+            max_chars=_SUBAGENT_INSTRUCTIONS_MAX_CHARS,
+            label="task instructions",
+        )
+        prompt_resume_context = _bounded_text(
+            resume_context,
+            max_chars=_SUBAGENT_RESUME_CONTEXT_MAX_CHARS,
+            label="resume context",
+        )
         active_skill_names = subagent_skill_names(
             scoped_config,
             self._definition.name if self._definition else "delegate",
@@ -334,22 +354,24 @@ class SubAgentTool:
         system_prompt = _direct_subagent_system_prompt(
             self._definition,
             title=title,
-            instructions=instructions,
+            instructions=prompt_instructions,
             allowed_tools=allowed_tool_names,
             allowed_mcp_servers=allowed_mcp_servers,
             allowed_skill_names=tuple(active_skill_names),
             allowed_skill_metadata=allowed_skill_metadata,
             shared_context=shared_context,
             input_packet_ids=input_packet_ids,
-            resume_context=resume_context,
+            resume_context=prompt_resume_context,
         )
-        history = [Message(role="user", content=resume_context or instructions)]
+        history = [Message(role="user", content=_subagent_initial_user_message(title, resuming=bool(resume_context)))]
         final_response = ""
         tool_call_count = 0
         status = "completed"
         error = None
         failed_tool_outputs: list[dict[str, str]] = []
         modified_files: list[str] = []
+        max_subagent_turns = _subagent_max_turns(self._definition)
+        remaining_model_turns = max_subagent_turns
         deadline = asyncio.get_running_loop().time() + float(getattr(self._definition, "timeout_seconds", 600.0) or 600.0)
         logger.debug(
             "subagent.execute.start outer_session_id=%s sub_session_id=%s tool_name=%s call_id=%s title_chars=%s "
@@ -363,11 +385,11 @@ class SubAgentTool:
             len(allowed_tool_names),
             len(active_skill_names),
             len(allowed_mcp_servers),
-            int(getattr(self._definition, "max_turns", 20) or 20),
+            max_subagent_turns,
             float(getattr(self._definition, "timeout_seconds", 600.0) or 600.0),
         )
 
-        for _ in range(int(getattr(self._definition, "max_turns", 20) or 20)):
+        while remaining_model_turns > 0:
             try:
                 events = await _collect_inner_events(
                     agent.run(
@@ -381,7 +403,7 @@ class SubAgentTool:
                         auto_confirm_read_only=bool(outer_context.metadata.get("auto_confirm_read_only", True)),
                         temperature=float(getattr(self._config, "temperature", 0.0)),
                         max_output_tokens=getattr(self._config, "max_output_tokens", None),
-                        max_turns=1,
+                        max_turns=remaining_model_turns,
                         parallel_tools=bool(getattr(self._config, "parallel_tools", True)),
                         parallel_tool_window=int(getattr(self._config, "parallel_tool_window", 4) or 4),
                     ),
@@ -393,6 +415,7 @@ class SubAgentTool:
                 error = f"Sub-agent timed out after {float(getattr(self._definition, 'timeout_seconds', 600.0) or 600.0):g}s."
                 final_response = error
                 break
+            remaining_model_turns = max(0, remaining_model_turns - _model_response_count(events))
             logger.debug(
                 "subagent.execute.batch outer_session_id=%s sub_session_id=%s tool_name=%s call_id=%s events=%s "
                 "tool_results=%s agent_errors=%s confirmations=%s history_messages=%s status=%s",
@@ -494,23 +517,41 @@ class SubAgentTool:
                         elif event.kind == AgentEventType.AGENT_ERROR:
                             status = "failed"
                             error = str(event.payload)
+                    if remaining_model_turns <= 0:
+                        status = "failed"
+                        error = error or final_response or _subagent_turn_budget_message(max_subagent_turns)
+                        break
                     continue
                 if confirmation.payload.kind is ConfirmationKind.CLARIFICATION and decision:
                     field_name = str(confirmation.payload.payload.get("field", "value"))
                     clarification_text = f"Clarification for {confirmation.payload.tool_name} ({field_name}): {decision}"
                     history.append(Message(role="user", content=clarification_text))
                     final_response = clarification_text
+                    if remaining_model_turns <= 0:
+                        status = "failed"
+                        error = final_response or _subagent_turn_budget_message(max_subagent_turns)
+                        break
                     continue
                 if decision == "denied":
-                    continue
+                    status = "failed"
+                    final_response = "Sub-agent approval was denied."
+                    break
                 status = "needs_approval" if confirmation.payload.kind is ConfirmationKind.APPROVAL else "needs_clarification"
                 final_response = confirmation.payload.prompt
                 break
 
+            pause_reason = _inner_pause_reason(events)
+            completed_tool_call_ids = _completed_tool_call_ids(events)
             for event in events:
                 if event.kind == AgentEventType.MODEL_RESPONSE:
                     message = event.payload.message
-                    history.append(message)
+                    safe_message = _history_safe_model_message(
+                        message,
+                        event.payload.tool_calls or message.tool_calls,
+                        completed_tool_call_ids,
+                    )
+                    if safe_message is not None:
+                        history.append(safe_message)
                     if message.content:
                         final_response = message.content
                 elif event.kind == AgentEventType.TOOL_RESULT:
@@ -534,8 +575,11 @@ class SubAgentTool:
                 elif event.kind == AgentEventType.AGENT_ERROR:
                     status = "failed"
                     error = str(event.payload)
-            if not any(event.kind == AgentEventType.TOOL_RESULT for event in events):
+            if pause_reason:
+                status = "failed"
+                error = final_response or pause_reason
                 break
+            break
 
         context_snapshot = {
             "scope": "isolated",
@@ -636,11 +680,105 @@ def _packet_summaries_from_context(
     if not isinstance(summaries, dict):
         return ()
     rendered: list[str] = []
+    total_chars = 0
     for packet_id in packet_ids:
         summary = summaries.get(packet_id)
         if isinstance(summary, str) and summary.strip():
-            rendered.append(summary)
+            bounded = _bounded_text(
+                summary,
+                max_chars=_SUBAGENT_SHARED_CONTEXT_ITEM_MAX_CHARS,
+                label=f"context packet {packet_id}",
+            )
+            if total_chars + len(bounded) > _SUBAGENT_SHARED_CONTEXT_MAX_CHARS:
+                remaining = _SUBAGENT_SHARED_CONTEXT_MAX_CHARS - total_chars
+                if remaining > 200:
+                    rendered.append(
+                        _bounded_text(
+                            bounded,
+                            max_chars=remaining,
+                            label="shared context",
+                        )
+                    )
+                break
+            rendered.append(bounded)
+            total_chars += len(bounded)
     return tuple(rendered)
+
+
+def _subagent_max_turns(definition: SubagentDefinition | None) -> int:
+    return max(2, int(getattr(definition, "max_turns", 20) or 20))
+
+
+def _model_response_count(events: list) -> int:
+    return sum(1 for event in events if event.kind == AgentEventType.MODEL_RESPONSE)
+
+
+def _subagent_turn_budget_message(max_turns: int) -> str:
+    return (
+        f"Sub-agent model turn budget reached ({max_turns}). "
+        "Return a narrower task or provide a compact handoff packet before retrying."
+    )
+
+
+def _subagent_initial_user_message(title: str, *, resuming: bool) -> str:
+    action = "Resume" if resuming else "Begin"
+    clean_title = str(title).strip() or "delegated task"
+    clean_title = _bounded_text(clean_title, max_chars=240, label="task title")
+    return f"{action} delegated task: {clean_title}. Use the system task instructions and return only the required JSON."
+
+
+def _bounded_text(value: str, *, max_chars: int, label: str) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    suffix = f"\n\n[{label} truncated by Nexus: {omitted} chars omitted. Pass a focused packet or narrower instructions if needed.]"
+    keep = max(0, max_chars - len(suffix))
+    return text[:keep].rstrip() + suffix
+
+
+def _inner_pause_reason(events: list) -> str:
+    for event in reversed(events):
+        if event.kind != AgentEventType.TURN_COMPLETED:
+            continue
+        reason = str(event.payload or "")
+        return reason if reason in _INNER_RESUMABLE_PAUSE_REASONS else ""
+    return ""
+
+
+def _completed_tool_call_ids(events: list) -> set[str]:
+    return {
+        str(event.payload.call_id)
+        for event in events
+        if event.kind == AgentEventType.TOOL_RESULT
+    }
+
+
+def _history_safe_model_message(
+    message: Message,
+    tool_calls: tuple[ToolCall, ...],
+    completed_tool_call_ids: set[str],
+) -> Message | None:
+    if not tool_calls:
+        return message if message.content else None
+
+    completed_calls = tuple(
+        tool_call
+        for tool_call in tool_calls
+        if tool_call.call_id in completed_tool_call_ids
+    )
+    if not completed_calls:
+        return None
+
+    return Message(
+        role=message.role,
+        content=message.content,
+        name=message.name,
+        reasoning_content=message.reasoning_content,
+        provider_state=message.provider_state,
+        tool_calls=completed_calls,
+        tool_call_id=message.tool_call_id,
+    )
 
 
 async def _collect_inner_events(agent_events, outer_context: ToolExecutionContext, *, deadline: float) -> list:
@@ -710,7 +848,9 @@ def _direct_subagent_system_prompt(
         "Operate goal-first: restate the objective internally, use the fewest tools needed to reach that objective, "
         "and stop when you can return a decision. Do not keep calling read/search tools just because more context "
         "might exist. Repeating the same kind of read/search without changing your next action is a stall; return "
-        "status `blocked` with what evidence is missing.\n\n"
+        "status `blocked` with what evidence is missing. For implementation tasks with known source and target "
+        "files, gather only minimal sufficient context before the first edit; after about three read/search calls "
+        "without a mutation, either edit or return `blocked` with the missing evidence.\n\n"
         f"Role instructions:\n{role_prompt}\n\n"
         f"Task title: {title}\n"
         f"Task instructions:\n{instructions}\n\n"
@@ -906,13 +1046,12 @@ def _packet_type_for_subagent(role: str, payload: dict[str, Any]) -> str:
     status = str(payload.get("status") or "").lower()
     if status == "failed" or payload.get("failure_analysis"):
         return "failure_analysis"
-    if role == "explorer":
-        return "exploration_summary"
-    if role == "coding":
-        return "coding_summary"
-    if role == "impact_analyzer":
-        return "impact_analysis"
-    if role == "code_reviewer":
+    packet_type = builtin_subagent_context_packet_key(role)
+    if packet_type != "subagent_summary":
+        if packet_type == "review_findings" and (payload.get("tests_run") or payload.get("candidate_tests")):
+            return "verification_result"
+        return packet_type
+    if role == "review":
         if payload.get("tests_run") or payload.get("candidate_tests"):
             return "verification_result"
         return "review_findings"

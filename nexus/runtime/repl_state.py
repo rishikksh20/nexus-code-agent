@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 from nexus.config.defaults import AgentConfig
 from nexus.tools.mcp import MCPServerRuntime
 from nexus.memory.store import MemoryStore
@@ -12,7 +14,13 @@ from nexus.context import CarryOverState, ContextBuilder, ContextCompactor, Toke
 from nexus.hooks import HookEvent
 from nexus.runtime.context_state import load_multi_agent_state, multi_agent_carry_over_lines, render_context_packet
 from nexus.runtime.execution import ExecutionMode
-from nexus.runtime.agent_scope import skill_metadata_catalog, supervisor_skill_names, supervisor_tool_names
+from nexus.runtime.agent_scope import (
+    normalize_subagent_name,
+    skill_metadata_catalog,
+    subagent_tool_names,
+    supervisor_skill_names,
+    supervisor_tool_names,
+)
 from nexus.hooks import HookExecutor
 from nexus.runtime.sessions import SessionSnapshot, SessionStore, prepare_messages_for_model, sanitize_session_messages
 from nexus.security.manager import ApprovalManager
@@ -22,6 +30,8 @@ from nexus.ui import TerminalUI
 
 
 _PAUSED_TURN_KEY = "paused_turn"
+_PAUSED_TURN_PROGRESS_LIMIT = 12
+_PAUSED_TURN_TEXT_LIMIT = 500
 
 
 @dataclass(slots=True, frozen=True)
@@ -76,17 +86,32 @@ class ReplState:
 
     @property
     def paused_turn_prompt(self) -> str:
-        payload = self.session.metadata.get(_PAUSED_TURN_KEY)
-        if not isinstance(payload, dict):
-            return ""
+        payload = self.paused_turn_payload
         prompt = payload.get("prompt")
         return str(prompt).strip() if prompt else ""
+
+    @property
+    def paused_turn_payload(self) -> dict[str, Any]:
+        payload = self.session.metadata.get(_PAUSED_TURN_KEY)
+        return payload if isinstance(payload, dict) else {}
 
     def has_paused_turn(self) -> bool:
         return bool(self.paused_turn_prompt)
 
-    def mark_paused_turn(self, prompt_text: str) -> None:
-        self.session.metadata[_PAUSED_TURN_KEY] = {"prompt": prompt_text}
+    def mark_paused_turn(
+        self,
+        prompt_text: str,
+        *,
+        reason: str = "",
+        progress: list[str] | tuple[str, ...] = (),
+    ) -> None:
+        payload: dict[str, Any] = {"prompt": str(prompt_text or "").strip()}
+        if reason:
+            payload["reason"] = str(reason).strip()
+        compact_progress = _compact_paused_turn_progress(progress)
+        if compact_progress:
+            payload["progress"] = compact_progress
+        self.session.metadata[_PAUSED_TURN_KEY] = payload
 
     def clear_paused_turn(self) -> None:
         self.session.metadata.pop(_PAUSED_TURN_KEY, None)
@@ -100,9 +125,10 @@ class ReplState:
                 if previous_prompt:
                     return previous_prompt, False
             return stripped, False
+        paused_payload = self.paused_turn_payload
         self.clear_paused_turn()
         if _is_continue_prompt(stripped):
-            return paused_prompt, True
+            return _render_paused_turn_prompt(paused_payload), True
         return stripped, False
 
     def build_system_prompt(self, prompt_text: str) -> str:
@@ -117,7 +143,11 @@ class ReplState:
             skill_registry=self.skill_registry,
             active_skills=scoped_active_skills,
             carry_over=self.carry_over,
-            memory_entries=_load_all_memory(self.memory_store),
+            memory_entries=_load_all_memory(
+                self.memory_store,
+                max_entries=self.config.memory_prompt_max_entries,
+                max_entry_chars=self.config.memory_prompt_max_entry_chars,
+            ),
         )
         sections.carry_over.extend(multi_agent_carry_over_lines(self.session.metadata))
         self.current_system_prompt = ContextBuilder().build(sections)
@@ -231,8 +261,47 @@ def _supervisor_prompt_tool_registry(config: AgentConfig, registry: ToolRegistry
     scoped = ToolRegistry()
     for record in registry.records():
         if record.name in available:
-            scoped.register(record.tool, source=record.source, origin=record.origin)
+            scoped.register(
+                _prompt_scoped_tool(config, registry, record),
+                source=record.source,
+                origin=record.origin,
+            )
     return scoped
+
+
+def _prompt_scoped_tool(config: AgentConfig, registry: ToolRegistry, record) -> object:
+    if not str(record.name).startswith("subagent_"):
+        return record.tool
+    tool = copy.copy(record.tool)
+    definition = getattr(tool, "_definition", None)
+    subagent_name = getattr(definition, "name", None) or normalize_subagent_name(str(record.name))
+    effective_tools = subagent_tool_names(
+        config,
+        registry,
+        str(subagent_name),
+        base_allowed_tools=getattr(definition, "allowed_tools", None),
+        base_allowed_mcps=getattr(definition, "allowed_mcps", None),
+    )
+    ordered_tool_names = tuple(
+        item.name
+        for item in registry.records()
+        if item.name in effective_tools
+        and item.name != record.name
+        and not item.name.startswith("subagent_")
+        and item.name != "delegate_task"
+    )
+    allowed_mcp_servers = tuple(
+        sorted(
+            {
+                item.origin
+                for item in registry.records()
+                if item.name in effective_tools and item.source == "mcp" and item.origin
+            }
+        )
+    )
+    setattr(tool, "_prompt_allowed_tools", ordered_tool_names)
+    setattr(tool, "_prompt_allowed_mcps", allowed_mcp_servers)
+    return tool
 
 
 def _carry_over_entry_count(carry_over: CarryOverState) -> int:
@@ -298,6 +367,43 @@ def _is_continue_prompt(value: str) -> bool:
     return normalized == "continue"
 
 
+def _render_paused_turn_prompt(payload: dict[str, Any]) -> str:
+    prompt = str(payload.get("prompt") or "").strip()
+    if not prompt:
+        return ""
+    progress = _compact_paused_turn_progress(payload.get("progress", ()))
+    reason = str(payload.get("reason") or "").strip()
+    if not progress and not reason:
+        return prompt
+
+    lines = [
+        "Continue the interrupted Nexus task below. Use the progress notes as context, avoid repeating completed work, and take the next necessary action.",
+        "",
+        "Original user request:",
+        prompt,
+    ]
+    if reason:
+        lines.extend(["", f"Pause reason: {reason}"])
+    if progress:
+        lines.extend(["", "Progress before the pause:"])
+        lines.extend(f"- {item}" for item in progress)
+    return "\n".join(lines)
+
+
+def _compact_paused_turn_progress(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    progress: list[str] = []
+    for item in value:
+        text = " ".join(str(item or "").split())
+        if not text:
+            continue
+        progress.append(text[:_PAUSED_TURN_TEXT_LIMIT])
+        if len(progress) >= _PAUSED_TURN_PROGRESS_LIMIT:
+            break
+    return progress
+
+
 def _previous_user_task_prompt(history: list[Message]) -> str:
     for message in reversed(history):
         if message.role != "user":
@@ -309,18 +415,34 @@ def _previous_user_task_prompt(history: list[Message]) -> str:
     return ""
 
 
-def _load_all_memory(store: MemoryStore) -> list[str]:
+def _load_all_memory(
+    store: MemoryStore,
+    *,
+    max_entries: int = 50,
+    max_entry_chars: int = 4000,
+) -> list[str]:
     """Return all entries from *store* as pre-formatted ``"key: content"`` strings.
 
-    Called once per system-prompt build so the agent always sees the full
-    persistent memory regardless of which session it is in.  Multi-line values
-    are preserved; the caller (ContextBuilder) wraps each item in a list bullet.
+    Called once per system-prompt build. Memory is bounded so long-running
+    stores do not grow every prompt without limit. Multi-line values are
+    preserved; the caller (ContextBuilder) wraps each item in a list bullet.
     """
+    all_entries = store.load_all()
     entries: list[str] = []
-    for entry in store.load_all():
+    for entry in all_entries[:max_entries]:
         content = entry.content.strip()
         if content:
+            if len(content) > max_entry_chars:
+                content = (
+                    content[:max_entry_chars].rstrip()
+                    + f"\n[Memory entry truncated to {max_entry_chars} chars]"
+                )
             entries.append(f"{entry.key}: {content}")
+    if len(all_entries) > max_entries:
+        entries.append(
+            f"[Memory truncated: showing {max_entries} of {len(all_entries)} entries. "
+            "Use /memory list, /memory search, or /memory show to inspect more.]"
+        )
     return entries
 
 

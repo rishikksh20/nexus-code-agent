@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from nexus.integrations.fake_model import FakeModelClient
+from nexus.memory.store import MemoryEntry, MemoryStore, MemoryStoreWarning
 from nexus.models import ConfirmationKind, ConfirmationRequest, ConfirmationResponse, Message, RuntimeResponse, ToolCall, ToolExecutionContext, ToolResult
 from nexus.security import ApprovalManager, ApprovalPolicy, ApprovalScope, PermissionChecker, PermissionDecision
 from nexus.runtime.execution import ExecutionMode
@@ -83,6 +85,7 @@ def test_core_tools_register_canonical_tool_surface(tmp_path):
     assert "lsp" in tool_names
     assert "run_python_check" in tool_names
     assert "modify_file" not in tool_names
+    assert "replace_text" not in tool_names
     assert edit_tool.is_mutating is True
     assert edit_tool.kind is ToolKind.WRITE
     assert len(tool_names) == len(set(tool_names))
@@ -112,6 +115,25 @@ async def test_memory_tool_persists_entries_as_dictionary(tmp_path, tool_context
 
     assert result.is_error is False
     assert payload == {"entries": {"user_name": "rishikesh"}}
+
+
+def test_memory_store_quarantines_corrupt_json_before_writing_fresh_memory(tmp_path):
+    memory_dir = tmp_path / ".nexus" / "memory"
+    memory_dir.mkdir(parents=True)
+    memory_file = memory_dir / "user_memory.json"
+    memory_file.write_text("{", encoding="utf-8")
+
+    store = MemoryStore(memory_dir)
+
+    with pytest.warns(MemoryStoreWarning, match="could not be loaded"):
+        store.save(MemoryEntry(key="user_name", content="rishikesh"))
+
+    backups = sorted(memory_dir.glob("user_memory.json.corrupt*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{"
+    assert json.loads(memory_file.read_text(encoding="utf-8")) == {
+        "entries": {"user_name": "rishikesh"}
+    }
 
 
 def test_permission_checker_denies_direct_nexus_memory_file_writes_with_memory_hint(tmp_path, tool_context):
@@ -188,8 +210,10 @@ async def test_register_subagent_tools_registers_default_and_specialist_tools():
     assert registry.record("subagent_code_reviewer").origin == "code_reviewer"
     assert registry.record("subagent_impact_analyzer").origin == "impact_analyzer"
     coding_tools = registry.record("subagent_coding").tool._definition.allowed_tools
+    coding_prompt = registry.record("subagent_coding").tool._definition.goal_prompt
     reviewer_tools = registry.record("subagent_code_reviewer").tool._definition.allowed_tools
     assert "run_formatter" in coding_tools
+    assert "code reviewer" in coding_prompt
     assert "run_tests" in reviewer_tools
 
 
@@ -435,7 +459,9 @@ async def test_subagent_goal_prompt_stays_in_system_prompt_only(tool_context):
     request = model.requests[0]
     assert goal_prompt in request.system_prompt
     assert request.system_prompt.count(goal_prompt) == 1
-    assert request.messages[-1].content == task_instructions
+    assert task_instructions in request.system_prompt
+    assert request.messages[-1].content.startswith("Begin delegated task: Plan focused change.")
+    assert task_instructions not in request.messages[-1].content
     assert goal_prompt not in request.messages[-1].content
 
 
@@ -528,7 +554,7 @@ async def test_subagent_tool_reports_missing_mutation_path_as_model_repair_error
 
 
 @pytest.mark.asyncio
-async def test_subagent_tool_continues_after_clarification_and_completes_write(tmp_path):
+async def test_subagent_tool_continues_after_missing_read_path_feedback_and_completes_write(tmp_path):
     registry = ToolRegistry()
     registry.register(ReadFileTool(), source="core", origin="builtin")
     registry.register(WriteFileTool(), source="core", origin="builtin")
@@ -563,16 +589,10 @@ async def test_subagent_tool_continues_after_clarification_and_completes_write(t
         config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
     )
 
-    async def approval_callback(request):
-        if request.kind is ConfirmationKind.CLARIFICATION:
-            return ConfirmationResponse(clarification="calculator.py")
-        return ConfirmationResponse(approved=True)
-
     context = ToolExecutionContext(
         session_id="test-session",
         working_directory=tmp_path,
         metadata={
-            "approval_callback": approval_callback,
             "auto_confirm": True,
             "execution_mode": "auto",
         },
@@ -589,10 +609,10 @@ async def test_subagent_tool_continues_after_clarification_and_completes_write(t
     assert payload["status"] == "completed"
     assert payload["runtime_status"] == "completed"
     assert (tmp_path / "subagent.txt").read_text(encoding="utf-8") == "done"
-    clarification_request = model.requests[1]
+    repair_request = model.requests[1]
     assert any(
-        message.role == "user" and "Clarification for read_file (path): calculator.py" in message.content
-        for message in clarification_request.messages
+        message.role == "tool" and "Missing required argument(s) for tool 'read_file': 'path'" in message.content
+        for message in repair_request.messages
     )
 
 
@@ -738,8 +758,8 @@ def test_register_subagent_tools_loads_configured_subagents_in_basic_mode():
         allowed_tools=[],
         denied_tools=[],
         subagent_profiles=[
-            {"name": "coding", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
-            {"name": "code_reviewer", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
+            {"name": "execution", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
+            {"name": "review", "allowed_tools": [], "allowed_mcps": [], "allowed_skills": []},
         ],
     )
 
@@ -910,6 +930,41 @@ async def test_python_lsp_workspace_definition_and_references(tool_context):
     assert references.is_error is False
     assert "lib.py:1:def helper(value):" in references.output
     assert "main.py:3:result = helper(41)" in references.output
+
+
+@pytest.mark.asyncio
+async def test_python_lsp_reuses_workspace_index_between_operations(tmp_path):
+    (tmp_path / "lib.py").write_text(
+        "def helper(value):\n"
+        "    return value + 1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "main.py").write_text(
+        "from lib import helper\n"
+        "result = helper(41)\n",
+        encoding="utf-8",
+    )
+    context = ToolExecutionContext(session_id="test", working_directory=tmp_path)
+    tool = PythonLspTool()
+
+    import nexus.tools.builtin.python_index as python_index
+
+    original_parse = python_index.ast.parse
+    with patch.object(python_index.ast, "parse", wraps=original_parse) as parse:
+        definition = await tool.execute(
+            "call-lsp-cache-1",
+            {"operation": "go_to_definition", "file_path": "main.py", "symbol": "helper"},
+            context,
+        )
+        references = await tool.execute(
+            "call-lsp-cache-2",
+            {"operation": "find_references", "file_path": "main.py", "symbol": "helper"},
+            context,
+        )
+
+        assert definition.is_error is False
+        assert references.is_error is False
+        assert parse.call_count == 2
 
 
 @pytest.mark.asyncio

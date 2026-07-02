@@ -2288,8 +2288,8 @@ async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_p
     result_payload = {
         "schema_version": 1,
         "status": "completed",
-        "agent": "subagent_explorer",
-        "role": "explorer",
+        "agent": "subagent_planning_analysis",
+        "role": "planning_analysis",
         "task_id": "call-sub",
         "title": "Summarize the algorithms directory",
         "summary": "Algorithms contains heap and table examples.",
@@ -2308,7 +2308,7 @@ async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_p
         app.ui.render_event(
             AgentEvent.tool_call_start(
                 "call-sub",
-                "subagent_explorer",
+                "subagent_planning_analysis",
                 {"title": "Summarize the algorithms directory", "instructions": "Summarize algorithms."},
             ),
             stream_output=True,
@@ -2319,7 +2319,7 @@ async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_p
                 "inner-1",
                 "list_dir",
                 {"path": "algorithms"},
-                actor="subagent_explorer",
+                actor="subagent_planning_analysis",
             ),
             stream_output=True,
             show_tool_calls=True,
@@ -2330,7 +2330,7 @@ async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_p
                     call_id="inner-1",
                     tool_name="list_dir",
                     output="heap.py\nheap_table.py",
-                    metadata={"actor": "subagent_explorer", "duration_ms": 4},
+                    metadata={"actor": "subagent_planning_analysis", "duration_ms": 4},
                 )
             ),
             stream_output=True,
@@ -2341,7 +2341,7 @@ async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_p
                 "inner-2",
                 "read_file",
                 {"path": "algorithms/README.md"},
-                actor="subagent_explorer",
+                actor="subagent_planning_analysis",
             ),
             stream_output=True,
             show_tool_calls=True,
@@ -2352,7 +2352,7 @@ async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_p
                     call_id="inner-2",
                     tool_name="read_file",
                     output="# Algorithms",
-                    metadata={"actor": "subagent_explorer", "duration_ms": 8},
+                    metadata={"actor": "subagent_planning_analysis", "duration_ms": 8},
                 )
             ),
             stream_output=True,
@@ -2362,7 +2362,7 @@ async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_p
             AgentEvent.tool_call_complete(
                 ToolResult(
                     call_id="call-sub",
-                    tool_name="subagent_explorer",
+                    tool_name="subagent_planning_analysis",
                     output=json.dumps(result_payload, indent=2),
                     metadata={"duration_ms": 21000, "title": "Summarize the algorithms directory"},
                 )
@@ -2372,7 +2372,7 @@ async def test_textual_subagent_tools_render_inside_collapsible_task_block(tmp_p
         )
 
         collapsed = app._transcript_text()
-        assert "[+] ● Explore Task - Summarize the algorithms directory" in collapsed
+        assert "[+] ● Planning Task - Summarize the algorithms directory" in collapsed
         assert "completed · 21.0s · 2 tools" in collapsed
         assert "Algorithms contains heap and table examples." in collapsed
         assert "> Delegate" not in collapsed
