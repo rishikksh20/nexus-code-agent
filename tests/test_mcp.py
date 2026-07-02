@@ -418,14 +418,14 @@ def test_builtin_subagent_allowlists_ingest_registered_mcp_tools():
     )
 
     assert count == 5
-    assert registry.record("subagent_execution").tool._definition.allowed_mcps == []
-    assert "fs_echo" not in registry.record("subagent_execution").tool._definition.allowed_tools
+    assert registry.record("subagent_coding").tool._definition.allowed_mcps == []
+    assert "fs_echo" not in registry.record("subagent_coding").tool._definition.allowed_tools
     assert "fs_echo" not in subagent_tool_names(
         config,
         registry,
-        "execution",
-        base_allowed_tools=registry.record("subagent_execution").tool._definition.allowed_tools,
-        base_allowed_mcps=registry.record("subagent_execution").tool._definition.allowed_mcps,
+        "coding",
+        base_allowed_tools=registry.record("subagent_coding").tool._definition.allowed_tools,
+        base_allowed_mcps=registry.record("subagent_coding").tool._definition.allowed_mcps,
     )
     assert registry.record("subagent_custom").tool._definition.allowed_tools == ["get_time"]
 

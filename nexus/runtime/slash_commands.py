@@ -35,6 +35,7 @@ from nexus.runtime.context_state import (
 )
 from nexus.runtime.execution import ExecutionMode
 from nexus.runtime.agent_scope import (
+    canonical_builtin_subagent_name,
     clean_string_list,
     is_all_scope,
     mcp_tool_names_for_servers,
@@ -1457,23 +1458,17 @@ def _set_agent_resource_allowed(state: ReplState, kind: str, name: str, *, allow
     normalized = _normalize_resource_name(state, kind, name, require_active=allowed)
     if normalized is None:
         return False
-    field_name = {
-        "tool": "allowed_tools",
-        "skill": "allowed_skills",
-        "mcp": "allowed_mcp_servers",
+    field_names = {
+        "tool": ("add_tools", "remove_tools"),
+        "skill": ("add_skills", "remove_skills"),
+        "mcp": ("add_mcp_servers", "remove_mcp_servers"),
     }.get(kind)
-    if field_name is None:
+    if field_names is None:
         state.console.print("Resource kind must be one of: tool, skill, mcp")
         return False
     payload = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8")) if state.config.local_config_file.exists() else {}
     agent_scope = _payload_agent_scope(payload)
-    _set_allowed_list_value(
-        agent_scope,
-        field_name,
-        normalized,
-        allowed=allowed,
-        current_values=_current_supervisor_resource_names(state, kind),
-    )
+    _set_delta_list_value(agent_scope, field_names[0], field_names[1], normalized, allowed=allowed)
     _write_toml(state.config.local_config_file, payload)
     _reload_config(state)
     action = "Allowed" if allowed else "Disallowed"
@@ -1596,24 +1591,18 @@ def _set_subagent_resource_allowed(state: ReplState, record, kind: str, name: st
         return False
     definition = getattr(record.tool, "_definition", None)
     subagent_name = normalize_subagent_name(getattr(definition, "name", record.name))
-    field_name = {
-        "tool": "allowed_tools",
-        "skill": "allowed_skills",
-        "mcp": "allowed_mcps",
+    field_names = {
+        "tool": ("add_tools", "remove_tools"),
+        "skill": ("add_skills", "remove_skills"),
+        "mcp": ("add_mcps", "remove_mcps"),
     }
-    target_field = field_name.get(kind)
-    if target_field is None:
+    target_fields = field_names.get(kind)
+    if target_fields is None:
         state.console.print("Resource kind must be one of: tool, skill, mcp")
         return False
     payload = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8")) if state.config.local_config_file.exists() else {}
     profile = _payload_subagent_profile(payload, subagent_name)
-    _set_allowed_list_value(
-        profile,
-        target_field,
-        normalized_resource,
-        allowed=allowed,
-        current_values=_current_subagent_resource_names(state, record, kind),
-    )
+    _set_delta_list_value(profile, target_fields[0], target_fields[1], normalized_resource, allowed=allowed)
     _write_toml(state.config.local_config_file, payload)
     _reload_config(state)
     action = "Allowed" if allowed else "Disallowed"
@@ -1654,12 +1643,16 @@ def _subagent_records(state: ReplState) -> list:
 def _subagent_record(state: ReplState, name: str):
     target_tool = subagent_tool_name(name)
     target_name = normalize_subagent_name(name)
+    target_canonical_name = canonical_builtin_subagent_name(name)
+    fallback = None
     for record in _subagent_records(state):
         definition = getattr(record.tool, "_definition", None)
         definition_name = normalize_subagent_name(getattr(definition, "name", record.name))
         if record.name == target_tool or definition_name == target_name:
             return record
-    return None
+        if canonical_builtin_subagent_name(definition_name) == target_canonical_name:
+            fallback = record
+    return fallback
 
 
 def _effective_subagent_tools(state: ReplState, record) -> list[str]:
@@ -1739,26 +1732,32 @@ def _current_subagent_resource_names(state: ReplState, record, kind: str) -> lis
     return []
 
 
-def _set_allowed_list_value(
+def _set_delta_list_value(
     payload: dict[str, object],
-    field_name: str,
+    add_key: str,
+    remove_key: str,
     value: str,
     *,
     allowed: bool,
-    current_values: list[str],
 ) -> None:
-    existing = clean_string_list(payload.get(field_name, []))
-    if is_all_scope(existing):
-        values = [item for item in current_values if item != value]
-    elif existing:
-        values = list(existing)
+    additions = clean_string_list(payload.get(add_key, []))
+    removals = clean_string_list(payload.get(remove_key, []))
+    if allowed:
+        removals = [item for item in removals if item != value]
+        if value not in additions:
+            additions.append(value)
     else:
-        values = list(current_values)
-    if allowed and value not in values:
-        values.append(value)
-    if not allowed:
-        values = [item for item in values if item != value]
-    payload[field_name] = values
+        additions = [item for item in additions if item != value]
+        if value not in removals:
+            removals.append(value)
+    if additions:
+        payload[add_key] = additions
+    else:
+        payload.pop(add_key, None)
+    if removals:
+        payload[remove_key] = removals
+    else:
+        payload.pop(remove_key, None)
 
 
 def _payload_subagent_profile(payload: dict[str, object], name: str) -> dict[str, object]:
@@ -1774,12 +1773,8 @@ def _payload_subagent_profile(payload: dict[str, object], name: str) -> dict[str
         if not isinstance(entry, dict):
             continue
         if normalize_subagent_name(str(entry.get("name", ""))) == name:
-            for field_name in ("allowed_tools", "allowed_skills", "allowed_mcps"):
-                entry.setdefault(field_name, [])
             return entry
     entry: dict[str, object] = {"name": name}
-    for field_name in ("allowed_tools", "allowed_skills", "allowed_mcps"):
-        entry[field_name] = []
     profiles.append(entry)
     return entry
 

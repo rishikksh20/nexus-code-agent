@@ -205,16 +205,15 @@ async def test_register_subagent_tools_registers_default_and_specialist_tools():
     assert specialist.source == "agent"
     assert specialist.origin == "explore"
     assert specialist.tool.is_mutating is False
-    assert registry.record("subagent_planning_analysis").origin == "planning_analysis"
-    assert registry.record("subagent_execution").origin == "execution"
-    assert registry.record("subagent_review").origin == "review"
-    assert registry.record("subagent_verification").origin == "verification"
-    coding_tools = registry.record("subagent_execution").tool._definition.allowed_tools
-    coding_prompt = registry.record("subagent_execution").tool._definition.goal_prompt
-    reviewer_tools = registry.record("subagent_review").tool._definition.allowed_tools
+    assert registry.record("subagent_explorer").origin == "explorer"
+    assert registry.record("subagent_coding").origin == "coding"
+    assert registry.record("subagent_code_reviewer").origin == "code_reviewer"
+    assert registry.record("subagent_impact_analyzer").origin == "impact_analyzer"
+    coding_tools = registry.record("subagent_coding").tool._definition.allowed_tools
+    coding_prompt = registry.record("subagent_coding").tool._definition.goal_prompt
+    reviewer_tools = registry.record("subagent_code_reviewer").tool._definition.allowed_tools
     assert "run_formatter" in coding_tools
-    assert "minimal sufficient context" in coding_prompt
-    assert "three read/search calls before the first mutation" in coding_prompt
+    assert "code reviewer" in coding_prompt
     assert "run_tests" in reviewer_tools
 
 
@@ -460,7 +459,9 @@ async def test_subagent_goal_prompt_stays_in_system_prompt_only(tool_context):
     request = model.requests[0]
     assert goal_prompt in request.system_prompt
     assert request.system_prompt.count(goal_prompt) == 1
-    assert request.messages[-1].content == task_instructions
+    assert task_instructions in request.system_prompt
+    assert request.messages[-1].content.startswith("Begin delegated task: Plan focused change.")
+    assert task_instructions not in request.messages[-1].content
     assert goal_prompt not in request.messages[-1].content
 
 
@@ -732,10 +733,10 @@ async def test_register_subagent_tools_advanced_mode_does_not_require_delegation
 
     assert count == 4
     assert {record.name for record in registry.records()} == {
-        "subagent_planning_analysis",
-        "subagent_execution",
-        "subagent_review",
-        "subagent_verification",
+        "subagent_explorer",
+        "subagent_coding",
+        "subagent_code_reviewer",
+        "subagent_impact_analyzer",
     }
 
 
@@ -765,7 +766,7 @@ def test_register_subagent_tools_loads_configured_subagents_in_basic_mode():
     count = register_subagent_tools(registry, config)
 
     assert count == 2
-    assert {record.name for record in registry.records()} == {"subagent_execution", "subagent_review"}
+    assert {record.name for record in registry.records()} == {"subagent_coding", "subagent_code_reviewer"}
 
 
 def test_load_subagent_definitions_builds_definition_objects():

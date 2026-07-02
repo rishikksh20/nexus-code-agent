@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 
 from nexus.memory.workspace import AgentDirs, bootstrap_workspace_knowledge
-from nexus.runtime.agent_scope import BUILTIN_SUBAGENT_SPECS, builtin_subagent_tool_names
+from nexus.runtime.agent_scope import builtin_subagent_tool_names
 from nexus.skills import BUILTIN_SKILLS_DIR
 from nexus.tools.mcp import mcp_server_example_for_workspace
 from nexus.config.upgrade import CURRENT_CONFIG_VERSION
@@ -126,32 +126,6 @@ def _global_config_toml() -> str:
 
 def _local_config_toml(*, workspace_root: Path, project_name: str, project_description: str) -> str:
     cognitive_tool_names = ", ".join(builtin_subagent_tool_names())
-    allowed_tool_names = [
-        "get_time",
-        "read_file",
-        "write_file",
-        "edit",
-        "insert_edit_into_file",
-        "apply_patch",
-        "glob",
-        "grep",
-        "list_dir",
-        "lsp",
-        "code_index",
-        "semantic_search",
-        "git_status",
-        "git_diff",
-        "run_tests",
-        "run_python_check",
-        "run_formatter",
-        "bash",
-        "memory",
-        "todos",
-        "web_fetch",
-        "web_search",
-        "ask_user",
-        *builtin_subagent_tool_names(),
-    ]
     return "\n".join(
         [
             f'project_name = "{project_name}"',
@@ -159,8 +133,8 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             f'config_version = {CURRENT_CONFIG_VERSION}',
             '# Select a reusable model profile for this workspace:',
             '# active_model_profile = "default-mistral-compatible"',
-            '# Allowlist of tools available in this workspace.',
-            '# Remove this key entirely (or set to []) to allow ALL registered tools.',
+            '# Optional workspace-level tool filters.',
+            '# Omit allowed_tools (or set it to []) to allow ALL registered tools.',
             '# Builtin tool names: get_time, read_file, write_file, edit,',
             '#   insert_edit_into_file, apply_patch, glob, grep,',
             '#   list_dir, lsp, code_index, semantic_search,',
@@ -170,7 +144,7 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             '# Add plugin or sandboxed command tool names here when enabling them.',
             '# MCP tool names are discovered dynamically from active MCP servers;',
             '# activate/deactivate MCP servers by name instead of adding MCP tool names here.',
-            f'allowed_tools = {_toml_string_list(allowed_tool_names)}',
+            '# allowed_tools = ["read_file", "bash"]',
             'denied_tools = []',
             'ask_user_max_questions_per_turn = 3',
             '# Hidden/private dot-path reads are blocked by default. .agents/skills and',
@@ -236,51 +210,39 @@ def _local_config_toml(*, workspace_root: Path, project_name: str, project_descr
             '# Agent mode profile:',
             '#   basic = single LLM execution, no cognitive sub-agent tools',
             '#   advanced = supervisor LLM with all built-in cognitive sub-agent tools',
-            '# Listing names under [[sub-agents]] also loads those sub-agent tools.',
+            '# Built-in cognitive sub-agent definitions live in code.',
+            '# Listing names under [[sub-agents]] adds scope deltas and also loads those sub-agent tools.',
             'agent_mode = "basic"',
             'delegation_subagents = [] # Custom cognitive sub-agent definitions.',
             '# Optional specialists for advanced mode:',
             '# delegation_subagents = [',
-            '#   { name = "planning_analysis", description = "Summarize a bounded codebase slice.", goal_prompt = "Read-only planning analysis. Stop once you have enough evidence to answer.", allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"] },',
-            '#   { name = "verification", description = "Scope blast radius and verification targets.", goal_prompt = "Read-only verification. Return affected files, risks, and candidate tests.", allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"] },',
+            '#   { name = "custom_explorer", description = "Summarize a bounded codebase slice.", goal_prompt = "Read-only planning analysis. Stop once you have enough evidence to answer.", allowed_tools = ["read_file", "glob", "grep", "list_dir", "lsp", "git_diff", "git_status"] },',
             '# ]',
             '# Example: delegation_subagents = [{ name = "explore", description = "Investigate a focused codebase question.", goal_prompt = "Read the relevant code and summarize the answer.", allowed_tools = ["read_file", "glob", "grep"], max_turns = 12, timeout_seconds = 300 }]',
             'sandbox_commands = false',
             '',
-            '# Optional main/supervisor agent resource scope.',
+            '# Optional main/supervisor agent resource deltas.',
             '# Global MCP/skill activation still happens through /mcp and /skills.',
-            '# Empty allowed_* lists preserve the default behavior.',
-            '# In advanced mode, empty allowed_* means delegate through sub-agents by default.',
-            '# Set allowed_tools/allowed_skills/allowed_mcp_servers to "all" to inherit',
-            '# all normal tools, active skills, or active MCP servers for that scope.',
-            '[agents]',
-            'allowed_tools = ["bash", "read_file", "ask_user"]',
-            'allowed_skills = []',
-            'allowed_mcp_servers = []',
+            '# Advanced mode defaults are defined in code: bash, read_file, ask_user, and active MCP servers.',
+            '# Use add_* and remove_* to persist only changes from those defaults.',
+            '# [agents]',
+            '# add_tools = []',
+            '# remove_tools = []',
+            '# add_skills = []',
+            '# remove_skills = []',
+            '# add_mcp_servers = []',
+            '# remove_mcp_servers = []',
             '',
-            '# Optional per-sub-agent resource scopes.',
-            *_builtin_subagent_profile_lines(),
+            '# Optional per-sub-agent resource deltas.',
+            '# Built-in sub-agent defaults are defined in code; these entries only store changes.',
+            '# [[sub-agents]]',
+            '# name = "coding"',
+            '# add_tools = []',
+            '# remove_tools = []',
+            '# add_mcps = []',
+            '# remove_mcps = []',
+            '# add_skills = []',
+            '# remove_skills = []',
             '',
         ]
     )
-
-
-def _builtin_subagent_profile_lines() -> list[str]:
-    lines: list[str] = []
-    for index, spec in enumerate(sorted(BUILTIN_SUBAGENT_SPECS, key=lambda item: item.priority)):
-        if index:
-            lines.append("")
-        lines.extend(
-            [
-                '[[sub-agents]]',
-                f'name = "{spec.name}"',
-                f"allowed_tools = {_toml_string_list(spec.allowed_tools)}",
-                "allowed_mcps = []",
-                "allowed_skills = []",
-            ]
-        )
-    return lines
-
-
-def _toml_string_list(values: list[str] | tuple[str, ...]) -> str:
-    return "[" + ", ".join(f'"{value}"' for value in values) + "]"

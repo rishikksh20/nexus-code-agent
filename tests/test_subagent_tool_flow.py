@@ -288,7 +288,7 @@ async def test_supervisor_repairs_subagent_call_missing_title_and_instructions(t
 async def test_execution_subagent_can_execute_allowed_write_tool(tmp_path):
     registry = ToolRegistry()
     registry.register(WriteFileTool(), source="core", origin="builtin")
-    model = FakeModelClient(
+    model = _StrictHistoryModel(
         scripted=[
             RuntimeResponse(
                 message=Message(role="assistant", content="Writing through the execution sub-agent."),
@@ -331,6 +331,42 @@ async def test_execution_subagent_can_execute_allowed_write_tool(tmp_path):
     assert result.is_error is False
     assert payload["status"] == "completed"
     assert (tmp_path / "subagent.txt").read_text(encoding="utf-8") == "done"
+    assert len(model.requests) == 2
+    assert model.requests[0].messages[0].content.startswith("Begin delegated task: Write file.")
+    assert "Create subagent.txt with the requested content." not in model.requests[0].messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_subagent_request_context_truncates_oversized_instructions(tmp_path):
+    registry = ToolRegistry()
+    long_instructions = "inspect this carefully\n" + ("context-line\n" * 2_000)
+    model = _RecordingModel()
+    tool = SubAgentTool(
+        SubagentDefinition(
+            name="explorer",
+            description="Explore focused context.",
+            goal_prompt="Return a concise summary.",
+            allowed_tools=[],
+        ),
+        model_client_factory=lambda: model,
+        base_tool_registry=registry,
+        config=SimpleNamespace(model_name="fake", temperature=0.0, max_output_tokens=4096),
+    )
+    context = ToolExecutionContext(session_id="test-session", working_directory=tmp_path)
+
+    result = await tool.execute(
+        "sub-call",
+        {"title": "Large context", "instructions": long_instructions},
+        context,
+    )
+
+    assert result.is_error is False
+    assert len(model.requests) == 1
+    request = model.requests[0]
+    assert len(request.messages[0].content) < 320
+    assert "context-line" not in request.messages[0].content
+    assert "task instructions truncated by Nexus" in request.system_prompt
+    assert len(request.system_prompt) < len(long_instructions)
 
 
 @pytest.mark.asyncio
