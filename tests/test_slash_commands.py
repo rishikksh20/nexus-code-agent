@@ -434,6 +434,57 @@ async def test_subagent_commands_show_and_persist_resource_scope(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_scope_reset_tools_enable_disable_and_subagent_new_alias(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    config.agent_mode = "advanced"
+    registry = ToolRegistry()
+    registry.register(GetTimeTool(), source="core", origin="builtin")
+    registry.register(ReadFileTool(), source="core", origin="builtin")
+    registry.register(
+        SubAgentTool(
+            SubagentDefinition(
+                name="execution",
+                description="Execute focused work.",
+                goal_prompt="Do the task.",
+                allowed_tools=["get_time"],
+            ),
+            base_tool_registry=registry,
+            config=config,
+        ),
+        source="agent",
+        origin="execution",
+    )
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("scope-reset"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=registry,
+        memory_store=MemoryStore(config.memory_dir),
+        console=Console(record=True, no_color=True, width=200),
+    )
+    router = build_router()
+
+    assert await router.dispatch(state, "/agent allow tool read_file") is True
+    assert state.config.agent_add_tools == ["read_file"]
+    assert await router.dispatch(state, "/agent reset tool") is True
+    assert state.config.agent_add_tools == []
+
+    assert await router.dispatch(state, "/sub-agent allow execution tool read_file") is True
+    assert state.config.subagent_profiles[0]["add_tools"] == ["read_file"]
+    assert await router.dispatch(state, "/sub-agent reset execution tool") is True
+    assert state.config.subagent_profiles == []
+
+    assert await router.dispatch(state, "/tools disable get_time") is True
+    assert "get_time" in state.config.denied_tools
+    assert await router.dispatch(state, "/tools enable get_time") is True
+    assert "get_time" not in state.config.denied_tools
+
+    assert await router.dispatch(state, "/sub-agent new investigate") is True
+    assert (config.local_root / "agents" / "investigate.yml").exists()
+
+
+@pytest.mark.asyncio
 async def test_agent_allowed_config_restricts_tools_and_skills(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     config.agent_mode = "advanced"
@@ -1812,7 +1863,7 @@ async def test_unknown_slash_command_returns_false(tmp_path):
 
 def test_get_model_context_limit_exact_match():
     from nexus.config.model_limits import get_model_context_limit
-    assert get_model_context_limit("mistral-medium-latest") == 200_000
+    assert get_model_context_limit("mistral-medium-latest") == 32_768
 
 
 def test_get_model_context_limit_prefix_match():

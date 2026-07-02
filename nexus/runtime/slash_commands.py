@@ -213,7 +213,7 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
         ("/config show [scope]", "Print config for merged, local, or global scope."),
         ("/config upgrade [local|global]", "Add new config keys/tool allowlist entries from latest Nexus defaults, then reload tools."),
         ("/session [new|list|resume|save|export]", "Show current session or manage saved sessions."),
-        ("/tools [reload]", "List tools or reload the tool registry from config."),
+        ("/tools [reload|enable|disable]", "List tools, reload the registry, or update workspace tool filters."),
         ("/memory list|search|save|show", "Inspect or update workspace memory."),
         ("/context [show|usage]", "Print the system prompt or show context/token usage stats."),
         ("/history [n]", "Show recent messages."),
@@ -299,6 +299,7 @@ async def handle_agent(state: ReplState, args: list[str]) -> None:
                 ("disallow skill <skill>", "Remove a skill from the supervisor allowlist.", "/agent disallow skill review"),
                 ("allow mcp <server>", "Add an active MCP server to the supervisor allowlist.", "/agent allow mcp filesystem"),
                 ("disallow mcp <server>", "Remove an MCP server from the supervisor allowlist.", "/agent disallow mcp filesystem"),
+                ("reset tool|skill|mcp", "Remove stored supervisor scope overrides for a resource type.", "/agent reset tool"),
             ),
         )
         return
@@ -337,7 +338,15 @@ async def handle_agent(state: ReplState, args: list[str]) -> None:
             state.refresh_system_prompt()
             _print_agent_status(state)
         return
-    state.console.print("Usage: /agent [status|switch|tools|skills|mcp|allow|disallow|help]")
+    if subcommand == "reset":
+        if len(args) < 2:
+            state.console.print("Usage: /agent reset tool|skill|mcp")
+            return
+        if _reset_agent_resource_scope(state, args[1].lower()):
+            state.refresh_system_prompt()
+            _print_agent_status(state)
+        return
+    state.console.print("Usage: /agent [status|switch|tools|skills|mcp|allow|disallow|reset|help]")
 
 
 async def handle_sub_agent(state: ReplState, args: list[str]) -> None:
@@ -353,6 +362,8 @@ async def handle_sub_agent(state: ReplState, args: list[str]) -> None:
                 ("mcp <name>", "List active MCP servers and sub-agent scoped state.", "/sub-agent mcp execution"),
                 ("allow <name> tool|skill|mcp <id>", "Add a resource to a sub-agent allowlist.", "/sub-agent allow execution tool read_file"),
                 ("disallow <name> tool|skill|mcp <id>", "Remove a resource from a sub-agent allowlist.", "/sub-agent disallow execution mcp filesystem"),
+                ("reset <name> tool|skill|mcp", "Remove stored scope overrides for one sub-agent resource type.", "/sub-agent reset execution tool"),
+                ("new <name> [local|global]", "Scaffold a new YAML sub-agent file.", "/sub-agent new explore"),
                 ("agents list", "List YAML sub-agents in local and global agent directories.", "/sub-agent agents list"),
                 ("agents new <name> [local|global]", "Scaffold a new YAML sub-agent file.", "/sub-agent agents new explore"),
                 ("agents promote <name>", "Move a local YAML sub-agent to the global directory.", "/sub-agent agents promote explore"),
@@ -366,6 +377,19 @@ async def handle_sub_agent(state: ReplState, args: list[str]) -> None:
         return
     if subcommand == "agents":
         await _handle_sub_agent_agents(state, args[1:])
+        return
+    if subcommand in {"new", "create"}:
+        await _handle_sub_agent_agents(state, ["new", *args[1:]])
+        return
+    if subcommand == "reset":
+        if len(args) < 3:
+            state.console.print("Usage: /sub-agent reset <name> tool|skill|mcp")
+            return
+        if _reset_subagent_resource_scope(state, args[1], args[2].lower()):
+            state.refresh_system_prompt()
+            record = _subagent_record(state, args[1])
+            if record is not None:
+                _print_subagent_show(state, record)
         return
     if subcommand in {"show", "tools", "skills", "mcp"}:
         if len(args) < 2:
@@ -396,7 +420,7 @@ async def handle_sub_agent(state: ReplState, args: list[str]) -> None:
             state.refresh_system_prompt()
             _print_subagent_show(state, record)
         return
-    state.console.print("Usage: /sub-agent [list|show|tools|skills|mcp|allow|disallow|agents|help]")
+    state.console.print("Usage: /sub-agent [list|show|tools|skills|mcp|allow|disallow|reset|new|agents|help]")
 
 
 async def _handle_sub_agent_agents(state: ReplState, args: list[str]) -> None:
@@ -1034,6 +1058,8 @@ async def handle_tools(state: ReplState, args: list[str]) -> None:
             (
                 ("(no args)", "Print a table of all tools: name, source, mutating flag, and description.", "/tools"),
                 ("reload",   "Reload config and re-register builtin and plugin tools without restarting.", "/tools reload"),
+                ("enable <tool>", "Remove a tool from denied_tools, and add it to allowed_tools when an allowlist is active.", "/tools enable read_file"),
+                ("disable <tool>", "Add a tool to denied_tools and remove it from allowed_tools.", "/tools disable bash"),
                 ("help",     "Show this help.",                                                            "/tools help"),
             ),
         )
@@ -1042,6 +1068,12 @@ async def handle_tools(state: ReplState, args: list[str]) -> None:
         _reload_config(state)
         count = _reload_tools(state)
         state.console.print(f"[green]Tools reloaded.[/green] {count} tool(s) registered.")
+        return
+    if subcommand in {"enable", "disable"}:
+        if len(args) < 2:
+            state.console.print("Usage: /tools enable|disable <tool>")
+            return
+        _set_workspace_tool_enabled(state, args[1], enabled=(subcommand == "enable"))
         return
     table = Table(title="Registered Tools")
     table.add_column("Name")
@@ -1062,6 +1094,44 @@ async def handle_tools(state: ReplState, args: list[str]) -> None:
             str(getattr(tool, "description", "")),
         )
     state.console.print(table)
+
+
+def _set_workspace_tool_enabled(state: ReplState, name: str, *, enabled: bool) -> None:
+    tool_name = name.strip()
+    if not tool_name:
+        state.console.print("Usage: /tools enable|disable <tool>")
+        return
+    try:
+        tool_name = state.tool_registry.record(tool_name).name
+    except LookupError:
+        # Disabled tools may not be registered in the current live registry.
+        pass
+
+    payload = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8")) if state.config.local_config_file.exists() else {}
+    allowed_tools = clean_string_list(payload.get("allowed_tools", []))
+    denied_tools = clean_string_list(payload.get("denied_tools", []))
+
+    if enabled:
+        denied_tools = [item for item in denied_tools if item != tool_name]
+        if allowed_tools and not is_all_scope(allowed_tools) and tool_name not in allowed_tools:
+            allowed_tools.append(tool_name)
+        action = "Enabled"
+    else:
+        allowed_tools = [item for item in allowed_tools if item != tool_name]
+        if tool_name not in denied_tools:
+            denied_tools.append(tool_name)
+        action = "Disabled"
+
+    if allowed_tools:
+        payload["allowed_tools"] = allowed_tools
+    else:
+        payload.pop("allowed_tools", None)
+    payload["denied_tools"] = denied_tools
+    _write_toml(state.config.local_config_file, payload)
+    _reload_config(state)
+    count = _reload_tools(state)
+    state.refresh_system_prompt()
+    state.console.print(f"{action} workspace tool: {tool_name}. {count} tool(s) registered.")
 
 
 async def handle_memory(state: ReplState, args: list[str]) -> None:
@@ -1476,6 +1546,28 @@ def _set_agent_resource_allowed(state: ReplState, kind: str, name: str, *, allow
     return True
 
 
+def _reset_agent_resource_scope(state: ReplState, kind: str) -> bool:
+    field_names = {
+        "tool": ("allowed_tools", "add_tools", "remove_tools"),
+        "skill": ("allowed_skills", "add_skills", "remove_skills"),
+        "mcp": ("allowed_mcp_servers", "allowed_mcps", "add_mcp_servers", "remove_mcp_servers", "add_mcps", "remove_mcps"),
+    }.get(kind)
+    if field_names is None:
+        state.console.print("Resource kind must be one of: tool, skill, mcp")
+        return False
+    payload = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8")) if state.config.local_config_file.exists() else {}
+    agent_scope = payload.get("agents")
+    if isinstance(agent_scope, dict):
+        for field_name in field_names:
+            agent_scope.pop(field_name, None)
+        if not agent_scope:
+            payload.pop("agents", None)
+    _write_toml(state.config.local_config_file, payload)
+    _reload_config(state)
+    state.console.print(f"Reset {kind} scope for supervisor.")
+    return True
+
+
 def _print_subagent_list(state: ReplState) -> None:
     records = _subagent_records(state)
     if not records:
@@ -1607,6 +1699,50 @@ def _set_subagent_resource_allowed(state: ReplState, record, kind: str, name: st
     _reload_config(state)
     action = "Allowed" if allowed else "Disallowed"
     state.console.print(f"{action} {kind} for sub-agent {subagent_name}: {normalized_resource}")
+    return True
+
+
+def _reset_subagent_resource_scope(state: ReplState, name: str, kind: str) -> bool:
+    field_names = {
+        "tool": ("allowed_tools", "add_tools", "remove_tools"),
+        "skill": ("allowed_skills", "add_skills", "remove_skills"),
+        "mcp": ("allowed_mcps", "allowed_mcp_servers", "add_mcps", "remove_mcps", "add_mcp_servers", "remove_mcp_servers"),
+    }.get(kind)
+    if field_names is None:
+        state.console.print("Resource kind must be one of: tool, skill, mcp")
+        return False
+    subagent_name = normalize_subagent_name(name)
+    payload = tomllib.loads(state.config.local_config_file.read_text(encoding="utf-8")) if state.config.local_config_file.exists() else {}
+    profiles = payload.get("sub-agents")
+    if not isinstance(profiles, list):
+        profiles = payload.pop("subagent_profiles", None)
+    if not isinstance(profiles, list):
+        state.console.print(f"No stored scope for sub-agent {subagent_name}.")
+        return False
+
+    kept_profiles: list[dict[str, object]] = []
+    reset = False
+    for entry in profiles:
+        if not isinstance(entry, dict):
+            continue
+        if normalize_subagent_name(str(entry.get("name", ""))) != subagent_name:
+            kept_profiles.append(entry)
+            continue
+        for field_name in field_names:
+            entry.pop(field_name, None)
+        reset = True
+        if any(key != "name" for key in entry):
+            kept_profiles.append(entry)
+    if not reset:
+        state.console.print(f"No stored scope for sub-agent {subagent_name}.")
+        return False
+    if kept_profiles:
+        payload["sub-agents"] = kept_profiles
+    else:
+        payload.pop("sub-agents", None)
+    _write_toml(state.config.local_config_file, payload)
+    _reload_config(state)
+    state.console.print(f"Reset {kind} scope for sub-agent {subagent_name}.")
     return True
 
 

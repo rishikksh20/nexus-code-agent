@@ -22,9 +22,6 @@ def init_workspace(
     dirs.ensure()
 
     created: list[Path] = []
-    if force or not dirs.global_config_file.exists():
-        dirs.global_config_file.write_text(_global_config_toml(), encoding="utf-8")
-        created.append(dirs.global_config_file)
     if force or not dirs.local_config_file.exists():
         dirs.local_config_file.write_text(
             _local_config_toml(

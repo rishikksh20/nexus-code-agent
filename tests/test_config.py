@@ -57,9 +57,9 @@ def test_config_synthesizes_legacy_current_profile_without_selection(tmp_path):
 
     assert config.active_model_profile == "legacy-current"
     assert config.active_model_profile_legacy is True
-    assert config.context_length == 200_000
+    assert config.context_length == get_model_context_limit(config.model_name)
     assert config.models["legacy-current"]["model_name"] == config.model_name
-    assert config.models["legacy-current"]["context_length"] == 200_000
+    assert config.models["legacy-current"]["context_length"] == get_model_context_limit(config.model_name)
 
 
 @pytest.mark.parametrize(
@@ -173,6 +173,18 @@ def test_init_creates_knowledge_file(tmp_path):
 
     assert any(path.name == "knowledge.md" for path in created)
     assert (workspace / ".nexus" / "knowledge.md").exists()
+
+
+def test_init_is_workspace_level_and_does_not_create_global_config(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_root = tmp_path / "global"
+
+    created = init_workspace(workspace, global_root=global_root, project_name="workspace")
+
+    assert (workspace / ".nexus" / "config.toml").exists()
+    assert not (global_root / "config.toml").exists()
+    assert global_root / "config.toml" not in created
 
 
 def test_init_copies_builtin_skills_without_overwriting_workspace_edits(tmp_path):
