@@ -8,8 +8,8 @@ import pytest
 from nexus.cli.init import init_workspace
 from nexus.config import load_config
 from nexus.config.loader import ConfigError
-from nexus.config.editor import update_model_profile_fields
-from nexus.config.model_limits import get_model_context_limit
+from nexus.config.editor import update_dotenv_value, update_model_profile_fields
+from nexus.config.model_catalog import get_model_context_limit
 from nexus.config.upgrade import inspect_config_upgrade, upgrade_config_file
 from nexus.skills import BUILTIN_SKILLS_DIR
 
@@ -103,6 +103,41 @@ def test_profile_editor_preserves_comments_and_nested_thinking(tmp_path):
     assert "# keep me" in content
     parsed = tomllib.loads(content)
     assert parsed["models"]["fast"]["thinking"] == {"enabled": False, "mode": "provider_default"}
+
+
+def test_dotenv_editor_updates_existing_key_and_preserves_other_lines(tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(
+        "# credentials\n"
+        "OPENAI_API_KEY=old\n"
+        "OTHER=value\n"
+        "OPENAI_API_KEY=duplicate\n",
+        encoding="utf-8",
+    )
+
+    update_dotenv_value(dotenv, "OPENAI_API_KEY", "new-key")
+
+    assert dotenv.read_text(encoding="utf-8") == "# credentials\nOPENAI_API_KEY=new-key\nOTHER=value\n"
+
+
+def test_builtin_model_catalog_includes_big_pickle_openai_compatible():
+    from nexus.config.model_catalog import builtin_model, builtin_models_for_provider
+    from nexus.config.model_catalog import get_model_context_limit
+
+    profile = builtin_model("openai-compatible", "big-pickle")
+
+    assert profile is not None
+    assert profile.openai_compatible is True
+    assert profile.context_length == 200_000
+    assert profile.max_output_tokens == 32_000
+    assert profile.reserved_output_tokens == 32_000
+    assert profile.supports_reasoning is True
+    assert profile.thinking_mode == "budget_tokens"
+    assert profile.thinking_budget_tokens == 4096
+    assert profile.base_url_env == "BASE_URL"
+    assert profile.api_key_env == "API_KEY"
+    assert profile in builtin_models_for_provider("openai-compatible")
+    assert get_model_context_limit("big-pickle") == 200_000
 
 
 def test_global_config_upgrade_adds_non_destructive_legacy_profile(tmp_path):

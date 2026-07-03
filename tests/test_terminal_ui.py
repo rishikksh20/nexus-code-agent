@@ -32,6 +32,17 @@ def test_terminal_ui_startup_banner_includes_ascii_wordmark():
     assert "demo-model" in output
 
 
+def test_terminal_ui_fake_provider_notice_mentions_setup_command():
+    ui = _build_ui()
+
+    ui.print_fake_provider_notice()
+    output = ui.console.export_text()
+
+    assert "Provider notice" in output
+    assert "fake provider" in output
+    assert "/setup" in output
+
+
 def test_terminal_ui_renders_inline_approval_inside_tool_panel():
     ui = _build_ui()
     diff_preview = {

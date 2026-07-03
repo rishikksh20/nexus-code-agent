@@ -1374,6 +1374,26 @@ async def test_provider_manage_classic_terminal_prints_textual_requirement(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_setup_classic_terminal_prints_textual_requirement(tmp_path):
+    config = load_config(tmp_path, global_root=tmp_path / "global")
+    console = Console(record=True, no_color=True)
+    state = ReplState(
+        config=config,
+        mode=ExecutionMode.DEFAULT,
+        session=new_snapshot("setup-classic"),
+        session_store=SessionStore(config.session_dir),
+        tool_registry=ToolRegistry(),
+        memory_store=MemoryStore(config.memory_dir),
+        console=console,
+    )
+
+    assert await build_router().dispatch(state, "/setup") is True
+    output = console.export_text()
+    assert "/setup requires the Textual UI" in output
+    assert "/provider set" in output
+
+
+@pytest.mark.asyncio
 async def test_provider_set_slash_command_rejects_restricted_key(tmp_path):
     config = load_config(tmp_path, global_root=tmp_path / "global")
     registry = ToolRegistry()
@@ -1862,19 +1882,19 @@ async def test_unknown_slash_command_returns_false(tmp_path):
 # ── Model context limits ──────────────────────────────────────────────────────
 
 def test_get_model_context_limit_exact_match():
-    from nexus.config.model_limits import get_model_context_limit
+    from nexus.config.model_catalog import get_model_context_limit
     assert get_model_context_limit("mistral-medium-latest") == 32_768
 
 
 def test_get_model_context_limit_prefix_match():
-    from nexus.config.model_limits import get_model_context_limit
+    from nexus.config.model_catalog import get_model_context_limit
     # "mistral-large-2407" is in the table but "mistral-large-9999" is not;
     # it should prefix-match "mistral-large" (131_072 tokens).
     assert get_model_context_limit("mistral-large-9999") == 131_072
 
 
 def test_get_model_context_limit_unknown_model_uses_default():
-    from nexus.config.model_limits import get_model_context_limit, _DEFAULT_CONTEXT_LIMIT
+    from nexus.config.model_catalog import get_model_context_limit, _DEFAULT_CONTEXT_LIMIT
     assert get_model_context_limit("some-unknown-model-xyz") == _DEFAULT_CONTEXT_LIMIT
 
 

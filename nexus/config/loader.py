@@ -839,7 +839,7 @@ def _ensure_legacy_profile(values: dict[str, Any]) -> dict[str, Any]:
         return resolved
     context_length = int(resolved.get("context_length", 0) or 0)
     if context_length <= 0:
-        from nexus.config.model_limits import get_model_context_limit
+        from nexus.config.model_catalog import get_model_context_limit
 
         context_length = get_model_context_limit(str(resolved.get("model_name", "")))
     max_output_tokens = int(resolved.get("max_output_tokens", 4096))

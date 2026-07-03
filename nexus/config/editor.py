@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 from tomlkit import TOMLDocument, dumps, parse, table
 
 from nexus.config.provider_profiles import ModelProfile, ProviderConfig
+
+
+_ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def save_provider(path: Path, provider: ProviderConfig) -> None:
@@ -53,6 +57,36 @@ def update_top_level(path: Path, key: str, value: Any) -> None:
     _write_document(path, document)
 
 
+def update_dotenv_value(path: Path, key: str, value: str) -> None:
+    key = key.strip()
+    if not _ENV_KEY_RE.fullmatch(key):
+        raise ValueError("Environment key must be a valid variable name.")
+    if "\n" in value or "\r" in value:
+        raise ValueError("Environment value must be a single line.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    replacement = f"{key}={_format_dotenv_value(value)}"
+    updated = False
+    next_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            current_key, _, _ = stripped.partition("=")
+            if current_key.strip() == key:
+                if not updated:
+                    next_lines.append(replacement)
+                    updated = True
+                continue
+        next_lines.append(line)
+    if not updated:
+        next_lines.append(replacement)
+    path.write_text("\n".join(next_lines).rstrip() + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
 def remove_top_level(path: Path, key: str) -> None:
     document = _load_document(path)
     document.pop(key, None)
@@ -96,3 +130,10 @@ def _write_document(path: Path, document: TOMLDocument) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(dumps(document), encoding="utf-8")
     temporary.replace(path)
+
+
+def _format_dotenv_value(value: str) -> str:
+    if value and all(char not in value for char in " \t#'\""):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'

@@ -110,7 +110,7 @@ The current Nexus implementation now reinforces this chapter in a few concrete w
 - `mistral` is now the default provider; `mistral-medium-latest` is the default model and `https://api.mistral.ai/v1` is the default `api_base_url`; the fake provider remains available for CI and offline development via `--provider fake`
 - auth resolution for Mistral checks `MISTRAL_API_KEY` → `NEXUS_API_KEY` → `OPENAI_API_KEY` in that order; a `.env` file in the workspace root is parsed at startup before any env-var lookup
 - the REPL startup banner shows the active provider, model, and mode; if no API key is detected for a live provider, a warning is printed before the first prompt so users are not left guessing why responses look wrong
-- a built-in model-limits table (`nexus/config/model_limits.py`, 40+ models) is used at startup to auto-tune compaction thresholds to 65% and 85% of the active model's context window
+- the built-in model catalogue (`nexus/config/model_catalog.py`) is used at startup to auto-tune compaction thresholds to 65% and 85% of the active model's context window
 - `nexus init` now prints a numbered API key setup guide when no key is found for the configured provider: `.env` file method, environment variable method, and config TOML method; for Mistral, a direct link to `https://console.mistral.ai` is included
 - provider errors during REPL turns and headless runs are now caught and presented as a friendly `✗ Request failed.` message; covered cases include: no API key, 401/403 auth failure, 429 rate limit, missing `api_base_url`, and connection errors; in the REPL the failed turn is removed from history and the session stays open; in headless mode `HeadlessResult(exit_code=EXIT_ERROR)` is returned
 

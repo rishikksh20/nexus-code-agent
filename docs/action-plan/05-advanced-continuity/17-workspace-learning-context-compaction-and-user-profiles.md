@@ -65,7 +65,7 @@ The current Nexus runtime now implements this chapter in a minimal but real way:
 - human-readable workspace knowledge is regenerated into `.nexus/knowledge.md`
 - user-scoped learning is written to `~/.nexus/profile.md` and `~/.nexus/workspaces.json`
 - context compaction now preserves recent turns and moves older detail into explicit carry-over summaries
-- compaction thresholds are no longer fixed at 10,000/14,000 tokens; at startup, Nexus looks up the active model in a built-in model-limits table (`nexus/config/model_limits.py`, covering 40+ Mistral and OpenAI models) and auto-sets soft to 65% and hard to 85% of that model's known context window; user-defined values are respected and never overwritten
+- compaction thresholds are no longer fixed at 10,000/14,000 tokens; at startup, Nexus looks up the active model in the built-in model catalogue (`nexus/config/model_catalog.py`) and auto-sets soft to 65% and hard to 85% of that model's known context window; user-defined values are respected and never overwritten
 - the current compaction limits and estimated token usage for system prompt and history are visible at any time via `/context usage` inside the REPL
 
 The current implementation still keeps learning conservative on purpose. It records stable workspace facts, recent tasks, and tool preferences rather than speculative summaries about the user.

@@ -184,6 +184,7 @@ def build_router() -> SlashCommandRouter:
     router.register(SlashCommand("subagent", "Inspect and scope cognitive sub-agent resources.", handle_sub_agent))
     router.register(SlashCommand("mode", "Show or switch execution mode.", handle_mode))
     router.register(SlashCommand("provider", "Show or update model provider and session parameters.", handle_provider))
+    router.register(SlashCommand("setup", "Open guided provider and model setup.", handle_setup))
     router.register(SlashCommand("skills", "Inspect and activate skills.", handle_skills))
     router.register(SlashCommand("config", "Show merged, local, or global config.", handle_config))
     router.register(SlashCommand("session", "Inspect or create sessions.", handle_session))
@@ -209,6 +210,7 @@ async def handle_help(state: ReplState, args: list[str]) -> None:
         ("/sub-agent [list|show|tools|skills|mcp|allow|disallow]", "Inspect and scope sub-agent resources."),
         ("/mode [plan|default|auto]", "Show or switch execution mode."),
         ("/provider [list|profiles|use|manage|set]", "Inspect provider cards, activate profiles, or update model/session parameters."),
+        ("/setup", "Open guided provider, model, thinking, and API key setup."),
         ("/skills [list|show|add|remove|reload]", "Inspect and activate session skills."),
         ("/config show [scope]", "Print config for merged, local, or global scope."),
         ("/config upgrade [local|global]", "Add new config keys/tool allowlist entries from latest Nexus defaults, then reload tools."),
@@ -586,6 +588,25 @@ async def handle_mode(state: ReplState, args: list[str]) -> None:
         return
     state.mode = ExecutionMode(args[0].lower())
     state.console.print(f"Mode set to: {state.mode.value}")
+
+
+async def handle_setup(state: ReplState, args: list[str]) -> None:
+    if args and args[0].lower() == "help":
+        _print_subcommand_help(
+            state, "setup", "Open guided provider, model, thinking, and API key setup.",
+            (
+                ("(no args)", "Open the setup wizard in the Textual UI.", "/setup"),
+                ("help", "Show this help.", "/setup help"),
+            ),
+        )
+        return
+    if state.setup_wizard_opener is None:
+        state.console.print(
+            "/setup requires the Textual UI. Use /provider manage for provider/profile editing "
+            "or /provider set <param> <value> for terminal updates."
+        )
+        return
+    state.setup_wizard_opener()
 
 
 async def handle_provider(state: ReplState, args: list[str]) -> None:

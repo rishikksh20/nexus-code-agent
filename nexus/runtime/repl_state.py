@@ -67,6 +67,7 @@ class ReplState:
     abort_requested: bool = False
     model_client_reloader: Callable[[AgentConfig], None] | None = None
     provider_settings_opener: Callable[[], None] | None = None
+    setup_wizard_opener: Callable[[], None] | None = None
 
     def begin_running_turn(self, task: asyncio.Task | None = None) -> None:
         self.current_turn_task = task or asyncio.current_task()

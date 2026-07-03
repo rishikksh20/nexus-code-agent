@@ -66,7 +66,7 @@ nexus/                         # Main package
 ├── config/                    # Config loading and defaults
 │   ├── defaults.py            # AgentConfig dataclass with all fields and defaults
 │   ├── loader.py              # Global + local TOML merge and env-var injection
-│   └── model_limits.py        # Context-window limits for 40+ models
+│   └── model_catalog.py       # Built-in providers, models, and context windows
 │
 ├── context/                   # Context management
 │   ├── builder.py             # ContextSections dataclass + ContextBuilder renderer
@@ -367,6 +367,7 @@ Available inside the interactive REPL. Every command accepts a `help` subcommand
 | `/context [show\|usage]` | Print system prompt or show supervisor token/context-window usage, including tool, MCP, sub-agent, and skill prompt/schema estimates |
 | `/context agents\|agent \<id\>\|usage \<id\>` | Inspect per-agent context isolation, handoffs, and usage |
 | `/provider [list\|profiles\|use \<profile\>\|manage\|set \<param\> \<value\>]` | Inspect providers, activate reusable profiles, open Textual settings, or update live parameters |
+| `/setup` | Open guided provider, model, thinking, and API key setup in the Textual UI |
 | `/config [show\|set\|reset\|reset-defaults\|reload\|upgrade\|reinit]` | Inspect or edit configuration; `reset-defaults` rewrites clean defaults |
 | `/skills [list\|show\|add\|remove\|reload]` | Manage session skills and skill-backed sub-agent tools |
 | `/agent [status\|switch\|tools\|skills\|mcp\|allow\|disallow]` | Inspect, switch, and scope supervisor tools, skills, and MCP servers |
@@ -802,6 +803,14 @@ Provider names are fixed adapter cards. Reusable provider settings and model
 profiles belong in `~/.nexus/config.toml`; a workspace selects one profile in
 `.nexus/config.toml`. Use `/provider manage` in the Textual UI, or
 `/provider profiles` and `/provider use <profile>` in either interactive UI.
+For first-time setup in the Textual UI, `/setup` opens a guided workspace-level
+wizard. It writes provider/model profile deltas and the active profile selection
+to `.nexus/config.toml`; when you enter an API key or endpoint, the secret and
+base URL are stored in the workspace `.env` under the provider-specific
+environment variables rather than in TOML. Builtin setup choices come from
+`nexus/config/model_catalog.py` and include provider, context window,
+OpenAI-compatible/native API type, thinking support, default thinking budget,
+and credential/env hints such as `BASE_URL` and `API_KEY`.
 
 ```toml
 # ~/.nexus/config.toml
@@ -1135,10 +1144,14 @@ name identifies the API adapter class; the user-created entity is the model
 profile. All agents and cognitive sub-agents use the same resolved active
 profile in this release.
 
-The Textual UI exposes `/provider manage` with **Providers** and **Model
-Profiles** tabs. Credential forms store environment-variable names only, never
-secret values. Live profile tests require a second confirmation click because
-they can incur a small provider charge.
+The Textual UI exposes `/setup` for guided workspace setup and `/provider manage`
+with **Providers** and **Model Profiles** tabs for advanced editing. Credential
+forms in `/provider manage` store environment-variable names only, never secret
+values; `/setup` writes newly entered keys and base URLs to the workspace `.env`.
+The builtin setup catalogue includes `big-pickle` for `openai-compatible` with a
+200k context window and budget-token thinking defaults. Live profile tests
+require a second confirmation click because they can incur a small provider
+charge.
 
 | Provider | Value | Notes |
 |---|---|---|

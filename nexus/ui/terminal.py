@@ -337,7 +337,7 @@ class TerminalUI:
         self._console.print(
             Panel(
                 Text(
-                    "Using the fake provider — responses are mocked. Set a real provider, API_KEY, and BASE_URL in .env for live coding-agent responses.",
+                    "Using the fake provider — responses are mocked. Run /setup to choose a real model, or set a real provider, API_KEY, and BASE_URL in .env.",
                     style="warning",
                 ),
                 title=Text("Provider notice", style="warning"),

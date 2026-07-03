@@ -382,12 +382,14 @@ class NexusTextualApp(App[None]):
         self.console.push_theme(NEXUS_THEME)
         self.state.console = self.ui
         self.state.provider_settings_opener = self.open_provider_settings
+        self.state.setup_wizard_opener = self.open_model_setup
         self._render_startup()
         self.refresh_footer()
         self._input.focus()
 
     def on_unmount(self) -> None:
         self.state.provider_settings_opener = None
+        self.state.setup_wizard_opener = None
         self.state.console = self._original_console
 
     def open_provider_settings(self) -> None:
@@ -395,6 +397,13 @@ class NexusTextualApp(App[None]):
 
         self.push_screen(
             ProviderSettingsScreen(self.state, on_reload=self._reload_provider_settings)
+        )
+
+    def open_model_setup(self) -> None:
+        from nexus.ui.model_setup import ModelSetupScreen
+
+        self.push_screen(
+            ModelSetupScreen(self.state, on_reload=self._reload_provider_settings)
         )
 
     def _reload_provider_settings(self) -> None:

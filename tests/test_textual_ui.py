@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import tomllib
+from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
 from rich.text import Text
 from textual.geometry import Offset
 from textual.selection import Selection
-from textual.widgets import Button, Input, OptionList
+from textual.widgets import Button, Checkbox, Input, OptionList, Select
 
 from nexus.config import load_config
 from nexus.integrations.fake_model import FakeModelClient
@@ -316,6 +319,165 @@ async def test_textual_provider_manage_opens_settings_screen(tmp_path):
         state.provider_settings_opener()
         await pilot.pause()
         assert isinstance(app.screen, ProviderSettingsScreen)
+
+
+@pytest.mark.asyncio
+async def test_textual_setup_opens_wizard_and_saves_workspace_model(tmp_path, monkeypatch):
+    from nexus.ui.model_setup import ModelSetupScreen
+
+    for key in ("OPENAI_API_KEY", "API_KEY", "MODEL", "PROVIDER", "BASE_URL", "AGENT_MODEL_NAME", "AGENT_PROVIDER"):
+        monkeypatch.delenv(key, raising=False)
+    app = _new_textual_app(tmp_path)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert await app.router.dispatch(app.state, "/setup") is True
+        await pilot.pause()
+        assert isinstance(app.screen, ModelSetupScreen)
+        await pilot.click(app.screen, offset=(1, 16))
+        await pilot.pause()
+        screen = app.screen
+        screen._load_provider("openai")
+        screen._load_model_choice("builtin:gpt-4o")
+        assert screen.query_one("#setup-profile-row").display is False
+        assert screen.query_one("#setup-base-url-env-row").display is False
+        assert screen.query_one("#setup-api-key-env-row").display is False
+        assert screen.query_one("#setup-base-url", Input).value == "https://api.openai.com/v1"
+        screen.query_one("#setup-thinking-enabled", Checkbox).value = True
+        screen.query_one("#setup-thinking-mode", Select).value = "reasoning_effort"
+        screen.query_one("#setup-api-key", Input).value = "sk-test"
+
+        screen._save_setup()
+        await pilot.pause()
+
+    local = tomllib.loads(app.state.config.local_config_file.read_text(encoding="utf-8"))
+    profile = local["models"]["openai-gpt-4o"]
+    assert local["active_model_profile"] == "openai-gpt-4o"
+    assert local["providers"]["openai"]["api_key_env"] == "OPENAI_API_KEY"
+    assert profile["provider"] == "openai"
+    assert profile["model_name"] == "gpt-4o"
+    assert profile["thinking"]["enabled"] is True
+    assert profile["thinking"]["mode"] == "reasoning_effort"
+    assert profile["thinking"]["reasoning_effort"] == "high"
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "BASE_URL=https://api.openai.com/v1\nOPENAI_API_KEY=sk-test\n"
+    assert app.state.config.provider == "openai"
+    assert app.state.config.model_name == "gpt-4o"
+    for key in ("OPENAI_API_KEY", "BASE_URL"):
+        os.environ.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_textual_setup_big_pickle_prefills_openai_compatible_budget_model(tmp_path, monkeypatch):
+    from nexus.ui.model_setup import ModelSetupScreen
+
+    for key in ("API_KEY", "BASE_URL", "MODEL", "PROVIDER", "AGENT_MODEL_NAME", "AGENT_PROVIDER"):
+        monkeypatch.delenv(key, raising=False)
+    app = _new_textual_app(tmp_path)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert await app.router.dispatch(app.state, "/setup") is True
+        await pilot.pause()
+        assert isinstance(app.screen, ModelSetupScreen)
+        screen = app.screen
+        screen._load_provider("openai-compatible")
+        screen._load_model_choice("builtin:big-pickle")
+
+        assert screen.query_one("#setup-profile-name", Input).value == "openai-compatible-big-pickle"
+        assert screen.query_one("#setup-model-name", Input).value == "big-pickle"
+        assert screen.query_one("#setup-context", Input).value == "200000"
+        assert screen.query_one("#setup-max-output", Input).value == "32000"
+        assert screen.query_one("#setup-reserved-output", Input).value == "32000"
+        assert screen.query_one("#setup-api-key-env", Input).value == "API_KEY"
+        assert screen.query_one("#setup-base-url-env", Input).value == "BASE_URL"
+        assert screen.query_one("#setup-thinking-mode", Select).value == "budget_tokens"
+        assert screen.query_one("#setup-thinking-budget", Input).value == "4096"
+
+
+@pytest.mark.asyncio
+async def test_textual_setup_inputs_support_copy_cut_and_paste(tmp_path, monkeypatch):
+    from textual import events
+
+    from nexus.ui.model_setup import ModelSetupScreen
+
+    monkeypatch.setattr("nexus.ui.textual_app._copy_to_system_clipboard", lambda text: True)
+    app = _new_textual_app(tmp_path)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert await app.router.dispatch(app.state, "/setup") is True
+        await pilot.pause()
+        assert isinstance(app.screen, ModelSetupScreen)
+        screen = app.screen
+        field = screen.query_one("#setup-model-name", Input)
+        field.value = ""
+        field.focus()
+        await pilot.pause()
+
+        app.copy_to_clipboard("keyboard-paste")
+        await pilot.press("ctrl+v")
+        assert field.value == "keyboard-paste"
+
+        field.value = ""
+        screen.on_paste(events.Paste("pasted-model\nignored"))
+        assert field.value == "pasted-model"
+
+        field.select_all()
+        screen.action_copy_focused_input()
+        assert app.clipboard == "pasted-model"
+
+        app.copy_to_clipboard("replacement")
+        screen.action_paste_focused_input()
+        assert field.value == "replacement"
+
+        field.select_all()
+        screen.action_cut_focused_input()
+        assert app.clipboard == "replacement"
+        assert field.value == ""
+
+
+@pytest.mark.asyncio
+async def test_textual_setup_custom_model_auto_names_profile_and_writes_env(tmp_path, monkeypatch):
+    from nexus.ui.model_setup import ModelSetupScreen
+
+    for key in ("API_KEY", "BASE_URL", "MODEL", "PROVIDER", "AGENT_MODEL_NAME", "AGENT_PROVIDER"):
+        monkeypatch.delenv(key, raising=False)
+    app = _new_textual_app(tmp_path)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert await app.router.dispatch(app.state, "/setup") is True
+        await pilot.pause()
+        assert isinstance(app.screen, ModelSetupScreen)
+        screen = app.screen
+        screen._load_provider("openai-compatible")
+        screen._load_model_choice("custom:")
+        assert screen.query_one("#setup-extra-row").display is False
+        await screen.on_button_pressed(SimpleNamespace(button=SimpleNamespace(id="setup-add-field")))  # type: ignore[arg-type]
+        await pilot.pause()
+        assert screen.query_one("#setup-extra-row").display is True
+        screen.query_one("#setup-profile-name", Input).value = ""
+        screen.query_one("#setup-model-name", Input).value = "my custom/model"
+        screen.query_one("#setup-base-url", Input).value = "https://llm.example.test/v1"
+        screen.query_one("#setup-api-key", Input).value = "custom-key"
+        screen.query_one("#setup-extra-key", Input).value = "CUSTOM_HEADER"
+        screen.query_one("#setup-extra-value", Input).value = "enabled"
+
+        screen._save_setup()
+        await pilot.pause()
+
+    local = tomllib.loads(app.state.config.local_config_file.read_text(encoding="utf-8"))
+    profile = local["models"]["openai-compatible-my-custom-model"]
+    assert local["active_model_profile"] == "openai-compatible-my-custom-model"
+    assert profile["provider"] == "openai-compatible"
+    assert profile["model_name"] == "my custom/model"
+    assert (
+        tmp_path / ".env"
+    ).read_text(encoding="utf-8") == "BASE_URL=https://llm.example.test/v1\nAPI_KEY=custom-key\nCUSTOM_HEADER=enabled\n"
+    assert app.state.config.provider == "openai-compatible"
+    assert app.state.config.model_name == "my custom/model"
+    for key in ("API_KEY", "BASE_URL", "CUSTOM_HEADER"):
+        os.environ.pop(key, None)
 
 
 @pytest.mark.asyncio

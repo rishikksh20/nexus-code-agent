@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from nexus.config.model_limits import get_model_context_limit
+from nexus.config.model_catalog import get_model_context_limit
 from nexus.runtime.agent_scope import BUILTIN_SUBAGENT_SPECS, SUPERVISOR_DEFAULT_TOOLS
 
 

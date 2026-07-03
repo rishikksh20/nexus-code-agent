@@ -276,7 +276,7 @@ class TextualTerminalUI(TerminalUI):
         self._write(
             Panel(
                 Text(
-                    "Using the fake provider. Responses are mocked; set a real provider, API_KEY, and BASE_URL in .env for live coding-agent responses.",
+                    "Using the fake provider. Responses are mocked; run /setup to choose a real model, or set a real provider, API_KEY, and BASE_URL in .env.",
                     style="yellow",
                 ),
                 title=Text("Provider notice", style="bold yellow"),
