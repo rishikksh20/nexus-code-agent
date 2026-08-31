@@ -1,4 +1,4 @@
-# Nexus AI Coding Agent
+# Nexus AI Coding Agent [WIP]
 
 **Nexus** is a CLI-first AI coding agent and terminal-based pair programmer. It runs in an interactive REPL or headless one-shot mode, executes tools, manages sessions, and keeps context across long conversations through compaction and carry-over summaries.
 
